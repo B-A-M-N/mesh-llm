@@ -6,7 +6,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
-use reqwest::blocking::Client;
+use reqwest::blocking::{Client, Response};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -181,8 +181,7 @@ pub fn local_single(args: LocalSingleArgs) -> Result<()> {
             .json(&warmup_request)
             .send()
             .context("failed to send warmup text request")?
-            .error_for_status()
-            .context("warmup text request failed")?;
+            .error_for_status_with_body("warmup text request failed")?;
     }
 
     let mut request_results = Vec::new();
@@ -206,8 +205,7 @@ pub fn local_single(args: LocalSingleArgs) -> Result<()> {
             .json(&request)
             .send()
             .context("failed to send text request")?
-            .error_for_status()
-            .context("text request failed")?
+            .error_for_status_with_body("text request failed")?
             .json()
             .context("failed to parse text response")?;
         let elapsed = text_request_start.elapsed();
@@ -302,4 +300,21 @@ pub fn local_single(args: LocalSingleArgs) -> Result<()> {
     );
 
     Ok(())
+}
+
+trait ResponseStatusBodyExt {
+    fn error_for_status_with_body(self, context: &str) -> Result<Response>;
+}
+
+impl ResponseStatusBodyExt for Response {
+    fn error_for_status_with_body(self, context: &str) -> Result<Response> {
+        let status = self.status();
+        if status.is_success() {
+            return Ok(self);
+        }
+        let body = self
+            .text()
+            .unwrap_or_else(|error| format!("failed to read error body: {error}"));
+        bail!("{context}: HTTP status {status}: {body}");
+    }
 }

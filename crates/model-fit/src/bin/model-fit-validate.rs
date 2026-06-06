@@ -6,14 +6,15 @@ use model_fit::{
     AcceleratorKind, BackendKind, CpuProfile, FitStatus, GpuBenchmarkAcceleratorFacts,
     GpuBenchmarkHardwareInput, GpuBenchmarkOutput, HardwareProfile, MemoryProfile, ModelProfile,
     ModelRecommendation, SelectionConfig, TensorTypeBytes, WorkloadProfile,
-    hardware_profile_from_gpu_benchmark, profile_gguf_path, score_model, throughput_sample_stats,
+    hardware_profile_from_gpu_benchmark, profile_gguf_path, score_model,
+    score_model_for_context_tokens, throughput_sample_stats,
 };
 use model_hf::{HfModelRepository, ModelDownloadProgress, ModelDownloadProgressEvent};
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::{
     cmp::Ordering,
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs,
     io::Write,
     path::{Path, PathBuf},
@@ -57,6 +58,8 @@ struct Args {
     fit_only: bool,
     dense_probe_depth: DenseProbeDepth,
     show_progress: bool,
+    skip_context_aligned_abi: bool,
+    allow_debug_validation: bool,
     models: Vec<ModelInput>,
 }
 
@@ -83,6 +86,7 @@ struct ValidationReport {
     schema_version: u32,
     generated_at_unix_secs: u64,
     command: Vec<String>,
+    validation_build: ValidationBuild,
     fit_input_contract: FitInputContract,
     hardware_profile: HardwareProfile,
     gpu_benchmark_outputs: Vec<GpuBenchmarkOutput>,
@@ -91,6 +95,16 @@ struct ValidationReport {
     validation_config: ValidationConfig,
     models: Vec<ModelValidationReport>,
     summary: ValidationSummary,
+}
+
+#[derive(Debug, Serialize)]
+struct ValidationBuild {
+    package_version: &'static str,
+    profile: &'static str,
+    debug_assertions: bool,
+    allow_debug_validation: bool,
+    benchmark_binary_warnings: Vec<String>,
+    note: &'static str,
 }
 
 #[derive(Debug, Serialize)]
@@ -120,6 +134,7 @@ struct ValidationConfig {
     fit_only: bool,
     dense_probe_depth: &'static str,
     show_progress: bool,
+    skip_context_aligned_abi: bool,
     prompt: String,
     primary_workload: String,
     scored_workloads: Vec<String>,
@@ -139,6 +154,7 @@ struct ModelValidationReport {
     runtime_diagnostic: Option<RuntimeDiagnostic>,
     recommendations: Vec<WorkloadRecommendation>,
     abi_decode_probe: Option<AbiDecodeProbeSummary>,
+    context_aligned_abi_decode_probe: Option<AbiDecodeProbeSummary>,
     decode_probe_diagnostic: Option<DecodeProbeDiagnostic>,
     graph_inventory_diagnostic: Option<GraphInventoryDiagnostic>,
     operation_bucket_diagnostic: Option<OperationBucketDiagnostic>,
@@ -179,6 +195,12 @@ struct RuntimeDiagnostic {
     notes: Vec<String>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AbiDecodeProbeKind {
+    Standard,
+    ContextAligned,
+}
+
 #[derive(Clone, Debug, Serialize)]
 struct AbiDecodeProbeSummary {
     attempted: bool,
@@ -193,6 +215,8 @@ struct AbiDecodeProbeSummary {
     decode_call_ms: Option<f64>,
     sampling_tokens_per_second: Option<f64>,
     sampling_ms: Option<f64>,
+    logits_ready_ms: Option<f64>,
+    logits_scan_ms: Option<f64>,
     llama_eval_count: Option<u64>,
     llama_graph_reuse_count: Option<i64>,
     graph_node_count: Option<u64>,
@@ -239,6 +263,8 @@ struct AbiDecodeProbeObservation {
     decode_call_ms: Option<f64>,
     sampling_tokens_per_second: Option<f64>,
     sampling_ms: Option<f64>,
+    logits_ready_ms: Option<f64>,
+    logits_scan_ms: Option<f64>,
     llama_eval_count: Option<u64>,
     llama_graph_reuse_count: Option<i64>,
     graph_node_count: Option<u64>,
@@ -253,16 +279,75 @@ struct AbiDecodeProbeObservation {
 #[derive(Clone, Debug, Serialize)]
 struct DecodeProbeDiagnostic {
     predicted_tokens_per_second: Option<f64>,
+    scenario_predicted_tokens_per_second: Option<f64>,
     abi_tokens_per_second: Option<f64>,
     observed_tokens_per_second: Option<f64>,
     observed_over_fit: Option<f64>,
+    observed_over_scenario_fit: Option<f64>,
     abi_over_fit: Option<f64>,
+    abi_over_scenario_fit: Option<f64>,
     observed_over_abi: Option<f64>,
+    scenario_prediction_source: Option<&'static str>,
     observed_vs_fit: String,
+    observed_vs_scenario_fit: String,
     abi_vs_fit: String,
+    abi_vs_scenario_fit: String,
     observed_vs_abi: String,
+    predicted_decode_submission_ms_per_token: Option<f64>,
+    abi_decode_call_ms_per_token: Option<f64>,
+    decode_submission_residual_ms_per_token: Option<f64>,
+    decode_submission_residual_share_of_predicted: Option<f64>,
+    predicted_sampler_sync_ms_per_token: Option<f64>,
+    abi_sampling_ms_per_token: Option<f64>,
+    abi_logits_ready_ms_per_token: Option<f64>,
+    abi_logits_scan_ms_per_token: Option<f64>,
+    abi_sampling_over_selected_fit: Option<f64>,
+    sampler_sync_residual_ms_per_token: Option<f64>,
+    sampler_sync_residual_share_of_predicted: Option<f64>,
+    selected_full_token_handoff_probe: bool,
+    selected_full_token_source_sampled_probe: bool,
+    selected_fit_probe_count: usize,
+    selected_fit_probe_max_spread_pct: Option<f64>,
     classification: String,
     notes: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct DecodeProbeClassificationInput {
+    predicted: Option<f64>,
+    abi: Option<f64>,
+    observed: Option<f64>,
+    missing_representative_model_probe: bool,
+    abi_probe_noisy: bool,
+    request_decode_noisy: bool,
+    request_spread_pct: Option<f64>,
+    observed_over_fit: Option<f64>,
+    observed_over_scenario_fit: Option<f64>,
+    abi_over_fit: Option<f64>,
+    abi_over_scenario_fit: Option<f64>,
+    observed_over_abi: Option<f64>,
+    abi_sampling_over_selected_fit: Option<f64>,
+    selected_full_token_handoff_probe: bool,
+    selected_full_token_source_sampled_probe: bool,
+    decode_submission_residual_share_of_predicted: Option<f64>,
+    sampler_sync_residual_share_of_predicted: Option<f64>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct DecodeProbeNotesInput<'a> {
+    observed_over_fit: Option<f64>,
+    abi_over_fit: Option<f64>,
+    observed_over_abi: Option<f64>,
+    decode_submission_residual_ms_per_token: Option<f64>,
+    abi_decode_call_ms_per_token: Option<f64>,
+    sampler_sync_residual_ms_per_token: Option<f64>,
+    abi_sampling_over_selected_fit: Option<f64>,
+    abi_logits_ready_ms_per_token: Option<f64>,
+    abi_logits_scan_ms_per_token: Option<f64>,
+    request_spread_pct: Option<f64>,
+    selected_fit_probe_max_spread_pct: Option<f64>,
+    selected_full_token_source_sampled_probe: bool,
+    classification: &'a str,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -273,6 +358,15 @@ struct GraphInventoryDiagnostic {
     graph_inventory_bucket_overflow_count: Option<u64>,
     selected_transformer_probe: Option<String>,
     selected_transformer_probe_layers: Option<u32>,
+    selected_probe_context_tokens: Option<u32>,
+    abi_graph_context_tokens: Option<u32>,
+    selected_probe_node_count: Option<u64>,
+    selected_probe_nodes_over_abi: Option<f64>,
+    selected_probe_inventory_bucket_mismatch_count: Option<u64>,
+    selected_probe_inventory_abs_node_delta: Option<u64>,
+    selected_probe_inventory_abs_src0_delta_bytes: Option<u64>,
+    selected_probe_inventory_abs_src1_delta_bytes: Option<u64>,
+    selected_probe_inventory_abs_output_delta_bytes: Option<u64>,
     metadata_transformer_matmul_nodes: u64,
     graph_transformer_matmul_nodes: u64,
     metadata_transformer_weight_bytes: u64,
@@ -296,6 +390,27 @@ struct GraphInventoryComparison {
     graph_node_count: u64,
     src0_over_metadata: Option<f64>,
     node_count_delta: i64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct SelectedProbeInventoryDelta {
+    bucket_mismatch_count: u64,
+    abs_node_delta: u64,
+    abs_src0_delta_bytes: u64,
+    abs_src1_delta_bytes: u64,
+    abs_output_delta_bytes: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct GraphInventoryNotesInput {
+    metadata_transformer_weight_bytes: u64,
+    graph_transformer_weight_src0_bytes: u64,
+    graph_unclassified_matmul_src0_bytes: u64,
+    metadata_transformer_matmul_nodes: u64,
+    graph_transformer_matmul_nodes: u64,
+    selected_probe_layers: Option<u32>,
+    estimated_transformer_over_abi: Option<f64>,
+    selected_probe_nodes_over_abi: Option<f64>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -357,6 +472,15 @@ enum BenchmarkScenarioKind {
     // is currently best at predicting because it is closest to llama.cpp's
     // memory-bandwidth-bound decode loop.
     SteadyDecode,
+    // Sustained decode after a prompt shaped to the primary recommendation's
+    // context. The short `steady_decode` scenario is useful for isolating the
+    // decode loop with cheap validation runs, but it cannot prove a primary
+    // chat/workload estimate that charges thousands of active KV tokens. This
+    // scenario deliberately creates a long synthetic prompt and then uses the
+    // tokenizer count reported by Skippy for comparison, so the estimator still
+    // sees only metadata + measured hardware and the benchmark only supplies
+    // the observed sequence shape being validated.
+    PrimaryContextSteadyDecode,
     // Prompt ingestion only, measured as prompt tokens divided by Skippy's
     // `prefill_elapsed_ms`. This is intentionally separate from first-token
     // latency so a miss can be attributed to prefill matmul throughput rather
@@ -370,6 +494,24 @@ enum BenchmarkScenarioKind {
     // Short repeated generation with session reuse. This gives us a small
     // signal for agent/tool loops where the same prefix remains resident.
     KvWarmReuse,
+}
+
+impl BenchmarkScenarioKind {
+    fn is_steady_decode(self) -> bool {
+        matches!(
+            self,
+            BenchmarkScenarioKind::SteadyDecode | BenchmarkScenarioKind::PrimaryContextSteadyDecode
+        )
+    }
+
+    fn uses_decode_tps_prediction(self) -> bool {
+        matches!(
+            self,
+            BenchmarkScenarioKind::SteadyDecode
+                | BenchmarkScenarioKind::PrimaryContextSteadyDecode
+                | BenchmarkScenarioKind::KvWarmReuse
+        )
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -391,12 +533,26 @@ struct BenchmarkExpected {
     range: Option<(f64, f64)>,
 }
 
+#[derive(Clone, Debug)]
+struct PromptLengthCandidate {
+    sequence: usize,
+    word_count: u32,
+    prompt: String,
+    prompt_tokens: u32,
+    requested_tokens: u32,
+    fits_context: bool,
+}
+
 #[derive(Clone, Debug, Serialize)]
 struct BenchmarkScenarioSummary {
     scenario: String,
     fit_metric: String,
     predicted: Option<f64>,
     predicted_range: Option<(f64, f64)>,
+    prediction_source: &'static str,
+    primary_predicted: Option<f64>,
+    primary_predicted_range: Option<(f64, f64)>,
+    primary_observed_over_fit: Option<f64>,
     prediction_context_tokens: Option<u32>,
     prediction_decode_cost_breakdown: Option<model_fit::DecodeCostBreakdown>,
     observed: Option<f64>,
@@ -446,6 +602,11 @@ struct BenchmarkSummary {
     raw_min_tokens_per_sec: Option<f64>,
     raw_max_tokens_per_sec: Option<f64>,
     raw_spread_pct: Option<f64>,
+    request_sample_count: usize,
+    request_median_tokens_per_sec: Option<f64>,
+    request_min_tokens_per_sec: Option<f64>,
+    request_max_tokens_per_sec: Option<f64>,
+    request_spread_pct: Option<f64>,
     denoised_outlier_count: usize,
     remeasured: bool,
     remeasure_reason: Option<String>,
@@ -554,7 +715,13 @@ struct LocalGpuBenchmark {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let raw_args = std::env::args().collect::<Vec<_>>();
+    if raw_args.get(1).is_some_and(|arg| arg == "__native-probe") {
+        return run_native_probe_child(&raw_args[2..]);
+    }
+
     let args = Args::parse()?;
+    enforce_validation_build(&args)?;
     let hardware = load_hardware_profile(&args)?;
     let selection_config = selection_config(&primary_workload_profile());
     let repository = HfModelRepository::from_env().context("create Hugging Face repository")?;
@@ -574,6 +741,228 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug)]
+enum NativeProbeKind {
+    FullToken,
+    FullTokenHandoff,
+    DecodeSubmission,
+    SourceSampledToken,
+}
+
+impl NativeProbeKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::FullToken => "dense-full-token",
+            Self::FullTokenHandoff => "dense-full-token-handoff",
+            Self::DecodeSubmission => "dense-decode-submission",
+            Self::SourceSampledToken => "dense-source-sampled-token",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "dense-full-token" => Ok(Self::FullToken),
+            "dense-full-token-handoff" => Ok(Self::FullTokenHandoff),
+            "dense-decode-submission" => Ok(Self::DecodeSubmission),
+            "dense-source-sampled-token" => Ok(Self::SourceSampledToken),
+            other => bail!("unknown native probe kind {other}"),
+        }
+    }
+}
+
+fn run_native_probe_child(args: &[String]) -> Result<()> {
+    let request = NativeProbeRequest::parse(args)?;
+    let probes = request.run()?;
+    serde_json::to_writer(std::io::stdout(), &probes).context("write native probe JSON")?;
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug)]
+struct NativeProbeRequest<'a> {
+    kind: NativeProbeKind,
+    backend: mesh_llm_gpu_bench::BenchmarkBackend,
+    block_tensor_type: &'a str,
+    output_tensor_type: &'a str,
+    shape: mesh_llm_gpu_bench::DenseFullTokenProbeShape,
+}
+
+impl<'a> NativeProbeRequest<'a> {
+    fn parse(args: &'a [String]) -> Result<Self> {
+        if args.len() != 16 {
+            bail!(
+                "native probe expects 16 args: kind backend block_tensor_type output_tensor_type hidden kv_width ffn vocab repeat_layers graph_features norm_head_width head_dim query_heads kv_heads context_tokens active_context_tokens"
+            );
+        }
+        let kind = NativeProbeKind::parse(&args[0])?;
+        let backend = parse_native_probe_backend(&args[1])?;
+        Ok(Self {
+            kind,
+            backend,
+            block_tensor_type: &args[2],
+            output_tensor_type: &args[3],
+            shape: mesh_llm_gpu_bench::DenseFullTokenProbeShape {
+                hidden: parse_native_probe_u32(&args[4], "hidden")?,
+                kv_width: parse_native_probe_u32(&args[5], "kv_width")?,
+                ffn: parse_native_probe_u32(&args[6], "ffn")?,
+                vocab: parse_native_probe_u32(&args[7], "vocab")?,
+                repeat_layers: parse_native_probe_u32(&args[8], "repeat_layers")?,
+                graph_features: parse_native_probe_u32(&args[9], "graph_features")?,
+                norm_head_width: parse_native_probe_u32(&args[10], "norm_head_width")?,
+                head_dim: parse_native_probe_u32(&args[11], "head_dim")?,
+                query_heads: parse_native_probe_u32(&args[12], "query_heads")?,
+                kv_heads: parse_native_probe_u32(&args[13], "kv_heads")?,
+                context_tokens: parse_native_probe_u32(&args[14], "context_tokens")?,
+                active_context_tokens: parse_native_probe_u32(&args[15], "active_context_tokens")?,
+            },
+        })
+    }
+
+    fn run(self) -> Result<Vec<DecodeKernelProbe>> {
+        match self.kind {
+            NativeProbeKind::FullToken => mesh_llm_gpu_bench::run_model_dense_full_token_probe(
+                self.backend,
+                self.block_tensor_type,
+                self.output_tensor_type,
+                self.shape,
+            ),
+            NativeProbeKind::FullTokenHandoff => {
+                mesh_llm_gpu_bench::run_model_dense_full_token_handoff_probe(
+                    self.backend,
+                    self.block_tensor_type,
+                    self.output_tensor_type,
+                    self.shape,
+                )
+            }
+            NativeProbeKind::DecodeSubmission => {
+                mesh_llm_gpu_bench::run_model_dense_decode_submission_probe(
+                    self.backend,
+                    self.block_tensor_type,
+                    self.output_tensor_type,
+                    self.shape,
+                )
+            }
+            NativeProbeKind::SourceSampledToken => {
+                mesh_llm_gpu_bench::run_model_dense_source_sampled_token_probe(
+                    self.backend,
+                    self.block_tensor_type,
+                    self.output_tensor_type,
+                    self.shape,
+                )
+            }
+        }
+    }
+}
+
+fn parse_native_probe_backend(value: &str) -> Result<mesh_llm_gpu_bench::BenchmarkBackend> {
+    match value {
+        "metal" => Ok(mesh_llm_gpu_bench::BenchmarkBackend::Metal),
+        "cuda" => Ok(mesh_llm_gpu_bench::BenchmarkBackend::Cuda),
+        "hip" => Ok(mesh_llm_gpu_bench::BenchmarkBackend::Hip),
+        other => bail!("unsupported native probe backend {other}"),
+    }
+}
+
+fn native_probe_backend_arg(backend: mesh_llm_gpu_bench::BenchmarkBackend) -> &'static str {
+    match backend {
+        mesh_llm_gpu_bench::BenchmarkBackend::Metal => "metal",
+        mesh_llm_gpu_bench::BenchmarkBackend::Cuda => "cuda",
+        mesh_llm_gpu_bench::BenchmarkBackend::Hip => "hip",
+        mesh_llm_gpu_bench::BenchmarkBackend::Intel => "intel",
+    }
+}
+
+fn parse_native_probe_u32(value: &str, name: &str) -> Result<u32> {
+    value
+        .parse::<u32>()
+        .with_context(|| format!("parse native probe {name}={value}"))
+}
+
+fn run_native_probe_isolated(
+    kind: NativeProbeKind,
+    backend: mesh_llm_gpu_bench::BenchmarkBackend,
+    block_tensor_type: &str,
+    output_tensor_type: &str,
+    shape: mesh_llm_gpu_bench::DenseFullTokenProbeShape,
+) -> Result<Vec<DecodeKernelProbe>> {
+    // Some GGML backends can accept a graph through `supports_op()` and still
+    // abort the process when a source-shaped synthetic probe reaches a concrete
+    // kernel. CUDA Flash Attention has produced that failure mode for a valid
+    // small-model GQA shape. The fitter must not turn a backend abort into a
+    // validator abort: a crashing probe means "no safe probe evidence for this
+    // shape", not "the model is bad" and not "fall back to observed tok/s".
+    //
+    // Keep isolation at the probe boundary instead of hardcoding backend,
+    // architecture, or model-family exceptions. The child receives only the
+    // metadata-derived shape and measured backend kind, writes probe JSON on
+    // success, and may die without taking the parent validation report with it.
+    let output = Command::new(std::env::current_exe().context("locate current validator binary")?)
+        .arg("__native-probe")
+        .arg(kind.as_str())
+        .arg(native_probe_backend_arg(backend))
+        .arg(block_tensor_type)
+        .arg(output_tensor_type)
+        .arg(shape.hidden.to_string())
+        .arg(shape.kv_width.to_string())
+        .arg(shape.ffn.to_string())
+        .arg(shape.vocab.to_string())
+        .arg(shape.repeat_layers.to_string())
+        .arg(shape.graph_features.to_string())
+        .arg(shape.norm_head_width.to_string())
+        .arg(shape.head_dim.to_string())
+        .arg(shape.query_heads.to_string())
+        .arg(shape.kv_heads.to_string())
+        .arg(shape.context_tokens.to_string())
+        .arg(shape.active_context_tokens.to_string())
+        .output()
+        .with_context(|| format!("run isolated native probe {}", kind.as_str()))?;
+    if !output.status.success() {
+        if let Ok(probes) = parse_isolated_native_probe_stdout(kind, &output.stdout)
+            && !probes.is_empty()
+        {
+            return Ok(probes);
+        }
+        let stderr = diagnostic_prefix(&String::from_utf8_lossy(&output.stderr), 2048);
+        bail!(
+            "isolated native probe {} exited with status {}; stderr prefix: {}",
+            kind.as_str(),
+            output.status,
+            stderr.trim()
+        );
+    }
+    parse_isolated_native_probe_stdout(kind, &output.stdout)
+}
+
+fn parse_isolated_native_probe_stdout(
+    kind: NativeProbeKind,
+    stdout: &[u8],
+) -> Result<Vec<DecodeKernelProbe>> {
+    // Some backends, notably Metal with residency-set lifetime checks, can
+    // abort during process teardown after the probe has already completed and
+    // written valid JSON. The isolated child exists specifically so backend
+    // cleanup failures do not take down validation. Accept complete JSON from
+    // stdout, but do not invent probe evidence when stdout is empty, partial, or
+    // malformed.
+    serde_json::from_slice(stdout).with_context(|| {
+        let stdout = String::from_utf8_lossy(stdout)
+            .chars()
+            .take(512)
+            .collect::<String>();
+        format!(
+            "parse isolated native probe {} JSON; stdout prefix: {stdout}",
+            kind.as_str()
+        )
+    })
+}
+
+fn diagnostic_prefix(text: &str, max_chars: usize) -> String {
+    text.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(max_chars)
+        .collect()
+}
+
 fn build_validation_report(
     args: &Args,
     hardware: &LoadedHardware,
@@ -585,6 +974,7 @@ fn build_validation_report(
         schema_version: 1,
         generated_at_unix_secs: unix_timestamp_secs(),
         command: std::env::args().collect(),
+        validation_build: validation_build(args),
         fit_input_contract: fit_input_contract(),
         hardware_profile: hardware.profile.clone(),
         gpu_benchmark_outputs: hardware.benchmark_outputs.clone(),
@@ -612,6 +1002,8 @@ impl Args {
             fit_only: false,
             dense_probe_depth: DenseProbeDepth::Standard,
             show_progress: true,
+            skip_context_aligned_abi: false,
+            allow_debug_validation: false,
             models: Vec::new(),
         };
 
@@ -670,6 +1062,8 @@ impl Args {
                     DenseProbeDepth::parse(&next_value(values, "--dense-probe-depth")?)?;
             }
             "--no-progress" => self.show_progress = false,
+            "--skip-context-aligned-abi" => self.skip_context_aligned_abi = true,
+            "--allow-debug-validation" => self.allow_debug_validation = true,
             "--model-ref" => self
                 .models
                 .push(ModelInput::Ref(next_value(values, "--model-ref")?)),
@@ -735,6 +1129,84 @@ impl Args {
     }
 }
 
+fn enforce_validation_build(args: &Args) -> Result<()> {
+    if cfg!(debug_assertions) && !args.allow_debug_validation {
+        bail!(
+            "model-fit-validate must be run from a release build for performance validation; \
+             debug builds change Rust-side hardware/probe timings and can produce false tok/s \
+             evidence. Rebuild with `just model-fit-release ...` or pass \
+             --allow-debug-validation for local development only."
+        );
+    }
+    for warning in benchmark_binary_warnings(args) {
+        if !args.allow_debug_validation {
+            bail!(
+                "{warning}. Use release benchmark binaries or pass --allow-debug-validation for local development only."
+            );
+        }
+        eprintln!("warning: {warning}; continuing because --allow-debug-validation was set");
+    }
+    if cfg!(debug_assertions) {
+        eprintln!(
+            "warning: debug validation enabled by override; do not use this report as tok/s evidence"
+        );
+    }
+    Ok(())
+}
+
+fn validation_build(args: &Args) -> ValidationBuild {
+    ValidationBuild {
+        package_version: env!("CARGO_PKG_VERSION"),
+        profile: build_profile_label(),
+        debug_assertions: cfg!(debug_assertions),
+        allow_debug_validation: args.allow_debug_validation,
+        benchmark_binary_warnings: benchmark_binary_warnings(args),
+        note: "model-fit validation uses runtime probe timings; release builds are required for tok/s evidence because debug Rust code changes measured overheads.",
+    }
+}
+
+fn build_profile_label() -> &'static str {
+    if cfg!(debug_assertions) {
+        "debug"
+    } else {
+        "release"
+    }
+}
+
+fn benchmark_binary_warnings(args: &Args) -> Vec<String> {
+    if args.fit_only {
+        return Vec::new();
+    }
+    [
+        ("skippy-bench", &args.skippy_bench_bin),
+        ("skippy-server", &args.skippy_server_bin),
+        ("metrics-server", &args.metrics_server_bin),
+    ]
+    .into_iter()
+    .filter(|(_, path)| path_looks_like_debug_target(path))
+    .map(|(name, path)| {
+        format!(
+            "{name} path {} appears to be a target/debug binary, which is not valid tok/s evidence",
+            path.display()
+        )
+    })
+    .collect()
+}
+
+fn path_looks_like_debug_target(path: &Path) -> bool {
+    let mut saw_target = false;
+    for component in path
+        .components()
+        .filter_map(|component| component.as_os_str().to_str())
+    {
+        if saw_target && component == "debug" {
+            return true;
+        }
+        saw_target = component == "target";
+    }
+    false
+}
+
 impl DenseProbeDepth {
     fn parse(value: &str) -> Result<Self> {
         match value {
@@ -798,6 +1270,7 @@ impl ValidationConfig {
             fit_only: args.fit_only,
             dense_probe_depth: args.dense_probe_depth.as_str(),
             show_progress: args.show_progress,
+            skip_context_aligned_abi: args.skip_context_aligned_abi,
             prompt: validation_prompt().into(),
             primary_workload: primary_workload_label().into(),
             scored_workloads: workload_profiles()
@@ -927,9 +1400,7 @@ fn validate_prepared_model(
         &recommendation,
         &benchmarks,
     ));
-    let steady_benchmark = benchmarks
-        .iter()
-        .find(|benchmark| benchmark.scenario == "steady_decode");
+    let steady_benchmark = steady_benchmark_for_decode_diagnostic(&benchmarks);
     let benchmark = steady_benchmark
         .map(|benchmark| benchmark.benchmark.clone())
         .unwrap_or_else(|| BenchmarkSummary {
@@ -937,12 +1408,32 @@ fn validate_prepared_model(
             skip_reason: Some("steady_decode scenario was not produced".into()),
             ..BenchmarkSummary::default()
         });
-    let decode_probe_diagnostic =
-        decode_probe_diagnostic(&recommendation, abi_decode_probe.as_ref(), steady_benchmark);
+    let decode_probe_diagnostic = decode_probe_diagnostic(
+        &recommendation,
+        abi_decode_probe.as_ref(),
+        steady_benchmark,
+        &model_specific_probes.errors,
+    );
+    let context_aligned_abi_decode_probe = context_aligned_abi_decode_probe(
+        args,
+        &prepared,
+        &recommendation,
+        model_index,
+        abi_decode_probe.as_ref(),
+        decode_probe_diagnostic.as_ref(),
+    );
     let graph_inventory_diagnostic = graph_inventory_diagnostic(
         &prepared.profile,
         &recommendation,
-        abi_decode_probe.as_ref(),
+        &model_specific_probes.probes,
+        context_aligned_abi_decode_probe
+            .as_ref()
+            .or(abi_decode_probe.as_ref()),
+        if context_aligned_abi_decode_probe.is_some() {
+            AbiDecodeProbeKind::ContextAligned
+        } else {
+            AbiDecodeProbeKind::Standard
+        },
     );
     let operation_bucket_diagnostic = operation_bucket_diagnostic(
         &prepared.profile,
@@ -961,6 +1452,7 @@ fn validate_prepared_model(
         runtime_diagnostic,
         recommendations,
         abi_decode_probe,
+        context_aligned_abi_decode_probe,
         decode_probe_diagnostic,
         graph_inventory_diagnostic,
         operation_bucket_diagnostic,
@@ -997,7 +1489,15 @@ fn model_specific_decode_kernel_probes(
             _ => ModelSpecificDecodeProbes::default(),
         }
     };
+    if matches!(
+        profile.architecture_class,
+        model_fit::ModelArchitectureClass::DenseTransformer
+            | model_fit::ModelArchitectureClass::SparseMoeTransformer
+    ) {
+        append_attention_runtime_probes(args, hardware, profile, model_index, &mut collected);
+    }
     append_model_output_projection_probes(args, hardware, profile, model_index, &mut collected);
+    append_model_logits_readback_probes(args, hardware, profile, model_index, &mut collected);
     collected
 }
 
@@ -1190,6 +1690,358 @@ fn dense_model_specific_decode_kernel_probes(
                     }
                 }
             }
+            // Do not run the dense sampled-token graph probe in default
+            // validation. That synthetic graph tried to combine transformer
+            // decode, output projection, logits handoff, and sampling into one
+            // backend-specific GGML graph. In practice it is both expensive and
+            // weaker evidence than the source-shaped pieces we score with:
+            // dense/full-token graph probes for model compute, explicit logits
+            // handoff probes, and the hardware-profile sampler probe. Metal can
+            // also report invalid-resource failures for large sampled-token
+            // shapes while still returning a result, which makes it poor smoke
+            // evidence. Keep the low-level probe callable for manual debugging,
+            // but do not spend every validation run on a non-scoring signal.
+            let Some(model_layers) = profile.layer_count.filter(|count| *count > 0) else {
+                continue;
+            };
+            let Some(vocab) = profile.tokenizer.vocab_size.filter(|vocab| *vocab > 0) else {
+                continue;
+            };
+            let Some(output_tensor_type) = output_projection_probe_tensor_type(profile) else {
+                continue;
+            };
+            let Some(query_heads) = profile.attention_heads.filter(|heads| *heads > 0) else {
+                continue;
+            };
+            let kv_heads = profile.kv_heads.unwrap_or(query_heads).max(1);
+            let head_dim = dense_probe_norm_head_width(profile);
+            // Full-token probes include context-sensitive runtime work: Flash
+            // Attention over the active KV length and llama.cpp-shaped K/V
+            // cache writes through GGML_OP_SET_ROWS. Do not confuse that active
+            // attention length with the runtime's KV allocation capacity:
+            // llama.cpp's `llama_kv_cache::get_n_kv()` pads the used sequence
+            // length so the graph can be reused, but it does not make every
+            // decode step attend over the entire `--ctx-size` allocation.
+            //
+            // Probe the same decode context that the scorer will charge for
+            // this workload. Memory-fit logic separately sizes the full KV
+            // allocation; decode tok/s should follow the occupied prompt/past
+            // length, which is what Skippy steady-decode validation measures.
+            let context_tokens = decode_context_tokens_for_validation(
+                &selection_config(&primary_workload_profile()),
+                profile,
+            );
+            let active_context_tokens = active_decode_context_tokens_for_validation(
+                &selection_config(&primary_workload_profile()),
+                profile,
+                context_tokens,
+            );
+            if head_dim == 0
+                || plan.kv_width != head_dim.saturating_mul(kv_heads)
+                || profile
+                    .context_length
+                    .is_some_and(|native| context_tokens > native)
+            {
+                continue;
+            }
+            heartbeat(
+                Some(model_index),
+                &model_label,
+                "model_dense_full_token_probe_start",
+                &format!(
+                    "backend={:?} block_tensor_type={} output_tensor_type={} hidden={} kv_width={} ffn={} vocab={} layers={} ctx={} nkv={} graph_features={} norm_head_width={}",
+                    accelerator.backend,
+                    plan.tensor_type,
+                    output_tensor_type,
+                    plan.hidden,
+                    plan.kv_width,
+                    plan.ffn,
+                    vocab,
+                    model_layers,
+                    context_tokens,
+                    active_context_tokens,
+                    plan.graph_features,
+                    plan.norm_head_width,
+                ),
+            );
+            let _status = TerminalStatus::start(
+                args.show_progress,
+                format!(
+                    "Probing model-shaped full token {} {}->{} l{} ctx{} nkv{} vocab{}",
+                    model_label,
+                    plan.tensor_type,
+                    output_tensor_type,
+                    model_layers,
+                    context_tokens,
+                    active_context_tokens,
+                    vocab,
+                ),
+            );
+            let full_token_shape = mesh_llm_gpu_bench::DenseFullTokenProbeShape {
+                hidden: plan.hidden,
+                kv_width: plan.kv_width,
+                ffn: plan.ffn,
+                vocab,
+                repeat_layers: model_layers,
+                graph_features: plan.graph_features,
+                norm_head_width: plan.norm_head_width,
+                head_dim,
+                query_heads,
+                kv_heads,
+                context_tokens,
+                active_context_tokens,
+            };
+            match run_native_probe_isolated(
+                NativeProbeKind::FullToken,
+                backend,
+                plan.tensor_type,
+                output_tensor_type,
+                full_token_shape,
+            ) {
+                Ok(probes) => {
+                    heartbeat(
+                        Some(model_index),
+                        &model_label,
+                        "model_dense_full_token_probe_done",
+                        &format!(
+                            "block_tensor_type={} output_tensor_type={} layers={} ctx={} vocab={} probes={}",
+                            plan.tensor_type,
+                            output_tensor_type,
+                            model_layers,
+                            context_tokens,
+                            vocab,
+                            probes.len()
+                        ),
+                    );
+                    collected.probes.extend(probes);
+                }
+                Err(error) => {
+                    let message = format!(
+                        "full-token block_tensor_type={} output_tensor_type={} layers={model_layers} ctx={context_tokens} vocab={vocab}: {error:#}",
+                        plan.tensor_type, output_tensor_type
+                    );
+                    heartbeat(
+                        Some(model_index),
+                        &model_label,
+                        "model_dense_full_token_probe_error",
+                        &message,
+                    );
+                    collected.errors.push(message);
+                }
+            }
+            heartbeat(
+                Some(model_index),
+                &model_label,
+                "model_dense_full_token_handoff_probe_start",
+                &format!(
+                    "backend={:?} block_tensor_type={} output_tensor_type={} hidden={} kv_width={} ffn={} vocab={} layers={} ctx={} nkv={} graph_features={} norm_head_width={}",
+                    accelerator.backend,
+                    plan.tensor_type,
+                    output_tensor_type,
+                    plan.hidden,
+                    plan.kv_width,
+                    plan.ffn,
+                    vocab,
+                    model_layers,
+                    context_tokens,
+                    active_context_tokens,
+                    plan.graph_features,
+                    plan.norm_head_width,
+                ),
+            );
+            let _status = TerminalStatus::start(
+                args.show_progress,
+                format!(
+                    "Probing model-shaped full token handoff {} {}->{} l{} ctx{} nkv{} vocab{}",
+                    model_label,
+                    plan.tensor_type,
+                    output_tensor_type,
+                    model_layers,
+                    context_tokens,
+                    active_context_tokens,
+                    vocab,
+                ),
+            );
+            match run_native_probe_isolated(
+                NativeProbeKind::FullTokenHandoff,
+                backend,
+                plan.tensor_type,
+                output_tensor_type,
+                full_token_shape,
+            ) {
+                Ok(probes) => {
+                    heartbeat(
+                        Some(model_index),
+                        &model_label,
+                        "model_dense_full_token_handoff_probe_done",
+                        &format!(
+                            "block_tensor_type={} output_tensor_type={} layers={} ctx={} vocab={} probes={}",
+                            plan.tensor_type,
+                            output_tensor_type,
+                            model_layers,
+                            context_tokens,
+                            vocab,
+                            probes.len()
+                        ),
+                    );
+                    collected.probes.extend(probes);
+                }
+                Err(error) => {
+                    let message = format!(
+                        "full-token handoff block_tensor_type={} output_tensor_type={} layers={model_layers} ctx={context_tokens} vocab={vocab}: {error:#}",
+                        plan.tensor_type, output_tensor_type
+                    );
+                    heartbeat(
+                        Some(model_index),
+                        &model_label,
+                        "model_dense_full_token_handoff_probe_error",
+                        &message,
+                    );
+                    collected.errors.push(message);
+                }
+            }
+            heartbeat(
+                Some(model_index),
+                &model_label,
+                "model_dense_decode_submission_probe_start",
+                &format!(
+                    "backend={:?} block_tensor_type={} output_tensor_type={} hidden={} kv_width={} ffn={} vocab={} layers={} ctx={} nkv={} graph_features={} norm_head_width={}",
+                    accelerator.backend,
+                    plan.tensor_type,
+                    output_tensor_type,
+                    plan.hidden,
+                    plan.kv_width,
+                    plan.ffn,
+                    vocab,
+                    model_layers,
+                    context_tokens,
+                    active_context_tokens,
+                    plan.graph_features,
+                    plan.norm_head_width,
+                ),
+            );
+            let _status = TerminalStatus::start(
+                args.show_progress,
+                format!(
+                    "Probing model-shaped decode submission {} {}->{} l{} ctx{} nkv{} vocab{}",
+                    model_label,
+                    plan.tensor_type,
+                    output_tensor_type,
+                    model_layers,
+                    context_tokens,
+                    active_context_tokens,
+                    vocab,
+                ),
+            );
+            match run_native_probe_isolated(
+                NativeProbeKind::DecodeSubmission,
+                backend,
+                plan.tensor_type,
+                output_tensor_type,
+                full_token_shape,
+            ) {
+                Ok(probes) => {
+                    heartbeat(
+                        Some(model_index),
+                        &model_label,
+                        "model_dense_decode_submission_probe_done",
+                        &format!(
+                            "block_tensor_type={} output_tensor_type={} layers={} ctx={} vocab={} probes={}",
+                            plan.tensor_type,
+                            output_tensor_type,
+                            model_layers,
+                            context_tokens,
+                            vocab,
+                            probes.len()
+                        ),
+                    );
+                    collected.probes.extend(probes);
+                }
+                Err(error) => {
+                    let message = format!(
+                        "decode submission block_tensor_type={} output_tensor_type={} layers={model_layers} ctx={context_tokens} vocab={vocab}: {error:#}",
+                        plan.tensor_type, output_tensor_type
+                    );
+                    heartbeat(
+                        Some(model_index),
+                        &model_label,
+                        "model_dense_decode_submission_probe_error",
+                        &message,
+                    );
+                    collected.errors.push(message);
+                }
+            }
+            heartbeat(
+                Some(model_index),
+                &model_label,
+                "model_dense_source_sampled_token_probe_start",
+                &format!(
+                    "backend={:?} block_tensor_type={} output_tensor_type={} hidden={} kv_width={} ffn={} vocab={} layers={} ctx={} nkv={} graph_features={} norm_head_width={}",
+                    accelerator.backend,
+                    plan.tensor_type,
+                    output_tensor_type,
+                    plan.hidden,
+                    plan.kv_width,
+                    plan.ffn,
+                    vocab,
+                    model_layers,
+                    context_tokens,
+                    active_context_tokens,
+                    plan.graph_features,
+                    plan.norm_head_width,
+                ),
+            );
+            let _status = TerminalStatus::start(
+                args.show_progress,
+                format!(
+                    "Probing model-shaped source sampled token {} {}->{} l{} ctx{} nkv{} vocab{}",
+                    model_label,
+                    plan.tensor_type,
+                    output_tensor_type,
+                    model_layers,
+                    context_tokens,
+                    active_context_tokens,
+                    vocab,
+                ),
+            );
+            match run_native_probe_isolated(
+                NativeProbeKind::SourceSampledToken,
+                backend,
+                plan.tensor_type,
+                output_tensor_type,
+                full_token_shape,
+            ) {
+                Ok(probes) => {
+                    heartbeat(
+                        Some(model_index),
+                        &model_label,
+                        "model_dense_source_sampled_token_probe_done",
+                        &format!(
+                            "block_tensor_type={} output_tensor_type={} layers={} ctx={} vocab={} probes={}",
+                            plan.tensor_type,
+                            output_tensor_type,
+                            model_layers,
+                            context_tokens,
+                            vocab,
+                            probes.len()
+                        ),
+                    );
+                    collected.probes.extend(probes);
+                }
+                Err(error) => {
+                    let message = format!(
+                        "source sampled-token block_tensor_type={} output_tensor_type={} layers={model_layers} ctx={context_tokens} vocab={vocab}: {error:#}",
+                        plan.tensor_type, output_tensor_type
+                    );
+                    heartbeat(
+                        Some(model_index),
+                        &model_label,
+                        "model_dense_source_sampled_token_probe_error",
+                        &message,
+                    );
+                    collected.errors.push(message);
+                }
+            }
         }
     }
     collected
@@ -1218,6 +2070,11 @@ fn moe_model_specific_decode_kernel_probes(
             continue;
         };
         for plan in &plans {
+            let model_layers = profile.layer_count.unwrap_or(1).max(1);
+            let context_tokens = decode_context_tokens_for_validation(
+                &selection_config(&primary_workload_profile()),
+                profile,
+            );
             for &repeat_layers in plan.repeat_layers {
                 heartbeat(
                     Some(model_index),
@@ -1288,6 +2145,78 @@ fn moe_model_specific_decode_kernel_probes(
                     }
                 }
             }
+            heartbeat(
+                Some(model_index),
+                &model_label,
+                "model_moe_submission_probe_start",
+                &format!(
+                    "backend={:?} tensor_type={} experts={} used={} expert_width={} hidden={} kv_width={} layers={} ctx={}",
+                    accelerator.backend,
+                    plan.tensor_type,
+                    plan.expert_count,
+                    plan.experts_used,
+                    plan.expert_width,
+                    plan.hidden,
+                    plan.kv_width,
+                    model_layers,
+                    context_tokens
+                ),
+            );
+            let _status = TerminalStatus::start(
+                args.show_progress,
+                format!(
+                    "Probing model-shaped MoE submission {} {} l{} ctx{} {}x{} kv{}",
+                    model_label,
+                    plan.tensor_type,
+                    model_layers,
+                    context_tokens,
+                    plan.expert_width,
+                    plan.hidden,
+                    plan.kv_width
+                ),
+            );
+            match mesh_llm_gpu_bench::run_model_moe_block_decode_submission_probe(
+                backend,
+                plan.tensor_type,
+                mesh_llm_gpu_bench::MoeBlockGraphProbeShape {
+                    expert_count: plan.expert_count,
+                    experts_used: plan.experts_used,
+                    expert_width: plan.expert_width,
+                    hidden: plan.hidden,
+                    kv_width: plan.kv_width,
+                    repeat_layers: model_layers,
+                },
+                context_tokens,
+            ) {
+                Ok(probes) => {
+                    heartbeat(
+                        Some(model_index),
+                        &model_label,
+                        "model_moe_submission_probe_done",
+                        &format!(
+                            "tensor_type={} layers={} ctx={} probes={}",
+                            plan.tensor_type,
+                            model_layers,
+                            context_tokens,
+                            probes.len()
+                        ),
+                    );
+                    collected.probes.extend(probes);
+                }
+                Err(error) => {
+                    let message = format!(
+                        "submission tensor_type={} layers={model_layers} ctx={context_tokens}: {error:#}",
+                        plan.tensor_type
+                    );
+                    heartbeat(
+                        Some(model_index),
+                        &model_label,
+                        "model_moe_submission_probe_error",
+                        &message,
+                    );
+                    collected.errors.push(message);
+                }
+            }
         }
     }
     collected
@@ -1299,6 +2228,86 @@ fn model_probe_label(profile: &ModelProfile) -> String {
         .metadata_name
         .clone()
         .unwrap_or_else(|| profile.source.id.clone())
+}
+
+fn append_attention_runtime_probes(
+    args: &Args,
+    hardware: &HardwareProfile,
+    profile: &ModelProfile,
+    model_index: usize,
+    collected: &mut ModelSpecificDecodeProbes,
+) {
+    let plans = attention_runtime_probe_plans(args, profile);
+    if plans.is_empty() {
+        return;
+    }
+    let model_label = model_probe_label(profile);
+    for accelerator in &hardware.accelerators {
+        let Some(backend) = gpu_bench_backend(accelerator.backend) else {
+            continue;
+        };
+        for plan in &plans {
+            heartbeat(
+                Some(model_index),
+                &model_label,
+                "model_attention_runtime_probe_start",
+                &format!(
+                    "backend={:?} head_dim={} query_heads={} kv_heads={} ctx={} layers={}",
+                    accelerator.backend,
+                    plan.head_dim,
+                    plan.query_heads,
+                    plan.kv_heads,
+                    plan.context_tokens,
+                    plan.repeat_layers,
+                ),
+            );
+            let _status = TerminalStatus::start(
+                args.show_progress,
+                format!(
+                    "Probing model-shaped attention runtime {} h{} qh{} kvh{} ctx{} l{}",
+                    model_label,
+                    plan.head_dim,
+                    plan.query_heads,
+                    plan.kv_heads,
+                    plan.context_tokens,
+                    plan.repeat_layers
+                ),
+            );
+            match mesh_llm_gpu_bench::run_model_attention_runtime_probe(
+                backend,
+                mesh_llm_gpu_bench::AttentionRuntimeProbeShape {
+                    head_dim: plan.head_dim,
+                    query_heads: plan.query_heads,
+                    kv_heads: plan.kv_heads,
+                    context_tokens: plan.context_tokens,
+                    repeat_layers: plan.repeat_layers,
+                },
+            ) {
+                Ok(probes) => {
+                    heartbeat(
+                        Some(model_index),
+                        &model_label,
+                        "model_attention_runtime_probe_done",
+                        &format!("ctx={} probes={}", plan.context_tokens, probes.len()),
+                    );
+                    collected.probes.extend(probes);
+                }
+                Err(error) => {
+                    let message = format!(
+                        "attention runtime ctx={} layers={}: {error:#}",
+                        plan.context_tokens, plan.repeat_layers
+                    );
+                    heartbeat(
+                        Some(model_index),
+                        &model_label,
+                        "model_attention_runtime_probe_error",
+                        &message,
+                    );
+                    collected.errors.push(message);
+                }
+            }
+        }
+    }
 }
 
 fn append_model_output_projection_probes(
@@ -1363,6 +2372,135 @@ fn append_model_output_projection_probes(
     }
 }
 
+fn append_model_logits_readback_probes(
+    args: &Args,
+    hardware: &HardwareProfile,
+    profile: &ModelProfile,
+    model_index: usize,
+    collected: &mut ModelSpecificDecodeProbes,
+) {
+    let Some(vocab) = profile.tokenizer.vocab_size.filter(|vocab| *vocab > 0) else {
+        return;
+    };
+    let model_label = model_probe_label(profile);
+    for accelerator in &hardware.accelerators {
+        let Some(backend) = gpu_bench_backend(accelerator.backend) else {
+            continue;
+        };
+        heartbeat(
+            Some(model_index),
+            &model_label,
+            "model_logits_readback_probe_start",
+            &format!("backend={:?} vocab={vocab}", accelerator.backend),
+        );
+        let _status = TerminalStatus::start(
+            args.show_progress,
+            format!(
+                "Probing model-shaped logits readback {} vocab{}",
+                model_label, vocab
+            ),
+        );
+        match mesh_llm_gpu_bench::run_model_logits_readback_probe(
+            backend,
+            mesh_llm_gpu_bench::LogitsReadbackProbeShape { vocab },
+        ) {
+            Ok(probes) => {
+                heartbeat(
+                    Some(model_index),
+                    &model_label,
+                    "model_logits_readback_probe_done",
+                    &format!("vocab={vocab} probes={}", probes.len()),
+                );
+                collected.probes.extend(probes);
+            }
+            Err(error) => {
+                let message = format!("logits readback vocab={vocab}: {error:#}");
+                heartbeat(
+                    Some(model_index),
+                    &model_label,
+                    "model_logits_readback_probe_error",
+                    &message,
+                );
+                collected.errors.push(message);
+            }
+        }
+        heartbeat(
+            Some(model_index),
+            &model_label,
+            "model_logits_sync_probe_start",
+            &format!("backend={:?} vocab={vocab}", accelerator.backend),
+        );
+        let _status = TerminalStatus::start(
+            args.show_progress,
+            format!(
+                "Probing model-shaped logits sync {} vocab{}",
+                model_label, vocab
+            ),
+        );
+        match mesh_llm_gpu_bench::run_model_logits_sync_probe(
+            backend,
+            mesh_llm_gpu_bench::LogitsReadbackProbeShape { vocab },
+        ) {
+            Ok(probes) => {
+                heartbeat(
+                    Some(model_index),
+                    &model_label,
+                    "model_logits_sync_probe_done",
+                    &format!("vocab={vocab} probes={}", probes.len()),
+                );
+                collected.probes.extend(probes);
+            }
+            Err(error) => {
+                let message = format!("logits sync vocab={vocab}: {error:#}");
+                heartbeat(
+                    Some(model_index),
+                    &model_label,
+                    "model_logits_sync_probe_error",
+                    &message,
+                );
+                collected.errors.push(message);
+            }
+        }
+        heartbeat(
+            Some(model_index),
+            &model_label,
+            "model_logits_output_handoff_probe_start",
+            &format!("backend={:?} vocab={vocab}", accelerator.backend),
+        );
+        let _status = TerminalStatus::start(
+            args.show_progress,
+            format!(
+                "Probing model-shaped logits output handoff {} vocab{}",
+                model_label, vocab
+            ),
+        );
+        match mesh_llm_gpu_bench::run_model_logits_output_handoff_probe(
+            backend,
+            mesh_llm_gpu_bench::LogitsReadbackProbeShape { vocab },
+        ) {
+            Ok(probes) => {
+                heartbeat(
+                    Some(model_index),
+                    &model_label,
+                    "model_logits_output_handoff_probe_done",
+                    &format!("vocab={vocab} probes={}", probes.len()),
+                );
+                collected.probes.extend(probes);
+            }
+            Err(error) => {
+                let message = format!("logits output handoff vocab={vocab}: {error:#}");
+                heartbeat(
+                    Some(model_index),
+                    &model_label,
+                    "model_logits_output_handoff_probe_error",
+                    &message,
+                );
+                collected.errors.push(message);
+            }
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 struct MoeGraphProbePlan {
     tensor_type: &'static str,
@@ -1383,6 +2521,15 @@ struct DenseGraphProbePlan {
     graph_features: u32,
     norm_head_width: u32,
     repeat_layers: Vec<u32>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct AttentionRuntimeProbePlan {
+    head_dim: u32,
+    query_heads: u32,
+    kv_heads: u32,
+    context_tokens: u32,
+    repeat_layers: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -1603,6 +2750,68 @@ fn dense_graph_probe_plans(args: &Args, profile: &ModelProfile) -> Vec<DenseGrap
         .collect()
 }
 
+fn attention_runtime_probe_plans(
+    args: &Args,
+    profile: &ModelProfile,
+) -> Vec<AttentionRuntimeProbePlan> {
+    let Some(layer_count) = profile.layer_count.filter(|layers| *layers > 0) else {
+        return Vec::new();
+    };
+    let Some(query_heads) = profile.attention_heads.filter(|heads| *heads > 0) else {
+        return Vec::new();
+    };
+    let kv_heads = profile.kv_heads.unwrap_or(query_heads).max(1);
+    if query_heads % kv_heads != 0 {
+        return Vec::new();
+    }
+    let head_dim = dense_probe_norm_head_width(profile);
+    if head_dim == 0 {
+        return Vec::new();
+    }
+    attention_runtime_context_ladder(args)
+        .into_iter()
+        .filter(|context_tokens| {
+            profile
+                .context_length
+                .is_none_or(|native| *context_tokens <= native)
+        })
+        .map(|context_tokens| AttentionRuntimeProbePlan {
+            head_dim,
+            query_heads,
+            kv_heads,
+            context_tokens,
+            repeat_layers: layer_count,
+        })
+        .collect()
+}
+
+fn attention_runtime_context_ladder(args: &Args) -> Vec<u32> {
+    // llama.cpp decode attention cost is not just a dimensionless KV byte
+    // count. The graph built in llama.cpp's one-token decode path calls
+    // `ggml_flash_attn_ext` against the current KV length, and backend kernels
+    // can change behavior materially between short contexts and the several
+    // thousand token prompts used by agent/chat workloads. The validator's
+    // primary-context scenario intentionally benchmarks decode after a
+    // realistic prompt, so the hardware evidence we feed into model-fit must
+    // include a synthetic attention runtime probe at that same context scale.
+    //
+    // This is still metadata-only evidence: the probe shape is derived from
+    // GGUF fields such as layer count, head count, KV-head count, and head
+    // width. It does not load model weights, it does not look at observed
+    // model tok/s, and it does not branch on backend name. The smaller points
+    // remain useful for short-context scenarios and for detecting nonlinear
+    // context behavior; the default primary point prevents the scorer from
+    // extrapolating a 512-token synthetic attention measurement to a ~4K
+    // validation prompt.
+    let mut contexts = vec![128, 512, DEFAULT_CTX_SIZE];
+    if args.dense_probe_depth == DenseProbeDepth::Deep {
+        contexts.push(2048);
+    }
+    contexts.sort_unstable();
+    contexts.dedup();
+    contexts
+}
+
 fn dense_probe_norm_head_width(profile: &ModelProfile) -> u32 {
     profile
         .key_length
@@ -1633,24 +2842,17 @@ fn dense_probe_graph_features(profile: &ModelProfile) -> u32 {
 }
 
 fn dense_probe_repeat_layers(args: &Args, profile: &ModelProfile, tensor_type: &str) -> Vec<u32> {
-    if !tensor_type.eq_ignore_ascii_case("q4_k") && !tensor_type.eq_ignore_ascii_case("q8_0") {
+    if !supports_dense_depth_probe_tensor_type(tensor_type) {
         return vec![1];
     }
 
-    let mut layers = match (
-        args.dense_probe_depth,
-        tensor_type.eq_ignore_ascii_case("q8_0"),
-    ) {
-        (DenseProbeDepth::Standard, true) => vec![1],
-        (DenseProbeDepth::Deep, true) => vec![1, 4, 8],
-        (DenseProbeDepth::Standard, false) => vec![1, 4, 8],
-        (DenseProbeDepth::Deep, false) => vec![1, 4, 8, 16],
+    let mut layers = match args.dense_probe_depth {
+        DenseProbeDepth::Standard => vec![1, 4, 8],
+        DenseProbeDepth::Deep => vec![1, 4, 8, 16],
     };
 
     if let Some(model_layers) = profile.layer_count.filter(|count| *count > 0) {
-        if args.dense_probe_depth == DenseProbeDepth::Standard
-            && tensor_type.eq_ignore_ascii_case("q4_k")
-        {
+        if args.dense_probe_depth == DenseProbeDepth::Standard {
             add_standard_dense_depth_probes(&mut layers, model_layers);
         }
         if args.dense_probe_depth == DenseProbeDepth::Deep {
@@ -1670,6 +2872,12 @@ fn dense_probe_repeat_layers(args: &Args, profile: &ModelProfile, tensor_type: &
     layers
 }
 
+fn supports_dense_depth_probe_tensor_type(tensor_type: &str) -> bool {
+    tensor_type.eq_ignore_ascii_case("q4_k")
+        || tensor_type.eq_ignore_ascii_case("q6_k")
+        || tensor_type.eq_ignore_ascii_case("q8_0")
+}
+
 fn add_standard_dense_depth_probes(layers: &mut Vec<u32>, model_layers: u32) {
     // llama.cpp decode does not run one isolated matmul per layer. It submits a
     // whole one-token graph containing repeated attention/FFN matmuls, KV
@@ -1687,12 +2895,13 @@ fn add_standard_dense_depth_probes(layers: &mut Vec<u32>, model_layers: u32) {
     // not load the real model weights and we never feed observed tok/s back
     // into scoring.
     //
-    // Q8_0 deliberately stays on the older shallow default until we have
-    // broader held-out evidence. A small Q8 model can be dominated by runtime
-    // and sampling overhead rather than transformer matmul depth, so admitting
-    // a full-depth Q8 synthetic graph by default can overstate throughput even
-    // though the synthetic graph itself is honest. The explicit `deep` mode
-    // still collects those rows as diagnostics.
+    // The rule applies to every dense graph tensor type that the estimator can
+    // consume as a repeated llama block. Keeping Q6_K/Q8_0 shallow was useful
+    // while the validator was still distinguishing tensor traffic from graph
+    // depth, but it made the default evidence weaker exactly where llama.cpp's
+    // source graph says repeated-block scheduling matters. Unsupported small
+    // widths are rejected by the native GGML probe before graph construction,
+    // so collecting depth rows here does not force invalid synthetic layouts.
     if model_layers >= 16 {
         layers.push(16);
     }
@@ -2077,7 +3286,101 @@ fn run_abi_decode_probe_for_recommendation(
         );
         return skipped_abi_decode_probe(reason);
     }
-    run_abi_decode_probe(args, model, model_index)
+    run_abi_decode_probe(
+        args,
+        model,
+        model_index,
+        abi_decode_measured_tokens(recommendation),
+        DEFAULT_WARMUP_TOKENS,
+        "abi_probe",
+    )
+}
+
+fn context_aligned_abi_decode_probe(
+    args: &Args,
+    model: &PreparedModel,
+    recommendation: &ModelRecommendation,
+    model_index: usize,
+    standard_probe: Option<&AbiDecodeProbeSummary>,
+    decode_diagnostic: Option<&DecodeProbeDiagnostic>,
+) -> Option<AbiDecodeProbeSummary> {
+    if args.skip_context_aligned_abi {
+        heartbeat(
+            Some(model_index),
+            &model.input_ref,
+            "abi_context_probe_skip",
+            "skipping context-aligned ABI replay because --skip-context-aligned-abi was set",
+        );
+        return None;
+    }
+    if !context_aligned_abi_probe_needed(model, recommendation, standard_probe, decode_diagnostic) {
+        return None;
+    }
+    let standard_probe = standard_probe?;
+    let selected_context = selected_graph_probe_context_tokens(&model.profile, recommendation)?;
+    let abi_context = abi_graph_context_tokens(standard_probe)?;
+    let measured_tokens = abi_decode_measured_tokens(recommendation);
+    let prompt_tokens = first_abi_prompt_tokens(standard_probe)
+        .and_then(|value| usize::try_from(value).ok())
+        .unwrap_or_default();
+    let warmup_tokens =
+        context_aligned_abi_warmup_tokens(selected_context, prompt_tokens, measured_tokens)?;
+    heartbeat(
+        Some(model_index),
+        &model.input_ref,
+        "abi_context_probe_plan",
+        &format!(
+            "selected_context={selected_context} abi_context={abi_context} prompt_tokens={prompt_tokens} warmup_tokens={warmup_tokens} measured_tokens={measured_tokens}"
+        ),
+    );
+    Some(run_abi_decode_probe(
+        args,
+        model,
+        model_index,
+        measured_tokens,
+        warmup_tokens,
+        "abi_context_probe",
+    ))
+}
+
+fn context_aligned_abi_probe_needed(
+    model: &PreparedModel,
+    recommendation: &ModelRecommendation,
+    standard_probe: Option<&AbiDecodeProbeSummary>,
+    decode_diagnostic: Option<&DecodeProbeDiagnostic>,
+) -> bool {
+    let Some(standard_probe) = standard_probe else {
+        return false;
+    };
+    if standard_probe.error.is_some() || !standard_probe.attempted {
+        return false;
+    }
+    if decode_diagnostic.is_none_or(|diagnostic| diagnostic.classification == "match") {
+        return false;
+    }
+    let selected_context = selected_graph_probe_context_tokens(&model.profile, recommendation);
+    let abi_context = abi_graph_context_tokens(standard_probe);
+    !graph_contexts_match(selected_context, abi_context)
+}
+
+fn context_aligned_abi_warmup_tokens(
+    selected_context: u32,
+    prompt_tokens: usize,
+    measured_tokens: usize,
+) -> Option<usize> {
+    let selected_context = usize::try_from(selected_context).ok()?;
+    // `skippy_session_benchmark_decode()` builds the decode graph after the
+    // prompt is loaded, after warmup decode calls, and during the measured
+    // decode window. The graph inventory reports the active `n_kv` view for
+    // that late measured decode graph, not just the requested context size.
+    // To compare source-shaped synthetic probes to the ABI graph at the same
+    // active-cache depth, put most of the distance to the selected synthetic
+    // `_nkv` into warmup tokens and keep the same metadata-sized measured
+    // window. This is diagnostic-only; the fitter still sees only metadata and
+    // hardware benchmark facts.
+    let occupied_before_warmup = prompt_tokens.saturating_add(measured_tokens);
+    let warmup_tokens = selected_context.saturating_sub(occupied_before_warmup);
+    (warmup_tokens > DEFAULT_WARMUP_TOKENS).then_some(warmup_tokens)
 }
 
 fn abi_decode_probe_skip_reason(
@@ -2118,6 +3421,8 @@ fn skipped_abi_decode_probe(reason: String) -> AbiDecodeProbeSummary {
         decode_call_ms: None,
         sampling_tokens_per_second: None,
         sampling_ms: None,
+        logits_ready_ms: None,
+        logits_scan_ms: None,
         llama_eval_count: None,
         llama_graph_reuse_count: None,
         graph_node_count: None,
@@ -2142,6 +3447,9 @@ fn run_abi_decode_probe(
     args: &Args,
     model: &PreparedModel,
     model_index: usize,
+    measured_tokens: usize,
+    warmup_tokens: usize,
+    phase: &'static str,
 ) -> AbiDecodeProbeSummary {
     let mut summary = AbiDecodeProbeSummary {
         attempted: true,
@@ -2156,6 +3464,8 @@ fn run_abi_decode_probe(
         decode_call_ms: None,
         sampling_tokens_per_second: None,
         sampling_ms: None,
+        logits_ready_ms: None,
+        logits_scan_ms: None,
         llama_eval_count: None,
         llama_graph_reuse_count: None,
         graph_node_count: None,
@@ -2196,25 +3506,25 @@ fn run_abi_decode_probe(
         "--prompt".to_string(),
         validation_prompt().to_string(),
         "--warmup-tokens".to_string(),
-        DEFAULT_WARMUP_TOKENS.to_string(),
+        warmup_tokens.to_string(),
         "--measured-tokens".to_string(),
-        DEFAULT_ABI_DECODE_MEASURED_TOKENS.to_string(),
+        measured_tokens.to_string(),
     ];
     summary.command = command_display(&args.skippy_bench_bin, &command_args);
     heartbeat(
         Some(model_index),
         &model.input_ref,
-        "abi_probe_start",
+        &format!("{phase}_start"),
         &format!(
-            "repeats={} measured_tokens={}",
-            DEFAULT_ABI_DECODE_REPEATS, DEFAULT_ABI_DECODE_MEASURED_TOKENS
+            "repeats={} warmup_tokens={} measured_tokens={}",
+            DEFAULT_ABI_DECODE_REPEATS, warmup_tokens, measured_tokens
         ),
     );
     for repeat in 0..DEFAULT_ABI_DECODE_REPEATS {
         heartbeat(
             Some(model_index),
             &model.input_ref,
-            "abi_probe_repeat_start",
+            &format!("{phase}_repeat_start"),
             &format!("repeat={}", repeat + 1),
         );
         summary.observations.push(run_abi_decode_probe_once(
@@ -2228,14 +3538,14 @@ fn run_abi_decode_probe(
             heartbeat(
                 Some(model_index),
                 &model.input_ref,
-                "abi_probe_repeat_done",
+                &format!("{phase}_repeat_done"),
                 &abi_probe_observation_detail(observation),
             );
             if fatal_abi_probe_observation(observation) {
                 heartbeat(
                     Some(model_index),
                     &model.input_ref,
-                    "abi_probe_repeats_abort",
+                    &format!("{phase}_repeats_abort"),
                     "aborting ABI decode probe repeats after runtime startup failure",
                 );
                 break;
@@ -2246,7 +3556,7 @@ fn run_abi_decode_probe(
     heartbeat(
         Some(model_index),
         &model.input_ref,
-        "abi_probe_done",
+        &format!("{phase}_done"),
         &format!(
             "tok_s={} sample_count={} error={}",
             display_opt(summary.tokens_per_second),
@@ -2255,6 +3565,22 @@ fn run_abi_decode_probe(
         ),
     );
     summary
+}
+
+fn abi_decode_measured_tokens(recommendation: &ModelRecommendation) -> usize {
+    // The ABI decode probe is a validation diagnostic, not a scorer input. A
+    // fixed 128-token window is enough for large local models where each token
+    // is dominated by the repeated llama.cpp decode graph, but it is too short
+    // for tiny models: sampler/session/runtime scheduling becomes a visible
+    // fraction of elapsed time and the probe can classify as noisy even when
+    // the graph inventory is correct. Reuse the steady-decode active-byte rule
+    // so the measurement window grows only from metadata-derived model shape,
+    // not from observed benchmark results, backend names, or model families.
+    recommendation
+        .estimated_active_decode_bytes_per_token
+        .map(steady_decode_tokens_for_active_bytes)
+        .unwrap_or(DEFAULT_ABI_DECODE_MEASURED_TOKENS)
+        .max(DEFAULT_ABI_DECODE_MEASURED_TOKENS)
 }
 
 fn run_abi_decode_probe_once(
@@ -2284,6 +3610,8 @@ fn run_abi_decode_probe_once(
                     decode_call_ms: parsed.decode_call_ms,
                     sampling_tokens_per_second: parsed.sampling_tokens_per_second,
                     sampling_ms: parsed.sampling_ms,
+                    logits_ready_ms: parsed.logits_ready_ms,
+                    logits_scan_ms: parsed.logits_scan_ms,
                     llama_eval_count: parsed.llama_eval_count,
                     llama_graph_reuse_count: parsed.llama_graph_reuse_count,
                     graph_node_count: parsed.graph_node_count,
@@ -2308,6 +3636,8 @@ fn run_abi_decode_probe_once(
                     decode_call_ms: None,
                     sampling_tokens_per_second: None,
                     sampling_ms: None,
+                    logits_ready_ms: None,
+                    logits_scan_ms: None,
                     llama_eval_count: None,
                     llama_graph_reuse_count: None,
                     graph_node_count: None,
@@ -2333,6 +3663,8 @@ fn run_abi_decode_probe_once(
             decode_call_ms: None,
             sampling_tokens_per_second: None,
             sampling_ms: None,
+            logits_ready_ms: None,
+            logits_scan_ms: None,
             llama_eval_count: None,
             llama_graph_reuse_count: None,
             graph_node_count: None,
@@ -2366,6 +3698,8 @@ fn run_abi_decode_probe_once(
                 decode_call_ms: None,
                 sampling_tokens_per_second: None,
                 sampling_ms: None,
+                logits_ready_ms: None,
+                logits_scan_ms: None,
                 llama_eval_count: None,
                 llama_graph_reuse_count: None,
                 graph_node_count: None,
@@ -2427,6 +3761,8 @@ fn finalize_abi_decode_probe_summary(mut summary: AbiDecodeProbeSummary) -> AbiD
         (Some(tokens), Some(tps)) if tps > 0.0 => Some(tokens as f64 * 1000.0 / tps),
         _ => first_abi_sampling_ms(&summary),
     };
+    summary.logits_ready_ms = median_abi_logits_ready_ms(&summary);
+    summary.logits_scan_ms = median_abi_logits_scan_ms(&summary);
     summary.non_eval_overhead_ms = match (
         summary.elapsed_ms,
         summary.decode_call_ms,
@@ -2469,6 +3805,8 @@ struct ParsedAbiDecodeProbe {
     decode_call_ms: Option<f64>,
     sampling_tokens_per_second: Option<f64>,
     sampling_ms: Option<f64>,
+    logits_ready_ms: Option<f64>,
+    logits_scan_ms: Option<f64>,
     llama_eval_count: Option<u64>,
     llama_graph_reuse_count: Option<i64>,
     graph_node_count: Option<u64>,
@@ -2501,6 +3839,8 @@ fn parse_abi_decode_probe_json(stdout: &[u8]) -> Result<ParsedAbiDecodeProbe, St
             .get("sampling_tokens_per_second")
             .and_then(Value::as_f64),
         sampling_ms: value.get("sampling_ms").and_then(Value::as_f64),
+        logits_ready_ms: value.get("logits_ready_ms").and_then(Value::as_f64),
+        logits_scan_ms: value.get("logits_scan_ms").and_then(Value::as_f64),
         llama_eval_count: value.get("llama_eval_count").and_then(Value::as_u64),
         llama_graph_reuse_count: value.get("llama_graph_reuse_count").and_then(Value::as_i64),
         graph_node_count: value.get("graph_node_count").and_then(Value::as_u64),
@@ -2592,6 +3932,36 @@ fn median_abi_sampling_tokens_per_second(summary: &AbiDecodeProbeSummary) -> Opt
     (!samples.is_empty())
         .then(|| throughput_sample_stats(&samples, DEFAULT_MAX_SPREAD))
         .and_then(|stats| stats.clean_median)
+}
+
+fn median_abi_logits_ready_ms(summary: &AbiDecodeProbeSummary) -> Option<f64> {
+    median_abi_ms_total_from_observations(summary, |observation| observation.logits_ready_ms)
+}
+
+fn median_abi_logits_scan_ms(summary: &AbiDecodeProbeSummary) -> Option<f64> {
+    median_abi_ms_total_from_observations(summary, |observation| observation.logits_scan_ms)
+}
+
+fn median_abi_ms_total_from_observations(
+    summary: &AbiDecodeProbeSummary,
+    field: impl Fn(&AbiDecodeProbeObservation) -> Option<f64>,
+) -> Option<f64> {
+    let samples = summary
+        .observations
+        .iter()
+        .filter_map(|observation| {
+            let tokens = observation.measured_tokens?;
+            (tokens > 0).then(|| field(observation).map(|ms| ms / tokens as f64))?
+        })
+        .collect::<Vec<_>>();
+    if samples.is_empty() {
+        return None;
+    }
+    let per_token_ms = median(&samples);
+    summary
+        .measured_tokens
+        .map(|tokens| per_token_ms * tokens as f64)
+        .filter(|value| value.is_finite())
 }
 
 fn first_abi_non_eval_overhead_ms(summary: &AbiDecodeProbeSummary) -> Option<f64> {
@@ -2729,6 +4099,7 @@ fn benchmark_scenario(
     scenario: BenchmarkScenarioSpec,
 ) -> BenchmarkScenarioSummary {
     let scenario = adapt_scenario_for_model(scenario, recommendation);
+    let scenario = calibrate_scenario_prompt(args, model, recommendation, model_index, scenario);
     heartbeat(
         Some(model_index),
         &model.input_ref,
@@ -2750,7 +4121,13 @@ fn benchmark_scenario(
             &format!("scenario={} reason={reason}", scenario.name),
         );
         summary.skip_reason = Some(reason);
-        let result = scenario_summary(scenario, &model.profile, recommendation, summary);
+        let result = scenario_summary(
+            scenario,
+            &model.profile,
+            recommendation,
+            recommendation,
+            summary,
+        );
         heartbeat(
             Some(model_index),
             &model.input_ref,
@@ -2760,12 +4137,6 @@ fn benchmark_scenario(
         return result;
     }
 
-    let prediction = scenario_prediction(&scenario, recommendation);
-    let range = scenario_prediction_range(&scenario, recommendation);
-    let expected = BenchmarkExpected {
-        predicted: prediction,
-        range,
-    };
     let initial = run_benchmark_repeats(
         args,
         model,
@@ -2774,6 +4145,22 @@ fn benchmark_scenario(
         &scenario,
         0,
         DEFAULT_REPEATS,
+    );
+    // The default recommendation is scored for the default workload context,
+    // but validation scenarios intentionally exercise different prompt shapes:
+    // short steady decode, first-token/prefill, and KV reuse. Compare each
+    // observed benchmark to a recommendation rescored with the measured prompt
+    // and generated-token shape from that scenario. Otherwise the validator can
+    // manufacture a false miss by judging a short decode run against a
+    // long-context/default-chat estimate. This still stays honest: the
+    // observation only selects the scenario context being validated, and no
+    // observed tok/s is fed back into model-fit scoring.
+    let expected = benchmark_expected_for_summary(
+        hardware,
+        &model.profile,
+        recommendation,
+        &scenario,
+        &initial,
     );
     let summary = finalize_benchmark_summary(initial, &scenario, expected);
     let summary = remeasure_unstable_summary(
@@ -2801,7 +4188,13 @@ fn benchmark_scenario(
         &scenario,
         &summary,
     );
-    let result = scenario_summary(scenario, &model.profile, &scenario_recommendation, summary);
+    let result = scenario_summary(
+        scenario,
+        &model.profile,
+        recommendation,
+        &scenario_recommendation,
+        summary,
+    );
     heartbeat(
         Some(model_index),
         &model.input_ref,
@@ -2891,7 +4284,7 @@ fn skipped_scenario_summary(
         verdict: "skipped".into(),
         ..BenchmarkSummary::default()
     };
-    scenario_summary(scenario, model, recommendation, summary)
+    scenario_summary(scenario, model, recommendation, recommendation, summary)
 }
 
 fn benchmark_skip_reason(
@@ -2914,7 +4307,7 @@ fn benchmark_skip_reason(
             recommendation.fit_status
         ));
     }
-    if scenario == BenchmarkScenarioKind::SteadyDecode
+    if scenario.uses_decode_tps_prediction()
         && recommendation.estimated_decode_tokens_per_sec.is_none()
     {
         return Some("fit algorithm did not produce a decode tokens/sec estimate".into());
@@ -2943,13 +4336,15 @@ fn adapt_scenario_for_model(
     // validator honest: the fit algorithm still predicts from metadata alone,
     // while validation gives each model enough generated tokens for tok/s to be
     // a useful signal.
-    if scenario.kind != BenchmarkScenarioKind::SteadyDecode {
+    if !scenario.kind.is_steady_decode() {
         return scenario;
     }
-    let Some(active_bytes) = recommendation.estimated_active_decode_bytes_per_token else {
-        return scenario;
-    };
-    scenario.max_new_tokens = steady_decode_tokens_for_active_bytes(active_bytes);
+    if let Some(active_bytes) = recommendation.estimated_active_decode_bytes_per_token {
+        scenario.max_new_tokens = steady_decode_tokens_for_active_bytes(active_bytes);
+    }
+    if scenario.kind == BenchmarkScenarioKind::PrimaryContextSteadyDecode {
+        scenario.prompt = primary_context_prompt(recommendation, scenario.max_new_tokens);
+    }
     scenario
 }
 
@@ -2962,6 +4357,233 @@ fn steady_decode_tokens_for_active_bytes(active_bytes: u64) -> usize {
     } else {
         DEFAULT_MAX_NEW_TOKENS
     }
+}
+
+fn primary_context_prompt(recommendation: &ModelRecommendation, max_new_tokens: usize) -> String {
+    let target_context = recommendation
+        .estimated_decode_context_tokens
+        .unwrap_or(DEFAULT_CTX_SIZE / 2);
+    let generated = u32::try_from(max_new_tokens).unwrap_or(u32::MAX);
+    let generated_prefix = average_generated_prefix_tokens(generated);
+    let prompt_words = target_context.saturating_sub(generated_prefix).max(64);
+    synthetic_word_prompt(prompt_words)
+}
+
+fn calibrate_scenario_prompt(
+    args: &Args,
+    model: &PreparedModel,
+    recommendation: &ModelRecommendation,
+    model_index: usize,
+    mut scenario: BenchmarkScenarioSpec,
+) -> BenchmarkScenarioSpec {
+    if scenario.kind != BenchmarkScenarioKind::PrimaryContextSteadyDecode {
+        return scenario;
+    }
+    match tokenizer_calibrated_primary_context_prompt(args, model, recommendation, &scenario) {
+        Ok(candidate) => {
+            heartbeat(
+                Some(model_index),
+                &model.input_ref,
+                "scenario_prompt_calibrated",
+                &format!(
+                    "scenario={} target_ctx={} measured_prompt_tokens={} requested_tokens={} word_count={} sequence={}",
+                    scenario.name,
+                    display_u32(recommendation.estimated_decode_context_tokens),
+                    candidate.prompt_tokens,
+                    candidate.requested_tokens,
+                    candidate.word_count,
+                    candidate.sequence
+                ),
+            );
+            scenario.prompt = candidate.prompt;
+        }
+        Err(error) => heartbeat(
+            Some(model_index),
+            &model.input_ref,
+            "scenario_prompt_calibration_failed",
+            &format!(
+                "scenario={} error={error:#}; using uncalibrated synthetic prompt",
+                scenario.name
+            ),
+        ),
+    }
+    scenario
+}
+
+fn tokenizer_calibrated_primary_context_prompt(
+    args: &Args,
+    model: &PreparedModel,
+    recommendation: &ModelRecommendation,
+    scenario: &BenchmarkScenarioSpec,
+) -> Result<PromptLengthCandidate> {
+    let target_prompt_tokens = target_primary_prompt_tokens(recommendation, scenario);
+    let word_counts = primary_prompt_candidate_word_counts(target_prompt_tokens);
+    let prompts = word_counts
+        .iter()
+        .map(|word_count| synthetic_word_prompt(*word_count))
+        .collect::<Vec<_>>();
+    let run_id = format!("model-fit-token-lengths-{}", std::process::id());
+    let corpus_path = std::env::temp_dir().join(format!("{run_id}.jsonl"));
+    let tsv_path = std::env::temp_dir().join(format!("{run_id}.tsv"));
+    write_prompt_candidate_corpus(&corpus_path, &prompts)?;
+    run_raw_token_lengths(args, model, scenario, &corpus_path, &tsv_path)?;
+    let rows = read_prompt_length_candidates(&tsv_path, &word_counts, &prompts)?;
+    select_prompt_length_candidate(rows, target_prompt_tokens, scenario.ctx_size)
+}
+
+fn target_primary_prompt_tokens(
+    recommendation: &ModelRecommendation,
+    scenario: &BenchmarkScenarioSpec,
+) -> u32 {
+    let target_context = recommendation
+        .estimated_decode_context_tokens
+        .unwrap_or(DEFAULT_CTX_SIZE / 2);
+    let generated = u32::try_from(scenario.max_new_tokens).unwrap_or(u32::MAX);
+    target_context
+        .saturating_sub(average_generated_prefix_tokens(generated))
+        .max(64)
+}
+
+fn primary_prompt_candidate_word_counts(target_prompt_tokens: u32) -> Vec<u32> {
+    let mut counts = BTreeSet::new();
+    counts.insert(64);
+    for divisor in [4, 3, 2] {
+        counts.insert((target_prompt_tokens / divisor).max(64));
+    }
+    for (numerator, denominator) in [(2, 3), (3, 4), (1, 1), (5, 4), (3, 2), (2, 1)] {
+        counts.insert(
+            target_prompt_tokens
+                .saturating_mul(numerator)
+                .checked_div(denominator)
+                .unwrap_or(target_prompt_tokens)
+                .max(64),
+        );
+    }
+    counts.into_iter().collect()
+}
+
+fn write_prompt_candidate_corpus(path: &Path, prompts: &[String]) -> Result<()> {
+    let mut corpus = String::new();
+    for (index, prompt) in prompts.iter().enumerate() {
+        corpus.push_str(&serde_json::to_string(&json!({
+            "id": format!("candidate_{index}"),
+            "prompt": prompt,
+        }))?);
+        corpus.push('\n');
+    }
+    fs::write(path, corpus).with_context(|| format!("write prompt corpus {}", path.display()))
+}
+
+fn run_raw_token_lengths(
+    args: &Args,
+    model: &PreparedModel,
+    scenario: &BenchmarkScenarioSpec,
+    corpus_path: &Path,
+    tsv_path: &Path,
+) -> Result<()> {
+    let layer_count = model.profile.layer_count.unwrap_or(1).max(1);
+    let output = Command::new(&args.skippy_bench_bin)
+        .args([
+            "token-lengths",
+            "--model-path",
+            &model.primary_gguf_path.display().to_string(),
+            "--prompt-corpus",
+            &corpus_path.display().to_string(),
+            "--ctx-size",
+            &scenario.ctx_size.to_string(),
+            "--generation-limit",
+            &scenario.max_new_tokens.to_string(),
+            "--layer-end",
+            &layer_count.to_string(),
+            "--n-gpu-layers=-1",
+            "--raw-prompt",
+            "--output-tsv",
+            &tsv_path.display().to_string(),
+        ])
+        .output()
+        .context("run skippy-bench token-lengths")?;
+    if output.status.success() {
+        return Ok(());
+    }
+    bail!(
+        "skippy-bench token-lengths failed with status {}; stderr: {}",
+        output.status.code().unwrap_or(-1),
+        tail_lines(&String::from_utf8_lossy(&output.stderr), 20)
+    )
+}
+
+fn read_prompt_length_candidates(
+    path: &Path,
+    word_counts: &[u32],
+    prompts: &[String],
+) -> Result<Vec<PromptLengthCandidate>> {
+    let contents = fs::read_to_string(path)
+        .with_context(|| format!("read token lengths {}", path.display()))?;
+    let mut rows = Vec::new();
+    for line in contents.lines().skip(1).filter(|line| !line.is_empty()) {
+        let fields = line.split('\t').collect::<Vec<_>>();
+        if fields.len() < 11 {
+            bail!("token length row had {} fields, expected 11", fields.len());
+        }
+        let sequence = fields[0].parse::<usize>().context("parse sequence")?;
+        let word_count = *word_counts
+            .get(sequence)
+            .with_context(|| format!("token length sequence {sequence} has no word count"))?;
+        let prompt = prompts
+            .get(sequence)
+            .with_context(|| format!("token length sequence {sequence} has no prompt"))?
+            .clone();
+        rows.push(PromptLengthCandidate {
+            sequence,
+            word_count,
+            prompt,
+            prompt_tokens: fields[6].parse().context("parse prompt_tokens")?,
+            requested_tokens: fields[8].parse().context("parse requested_tokens")?,
+            fits_context: fields[10].parse().context("parse fits_context")?,
+        });
+    }
+    if rows.is_empty() {
+        bail!("skippy-bench token-lengths produced no rows");
+    }
+    Ok(rows)
+}
+
+fn select_prompt_length_candidate(
+    rows: Vec<PromptLengthCandidate>,
+    target_prompt_tokens: u32,
+    ctx_size: u32,
+) -> Result<PromptLengthCandidate> {
+    let fits = rows
+        .iter()
+        .filter(|row| row.fits_context && row.requested_tokens <= ctx_size)
+        .collect::<Vec<_>>();
+    let candidates = if fits.is_empty() {
+        rows.iter().collect::<Vec<_>>()
+    } else {
+        fits
+    };
+    candidates
+        .into_iter()
+        .min_by_key(|row| row.prompt_tokens.abs_diff(target_prompt_tokens))
+        .cloned()
+        .context("select prompt length candidate")
+}
+
+fn synthetic_word_prompt(word_count: u32) -> String {
+    let mut prompt = String::from(
+        "Synthetic context for model-fit primary-context validation. The benchmark uses the tokenizer-reported prompt length, not this word count, when comparing fit.\n",
+    );
+    for index in 0..word_count {
+        if index > 0 {
+            prompt.push(' ');
+        }
+        if index > 0 && index % 32 == 0 {
+            prompt.push('\n');
+        }
+        prompt.push_str("context");
+    }
+    prompt.push_str("\nExplain how local inference speed depends on active model bytes.");
+    prompt
 }
 
 fn finalize_benchmark_summary(
@@ -3006,10 +4628,30 @@ fn finalize_benchmark_summary(
     summary.raw_min_tokens_per_sec = stats.raw_min;
     summary.raw_max_tokens_per_sec = stats.raw_max;
     summary.raw_spread_pct = stats.raw_spread.map(|spread| spread * 100.0);
+    add_request_level_steady_decode_stats(&mut summary, scenario);
     summary.denoised_outlier_count = stats.outlier_count;
     summary.observed_over_fit = observed_over_fit;
     summary.verdict = benchmark_verdict(median, observed_over_fit, spread, expected.range);
     summary
+}
+
+fn add_request_level_steady_decode_stats(
+    summary: &mut BenchmarkSummary,
+    scenario: &BenchmarkScenarioSpec,
+) {
+    if !scenario.kind.is_steady_decode() {
+        return;
+    }
+    let samples = steady_decode_request_tokens_per_sec_samples(summary);
+    if samples.is_empty() {
+        return;
+    }
+    let stats = throughput_sample_stats(&samples, DEFAULT_MAX_SPREAD);
+    summary.request_sample_count = samples.len();
+    summary.request_median_tokens_per_sec = stats.raw_median;
+    summary.request_min_tokens_per_sec = stats.raw_min;
+    summary.request_max_tokens_per_sec = stats.raw_max;
+    summary.request_spread_pct = stats.raw_spread.map(|spread| spread * 100.0);
 }
 
 fn remeasure_unstable_summary(
@@ -3065,7 +4707,7 @@ fn remeasure_reason(
             DEFAULT_REMEASURE_RAW_SPREAD * 100.0
         ));
     }
-    if scenario.kind != BenchmarkScenarioKind::SteadyDecode {
+    if !scenario.kind.is_steady_decode() {
         return None;
     }
     let ordered_drop = ordered_sample_drop(summary, scenario)?;
@@ -3140,8 +4782,7 @@ fn stable_fit_mismatch_confirmation_reason(
     summary: &BenchmarkSummary,
     scenario: &BenchmarkScenarioSpec,
 ) -> Option<String> {
-    if scenario.kind != BenchmarkScenarioKind::SteadyDecode || benchmark_has_runtime_error(summary)
-    {
+    if !scenario.kind.is_steady_decode() || benchmark_has_runtime_error(summary) {
         return None;
     }
     if !is_stable_summary(summary) {
@@ -3273,11 +4914,13 @@ fn scenario_metric_samples(
     // prompt can include graph/session/synchronization costs that sustained
     // steady decode does not see.
     let request_samples = match scenario.kind {
-        BenchmarkScenarioKind::SteadyDecode => summary
-            .observations
-            .iter()
-            .filter_map(steady_decode_observation_tokens_per_sec)
-            .collect::<Vec<_>>(),
+        BenchmarkScenarioKind::SteadyDecode | BenchmarkScenarioKind::PrimaryContextSteadyDecode => {
+            summary
+                .observations
+                .iter()
+                .filter_map(steady_decode_observation_tokens_per_sec)
+                .collect::<Vec<_>>()
+        }
         BenchmarkScenarioKind::Prefill => summary
             .observations
             .iter()
@@ -3330,6 +4973,28 @@ fn steady_decode_observation_tokens_per_sec(observation: &BenchmarkObservation) 
     })
 }
 
+fn steady_decode_request_tokens_per_sec_samples(summary: &BenchmarkSummary) -> Vec<f64> {
+    // Repeat-level steady decode aggregates all generated tokens in a repeat so
+    // a single fast or slow request does not dominate the pass/fail verdict.
+    // Tiny models can still show a different failure mode: individual requests
+    // inside one repeat swing widely even though aggregate throughput looks
+    // stable enough after remeasurement. Keep that request-level spread in the
+    // report as evidence for confidence decisions. This is not consumed by
+    // scoring; it tells developers when the validation path is measuring
+    // request/runtime variability more than metadata-visible matmul traffic.
+    summary
+        .observations
+        .iter()
+        .flat_map(|observation| observation.request_results.iter())
+        .filter_map(|request| {
+            request
+                .decode_tokens_per_sec
+                .or(request.generated_tokens_per_sec)
+        })
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .collect()
+}
+
 fn prefill_observation_tokens_per_sec(observation: &BenchmarkObservation) -> Option<f64> {
     let prompt_tokens = observation
         .request_results
@@ -3357,6 +5022,7 @@ fn benchmark_scenario_recommendation(
     if !matches!(
         scenario.kind,
         BenchmarkScenarioKind::SteadyDecode
+            | BenchmarkScenarioKind::PrimaryContextSteadyDecode
             | BenchmarkScenarioKind::Prefill
             | BenchmarkScenarioKind::FirstToken
             | BenchmarkScenarioKind::KvWarmReuse
@@ -3366,9 +5032,27 @@ fn benchmark_scenario_recommendation(
     let Some(context_tokens) = prediction_context_tokens(scenario, benchmark) else {
         return fallback.clone();
     };
-    let mut workload = primary_workload_profile();
-    workload.interaction.expected_prompt_tokens = Some(context_tokens);
-    score_model(hardware, profile, &selection_config(&workload))
+    score_model_for_context_tokens(
+        hardware,
+        profile,
+        &selection_config(&primary_workload_profile()),
+        context_tokens,
+    )
+}
+
+fn benchmark_expected_for_summary(
+    hardware: &HardwareProfile,
+    profile: &ModelProfile,
+    fallback: &ModelRecommendation,
+    scenario: &BenchmarkScenarioSpec,
+    benchmark: &BenchmarkSummary,
+) -> BenchmarkExpected {
+    let recommendation =
+        benchmark_scenario_recommendation(hardware, profile, fallback, scenario, benchmark);
+    BenchmarkExpected {
+        predicted: scenario_prediction(scenario, &recommendation),
+        range: scenario_prediction_range(scenario, &recommendation),
+    }
 }
 
 fn prediction_context_tokens(
@@ -3377,7 +5061,7 @@ fn prediction_context_tokens(
 ) -> Option<u32> {
     let prompt_tokens = median_prompt_token_count(benchmark)?;
     match scenario.kind {
-        BenchmarkScenarioKind::SteadyDecode => {
+        BenchmarkScenarioKind::SteadyDecode | BenchmarkScenarioKind::PrimaryContextSteadyDecode => {
             let generated = median_generated_tokens_per_request(benchmark, scenario)?;
             Some(prompt_tokens.saturating_add(average_generated_prefix_tokens(generated)))
         }
@@ -3463,13 +5147,20 @@ fn median_prompt_token_count(benchmark: &BenchmarkSummary) -> Option<u32> {
 fn scenario_summary(
     scenario: BenchmarkScenarioSpec,
     model: &ModelProfile,
-    recommendation: &ModelRecommendation,
+    primary_recommendation: &ModelRecommendation,
+    prediction_recommendation: &ModelRecommendation,
     mut benchmark: BenchmarkSummary,
 ) -> BenchmarkScenarioSummary {
-    let predicted = scenario_prediction(&scenario, recommendation);
-    let predicted_range = scenario_prediction_range(&scenario, recommendation);
+    let predicted = scenario_prediction(&scenario, prediction_recommendation);
+    let predicted_range = scenario_prediction_range(&scenario, prediction_recommendation);
+    let primary_predicted = scenario_prediction(&scenario, primary_recommendation);
+    let primary_predicted_range = scenario_prediction_range(&scenario, primary_recommendation);
     let observed = scenario_observed(&scenario, &benchmark);
     let observed_over_fit = match (observed, predicted) {
+        (Some(observed), Some(predicted)) if predicted > 0.0 => Some(observed / predicted),
+        _ => None,
+    };
+    let primary_observed_over_fit = match (observed, primary_predicted) {
         (Some(observed), Some(predicted)) if predicted > 0.0 => Some(observed / predicted),
         _ => None,
     };
@@ -3494,14 +5185,34 @@ fn scenario_summary(
         fit_metric: scenario.fit_metric.into(),
         predicted,
         predicted_range,
+        prediction_source: prediction_source(primary_recommendation, prediction_recommendation),
+        primary_predicted,
+        primary_predicted_range,
+        primary_observed_over_fit,
         prediction_context_tokens: prediction_context_tokens(&scenario, &benchmark),
-        prediction_decode_cost_breakdown: recommendation.decode_cost_breakdown.clone(),
+        prediction_decode_cost_breakdown: prediction_recommendation.decode_cost_breakdown.clone(),
         observed,
         observed_over_fit,
         observed_over_abi: benchmark.observed_over_abi,
-        first_token_breakdown: first_token_breakdown(&scenario, model, recommendation, &benchmark),
+        first_token_breakdown: first_token_breakdown(
+            &scenario,
+            model,
+            prediction_recommendation,
+            &benchmark,
+        ),
         verdict,
         benchmark,
+    }
+}
+
+fn prediction_source(
+    primary_recommendation: &ModelRecommendation,
+    prediction_recommendation: &ModelRecommendation,
+) -> &'static str {
+    if std::ptr::eq(primary_recommendation, prediction_recommendation) {
+        "primary_recommendation"
+    } else {
+        "scenario_rescored_for_benchmark_prompt_shape"
     }
 }
 
@@ -3643,7 +5354,9 @@ fn scenario_observed(
     benchmark: &BenchmarkSummary,
 ) -> Option<f64> {
     match scenario.kind {
-        BenchmarkScenarioKind::SteadyDecode => benchmark.median_tokens_per_sec,
+        BenchmarkScenarioKind::SteadyDecode | BenchmarkScenarioKind::PrimaryContextSteadyDecode => {
+            benchmark.median_tokens_per_sec
+        }
         BenchmarkScenarioKind::Prefill => benchmark.median_tokens_per_sec,
         BenchmarkScenarioKind::FirstToken => {
             median_observation_value(benchmark, |observation| observation.text_request_elapsed_ms)
@@ -3678,7 +5391,9 @@ fn scenario_prediction(
     recommendation: &ModelRecommendation,
 ) -> Option<f64> {
     match scenario.kind {
-        BenchmarkScenarioKind::SteadyDecode | BenchmarkScenarioKind::KvWarmReuse => recommendation
+        BenchmarkScenarioKind::SteadyDecode
+        | BenchmarkScenarioKind::PrimaryContextSteadyDecode
+        | BenchmarkScenarioKind::KvWarmReuse => recommendation
             .estimated_decode_tokens_per_sec
             .map(f64::from),
         BenchmarkScenarioKind::Prefill => recommendation
@@ -3693,7 +5408,9 @@ fn scenario_prediction_range(
     recommendation: &ModelRecommendation,
 ) -> Option<(f64, f64)> {
     match scenario.kind {
-        BenchmarkScenarioKind::SteadyDecode | BenchmarkScenarioKind::KvWarmReuse => recommendation
+        BenchmarkScenarioKind::SteadyDecode
+        | BenchmarkScenarioKind::PrimaryContextSteadyDecode
+        | BenchmarkScenarioKind::KvWarmReuse => recommendation
             .estimated_decode_tokens_per_sec_range
             .map(|range| (f64::from(range.lower), f64::from(range.upper))),
         BenchmarkScenarioKind::Prefill => None,
@@ -4426,8 +6143,73 @@ fn selection_config(workload: &WorkloadProfile) -> SelectionConfig {
         workload: workload.clone(),
         ..SelectionConfig::default()
     };
+    // The validator uses DEFAULT_CTX_SIZE as runtime capacity, but the
+    // steady-decode speed estimate is about the active prompt/past length for a
+    // request. Keep the workload's default `expected_prompt_tokens` intact so
+    // the primary recommendation predicts the same occupied KV length that the
+    // validator's primary-context prompt generator targets. Memory fit still
+    // sizes the KV allocation through the normal context requirement path.
     config.weights = config.workload.default_weights();
     config
+}
+
+fn decode_context_tokens_for_validation(config: &SelectionConfig, model: &ModelProfile) -> u32 {
+    let required = config
+        .workload
+        .requirements
+        .min_context_tokens
+        .or(config.workload.interaction.expected_prompt_tokens)
+        .unwrap_or(4096)
+        .max(1);
+    let target = model
+        .context_length
+        .map_or(required, |native| required.min(native));
+    // The model-shaped full-token probes are validation evidence for the
+    // source graph that Skippy/llama.cpp submits, not only for the logical
+    // attention length a request has occupied so far. Source inspection matters
+    // here: `llama_kv_cache::cpy_k()` and `cpy_v()` return GGML_SET_ROWS nodes
+    // whose output tensors are the layer KV-cache buffers. Those buffers are
+    // shaped by the runtime context capacity (`--ctx-size` / workload context
+    // requirement), and ABI graph inventory reports their full tensor bytes even
+    // in single-token steady decode. For mid-size models the transformer
+    // matmuls dominate and this distinction is easy to miss. For tiny models,
+    // these capacity-shaped cache/runtime nodes can be a large part of token
+    // time, so probing only `expected_prompt_tokens` under-measures the
+    // source-visible decode boundary.
+    target.max(1)
+}
+
+fn active_decode_context_tokens_for_validation(
+    config: &SelectionConfig,
+    model: &ModelProfile,
+    capacity_tokens: u32,
+) -> u32 {
+    let prompt_tokens = config
+        .workload
+        .interaction
+        .expected_prompt_tokens
+        .unwrap_or_else(|| capacity_tokens.saturating_div(2))
+        .max(1);
+    let generated_prefix_tokens = config
+        .workload
+        .interaction
+        .expected_output_tokens
+        .unwrap_or_default()
+        .saturating_div(2);
+    let occupied = prompt_tokens.saturating_add(generated_prefix_tokens).max(1);
+    let native = model.context_length.unwrap_or(capacity_tokens);
+    let capped = occupied.min(capacity_tokens).min(native).max(1);
+
+    // llama.cpp does not usually build decode attention over the full KV
+    // allocation. `llama_kv_cache::get_n_kv()` pads the currently occupied
+    // cells with `max(n_pad, 256)` so graph topology remains reusable. Mirror
+    // that source rule for synthetic full-token probes: SET_ROWS still sees the
+    // allocation capacity through `context_tokens`, while Flash Attention, K/V
+    // cache views, and KQ mask shape use this padded active n_kv.
+    const LLAMA_DECODE_N_KV_PAD: u32 = 256;
+    let padded = capped.saturating_add(LLAMA_DECODE_N_KV_PAD - 1) / LLAMA_DECODE_N_KV_PAD
+        * LLAMA_DECODE_N_KV_PAD;
+    padded.min(capacity_tokens).min(native).max(1)
 }
 
 fn score_workloads(
@@ -4479,6 +6261,31 @@ fn benchmark_scenarios() -> Vec<BenchmarkScenarioSpec> {
             max_new_tokens: DEFAULT_MAX_NEW_TOKENS,
             warmup_tokens: DEFAULT_WARMUP_TOKENS,
             request_count: 3,
+            reuse_session: false,
+        },
+        BenchmarkScenarioSpec {
+            kind: BenchmarkScenarioKind::PrimaryContextSteadyDecode,
+            name: "steady_decode_primary_context",
+            fit_metric: "estimated_decode_tokens_per_sec",
+            prompt: validation_prompt().into(),
+            ctx_size: DEFAULT_CTX_SIZE,
+            max_new_tokens: DEFAULT_MAX_NEW_TOKENS,
+            // This scenario intentionally validates a single request at the
+            // fitter's primary/default decode context. The short
+            // steady_decode scenario can safely use warmup plus repeated
+            // independent sessions because each session occupies only a small
+            // number of KV cells. At primary context, doing the same thing
+            // changes the experiment: a long warmup session and several long
+            // measured sessions can coexist in the server's KV arena and make
+            // an otherwise valid single local request fail with KV exhaustion.
+            //
+            // The fitter prediction being checked here is "how fast does one
+            // local request decode once its prompt has occupied the normal
+            // target context?", not "how many unrelated primary-context
+            // sessions can the runtime keep resident at once". Keep benchmark
+            // mechanics from becoming the source of a false local-fit failure.
+            warmup_tokens: 0,
+            request_count: 1,
             reuse_session: false,
         },
         BenchmarkScenarioSpec {
@@ -4770,9 +6577,24 @@ fn steady_decode_accuracy_exclusion_for_model(model: &ModelValidationReport) -> 
     // tuning the estimator around a noisy local run.
     match classification {
         "steady_path_overhead_mismatch"
+        | "steady_path_overhead_mismatch_noisy"
+        | "estimate_and_probe_agree_noisy_requests"
+        | "primary_estimate_and_probe_agree_context_rescore_unstable"
+        | "scenario_estimate_and_probe_agree_noisy_requests"
         | "runtime_path_mismatch"
         | "mixed_estimate_and_runtime_mismatch"
+        | "sampler_sync_residual"
+        | "sampler_sync_residual_noisy"
+        | "llama_source_boundary_residual"
+        | "llama_source_boundary_residual_noisy"
+        | "decode_submission_residual"
+        | "decode_submission_residual_noisy"
+        | "decode_and_sampler_residual"
+        | "decode_and_sampler_residual_noisy"
+        | "context_rescore_unstable"
         | "abi_probe_noisy"
+        | "validation_request_noise"
+        | "missing_representative_decode_probe"
         | "probe_not_representative"
         | "unstable_probe_geometry" => Some(classification),
         _ => None,
@@ -4786,9 +6608,25 @@ fn count_decode_probe_classification(
     match classification {
         "metadata_estimate_miss" => summary.metadata_estimate_miss_count += 1,
         "steady_path_overhead_mismatch"
+        | "steady_path_overhead_mismatch_noisy"
         | "runtime_path_mismatch"
-        | "mixed_estimate_and_runtime_mismatch" => summary.runtime_path_mismatch_count += 1,
-        "abi_probe_noisy" | "probe_not_representative" | "unstable_probe_geometry" => {
+        | "mixed_estimate_and_runtime_mismatch"
+        | "sampler_sync_residual"
+        | "sampler_sync_residual_noisy"
+        | "llama_source_boundary_residual"
+        | "llama_source_boundary_residual_noisy"
+        | "decode_submission_residual"
+        | "decode_submission_residual_noisy"
+        | "decode_and_sampler_residual"
+        | "decode_and_sampler_residual_noisy" => summary.runtime_path_mismatch_count += 1,
+        "abi_probe_noisy"
+        | "estimate_and_probe_agree_noisy_requests"
+        | "primary_estimate_and_probe_agree_context_rescore_unstable"
+        | "scenario_estimate_and_probe_agree_noisy_requests"
+        | "validation_request_noise"
+        | "missing_representative_decode_probe"
+        | "probe_not_representative"
+        | "unstable_probe_geometry" => {
             summary.probe_mismatch_count += 1;
         }
         _ => {}
@@ -4802,9 +6640,25 @@ fn count_decode_probe_classification_for_model(
     match classification {
         "metadata_estimate_miss" => summary.metadata_estimate_miss_count += 1,
         "steady_path_overhead_mismatch"
+        | "steady_path_overhead_mismatch_noisy"
         | "runtime_path_mismatch"
-        | "mixed_estimate_and_runtime_mismatch" => summary.runtime_path_mismatch_count += 1,
-        "abi_probe_noisy" | "probe_not_representative" | "unstable_probe_geometry" => {
+        | "mixed_estimate_and_runtime_mismatch"
+        | "sampler_sync_residual"
+        | "sampler_sync_residual_noisy"
+        | "llama_source_boundary_residual"
+        | "llama_source_boundary_residual_noisy"
+        | "decode_submission_residual"
+        | "decode_submission_residual_noisy"
+        | "decode_and_sampler_residual"
+        | "decode_and_sampler_residual_noisy" => summary.runtime_path_mismatch_count += 1,
+        "abi_probe_noisy"
+        | "estimate_and_probe_agree_noisy_requests"
+        | "primary_estimate_and_probe_agree_context_rescore_unstable"
+        | "scenario_estimate_and_probe_agree_noisy_requests"
+        | "validation_request_noise"
+        | "missing_representative_decode_probe"
+        | "probe_not_representative"
+        | "unstable_probe_geometry" => {
             summary.probe_mismatch_count += 1;
         }
         _ => {}
@@ -4876,6 +6730,7 @@ fn error_report(input_ref: String, error: String) -> ModelValidationReport {
         runtime_diagnostic: None,
         recommendations: Vec::new(),
         abi_decode_probe: None,
+        context_aligned_abi_decode_probe: None,
         decode_probe_diagnostic: None,
         graph_inventory_diagnostic: None,
         operation_bucket_diagnostic: None,
@@ -4893,26 +6748,38 @@ fn error_report(input_ref: String, error: String) -> ModelValidationReport {
 
 fn print_markdown_table(rows: &[ModelValidationReport]) {
     println!(
-        "| model_ref | fit | meaning | backend | est tok/s | abi tok/s | sample/sync tok/s | abi overhead | est range | steady median | steady/fit | steady/abi | decode diag | steady | first-token | kv-reuse |"
+        "| model_ref | fit | meaning | backend | primary tok/s | primary ctx | steady scenario tok/s | steady ctx | primary-context scenario tok/s | primary-context ctx | abi tok/s | sample/sync tok/s | abi overhead | steady range | steady median | steady observed/scenario-fit | steady observed/primary-fit | primary-context median | primary-context observed/scenario-fit | primary-context observed/primary-fit | steady/abi | decode diag | steady | primary-context | first-token | kv-reuse |"
     );
-    println!("|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---|---|---|---|");
+    println!(
+        "|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---|---|---|---|"
+    );
     for row in rows {
         println!(
-            "| `{}` | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
+            "| `{}` | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
             row.input_ref,
             fit_status(row),
             display_fit_meaning(row),
             display_selected_backend(row),
+            display_estimated_tps(row),
+            display_estimated_decode_context(row),
             display_steady_estimated_tps(row),
+            display_steady_prediction_context(row),
+            display_scenario_estimated_tps(row, "steady_decode_primary_context"),
+            display_scenario_prediction_context(row, "steady_decode_primary_context"),
             display_abi_decode_probe(row),
             display_abi_sampling_probe(row),
             display_abi_non_eval_overhead(row),
             display_steady_estimated_range(row),
             display_steady_observed(row),
             display_steady_observed_over_fit(row),
+            display_steady_observed_over_primary(row),
+            display_scenario_observed(row, "steady_decode_primary_context"),
+            display_scenario_observed_over_fit(row, "steady_decode_primary_context"),
+            display_scenario_observed_over_primary(row, "steady_decode_primary_context"),
             display_observed_over_abi(row),
             display_decode_probe_classification(row),
             scenario_verdict(row, "steady_decode"),
+            scenario_verdict(row, "steady_decode_primary_context"),
             scenario_verdict(row, "first_token"),
             scenario_verdict(row, "kv_warm_reuse"),
         );
@@ -4938,20 +6805,31 @@ fn print_graph_inventory_diagnostic_table(rows: &[ModelValidationReport]) {
     println!();
     println!("Graph inventory diagnostic");
     println!(
-        "| model_ref | status | graph nodes | selected probe layers | transformer src0/meta | transformer+unclassified src0/meta | unclassified matmul src0 | transformer nodes graph/meta | transformer ms / ABI ms | notes |"
+        "| model_ref | status | ABI graph nodes | selected probe nodes | probe/ABI nodes | selected probe layers | selected ctx | ABI ctx | synthetic/ABI bucket misses | synthetic/ABI node delta | synthetic/ABI src0 delta | synthetic/ABI src1 delta | synthetic/ABI output delta | transformer src0/meta | transformer+unclassified src0/meta | unclassified matmul src0 | transformer nodes graph/meta | transformer ms / ABI ms | notes |"
     );
-    println!("|---|---|---:|---:|---:|---:|---:|---:|---:|---|");
+    println!(
+        "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|"
+    );
     for row in rows_with_inventory {
         let diagnostic = row
             .graph_inventory_diagnostic
             .as_ref()
             .expect("filtered row has graph inventory diagnostic");
         println!(
-            "| `{}` | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
+            "| `{}` | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
             row.input_ref,
             diagnostic.status,
             display_option_u64(diagnostic.graph_node_count),
+            display_option_u64(diagnostic.selected_probe_node_count),
+            display_option_ratio(diagnostic.selected_probe_nodes_over_abi),
             display_option_u32(diagnostic.selected_transformer_probe_layers),
+            display_option_u32(diagnostic.selected_probe_context_tokens),
+            display_option_u32(diagnostic.abi_graph_context_tokens),
+            display_option_u64(diagnostic.selected_probe_inventory_bucket_mismatch_count),
+            display_option_u64(diagnostic.selected_probe_inventory_abs_node_delta),
+            display_option_u64(diagnostic.selected_probe_inventory_abs_src0_delta_bytes),
+            display_option_u64(diagnostic.selected_probe_inventory_abs_src1_delta_bytes),
+            display_option_u64(diagnostic.selected_probe_inventory_abs_output_delta_bytes),
             display_option_ratio(diagnostic.graph_transformer_src0_over_metadata),
             display_option_ratio(diagnostic.graph_transformer_plus_unclassified_src0_over_metadata),
             diagnostic.graph_unclassified_matmul_src0_bytes,
@@ -5160,10 +7038,30 @@ fn dense_probe_layers(probe: &DecodeKernelProbe) -> u32 {
     digits.parse::<u32>().unwrap_or(1).max(1)
 }
 
+fn steady_benchmark_for_decode_diagnostic(
+    benchmarks: &[BenchmarkScenarioSummary],
+) -> Option<&BenchmarkScenarioSummary> {
+    // Prefer the normal steady-decode scenario when present because it is the
+    // stable smoke-test shape used by broad validation. Some focused runs only
+    // request `steady_decode_primary_context` so the prompt length matches the
+    // primary workload estimate. That scenario is still sampled steady decode:
+    // it exercises the same `skippy_decode_step_sampled()` path and is valid
+    // evidence for ABI-vs-observed and sampler/logits-sync diagnostics.
+    benchmarks
+        .iter()
+        .find(|benchmark| benchmark.scenario == "steady_decode")
+        .or_else(|| {
+            benchmarks
+                .iter()
+                .find(|benchmark| benchmark.scenario == "steady_decode_primary_context")
+        })
+}
+
 fn decode_probe_diagnostic(
     recommendation: &ModelRecommendation,
     abi_probe: Option<&AbiDecodeProbeSummary>,
     steady_benchmark: Option<&BenchmarkScenarioSummary>,
+    model_specific_probe_errors: &[String],
 ) -> Option<DecodeProbeDiagnostic> {
     if !matches!(
         recommendation.fit_status,
@@ -5172,13 +7070,10 @@ fn decode_probe_diagnostic(
         return None;
     }
 
-    let predicted = steady_benchmark
-        .and_then(|benchmark| benchmark.predicted)
-        .or_else(|| {
-            recommendation
-                .estimated_decode_tokens_per_sec
-                .map(f64::from)
-        });
+    let predicted = recommendation
+        .estimated_decode_tokens_per_sec
+        .map(f64::from);
+    let scenario_predicted = steady_benchmark.and_then(|benchmark| benchmark.predicted);
     let abi = abi_probe.and_then(|probe| probe.tokens_per_second);
     let observed = steady_benchmark
         .and_then(|benchmark| benchmark.observed)
@@ -5186,42 +7081,267 @@ fn decode_probe_diagnostic(
             steady_benchmark.and_then(|benchmark| benchmark.benchmark.median_tokens_per_sec)
         });
     let observed_over_fit = ratio(observed, predicted);
+    let observed_over_scenario_fit = ratio(observed, scenario_predicted);
     let abi_over_fit = ratio(abi, predicted);
+    let abi_over_scenario_fit = ratio(abi, scenario_predicted);
     let observed_over_abi = ratio(observed, abi);
     let observed_vs_fit = throughput_ratio_verdict(observed_over_fit);
+    let observed_vs_scenario_fit = throughput_ratio_verdict(observed_over_scenario_fit);
     let abi_vs_fit = throughput_ratio_verdict(abi_over_fit);
+    let abi_vs_scenario_fit = throughput_ratio_verdict(abi_over_scenario_fit);
     let observed_vs_abi = throughput_ratio_verdict(observed_over_abi);
+    let predicted_decode_submission_ms_per_token =
+        predicted_decode_submission_ms_per_token(recommendation);
+    let abi_decode_call_ms_per_token = abi_decode_call_ms_per_token(abi_probe);
+    let decode_submission_residual_ms_per_token = positive_delta(
+        abi_decode_call_ms_per_token,
+        predicted_decode_submission_ms_per_token,
+    );
+    let decode_submission_residual_share_of_predicted =
+        residual_share_of_selected_fit(decode_submission_residual_ms_per_token, recommendation);
+    let predicted_sampler_sync_ms_per_token = predicted_sampler_sync_ms_per_token(recommendation);
+    let abi_sampling_ms_per_token = abi_sampling_ms_per_token(abi_probe);
+    let abi_logits_ready_ms_per_token = abi_logits_ready_ms_per_token(abi_probe);
+    let abi_logits_scan_ms_per_token = abi_logits_scan_ms_per_token(abi_probe);
+    let abi_sampling_over_selected_fit = abi_sampling_over_selected_fit(recommendation, abi_probe);
+    let sampler_sync_residual_ms_per_token = positive_delta(
+        abi_sampling_ms_per_token,
+        predicted_sampler_sync_ms_per_token,
+    );
+    let sampler_sync_residual_share_of_predicted =
+        residual_share_of_selected_fit(sampler_sync_residual_ms_per_token, recommendation);
+    let selected_full_token_handoff_probe = selected_full_token_handoff_probe(recommendation);
+    let selected_full_token_source_sampled_probe =
+        selected_full_token_source_sampled_probe(recommendation);
+    let selected_fit_probe_count = selected_fit_probe_count(recommendation);
+    let selected_fit_probe_max_spread_pct = selected_fit_probe_max_spread_pct(recommendation);
     let abi_probe_noisy = abi_probe
         .and_then(|probe| probe.spread_pct)
         .is_some_and(|spread| spread > DEFAULT_MAX_SPREAD * 100.0);
-    let classification = decode_probe_classification(
+    let request_spread_pct = steady_benchmark
+        .and_then(|benchmark| benchmark.benchmark.request_spread_pct)
+        .filter(|spread| spread.is_finite());
+    let request_decode_noisy =
+        request_spread_pct.is_some_and(|spread| spread > DEFAULT_MAX_SPREAD * 100.0);
+    let classification = decode_probe_classification(DecodeProbeClassificationInput {
         predicted,
         abi,
         observed,
+        missing_representative_model_probe: missing_representative_model_probe(
+            recommendation,
+            model_specific_probe_errors,
+        ),
         abi_probe_noisy,
+        request_decode_noisy,
+        request_spread_pct,
+        observed_over_fit,
+        observed_over_scenario_fit,
+        abi_over_fit,
+        abi_over_scenario_fit,
+        observed_over_abi,
+        abi_sampling_over_selected_fit,
+        selected_full_token_handoff_probe,
+        selected_full_token_source_sampled_probe,
+        decode_submission_residual_share_of_predicted,
+        sampler_sync_residual_share_of_predicted,
+    });
+    let notes = decode_probe_notes(DecodeProbeNotesInput {
         observed_over_fit,
         abi_over_fit,
         observed_over_abi,
-    );
-    let notes = decode_probe_notes(
-        observed_over_fit,
-        abi_over_fit,
-        observed_over_abi,
-        &classification,
-    );
+        decode_submission_residual_ms_per_token,
+        abi_decode_call_ms_per_token,
+        sampler_sync_residual_ms_per_token,
+        abi_sampling_over_selected_fit,
+        abi_logits_ready_ms_per_token,
+        abi_logits_scan_ms_per_token,
+        request_spread_pct: steady_benchmark
+            .and_then(|benchmark| benchmark.benchmark.request_spread_pct),
+        selected_fit_probe_max_spread_pct,
+        selected_full_token_source_sampled_probe,
+        classification: &classification,
+    });
     Some(DecodeProbeDiagnostic {
         predicted_tokens_per_second: predicted,
+        scenario_predicted_tokens_per_second: scenario_predicted,
         abi_tokens_per_second: abi,
         observed_tokens_per_second: observed,
         observed_over_fit,
+        observed_over_scenario_fit,
         abi_over_fit,
+        abi_over_scenario_fit,
         observed_over_abi,
+        scenario_prediction_source: steady_benchmark.map(|benchmark| benchmark.prediction_source),
         observed_vs_fit,
+        observed_vs_scenario_fit,
         abi_vs_fit,
+        abi_vs_scenario_fit,
         observed_vs_abi,
+        predicted_decode_submission_ms_per_token,
+        abi_decode_call_ms_per_token,
+        decode_submission_residual_ms_per_token,
+        decode_submission_residual_share_of_predicted,
+        predicted_sampler_sync_ms_per_token,
+        abi_sampling_ms_per_token,
+        abi_logits_ready_ms_per_token,
+        abi_logits_scan_ms_per_token,
+        abi_sampling_over_selected_fit,
+        sampler_sync_residual_ms_per_token,
+        sampler_sync_residual_share_of_predicted,
+        selected_full_token_handoff_probe,
+        selected_full_token_source_sampled_probe,
+        selected_fit_probe_count,
+        selected_fit_probe_max_spread_pct,
         classification,
         notes,
     })
+}
+
+fn selected_fit_probe_count(recommendation: &ModelRecommendation) -> usize {
+    recommendation
+        .decode_cost_breakdown
+        .as_ref()
+        .map(|breakdown| {
+            breakdown
+                .groups
+                .iter()
+                .filter(|group| group.probe_name.is_some())
+                .count()
+        })
+        .unwrap_or_default()
+}
+
+fn selected_fit_probe_max_spread_pct(recommendation: &ModelRecommendation) -> Option<f64> {
+    recommendation
+        .decode_cost_breakdown
+        .as_ref()?
+        .groups
+        .iter()
+        .filter_map(|group| group.probe_spread_pct)
+        .filter(|spread| spread.is_finite())
+        .max_by(|left, right| left.partial_cmp(right).unwrap_or(Ordering::Equal))
+}
+
+fn predicted_decode_submission_ms_per_token(recommendation: &ModelRecommendation) -> Option<f64> {
+    recommendation
+        .decode_cost_breakdown
+        .as_ref()?
+        .groups
+        .iter()
+        .find(|group| group.group == "decode_submission")
+        .map(|group| f64::from(group.bandwidth_ms))
+        .filter(|value| value.is_finite())
+}
+
+fn abi_decode_call_ms_per_token(abi_probe: Option<&AbiDecodeProbeSummary>) -> Option<f64> {
+    let probe = abi_probe?;
+    let decode_call_ms = probe.decode_call_ms?;
+    let measured_tokens = probe.measured_tokens?;
+    (measured_tokens > 0).then_some(decode_call_ms / measured_tokens as f64)
+}
+
+fn predicted_sampler_sync_ms_per_token(recommendation: &ModelRecommendation) -> Option<f64> {
+    let breakdown = recommendation.decode_cost_breakdown.as_ref()?;
+    let logits_readback_ms = breakdown
+        .groups
+        .iter()
+        .filter(|group| group.group == "logits_readback")
+        .map(|group| f64::from(group.bandwidth_ms))
+        .sum::<f64>();
+    Some(f64::from(breakdown.sampled_decode_sampler_ms) + logits_readback_ms)
+}
+
+fn abi_sampling_ms_per_token(abi_probe: Option<&AbiDecodeProbeSummary>) -> Option<f64> {
+    let probe = abi_probe?;
+    let sampling_ms = probe.sampling_ms?;
+    let measured_tokens = probe.measured_tokens?;
+    (measured_tokens > 0).then_some(sampling_ms / measured_tokens as f64)
+}
+
+fn abi_logits_ready_ms_per_token(abi_probe: Option<&AbiDecodeProbeSummary>) -> Option<f64> {
+    let probe = abi_probe?;
+    let logits_ready_ms = probe.logits_ready_ms?;
+    let measured_tokens = probe.measured_tokens?;
+    (measured_tokens > 0).then_some(logits_ready_ms / measured_tokens as f64)
+}
+
+fn abi_logits_scan_ms_per_token(abi_probe: Option<&AbiDecodeProbeSummary>) -> Option<f64> {
+    let probe = abi_probe?;
+    let logits_scan_ms = probe.logits_scan_ms?;
+    let measured_tokens = probe.measured_tokens?;
+    (measured_tokens > 0).then_some(logits_scan_ms / measured_tokens as f64)
+}
+
+fn abi_sampling_over_selected_fit(
+    recommendation: &ModelRecommendation,
+    abi_probe: Option<&AbiDecodeProbeSummary>,
+) -> Option<f64> {
+    let breakdown = recommendation.decode_cost_breakdown.as_ref()?;
+    let selected_ms = f64::from(breakdown.selected_time_ms);
+    if selected_ms <= 0.0 || !selected_ms.is_finite() {
+        return None;
+    }
+    abi_sampling_ms_per_token(abi_probe).map(|sampling_ms| sampling_ms / selected_ms)
+}
+
+fn residual_share_of_selected_fit(
+    residual_ms_per_token: Option<f64>,
+    recommendation: &ModelRecommendation,
+) -> Option<f64> {
+    residual_ms_per_token
+        .zip(recommendation.decode_cost_breakdown.as_ref())
+        .and_then(|(residual, breakdown)| {
+            (breakdown.selected_time_ms > 0.0)
+                .then_some(residual / f64::from(breakdown.selected_time_ms))
+        })
+        .filter(|share| share.is_finite())
+}
+
+fn selected_full_token_handoff_probe(recommendation: &ModelRecommendation) -> bool {
+    recommendation
+        .decode_cost_breakdown
+        .as_ref()
+        .is_some_and(|breakdown| {
+            breakdown.groups.iter().any(|group| {
+                group.group == "full_token_graph"
+                    && group.source.starts_with("probe_full_token_handoff")
+            })
+        })
+}
+
+fn selected_full_token_source_sampled_probe(recommendation: &ModelRecommendation) -> bool {
+    recommendation
+        .decode_cost_breakdown
+        .as_ref()
+        .is_some_and(|breakdown| {
+            breakdown.groups.iter().any(|group| {
+                group.group == "full_token_graph"
+                    && group.source.starts_with("probe_full_token_source_sampled")
+            })
+        })
+}
+
+fn positive_delta(left: Option<f64>, right: Option<f64>) -> Option<f64> {
+    left.zip(right)
+        .map(|(left, right)| (left - right).max(0.0))
+        .filter(|value| value.is_finite())
+}
+
+fn missing_representative_model_probe(
+    recommendation: &ModelRecommendation,
+    model_specific_probe_errors: &[String],
+) -> bool {
+    let warned_about_representative_probe = recommendation.warnings.iter().any(|warning| {
+        warning.contains("shape-representative decode kernel probe")
+            || warning.contains("tok/s confidence cannot be high")
+    });
+    let model_probe_failed = model_specific_probe_errors.iter().any(|error| {
+        error.contains("dense graph probe did not produce a supported result")
+            || error.contains("linear attention graph probe did not produce a supported result")
+            || error.contains("MoE graph probe did not produce a supported result")
+            || error.contains("output projection probe did not produce a supported result")
+    });
+    warned_about_representative_probe && model_probe_failed
 }
 
 fn ratio(numerator: Option<f64>, denominator: Option<f64>) -> Option<f64> {
@@ -5244,36 +7364,166 @@ fn throughput_ratio_verdict(ratio: Option<f64>) -> String {
     }
 }
 
-fn decode_probe_classification(
-    predicted: Option<f64>,
-    abi: Option<f64>,
-    observed: Option<f64>,
-    abi_probe_noisy: bool,
-    observed_over_fit: Option<f64>,
-    abi_over_fit: Option<f64>,
-    observed_over_abi: Option<f64>,
-) -> String {
-    if predicted.is_none() {
+fn decode_probe_classification(input: DecodeProbeClassificationInput) -> String {
+    if input.predicted.is_none() {
         return "missing_fit_estimate".into();
     }
-    if observed.is_none() {
+    if input.observed.is_none() {
         return "missing_observed_benchmark".into();
     }
-    if abi.is_none() {
+    if input.abi.is_none() {
         return "missing_abi_probe".into();
     }
-    if abi_probe_noisy {
+
+    let fit_observed_matches = ratio_matches(input.observed_over_fit);
+    let fit_abi_matches = ratio_matches(input.abi_over_fit);
+    let scenario_observed_matches = ratio_matches(input.observed_over_scenario_fit);
+    let scenario_abi_matches = ratio_matches(input.abi_over_scenario_fit);
+    let abi_observed_matches = ratio_matches(input.observed_over_abi);
+    let context_rescore_less_representative =
+        context_rescore_is_less_representative_than_primary(&input);
+    if context_rescore_less_representative
+        && fit_observed_matches
+        && fit_abi_matches
+        && abi_observed_matches
+    {
+        // The validation scenario has a shorter prompt/context shape than the
+        // primary workload target, so the scenario rescore can be less
+        // representative than the main recommendation. When the primary
+        // estimate, ABI token loop, and observed request median all agree, keep
+        // that positive evidence visible instead of collapsing the row into a
+        // generic "context rescore unstable" bucket. The row still stays out of
+        // accuracy gates because either the ABI or request path was noisy enough
+        // to make the scenario comparison unclean.
+        return "primary_estimate_and_probe_agree_context_rescore_unstable".into();
+    }
+    if input.request_decode_noisy && fit_observed_matches && fit_abi_matches && abi_observed_matches
+    {
+        // The point estimate agrees, but the individual requests are swinging
+        // too much to count this as clean +/-10% evidence. This happens on tiny
+        // models where the full serving path can move by more than the model
+        // core cost. Keep the row useful as a positive diagnostic, but do not
+        // let it inflate the accuracy-gated sample set.
+        return "estimate_and_probe_agree_noisy_requests".into();
+    }
+    if input.request_decode_noisy
+        && !fit_observed_matches
+        && scenario_observed_matches
+        && scenario_abi_matches
+        && abi_observed_matches
+    {
+        // Primary fit and benchmark-scenario fit intentionally answer
+        // different questions when the workload context differs from the
+        // benchmark prompt shape. If the scenario-scoped estimate, ABI probe,
+        // and observed steady median all agree, keep that positive evidence
+        // visible while still excluding the row from +/-10% accuracy gates due
+        // request spread. This is validation reporting only; observed tok/s is
+        // never fed back into model-fit scoring.
+        return "scenario_estimate_and_probe_agree_noisy_requests".into();
+    }
+    if !fit_observed_matches
+        && scenario_observed_matches
+        && scenario_abi_matches
+        && abi_observed_matches
+    {
+        // The primary fit estimate and the benchmark-scenario estimate can be
+        // intentionally different. The primary recommendation answers the
+        // configured workload question, usually with the preferred context
+        // window. The scenario rescore answers the exact validation prompt
+        // shape. When the scenario estimate, ABI probe, and observed request
+        // path agree, the benchmark validates the metadata/probe model for that
+        // prompt shape; it does not falsify the primary estimate at a different
+        // context. Keep this out of metadata_estimate_miss so the report does
+        // not imply that a source-grounded context charge is wrong just because
+        // the validation prompt was shorter.
+        return "primary_context_differs_from_benchmark".into();
+    }
+    let decode_submission_residual = decode_submission_residual_exceeds_tolerance(
+        input.decode_submission_residual_share_of_predicted,
+    ) || selected_full_token_handoff_covers_abi_sampling(&input);
+    let sampler_sync_residual =
+        sampler_sync_residual_exceeds_tolerance(input.sampler_sync_residual_share_of_predicted);
+    let source_boundary_residual_is_representative = !fit_observed_matches
+        && ratio_is_slower(input.abi_over_fit)
+        && (abi_observed_matches || input.request_decode_noisy);
+    if decode_submission_residual
+        && sampler_sync_residual
+        && source_boundary_residual_is_representative
+    {
+        return if input.request_decode_noisy {
+            "decode_and_sampler_residual_noisy".into()
+        } else {
+            "decode_and_sampler_residual".into()
+        };
+    }
+    if decode_submission_residual && source_boundary_residual_is_representative {
+        return if input.request_decode_noisy {
+            "decode_submission_residual_noisy".into()
+        } else {
+            "decode_submission_residual".into()
+        };
+    }
+    if sampler_sync_residual && source_boundary_residual_is_representative {
+        if input.selected_full_token_source_sampled_probe {
+            return if input.request_decode_noisy {
+                "llama_source_boundary_residual_noisy".into()
+            } else {
+                "llama_source_boundary_residual".into()
+            };
+        }
+        return if input.request_decode_noisy {
+            "sampler_sync_residual_noisy".into()
+        } else {
+            "sampler_sync_residual".into()
+        };
+    }
+    if context_rescore_less_representative && (input.abi_probe_noisy || input.request_decode_noisy)
+    {
+        // Context-aligned rescoring is a validation diagnostic, not the primary
+        // recommendation. Keep it from masking source-boundary residuals above:
+        // when the ABI token loop and observed steady decode are both slower
+        // than the metadata estimate, the useful miss class is the source path
+        // that the synthetic probes did not cover. Fall back to this generic
+        // bucket only when no source-grounded residual explains the mismatch.
+        return "context_rescore_unstable".into();
+    }
+    if input.abi_probe_noisy {
         return "abi_probe_noisy".into();
     }
-
-    let fit_observed_matches = ratio_matches(observed_over_fit);
-    let fit_abi_matches = ratio_matches(abi_over_fit);
-    let abi_observed_matches = ratio_matches(observed_over_abi);
+    if input.request_decode_noisy && !fit_observed_matches {
+        if request_noise_cannot_explain_observed_abi_gap(
+            input.observed_over_abi,
+            input.request_spread_pct,
+        ) {
+            // This is still not clean metadata-estimator evidence: the steady
+            // benchmark path is noisy. But when the median steady result is
+            // much slower than the ABI decode probe by more than the observed
+            // request spread plus the normal +/-10% tolerance, calling the row
+            // "noise" hides the important miss class. The source-grounded
+            // interpretation is that the full request/serving path contains
+            // overhead not represented by the model-shaped decode graph probe.
+            return "steady_path_overhead_mismatch_noisy".into();
+        }
+        // Repeat medians can look stable after remeasurement while the
+        // individual steady-decode requests inside those repeats still swing
+        // widely. That is especially visible on tiny models where fixed server
+        // scheduling, sampler/session work, and backend runtime state are a
+        // large fraction of the request. Treat those rows as validation-path
+        // evidence rather than clean metadata-estimator accuracy evidence.
+        // This uses the same spread threshold as the rest of the validator; it
+        // is not a model-specific correction and it is never fed back into
+        // model-fit scoring.
+        return "validation_request_noise".into();
+    }
     match (fit_observed_matches, fit_abi_matches, abi_observed_matches) {
         (true, true, true) => "estimate_and_probe_agree".into(),
+        (false, _, true) if input.missing_representative_model_probe => {
+            "missing_representative_decode_probe".into()
+        }
         (false, _, true) => "metadata_estimate_miss".into(),
         (false, true, false) => {
-            if ratio_is_slower(observed_over_fit) && ratio_is_slower(observed_over_abi) {
+            if ratio_is_slower(input.observed_over_fit) && ratio_is_slower(input.observed_over_abi)
+            {
                 "steady_path_overhead_mismatch".into()
             } else {
                 "runtime_path_mismatch".into()
@@ -5286,6 +7536,27 @@ fn decode_probe_classification(
     }
 }
 
+fn selected_full_token_handoff_covers_abi_sampling(input: &DecodeProbeClassificationInput) -> bool {
+    input.selected_full_token_handoff_probe && ratio_matches(input.abi_sampling_over_selected_fit)
+}
+
+fn context_rescore_is_less_representative_than_primary(
+    input: &DecodeProbeClassificationInput,
+) -> bool {
+    let Some(primary_ratio) = input.observed_over_fit else {
+        return false;
+    };
+    let Some(scenario_ratio) = input.observed_over_scenario_fit else {
+        return false;
+    };
+    if !primary_ratio.is_finite() || !scenario_ratio.is_finite() {
+        return false;
+    }
+    let primary_error = (primary_ratio - 1.0).abs();
+    let scenario_error = (scenario_ratio - 1.0).abs();
+    scenario_error > primary_error + DEFAULT_TOLERANCE
+}
+
 fn ratio_matches(ratio: Option<f64>) -> bool {
     ratio.is_some_and(|ratio| (ratio - 1.0).abs() <= DEFAULT_TOLERANCE)
 }
@@ -5294,38 +7565,172 @@ fn ratio_is_slower(ratio: Option<f64>) -> bool {
     ratio.is_some_and(|ratio| ratio < 1.0 - DEFAULT_TOLERANCE)
 }
 
-fn decode_probe_notes(
-    observed_over_fit: Option<f64>,
-    abi_over_fit: Option<f64>,
+fn request_noise_cannot_explain_observed_abi_gap(
     observed_over_abi: Option<f64>,
-    classification: &str,
-) -> Vec<String> {
+    request_spread_pct: Option<f64>,
+) -> bool {
+    let Some(ratio) = observed_over_abi else {
+        return false;
+    };
+    if !ratio.is_finite() || ratio >= 1.0 - DEFAULT_TOLERANCE {
+        return false;
+    }
+    let gap_pct = (1.0 - ratio).max(0.0) * 100.0;
+    let spread_pct = request_spread_pct.unwrap_or_default().max(0.0);
+    gap_pct > spread_pct + DEFAULT_TOLERANCE * 100.0
+}
+
+fn sampler_sync_residual_exceeds_tolerance(residual_share: Option<f64>) -> bool {
+    residual_share.is_some_and(|share| share.is_finite() && share > DEFAULT_TOLERANCE)
+}
+
+fn decode_submission_residual_exceeds_tolerance(residual_share: Option<f64>) -> bool {
+    residual_share.is_some_and(|share| share.is_finite() && share > DEFAULT_TOLERANCE)
+}
+
+fn decode_probe_notes(input: DecodeProbeNotesInput<'_>) -> Vec<String> {
     let mut notes = Vec::new();
     notes.push(
         "ABI probe is validation evidence only; it is not fed into metadata-only fit scoring."
             .into(),
     );
-    if let Some(ratio) = observed_over_fit {
+    if let Some(ratio) = input.observed_over_fit {
         notes.push(format!(
             "Observed steady decode is {:.1}% of the metadata estimate.",
             ratio * 100.0
         ));
     }
-    if let Some(ratio) = abi_over_fit {
+    if let Some(ratio) = input.abi_over_fit {
         notes.push(format!(
             "ABI decode probe is {:.1}% of the metadata estimate.",
             ratio * 100.0
         ));
     }
-    if let Some(ratio) = observed_over_abi {
+    if let Some(ratio) = input.observed_over_abi {
         notes.push(format!(
             "Observed steady decode is {:.1}% of the ABI decode probe.",
             ratio * 100.0
         ));
     }
-    match classification {
+    if let Some(spread) = input.request_spread_pct {
+        notes.push(format!(
+            "Per-request steady decode spread was {spread:.1}% across benchmark requests."
+        ));
+    }
+    if let Some(spread) = input.selected_fit_probe_max_spread_pct {
+        notes.push(format!(
+            "Largest selected model-fit decode probe spread was {spread:.1}% across timed probe runs."
+        ));
+    }
+    if input.selected_full_token_source_sampled_probe {
+        notes.push(
+            "The selected model-fit probe is a source-sampled synthetic full-token graph: it times source-side decode bookkeeping, graph submission, async logits extraction, scheduler synchronization, and a CPU logits scan, but it still does not load a real llama_context or benchmark the target model."
+                .into(),
+        );
+    }
+    if let Some(residual) = input.decode_submission_residual_ms_per_token {
+        notes.push(format!(
+            "ABI decode-call time exceeds predicted synthetic decode submission by {residual:.3} ms/token."
+        ));
+    }
+    if let Some(decode_call_ms) = input.abi_decode_call_ms_per_token {
+        notes.push(format!(
+            "ABI decode-call time is {decode_call_ms:.3} ms/token before logits/sampling."
+        ));
+    }
+    if let Some(residual) = input.sampler_sync_residual_ms_per_token {
+        notes.push(format!(
+            "ABI sampling/logits-sync time exceeds predicted sampler+logits handoff by {residual:.3} ms/token."
+        ));
+    }
+    if let Some(ratio) = input.abi_sampling_over_selected_fit {
+        notes.push(format!(
+            "ABI sampling/logits-sync time is {:.1}% of the selected metadata decode estimate.",
+            ratio * 100.0
+        ));
+    }
+    match (
+        input.abi_logits_ready_ms_per_token,
+        input.abi_logits_scan_ms_per_token,
+    ) {
+        (Some(ready_ms), Some(scan_ms)) => notes.push(format!(
+            "ABI splits that sampling/logits-sync boundary into {ready_ms:.3} ms/token waiting for llama_get_logits_ith() readiness and {scan_ms:.3} ms/token scanning the CPU-visible vocab row."
+        )),
+        (Some(ready_ms), None) => notes.push(format!(
+            "ABI reports {ready_ms:.3} ms/token waiting for llama_get_logits_ith() readiness; vocab scan timing was unavailable."
+        )),
+        (None, Some(scan_ms)) => notes.push(format!(
+            "ABI reports {scan_ms:.3} ms/token scanning the CPU-visible vocab row; logits readiness timing was unavailable."
+        )),
+        (None, None) => {}
+    }
+    match input.classification {
         "metadata_estimate_miss" => notes.push(
             "ABI and observed decode agree, so the miss points at metadata cost modeling.".into(),
+        ),
+        "missing_representative_decode_probe" => notes.push(
+            "ABI and observed decode agree, but model-shaped decode probes were unavailable for this row, so the metadata estimate fell back to less representative timing evidence."
+                .into(),
+        ),
+        "validation_request_noise" => notes.push(
+            "The benchmark's per-request steady decode spread exceeded the validator noise threshold, so this row is not clean evidence that the metadata estimator is wrong."
+                .into(),
+        ),
+        "estimate_and_probe_agree_noisy_requests" => notes.push(
+            "The metadata estimate, ABI probe, and steady median agree, but per-request spread exceeded the validator noise threshold, so this row is positive diagnostic evidence rather than clean accuracy-gated evidence."
+                .into(),
+        ),
+        "primary_estimate_and_probe_agree_context_rescore_unstable" => notes.push(
+            "The primary workload-context estimate, ABI probe, and steady median agree, but the benchmark-context rescore is less representative on a noisy row; keep this as positive primary-scope evidence, not clean scenario-scope accuracy evidence."
+                .into(),
+        ),
+        "scenario_estimate_and_probe_agree_noisy_requests" => notes.push(
+            "The benchmark-scenario estimate, ABI probe, and steady median agree, but per-request spread exceeded the validator noise threshold; this is positive scenario-scope evidence, not clean primary metadata-estimator accuracy evidence."
+                .into(),
+        ),
+        "primary_context_differs_from_benchmark" => notes.push(
+            "The benchmark-scenario estimate, ABI probe, and steady median agree, while the primary workload estimate uses a different context target. This validates the scenario rescore without treating the primary context charge as a metadata miss."
+                .into(),
+        ),
+        "context_rescore_unstable" => notes.push(
+            "The benchmark-context rescore is less representative than the primary workload-context estimate on a noisy row; keep this as scenario-scope evidence, not clean metadata-estimator accuracy evidence."
+                .into(),
+        ),
+        "steady_path_overhead_mismatch_noisy" => notes.push(
+            "Per-request spread is high, but it is too small to explain the observed-vs-ABI gap; treat this as noisy evidence of request/serving-path overhead rather than clean metadata-estimator error."
+                .into(),
+        ),
+        "sampler_sync_residual" => notes.push(
+            "ABI decode shows the missing token time is in source-visible logits synchronization and sampler work after the decode graph is submitted; this is validation evidence for a benchmark/probe gap, not a fitted model correction."
+                .into(),
+        ),
+        "sampler_sync_residual_noisy" => notes.push(
+            "The steady requests are noisy, but ABI decode shows a large source-visible logits synchronization/sampler residual; keep the row out of clean accuracy gates while tracking this miss class explicitly."
+                .into(),
+        ),
+        "llama_source_boundary_residual" => notes.push(
+            "ABI and observed decode agree, but the source-sampled synthetic full-token graph is still faster than the real llama.cpp boundary where skippy_decode_tokens()/llama_decode() returns and skippy_greedy_sample() calls llama_get_logits_ith(). This is a source-representation gap in the probe, not an observed-throughput correction."
+                .into(),
+        ),
+        "llama_source_boundary_residual_noisy" => notes.push(
+            "The steady requests are noisy, but ABI and observed decode agree closely enough to expose a source-representation gap: the source-sampled synthetic full-token graph is faster than the real llama.cpp decode/logits-readiness boundary. Keep this row out of clean accuracy gates and use it to guide better source-shaped probes."
+                .into(),
+        ),
+        "decode_submission_residual" => notes.push(
+            "The selected full-token handoff probe already accounts for ABI sampling/logits visibility, while ABI total decode is still slower than the metadata estimate. The remaining gap is before sampling, in the source-visible decode submission path such as skippy_decode_tokens()/llama_decode(), not in a fitted scorer correction."
+                .into(),
+        ),
+        "decode_submission_residual_noisy" => notes.push(
+            "The steady requests are noisy, but the selected full-token handoff probe already accounts for ABI sampling/logits visibility while ABI total decode is still slower than the metadata estimate. Track this as decode-submission residual evidence and keep it out of clean accuracy gates."
+                .into(),
+        ),
+        "decode_and_sampler_residual" => notes.push(
+            "ABI timing shows missing token time on both source-visible sides of the boundary: the decode-call path before logits/sampling and the logits synchronization/sampler path after graph submission. This is validation evidence for probe coverage, not an observed-throughput correction."
+                .into(),
+        ),
+        "decode_and_sampler_residual_noisy" => notes.push(
+            "The steady requests are noisy, but ABI timing shows missing token time on both source-visible sides of the boundary: decode-call submission and logits synchronization/sampler work. Keep this row out of clean accuracy gates while tracking the residual explicitly."
+                .into(),
         ),
         "abi_probe_noisy" => notes.push(
             "The ABI decode probe exceeded the validator spread threshold, so this row is reported as probe-noise evidence rather than clean estimator accuracy evidence."
@@ -5349,7 +7754,9 @@ fn decode_probe_notes(
 fn graph_inventory_diagnostic(
     profile: &ModelProfile,
     recommendation: &ModelRecommendation,
+    model_specific_probes: &[DecodeKernelProbe],
     abi_probe: Option<&AbiDecodeProbeSummary>,
+    abi_probe_kind: AbiDecodeProbeKind,
 ) -> Option<GraphInventoryDiagnostic> {
     let abi_probe = abi_probe?;
     let comparisons = graph_inventory_comparisons(profile, abi_probe);
@@ -5360,20 +7767,36 @@ fn graph_inventory_diagnostic(
         graph_transformer_weight_src0_bytes.saturating_add(graph_unclassified_matmul_src0_bytes);
     let metadata_transformer_matmul_nodes = graph_metadata_transformer_nodes(profile);
     let graph_transformer_matmul_nodes = graph_transformer_node_count(profile, abi_probe);
-    let transformer_cost_group = graph_transformer_cost_group(profile);
-    let transformer_group = recommendation
-        .decode_cost_breakdown
-        .as_ref()
-        .and_then(|breakdown| {
-            breakdown
-                .groups
-                .iter()
-                .find(|group| group.group == transformer_cost_group)
-        });
+    let transformer_group = selected_graph_probe_group(profile, recommendation);
     let selected_transformer_probe = transformer_group.and_then(|group| group.probe_name.clone());
     let selected_transformer_probe_layers = selected_transformer_probe
         .as_deref()
         .map(graph_probe_layers_from_name);
+    let selected_probe_context_tokens = selected_transformer_probe
+        .as_deref()
+        .and_then(graph_probe_context_from_name);
+    let abi_graph_context_tokens = abi_graph_context_tokens(abi_probe);
+    let selected_probe_node_count = selected_transformer_probe.as_deref().and_then(|name| {
+        model_specific_probes
+            .iter()
+            .find(|probe| probe.name == name)
+            .and_then(|probe| probe.graph_node_count)
+    });
+    let selected_probe_inventory_delta =
+        if graph_contexts_match(selected_probe_context_tokens, abi_graph_context_tokens) {
+            selected_transformer_probe.as_deref().and_then(|name| {
+                model_specific_probes
+                    .iter()
+                    .find(|probe| probe.name == name)
+                    .and_then(|probe| selected_probe_inventory_delta(probe, abi_probe))
+            })
+        } else {
+            None
+        };
+    let selected_probe_nodes_over_abi = ratio(
+        selected_probe_node_count.map(|value| value as f64),
+        abi_probe.graph_node_count.map(|value| value as f64),
+    );
     let estimated_transformer_block_ms =
         transformer_group.map(|group| f64::from(group.bandwidth_ms));
     let abi_ms_per_token = match (abi_probe.measured_tokens, abi_probe.elapsed_ms) {
@@ -5392,20 +7815,46 @@ fn graph_inventory_diagnostic(
         graph_transformer_plus_unclassified_src0_bytes,
         metadata_transformer_weight_bytes,
     );
-    let mut notes = graph_inventory_notes(
+    let mut notes = graph_inventory_notes(GraphInventoryNotesInput {
         metadata_transformer_weight_bytes,
         graph_transformer_weight_src0_bytes,
         graph_unclassified_matmul_src0_bytes,
         metadata_transformer_matmul_nodes,
         graph_transformer_matmul_nodes,
-        selected_transformer_probe_layers,
+        selected_probe_layers: selected_transformer_probe_layers,
         estimated_transformer_over_abi,
-    );
+        selected_probe_nodes_over_abi,
+    });
     if abi_probe.graph_inventory_bucket_overflow_count.unwrap_or(0) > 0 {
         notes.push(
             "Graph inventory bucket overflowed; comparisons are partial and should not drive estimator changes."
                 .into(),
         );
+    }
+    if abi_probe_kind == AbiDecodeProbeKind::ContextAligned {
+        notes.push(
+            "Graph inventory uses a diagnostic ABI probe warmed to the selected synthetic active-context depth; this probe is not used by the fitter or the observed-vs-ABI throughput summary."
+                .into(),
+        );
+    }
+    match (selected_probe_context_tokens, abi_graph_context_tokens) {
+        (Some(selected_context), Some(abi_context))
+            if !graph_contexts_match(selected_probe_context_tokens, abi_graph_context_tokens) =>
+        {
+            notes.push(format!(
+                "Synthetic/ABI bucket deltas are suppressed because the selected synthetic probe used n_kv/context {selected_context} while the ABI graph inventory used n_kv/context {abi_context}."
+            ));
+        }
+        _ => {}
+    }
+    match selected_probe_inventory_delta {
+        Some(delta) if delta.bucket_mismatch_count > 0 => {
+            notes.push(format!(
+                "Selected synthetic probe differs from ABI graph inventory in {} buckets; this points at probe topology/layout representation rather than GGUF tensor grouping.",
+                delta.bucket_mismatch_count
+            ));
+        }
+        _ => {}
     }
     let available = !abi_probe.graph_inventory.is_empty();
     let status = graph_inventory_status(
@@ -5421,6 +7870,20 @@ fn graph_inventory_diagnostic(
         graph_inventory_bucket_overflow_count: abi_probe.graph_inventory_bucket_overflow_count,
         selected_transformer_probe,
         selected_transformer_probe_layers,
+        selected_probe_context_tokens,
+        abi_graph_context_tokens,
+        selected_probe_node_count,
+        selected_probe_nodes_over_abi,
+        selected_probe_inventory_bucket_mismatch_count: selected_probe_inventory_delta
+            .map(|delta| delta.bucket_mismatch_count),
+        selected_probe_inventory_abs_node_delta: selected_probe_inventory_delta
+            .map(|delta| delta.abs_node_delta),
+        selected_probe_inventory_abs_src0_delta_bytes: selected_probe_inventory_delta
+            .map(|delta| delta.abs_src0_delta_bytes),
+        selected_probe_inventory_abs_src1_delta_bytes: selected_probe_inventory_delta
+            .map(|delta| delta.abs_src1_delta_bytes),
+        selected_probe_inventory_abs_output_delta_bytes: selected_probe_inventory_delta
+            .map(|delta| delta.abs_output_delta_bytes),
         metadata_transformer_matmul_nodes,
         graph_transformer_matmul_nodes,
         metadata_transformer_weight_bytes,
@@ -5434,6 +7897,37 @@ fn graph_inventory_diagnostic(
         comparisons,
         notes,
     })
+}
+
+fn selected_graph_probe_group<'a>(
+    profile: &ModelProfile,
+    recommendation: &'a ModelRecommendation,
+) -> Option<&'a model_fit::DecodeCostGroupBreakdown> {
+    let transformer_cost_group = graph_transformer_cost_group(profile);
+    recommendation
+        .decode_cost_breakdown
+        .as_ref()
+        .and_then(|breakdown| {
+            breakdown
+                .groups
+                .iter()
+                .find(|group| group.group == "full_token_graph")
+                .or_else(|| {
+                    breakdown
+                        .groups
+                        .iter()
+                        .find(|group| group.group == transformer_cost_group)
+                })
+        })
+}
+
+fn selected_graph_probe_context_tokens(
+    profile: &ModelProfile,
+    recommendation: &ModelRecommendation,
+) -> Option<u32> {
+    selected_graph_probe_group(profile, recommendation)
+        .and_then(|group| group.probe_name.as_deref())
+        .and_then(graph_probe_context_from_name)
 }
 
 fn graph_inventory_comparisons(
@@ -5487,6 +7981,161 @@ fn graph_inventory_comparisons(
     ));
 
     comparisons
+}
+
+fn selected_probe_inventory_delta(
+    probe: &DecodeKernelProbe,
+    abi_probe: &AbiDecodeProbeSummary,
+) -> Option<SelectedProbeInventoryDelta> {
+    if probe.graph_inventory.is_empty() || abi_probe.graph_inventory.is_empty() {
+        return None;
+    }
+    let synthetic = synthetic_graph_inventory_totals(&probe.graph_inventory);
+    let abi = abi_graph_inventory_totals(&abi_probe.graph_inventory);
+    let keys = synthetic
+        .keys()
+        .chain(abi.keys())
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let mut delta = SelectedProbeInventoryDelta::default();
+    for key in keys {
+        let left = synthetic.get(&key).copied().unwrap_or_default();
+        let right = abi.get(&key).copied().unwrap_or_default();
+        let node_delta = abs_delta_u64(left.node_count, right.node_count);
+        let src0_delta = abs_delta_u64(left.src0_bytes, right.src0_bytes);
+        let src1_delta = abs_delta_u64(left.src1_bytes, right.src1_bytes);
+        let output_delta = abs_delta_u64(left.output_bytes, right.output_bytes);
+        if node_delta > 0 || src0_delta > 0 || src1_delta > 0 || output_delta > 0 {
+            delta.bucket_mismatch_count += 1;
+            delta.abs_node_delta = delta.abs_node_delta.saturating_add(node_delta);
+            delta.abs_src0_delta_bytes = delta.abs_src0_delta_bytes.saturating_add(src0_delta);
+            delta.abs_src1_delta_bytes = delta.abs_src1_delta_bytes.saturating_add(src1_delta);
+            delta.abs_output_delta_bytes =
+                delta.abs_output_delta_bytes.saturating_add(output_delta);
+        }
+    }
+    Some(delta)
+}
+
+fn graph_contexts_match(selected_context: Option<u32>, abi_context: Option<u32>) -> bool {
+    match (selected_context, abi_context) {
+        (Some(selected), Some(abi)) => ratio(Some(f64::from(selected)), Some(f64::from(abi)))
+            .is_some_and(|value| (value - 1.0).abs() <= DEFAULT_TOLERANCE),
+        _ => true,
+    }
+}
+
+fn abi_graph_context_tokens(abi_probe: &AbiDecodeProbeSummary) -> Option<u32> {
+    abi_graph_context_tokens_for_family(abi_probe, "kv_cache")
+        .or_else(|| abi_graph_context_tokens_for_family(abi_probe, "attention_runtime"))
+}
+
+fn abi_graph_context_tokens_for_family(
+    abi_probe: &AbiDecodeProbeSummary,
+    family: &str,
+) -> Option<u32> {
+    let mut dimensions = abi_probe
+        .graph_inventory
+        .iter()
+        .filter(|bucket| bucket.family.as_deref() == Some(family))
+        .flat_map(|bucket| bucket.ne.iter().copied())
+        .filter_map(|value| u32::try_from(value).ok())
+        .filter(|value| *value > 1)
+        .collect::<Vec<_>>();
+    dimensions.sort_unstable();
+    dimensions.dedup();
+    if family == "kv_cache" && dimensions.len() >= 2 {
+        // The KV-cache inventory contains both allocation-capacity tensors
+        // (`kv_width x ctx_size`) and active attention views
+        // (`head_dim x n_kv x kv_heads`). For context comparability with
+        // synthetic `_nkv` probes, the active view is the useful value. In the
+        // current llama.cpp graph it is the largest KV dimension below the
+        // capacity dimension.
+        return dimensions.iter().rev().nth(1).copied();
+    }
+    dimensions.last().copied()
+}
+
+fn synthetic_graph_inventory_totals(
+    buckets: &[mesh_llm_gpu_bench::DecodeGraphInventoryBucket],
+) -> BTreeMap<String, GraphInventoryTotals> {
+    buckets
+        .iter()
+        .map(|bucket| {
+            (
+                graph_inventory_bucket_key(
+                    bucket.family.as_deref(),
+                    bucket.ggml_op,
+                    bucket.ggml_type,
+                    &bucket.ne,
+                ),
+                GraphInventoryTotals {
+                    node_count: bucket.node_count.unwrap_or_default(),
+                    src0_bytes: bucket.src0_bytes.unwrap_or_default(),
+                    src1_bytes: bucket.src1_bytes.unwrap_or_default(),
+                    output_bytes: bucket.output_bytes.unwrap_or_default(),
+                },
+            )
+        })
+        .collect()
+}
+
+fn abi_graph_inventory_totals(
+    buckets: &[AbiGraphInventoryBucket],
+) -> BTreeMap<String, GraphInventoryTotals> {
+    buckets
+        .iter()
+        .map(|bucket| {
+            (
+                graph_inventory_bucket_key(
+                    bucket.family.as_deref(),
+                    bucket.ggml_op,
+                    bucket.ggml_type,
+                    &bucket.ne,
+                ),
+                GraphInventoryTotals {
+                    node_count: bucket.node_count.unwrap_or_default(),
+                    src0_bytes: bucket.src0_bytes.unwrap_or_default(),
+                    src1_bytes: bucket.src1_bytes.unwrap_or_default(),
+                    output_bytes: bucket.output_bytes.unwrap_or_default(),
+                },
+            )
+        })
+        .collect()
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct GraphInventoryTotals {
+    node_count: u64,
+    src0_bytes: u64,
+    src1_bytes: u64,
+    output_bytes: u64,
+}
+
+fn graph_inventory_bucket_key(
+    family: Option<&str>,
+    ggml_op: Option<i64>,
+    ggml_type: Option<u64>,
+    ne: &[i64],
+) -> String {
+    format!(
+        "{}|{}|{}|{}",
+        family.unwrap_or(""),
+        ggml_op
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "-".into()),
+        ggml_type
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "-".into()),
+        ne.iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("x")
+    )
+}
+
+fn abs_delta_u64(left: u64, right: u64) -> u64 {
+    left.max(right) - left.min(right)
 }
 
 fn graph_transformer_cost_group(profile: &ModelProfile) -> &'static str {
@@ -5614,41 +8263,42 @@ fn graph_inventory_status(
     }
 }
 
-fn graph_inventory_notes(
-    metadata_transformer_weight_bytes: u64,
-    graph_transformer_weight_src0_bytes: u64,
-    graph_unclassified_matmul_src0_bytes: u64,
-    metadata_transformer_matmul_nodes: u64,
-    graph_transformer_matmul_nodes: u64,
-    selected_probe_layers: Option<u32>,
-    estimated_transformer_over_abi: Option<f64>,
-) -> Vec<String> {
+fn graph_inventory_notes(input: GraphInventoryNotesInput) -> Vec<String> {
     let mut notes = Vec::new();
     if ratio_u64(
-        graph_transformer_weight_src0_bytes,
-        metadata_transformer_weight_bytes,
+        input.graph_transformer_weight_src0_bytes,
+        input.metadata_transformer_weight_bytes,
     )
     .is_some_and(|ratio| (ratio - 1.0).abs() <= DEFAULT_TOLERANCE)
-        && metadata_transformer_matmul_nodes == graph_transformer_matmul_nodes
+        && input.metadata_transformer_matmul_nodes == input.graph_transformer_matmul_nodes
     {
         notes.push(
             "GGUF tensor inventory matches the llama.cpp transformer matmul graph; the miss is likely timing/probe representation, not tensor grouping."
                 .into(),
         );
     }
-    if selected_probe_layers == Some(1) && graph_transformer_matmul_nodes > 0 {
+    if input.selected_probe_layers == Some(1) && input.graph_transformer_matmul_nodes > 0 {
         notes.push(
             "The selected transformer timing comes from a one-layer synthetic graph while the native decode graph contains the full repeated-layer matmul inventory."
                 .into(),
         );
     }
-    if graph_unclassified_matmul_src0_bytes > 0 {
+    if input
+        .selected_probe_nodes_over_abi
+        .is_some_and(|ratio| ratio < 1.0 - DEFAULT_TOLERANCE)
+    {
+        notes.push(
+            "The selected synthetic decode probe has fewer GGML graph nodes than the ABI llama.cpp decode graph; treat residual tok/s miss as possible probe-topology under-representation before changing bandwidth scoring."
+                .into(),
+        );
+    }
+    if input.graph_unclassified_matmul_src0_bytes > 0 {
         notes.push(format!(
             "Native graph has {:.1} MiB of unclassified GGML_OP_MUL_MAT src0 bytes; inspect source node names before treating a known-family mismatch as missing model work.",
-            graph_unclassified_matmul_src0_bytes as f64 / 1024.0 / 1024.0
+            input.graph_unclassified_matmul_src0_bytes as f64 / 1024.0 / 1024.0
         ));
     }
-    if let Some(ratio) = estimated_transformer_over_abi {
+    if let Some(ratio) = input.estimated_transformer_over_abi {
         notes.push(format!(
             "Estimated transformer-block time is {:.1}% of total ABI ms/token.",
             ratio * 100.0
@@ -5947,6 +8597,10 @@ fn abi_ms_per_token(abi_probe: &AbiDecodeProbeSummary) -> Option<f64> {
 fn graph_probe_layers_from_name(name: &str) -> u32 {
     for marker in [
         "_llama_graph_l",
+        "_full_token_source_sampled_l",
+        "_full_token_handoff_l",
+        "_full_token_l",
+        "_submission_l",
         "_moe_block_graph_l",
         "_moe_graph_l",
         "_linear_attn_graph_r",
@@ -5956,6 +8610,22 @@ fn graph_probe_layers_from_name(name: &str) -> u32 {
         }
     }
     1
+}
+
+fn graph_probe_context_from_name(name: &str) -> Option<u32> {
+    graph_probe_width_after_marker(name, "_nkv")
+        .or_else(|| graph_probe_width_after_marker(name, "_ctx"))
+}
+
+fn graph_probe_width_after_marker(name: &str, marker: &str) -> Option<u32> {
+    let (_, suffix) = name.split_once(marker)?;
+    suffix
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>()
+        .parse::<u32>()
+        .ok()
+        .filter(|value| *value > 0)
 }
 
 fn graph_probe_layers_after_marker(name: &str, marker: &str) -> Option<u32> {
@@ -6069,6 +8739,14 @@ fn display_estimated_tps(row: &ModelValidationReport) -> String {
         .unwrap_or_else(|| "-".into())
 }
 
+fn display_estimated_decode_context(row: &ModelValidationReport) -> String {
+    row.recommendation
+        .as_ref()
+        .and_then(|rec| rec.estimated_decode_context_tokens)
+        .map(|tokens| tokens.to_string())
+        .unwrap_or_else(|| "-".into())
+}
+
 fn display_steady_estimated_tps(row: &ModelValidationReport) -> String {
     if !row_is_local_fit(row) {
         return "-".into();
@@ -6077,6 +8755,30 @@ fn display_steady_estimated_tps(row: &ModelValidationReport) -> String {
         .and_then(|benchmark| benchmark.predicted)
         .map(|tps| format!("{tps:.1}"))
         .unwrap_or_else(|| display_estimated_tps(row))
+}
+
+fn display_steady_prediction_context(row: &ModelValidationReport) -> String {
+    scenario_summary_by_name(row, "steady_decode")
+        .and_then(|benchmark| benchmark.prediction_context_tokens)
+        .map(|tokens| tokens.to_string())
+        .unwrap_or_else(|| "-".into())
+}
+
+fn display_scenario_estimated_tps(row: &ModelValidationReport, scenario: &str) -> String {
+    if !row_is_local_fit(row) {
+        return "-".into();
+    }
+    scenario_summary_by_name(row, scenario)
+        .and_then(|benchmark| benchmark.predicted)
+        .map(|tps| format!("{tps:.1}"))
+        .unwrap_or_else(|| "-".into())
+}
+
+fn display_scenario_prediction_context(row: &ModelValidationReport, scenario: &str) -> String {
+    scenario_summary_by_name(row, scenario)
+        .and_then(|benchmark| benchmark.prediction_context_tokens)
+        .map(|tokens| tokens.to_string())
+        .unwrap_or_else(|| "-".into())
 }
 
 fn display_steady_estimated_range(row: &ModelValidationReport) -> String {
@@ -6101,6 +8803,34 @@ fn display_steady_observed_over_fit(row: &ModelValidationReport) -> String {
     scenario_summary_by_name(row, "steady_decode")
         .and_then(|benchmark| benchmark.observed_over_fit)
         .or(row.benchmark.observed_over_fit)
+        .map(|value| format!("{value:.2}"))
+        .unwrap_or_else(|| "-".into())
+}
+
+fn display_steady_observed_over_primary(row: &ModelValidationReport) -> String {
+    scenario_summary_by_name(row, "steady_decode")
+        .and_then(|benchmark| benchmark.primary_observed_over_fit)
+        .map(|value| format!("{value:.2}"))
+        .unwrap_or_else(|| "-".into())
+}
+
+fn display_scenario_observed(row: &ModelValidationReport, scenario: &str) -> String {
+    scenario_summary_by_name(row, scenario)
+        .and_then(|benchmark| benchmark.observed)
+        .map(|value| format!("{value:.2}"))
+        .unwrap_or_else(|| "-".into())
+}
+
+fn display_scenario_observed_over_fit(row: &ModelValidationReport, scenario: &str) -> String {
+    scenario_summary_by_name(row, scenario)
+        .and_then(|benchmark| benchmark.observed_over_fit)
+        .map(|value| format!("{value:.2}"))
+        .unwrap_or_else(|| "-".into())
+}
+
+fn display_scenario_observed_over_primary(row: &ModelValidationReport, scenario: &str) -> String {
+    scenario_summary_by_name(row, scenario)
+        .and_then(|benchmark| benchmark.primary_observed_over_fit)
         .map(|value| format!("{value:.2}"))
         .unwrap_or_else(|| "-".into())
 }
@@ -6163,11 +8893,15 @@ fn display_graph_node_ratio(diagnostic: &GraphInventoryDiagnostic) -> String {
 }
 
 fn display_graph_inventory_notes(diagnostic: &GraphInventoryDiagnostic) -> String {
+    if diagnostic.notes.is_empty() {
+        return "-".into();
+    }
     diagnostic
         .notes
-        .first()
+        .iter()
         .map(|note| note.replace('|', "/"))
-        .unwrap_or_else(|| "-".into())
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 fn display_operation_bucket_notes(bucket: &OperationBucketRow) -> String {
@@ -6216,7 +8950,7 @@ fn display_u64(value: Option<u64>) -> String {
 
 fn abi_probe_observation_detail(observation: &AbiDecodeProbeObservation) -> String {
     format!(
-        "repeat={} status={} tok_s={} sample_sync_tok_s={} elapsed_ms={} decode_call_ms={} sampling_ms={} overhead_ms={} error={}",
+        "repeat={} status={} tok_s={} sample_sync_tok_s={} elapsed_ms={} decode_call_ms={} sampling_ms={} logits_ready_ms={} logits_scan_ms={} overhead_ms={} error={}",
         observation.repeat + 1,
         status_label(observation.status_code),
         display_opt(observation.tokens_per_second),
@@ -6224,6 +8958,8 @@ fn abi_probe_observation_detail(observation: &AbiDecodeProbeObservation) -> Stri
         display_opt(observation.elapsed_ms),
         display_opt(observation.decode_call_ms),
         display_opt(observation.sampling_ms),
+        display_opt(observation.logits_ready_ms),
+        display_opt(observation.logits_scan_ms),
         display_opt(observation.non_eval_overhead_ms),
         observation.error.as_deref().unwrap_or("-")
     )
@@ -6249,7 +8985,7 @@ fn benchmark_observation_metric(
     scenario: &BenchmarkScenarioSpec,
 ) -> Option<f64> {
     match scenario.kind {
-        BenchmarkScenarioKind::SteadyDecode => {
+        BenchmarkScenarioKind::SteadyDecode | BenchmarkScenarioKind::PrimaryContextSteadyDecode => {
             steady_decode_observation_tokens_per_sec(observation)
         }
         BenchmarkScenarioKind::Prefill => prefill_observation_tokens_per_sec(observation),
@@ -6608,6 +9344,464 @@ fn unix_timestamp_secs() -> u64 {
 
 fn print_usage() {
     eprintln!(
-        "usage: model-fit-validate [--output-json report.json] [--models-file refs.txt] [--scenario steady_decode|prefill|first_token|kv_warm_reuse|all] [--dense-probe-depth standard|deep] [--benchmark-all] [--fit-only] [--no-progress] org/repo:Q4_K_M [org/repo:Q5_K_M ...]"
+        "usage: model-fit-validate [--output-json report.json] [--models-file refs.txt] [--scenario steady_decode|steady_decode_primary_context|prefill|first_token|kv_warm_reuse|all] [--dense-probe-depth standard|deep] [--benchmark-all] [--fit-only] [--skip-context-aligned-abi] [--no-progress] [--allow-debug-validation] org/repo:Q4_K_M [org/repo:Q5_K_M ...]"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use model_fit::{
+        CapabilityEvidence, DenseGraphFeatures, ModelArchitectureClass, ModelSource,
+        RecurrentAttentionProfile, RopeProfile, TensorGroupBytes, TensorMatmulProfile,
+        TokenizerProfile, WeightCoverage,
+    };
+
+    fn test_args() -> Args {
+        Args {
+            output_json: PathBuf::from("validation.json"),
+            skippy_bench_bin: PathBuf::from("skippy-bench"),
+            skippy_server_bin: PathBuf::from("skippy-server"),
+            metrics_server_bin: PathBuf::from("metrics-server"),
+            gpu_benchmark_json: None,
+            model_files: Vec::new(),
+            benchmark_scenarios: Vec::new(),
+            base_port: 18400,
+            benchmark_all: false,
+            fit_only: false,
+            dense_probe_depth: DenseProbeDepth::Standard,
+            show_progress: false,
+            skip_context_aligned_abi: false,
+            allow_debug_validation: false,
+            models: vec![ModelInput::Ref(
+                "unsloth/Qwen2.5-Coder-7B-Instruct-GGUF:Q4_K_M".into(),
+            )],
+        }
+    }
+
+    #[test]
+    fn registers_primary_context_steady_decode_scenario() {
+        let scenarios = benchmark_scenarios();
+        let steady_index = scenarios
+            .iter()
+            .position(|scenario| scenario.name == "steady_decode")
+            .expect("steady_decode scenario");
+        let primary_index = scenarios
+            .iter()
+            .position(|scenario| scenario.name == "steady_decode_primary_context")
+            .expect("steady_decode_primary_context scenario");
+
+        assert_eq!(
+            scenarios[primary_index].kind,
+            BenchmarkScenarioKind::PrimaryContextSteadyDecode
+        );
+        assert_eq!(primary_index, steady_index + 1);
+        assert_eq!(scenarios[primary_index].warmup_tokens, 0);
+        assert_eq!(scenarios[primary_index].request_count, 1);
+    }
+
+    #[test]
+    fn standard_attention_runtime_probes_include_primary_context_scale() {
+        let args = Args {
+            dense_probe_depth: DenseProbeDepth::Standard,
+            ..test_args()
+        };
+
+        assert_eq!(
+            attention_runtime_context_ladder(&args),
+            vec![128, 512, DEFAULT_CTX_SIZE]
+        );
+    }
+
+    #[test]
+    fn validation_full_token_probe_uses_required_context_capacity() {
+        let mut config = selection_config(&primary_workload_profile());
+        config.workload.interaction.expected_prompt_tokens = Some(4096);
+        config.workload.requirements.min_context_tokens = Some(8192);
+        let profile = ModelProfile {
+            source: ModelSource {
+                id: "test/smol:Q8_0".into(),
+                path: None,
+                metadata_name: None,
+            },
+            architecture: Some("llama".into()),
+            architecture_class: ModelArchitectureClass::DenseTransformer,
+            weight_coverage: WeightCoverage::Full,
+            file_size_bytes: 1,
+            tensor_bytes: Some(1),
+            base_resident_bytes: Some(1),
+            expert_tensor_bytes: Some(0),
+            tensor_group_bytes: TensorGroupBytes::default(),
+            tensor_matmul: TensorMatmulProfile::default(),
+            dense_graph_features: DenseGraphFeatures::default(),
+            recurrent_attention: RecurrentAttentionProfile::default(),
+            parameter_count: None,
+            quantization: Some("Q8_0".into()),
+            layer_count: Some(30),
+            hidden_size: Some(576),
+            ffn_size: Some(1536),
+            attention_heads: Some(9),
+            kv_heads: Some(3),
+            key_length: Some(64),
+            value_length: Some(64),
+            context_length: Some(8192),
+            expert_count: None,
+            expert_used_count: None,
+            rope: RopeProfile::default(),
+            tokenizer: TokenizerProfile {
+                model: None,
+                vocab_size: Some(49_152),
+                chat_template_available: true,
+            },
+            capability_evidence: vec![CapabilityEvidence::NativeContextAtLeast(8192)],
+        };
+
+        assert_eq!(
+            decode_context_tokens_for_validation(&config, &profile),
+            8192
+        );
+        assert_eq!(
+            active_decode_context_tokens_for_validation(&config, &profile, 8192),
+            4352
+        );
+    }
+
+    #[test]
+    fn graph_probe_layer_parser_handles_full_token_probe_names() {
+        assert_eq!(
+            graph_probe_layers_from_name(
+                "ggml_decode_q8_0_full_token_handoff_l30_gqa_576_kv192_1536_vocab49152_ctx4096_h64_qh9_kvh3",
+            ),
+            30
+        );
+        assert_eq!(
+            graph_probe_context_from_name(
+                "ggml_decode_q8_0_full_token_handoff_l30_gqa_576_kv192_1536_vocab49152_ctx8192_nkv4352_h64_qh9_kvh3",
+            ),
+            Some(4352)
+        );
+        assert_eq!(
+            graph_probe_layers_from_name(
+                "ggml_decode_q8_0_full_token_source_sampled_l30_gqa_576_kv192_1536_vocab49152_ctx8192_nkv4352_h64_qh9_kvh3",
+            ),
+            30
+        );
+        assert_eq!(
+            graph_probe_context_from_name(
+                "ggml_decode_q8_0_full_token_source_sampled_l30_gqa_576_kv192_1536_vocab49152_ctx8192_nkv4352_h64_qh9_kvh3",
+            ),
+            Some(4352)
+        );
+        assert_eq!(
+            graph_probe_layers_from_name(
+                "ggml_decode_q8_0_submission_l30_gqa_576_kv192_1536_vocab49152_ctx4096_h64_qh9_kvh3",
+            ),
+            30
+        );
+        assert_eq!(
+            graph_probe_context_from_name(
+                "ggml_decode_q8_0_submission_l30_gqa_576_kv192_1536_vocab49152_ctx4096_h64_qh9_kvh3",
+            ),
+            Some(4096)
+        );
+    }
+
+    #[test]
+    fn synthetic_primary_context_prompt_preserves_requested_word_count() {
+        let prompt = synthetic_word_prompt(96);
+        let body = prompt
+            .lines()
+            .skip(1)
+            .take_while(|line| !line.starts_with("Explain "))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let context_words = body
+            .split_whitespace()
+            .filter(|word| *word == "context")
+            .count();
+
+        assert_eq!(context_words, 96);
+        assert!(prompt.contains("tokenizer-reported prompt length"));
+    }
+
+    #[test]
+    fn classifies_noisy_context_rescore_when_primary_is_more_representative() {
+        let classification = decode_probe_classification(DecodeProbeClassificationInput {
+            predicted: Some(128.2),
+            abi: Some(157.8),
+            observed: Some(143.5),
+            missing_representative_model_probe: false,
+            abi_probe_noisy: true,
+            request_decode_noisy: true,
+            request_spread_pct: Some(41.8),
+            observed_over_fit: Some(143.5 / 128.2),
+            observed_over_scenario_fit: Some(143.5 / 543.4),
+            abi_over_fit: Some(157.8 / 128.2),
+            abi_over_scenario_fit: Some(157.8 / 543.4),
+            observed_over_abi: Some(143.5 / 157.8),
+            abi_sampling_over_selected_fit: None,
+            selected_full_token_handoff_probe: false,
+            selected_full_token_source_sampled_probe: false,
+            decode_submission_residual_share_of_predicted: None,
+            sampler_sync_residual_share_of_predicted: None,
+        });
+
+        assert_eq!(classification, "context_rescore_unstable");
+    }
+
+    #[test]
+    fn classifies_primary_agreement_when_context_rescore_is_unstable() {
+        let classification = decode_probe_classification(DecodeProbeClassificationInput {
+            predicted: Some(83.0),
+            abi: Some(77.3),
+            observed: Some(78.2),
+            missing_representative_model_probe: false,
+            abi_probe_noisy: true,
+            request_decode_noisy: true,
+            request_spread_pct: Some(60.2),
+            observed_over_fit: Some(78.2 / 83.0),
+            observed_over_scenario_fit: Some(78.2 / 99.1),
+            abi_over_fit: Some(77.3 / 83.0),
+            abi_over_scenario_fit: Some(77.3 / 99.1),
+            observed_over_abi: Some(78.2 / 77.3),
+            abi_sampling_over_selected_fit: None,
+            selected_full_token_handoff_probe: false,
+            selected_full_token_source_sampled_probe: false,
+            decode_submission_residual_share_of_predicted: None,
+            sampler_sync_residual_share_of_predicted: None,
+        });
+
+        assert_eq!(
+            classification,
+            "primary_estimate_and_probe_agree_context_rescore_unstable"
+        );
+    }
+
+    #[test]
+    fn classifies_noisy_scenario_agreement_separately_from_primary_miss() {
+        let classification = decode_probe_classification(DecodeProbeClassificationInput {
+            predicted: Some(43.6),
+            abi: Some(67.6),
+            observed: Some(63.2),
+            missing_representative_model_probe: false,
+            abi_probe_noisy: false,
+            request_decode_noisy: true,
+            request_spread_pct: Some(25.3),
+            observed_over_fit: Some(63.2 / 43.6),
+            observed_over_scenario_fit: Some(63.2 / 64.6),
+            abi_over_fit: Some(67.6 / 43.6),
+            abi_over_scenario_fit: Some(67.6 / 64.6),
+            observed_over_abi: Some(63.2 / 67.6),
+            abi_sampling_over_selected_fit: None,
+            selected_full_token_handoff_probe: false,
+            selected_full_token_source_sampled_probe: false,
+            decode_submission_residual_share_of_predicted: None,
+            sampler_sync_residual_share_of_predicted: None,
+        });
+
+        assert_eq!(
+            classification,
+            "scenario_estimate_and_probe_agree_noisy_requests"
+        );
+    }
+
+    #[test]
+    fn classifies_context_mismatch_when_scenario_and_probe_match() {
+        let classification = decode_probe_classification(DecodeProbeClassificationInput {
+            predicted: Some(150.0),
+            abi: Some(173.6),
+            observed: Some(171.0),
+            missing_representative_model_probe: false,
+            abi_probe_noisy: false,
+            request_decode_noisy: false,
+            request_spread_pct: Some(0.8),
+            observed_over_fit: Some(171.0 / 150.0),
+            observed_over_scenario_fit: Some(171.0 / 171.1),
+            abi_over_fit: Some(173.6 / 150.0),
+            abi_over_scenario_fit: Some(173.6 / 171.1),
+            observed_over_abi: Some(171.0 / 173.6),
+            abi_sampling_over_selected_fit: None,
+            selected_full_token_handoff_probe: false,
+            selected_full_token_source_sampled_probe: false,
+            decode_submission_residual_share_of_predicted: None,
+            sampler_sync_residual_share_of_predicted: None,
+        });
+
+        assert_eq!(classification, "primary_context_differs_from_benchmark");
+    }
+
+    #[test]
+    fn classifies_sampler_sync_residual_before_generic_noisy_miss() {
+        let classification = decode_probe_classification(DecodeProbeClassificationInput {
+            predicted: Some(143.6),
+            abi: Some(119.8),
+            observed: Some(110.2),
+            missing_representative_model_probe: false,
+            abi_probe_noisy: false,
+            request_decode_noisy: true,
+            request_spread_pct: Some(34.0),
+            observed_over_fit: Some(110.2 / 143.6),
+            observed_over_scenario_fit: Some(110.2 / 142.4),
+            abi_over_fit: Some(119.8 / 143.6),
+            abi_over_scenario_fit: Some(119.8 / 142.4),
+            observed_over_abi: Some(110.2 / 119.8),
+            abi_sampling_over_selected_fit: None,
+            selected_full_token_handoff_probe: false,
+            selected_full_token_source_sampled_probe: false,
+            decode_submission_residual_share_of_predicted: None,
+            sampler_sync_residual_share_of_predicted: Some(0.74),
+        });
+
+        assert_eq!(classification, "sampler_sync_residual_noisy");
+    }
+
+    #[test]
+    fn classifies_source_sampled_probe_gap_as_llama_boundary_residual() {
+        let classification = decode_probe_classification(DecodeProbeClassificationInput {
+            predicted: Some(150.6),
+            abi: Some(119.9),
+            observed: Some(120.3),
+            missing_representative_model_probe: false,
+            abi_probe_noisy: false,
+            request_decode_noisy: true,
+            request_spread_pct: Some(29.4),
+            observed_over_fit: Some(120.3 / 150.6),
+            observed_over_scenario_fit: Some(120.3 / 243.9),
+            abi_over_fit: Some(119.9 / 150.6),
+            abi_over_scenario_fit: Some(119.9 / 243.9),
+            observed_over_abi: Some(120.3 / 119.9),
+            abi_sampling_over_selected_fit: Some(5.33 / 6.64),
+            selected_full_token_handoff_probe: false,
+            selected_full_token_source_sampled_probe: true,
+            decode_submission_residual_share_of_predicted: None,
+            sampler_sync_residual_share_of_predicted: Some(0.80),
+        });
+
+        assert_eq!(classification, "llama_source_boundary_residual_noisy");
+    }
+
+    #[test]
+    fn classifies_noisy_source_boundary_residual_even_when_observed_abi_is_noisy() {
+        let classification = decode_probe_classification(DecodeProbeClassificationInput {
+            predicted: Some(148.2),
+            abi: Some(120.3),
+            observed: Some(108.0),
+            missing_representative_model_probe: false,
+            abi_probe_noisy: false,
+            request_decode_noisy: true,
+            request_spread_pct: Some(12.1),
+            observed_over_fit: Some(108.0 / 148.2),
+            observed_over_scenario_fit: Some(108.0 / 146.9),
+            abi_over_fit: Some(120.3 / 148.2),
+            abi_over_scenario_fit: Some(120.3 / 146.9),
+            observed_over_abi: Some(108.0 / 120.3),
+            abi_sampling_over_selected_fit: Some(5.3 / 6.7),
+            selected_full_token_handoff_probe: true,
+            selected_full_token_source_sampled_probe: false,
+            decode_submission_residual_share_of_predicted: Some(0.38),
+            sampler_sync_residual_share_of_predicted: Some(0.78),
+        });
+
+        assert_eq!(classification, "decode_and_sampler_residual_noisy");
+    }
+
+    #[test]
+    fn classifies_full_token_handoff_gap_as_decode_submission_residual() {
+        let classification = decode_probe_classification(DecodeProbeClassificationInput {
+            predicted: Some(188.5),
+            abi: Some(120.3),
+            observed: Some(109.1),
+            missing_representative_model_probe: false,
+            abi_probe_noisy: false,
+            request_decode_noisy: true,
+            request_spread_pct: Some(10.7),
+            observed_over_fit: Some(109.1 / 188.5),
+            observed_over_scenario_fit: Some(109.1 / 188.5),
+            abi_over_fit: Some(120.3 / 188.5),
+            abi_over_scenario_fit: Some(120.3 / 188.5),
+            observed_over_abi: Some(109.1 / 120.3),
+            abi_sampling_over_selected_fit: Some(5.32 / 5.31),
+            selected_full_token_handoff_probe: true,
+            selected_full_token_source_sampled_probe: false,
+            decode_submission_residual_share_of_predicted: Some(0.34),
+            sampler_sync_residual_share_of_predicted: None,
+        });
+
+        assert_eq!(classification, "decode_submission_residual_noisy");
+    }
+
+    #[test]
+    fn classifies_combined_decode_and_sampler_residual() {
+        let classification = decode_probe_classification(DecodeProbeClassificationInput {
+            predicted: Some(234.4),
+            abi: Some(121.2),
+            observed: Some(121.0),
+            missing_representative_model_probe: false,
+            abi_probe_noisy: false,
+            request_decode_noisy: true,
+            request_spread_pct: Some(23.8),
+            observed_over_fit: Some(121.0 / 234.4),
+            observed_over_scenario_fit: Some(121.0 / 234.4),
+            abi_over_fit: Some(121.2 / 234.4),
+            abi_over_scenario_fit: Some(121.2 / 234.4),
+            observed_over_abi: Some(121.0 / 121.2),
+            abi_sampling_over_selected_fit: Some(5.28 / 4.27),
+            selected_full_token_handoff_probe: true,
+            selected_full_token_source_sampled_probe: false,
+            decode_submission_residual_share_of_predicted: Some(0.64),
+            sampler_sync_residual_share_of_predicted: Some(1.22),
+        });
+
+        assert_eq!(classification, "decode_and_sampler_residual_noisy");
+    }
+
+    #[test]
+    fn source_boundary_residual_outranks_context_rescore_unstable() {
+        let classification = decode_probe_classification(DecodeProbeClassificationInput {
+            predicted: Some(165.5),
+            abi: Some(117.9),
+            observed: Some(119.3),
+            missing_representative_model_probe: false,
+            abi_probe_noisy: false,
+            request_decode_noisy: true,
+            request_spread_pct: Some(26.3),
+            observed_over_fit: Some(119.3 / 165.5),
+            observed_over_scenario_fit: Some(119.3 / 248.8),
+            abi_over_fit: Some(117.9 / 165.5),
+            abi_over_scenario_fit: Some(117.9 / 248.8),
+            observed_over_abi: Some(119.3 / 117.9),
+            abi_sampling_over_selected_fit: Some(5.41 / 6.04),
+            selected_full_token_handoff_probe: true,
+            selected_full_token_source_sampled_probe: false,
+            decode_submission_residual_share_of_predicted: Some(0.44),
+            sampler_sync_residual_share_of_predicted: Some(0.89),
+        });
+
+        assert_eq!(classification, "decode_and_sampler_residual_noisy");
+    }
+
+    #[test]
+    fn classifies_abi_only_residual_as_probe_not_representative() {
+        let classification = decode_probe_classification(DecodeProbeClassificationInput {
+            predicted: Some(66.1),
+            abi: Some(55.8),
+            observed: Some(61.4),
+            missing_representative_model_probe: false,
+            abi_probe_noisy: false,
+            request_decode_noisy: true,
+            request_spread_pct: Some(11.5),
+            observed_over_fit: Some(61.4 / 66.1),
+            observed_over_scenario_fit: Some(61.4 / 65.7),
+            abi_over_fit: Some(55.8 / 66.1),
+            abi_over_scenario_fit: Some(55.8 / 65.7),
+            observed_over_abi: Some(61.4 / 55.8),
+            abi_sampling_over_selected_fit: Some(15.1 / 15.2),
+            selected_full_token_handoff_probe: true,
+            selected_full_token_source_sampled_probe: false,
+            decode_submission_residual_share_of_predicted: Some(0.11),
+            sampler_sync_residual_share_of_predicted: Some(0.99),
+        });
+
+        assert_eq!(classification, "probe_not_representative");
+    }
 }

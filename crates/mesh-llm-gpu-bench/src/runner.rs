@@ -12,6 +12,10 @@ use std::{hint::black_box, sync::mpsc, thread, time::Duration};
 const SAMPLER_PROBE_PROMPT_TOKENS: usize = 4096;
 const SAMPLER_PROBE_VOCAB_TOKENS: usize = 131_072;
 const SAMPLER_PROBE_RUNS: usize = 9;
+const SAMPLER_PROBE_TOP_K: usize = 40;
+const SAMPLER_PROBE_TOP_P: f32 = 0.95;
+const SAMPLER_PROBE_MIN_P: f32 = 0.05;
+const SAMPLER_PROBE_TEMPERATURE: f32 = 0.8;
 const RUNTIME_DECODE_OVERHEAD_TOKENS: usize = 4096;
 const RUNTIME_DECODE_OVERHEAD_RUNS: usize = 7;
 
@@ -65,6 +69,47 @@ pub struct DenseGraphProbeShape {
     pub repeat_layers: u32,
     pub graph_features: u32,
     pub norm_head_width: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DenseSampledTokenProbeShape {
+    pub hidden: u32,
+    pub kv_width: u32,
+    pub ffn: u32,
+    pub vocab: u32,
+    pub repeat_layers: u32,
+    pub graph_features: u32,
+    pub norm_head_width: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DenseFullTokenProbeShape {
+    pub hidden: u32,
+    pub kv_width: u32,
+    pub ffn: u32,
+    pub vocab: u32,
+    pub repeat_layers: u32,
+    pub graph_features: u32,
+    pub norm_head_width: u32,
+    pub head_dim: u32,
+    pub query_heads: u32,
+    pub kv_heads: u32,
+    pub context_tokens: u32,
+    pub active_context_tokens: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AttentionRuntimeProbeShape {
+    pub head_dim: u32,
+    pub query_heads: u32,
+    pub kv_heads: u32,
+    pub context_tokens: u32,
+    pub repeat_layers: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LogitsReadbackProbeShape {
+    pub vocab: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -225,12 +270,108 @@ pub fn run_model_moe_block_graph_probe(
     run_model_moe_block_graph_probe_impl(backend, tensor_type, shape)
 }
 
+pub fn run_model_moe_block_decode_submission_probe(
+    backend: BenchmarkBackend,
+    tensor_type: &str,
+    shape: MoeBlockGraphProbeShape,
+    context_tokens: u32,
+) -> Result<Vec<crate::DecodeKernelProbe>> {
+    run_model_moe_block_decode_submission_probe_impl(backend, tensor_type, shape, context_tokens)
+}
+
 pub fn run_model_dense_graph_probe(
     backend: BenchmarkBackend,
     tensor_type: &str,
     shape: DenseGraphProbeShape,
 ) -> Result<Vec<crate::DecodeKernelProbe>> {
     run_model_dense_graph_probe_impl(backend, tensor_type, shape)
+}
+
+pub fn run_model_dense_sampled_token_probe(
+    backend: BenchmarkBackend,
+    tensor_type: &str,
+    shape: DenseSampledTokenProbeShape,
+) -> Result<Vec<crate::DecodeKernelProbe>> {
+    run_model_dense_sampled_token_probe_impl(backend, tensor_type, shape)
+}
+
+pub fn run_model_dense_full_token_probe(
+    backend: BenchmarkBackend,
+    block_tensor_type: &str,
+    output_tensor_type: &str,
+    shape: DenseFullTokenProbeShape,
+) -> Result<Vec<crate::DecodeKernelProbe>> {
+    run_model_dense_full_token_probe_impl(backend, block_tensor_type, output_tensor_type, shape)
+}
+
+pub fn run_model_dense_full_token_handoff_probe(
+    backend: BenchmarkBackend,
+    block_tensor_type: &str,
+    output_tensor_type: &str,
+    shape: DenseFullTokenProbeShape,
+) -> Result<Vec<crate::DecodeKernelProbe>> {
+    run_model_dense_full_token_handoff_probe_impl(
+        backend,
+        block_tensor_type,
+        output_tensor_type,
+        shape,
+    )
+}
+
+pub fn run_model_dense_decode_submission_probe(
+    backend: BenchmarkBackend,
+    block_tensor_type: &str,
+    output_tensor_type: &str,
+    shape: DenseFullTokenProbeShape,
+) -> Result<Vec<crate::DecodeKernelProbe>> {
+    run_model_dense_decode_submission_probe_impl(
+        backend,
+        block_tensor_type,
+        output_tensor_type,
+        shape,
+    )
+}
+
+pub fn run_model_dense_source_sampled_token_probe(
+    backend: BenchmarkBackend,
+    block_tensor_type: &str,
+    output_tensor_type: &str,
+    shape: DenseFullTokenProbeShape,
+) -> Result<Vec<crate::DecodeKernelProbe>> {
+    run_model_dense_source_sampled_token_probe_impl(
+        backend,
+        block_tensor_type,
+        output_tensor_type,
+        shape,
+    )
+}
+
+pub fn run_model_attention_runtime_probe(
+    backend: BenchmarkBackend,
+    shape: AttentionRuntimeProbeShape,
+) -> Result<Vec<crate::DecodeKernelProbe>> {
+    run_model_attention_runtime_probe_impl(backend, shape)
+}
+
+pub fn run_model_logits_readback_probe(
+    backend: BenchmarkBackend,
+    shape: LogitsReadbackProbeShape,
+) -> Result<Vec<crate::DecodeKernelProbe>> {
+    run_model_logits_readback_probe_impl(backend, shape)
+}
+
+pub fn run_model_logits_sync_probe(
+    backend: BenchmarkBackend,
+    shape: LogitsReadbackProbeShape,
+) -> Result<Vec<crate::DecodeKernelProbe>> {
+    run_model_logits_sync_probe_impl(backend, shape)
+}
+
+pub fn run_model_logits_output_handoff_probe(
+    backend: BenchmarkBackend,
+    shape: LogitsReadbackProbeShape,
+) -> Result<Vec<crate::DecodeKernelProbe>> {
+    run_model_logits_output_handoff_probe_impl(backend, shape)
 }
 
 pub fn run_model_linear_attention_graph_probe(
@@ -320,12 +461,128 @@ fn run_model_moe_block_graph_probe_impl(
 }
 
 #[cfg(all(feature = "ggml-probe", mesh_llm_gpu_bench_has_ggml_probe))]
+fn run_model_moe_block_decode_submission_probe_impl(
+    backend: BenchmarkBackend,
+    tensor_type: &str,
+    shape: MoeBlockGraphProbeShape,
+    context_tokens: u32,
+) -> Result<Vec<crate::DecodeKernelProbe>> {
+    crate::ggml_probe::run_moe_block_decode_submission_probe(
+        backend,
+        tensor_type,
+        shape,
+        context_tokens,
+    )
+}
+
+#[cfg(all(feature = "ggml-probe", mesh_llm_gpu_bench_has_ggml_probe))]
 fn run_model_dense_graph_probe_impl(
     backend: BenchmarkBackend,
     tensor_type: &str,
     shape: DenseGraphProbeShape,
 ) -> Result<Vec<crate::DecodeKernelProbe>> {
     crate::ggml_probe::run_dense_graph_probe(backend, tensor_type, shape)
+}
+
+#[cfg(all(feature = "ggml-probe", mesh_llm_gpu_bench_has_ggml_probe))]
+fn run_model_dense_sampled_token_probe_impl(
+    backend: BenchmarkBackend,
+    tensor_type: &str,
+    shape: DenseSampledTokenProbeShape,
+) -> Result<Vec<crate::DecodeKernelProbe>> {
+    crate::ggml_probe::run_dense_sampled_token_probe(backend, tensor_type, shape)
+}
+
+#[cfg(all(feature = "ggml-probe", mesh_llm_gpu_bench_has_ggml_probe))]
+fn run_model_dense_full_token_probe_impl(
+    backend: BenchmarkBackend,
+    block_tensor_type: &str,
+    output_tensor_type: &str,
+    shape: DenseFullTokenProbeShape,
+) -> Result<Vec<crate::DecodeKernelProbe>> {
+    crate::ggml_probe::run_dense_full_token_probe(
+        backend,
+        block_tensor_type,
+        output_tensor_type,
+        shape,
+    )
+}
+
+#[cfg(all(feature = "ggml-probe", mesh_llm_gpu_bench_has_ggml_probe))]
+fn run_model_dense_full_token_handoff_probe_impl(
+    backend: BenchmarkBackend,
+    block_tensor_type: &str,
+    output_tensor_type: &str,
+    shape: DenseFullTokenProbeShape,
+) -> Result<Vec<crate::DecodeKernelProbe>> {
+    crate::ggml_probe::run_dense_full_token_handoff_probe(
+        backend,
+        block_tensor_type,
+        output_tensor_type,
+        shape,
+    )
+}
+
+#[cfg(all(feature = "ggml-probe", mesh_llm_gpu_bench_has_ggml_probe))]
+fn run_model_dense_decode_submission_probe_impl(
+    backend: BenchmarkBackend,
+    block_tensor_type: &str,
+    output_tensor_type: &str,
+    shape: DenseFullTokenProbeShape,
+) -> Result<Vec<crate::DecodeKernelProbe>> {
+    crate::ggml_probe::run_dense_decode_submission_probe(
+        backend,
+        block_tensor_type,
+        output_tensor_type,
+        shape,
+    )
+}
+
+#[cfg(all(feature = "ggml-probe", mesh_llm_gpu_bench_has_ggml_probe))]
+fn run_model_dense_source_sampled_token_probe_impl(
+    backend: BenchmarkBackend,
+    block_tensor_type: &str,
+    output_tensor_type: &str,
+    shape: DenseFullTokenProbeShape,
+) -> Result<Vec<crate::DecodeKernelProbe>> {
+    crate::ggml_probe::run_dense_source_sampled_token_probe(
+        backend,
+        block_tensor_type,
+        output_tensor_type,
+        shape,
+    )
+}
+
+#[cfg(all(feature = "ggml-probe", mesh_llm_gpu_bench_has_ggml_probe))]
+fn run_model_attention_runtime_probe_impl(
+    backend: BenchmarkBackend,
+    shape: AttentionRuntimeProbeShape,
+) -> Result<Vec<crate::DecodeKernelProbe>> {
+    crate::ggml_probe::run_attention_runtime_probe(backend, shape)
+}
+
+#[cfg(all(feature = "ggml-probe", mesh_llm_gpu_bench_has_ggml_probe))]
+fn run_model_logits_readback_probe_impl(
+    backend: BenchmarkBackend,
+    shape: LogitsReadbackProbeShape,
+) -> Result<Vec<crate::DecodeKernelProbe>> {
+    crate::ggml_probe::run_logits_readback_probe(backend, shape)
+}
+
+#[cfg(all(feature = "ggml-probe", mesh_llm_gpu_bench_has_ggml_probe))]
+fn run_model_logits_sync_probe_impl(
+    backend: BenchmarkBackend,
+    shape: LogitsReadbackProbeShape,
+) -> Result<Vec<crate::DecodeKernelProbe>> {
+    crate::ggml_probe::run_logits_sync_probe(backend, shape)
+}
+
+#[cfg(all(feature = "ggml-probe", mesh_llm_gpu_bench_has_ggml_probe))]
+fn run_model_logits_output_handoff_probe_impl(
+    backend: BenchmarkBackend,
+    shape: LogitsReadbackProbeShape,
+) -> Result<Vec<crate::DecodeKernelProbe>> {
+    crate::ggml_probe::run_logits_output_handoff_probe(backend, shape)
 }
 
 #[cfg(all(feature = "ggml-probe", mesh_llm_gpu_bench_has_ggml_probe))]
@@ -369,10 +626,101 @@ fn run_model_moe_block_graph_probe_impl(
 }
 
 #[cfg(not(all(feature = "ggml-probe", mesh_llm_gpu_bench_has_ggml_probe)))]
+fn run_model_moe_block_decode_submission_probe_impl(
+    _backend: BenchmarkBackend,
+    _tensor_type: &str,
+    _shape: MoeBlockGraphProbeShape,
+    _context_tokens: u32,
+) -> Result<Vec<crate::DecodeKernelProbe>> {
+    Ok(Vec::new())
+}
+
+#[cfg(not(all(feature = "ggml-probe", mesh_llm_gpu_bench_has_ggml_probe)))]
 fn run_model_dense_graph_probe_impl(
     _backend: BenchmarkBackend,
     _tensor_type: &str,
     _shape: DenseGraphProbeShape,
+) -> Result<Vec<crate::DecodeKernelProbe>> {
+    Ok(Vec::new())
+}
+
+#[cfg(not(all(feature = "ggml-probe", mesh_llm_gpu_bench_has_ggml_probe)))]
+fn run_model_dense_sampled_token_probe_impl(
+    _backend: BenchmarkBackend,
+    _tensor_type: &str,
+    _shape: DenseSampledTokenProbeShape,
+) -> Result<Vec<crate::DecodeKernelProbe>> {
+    Ok(Vec::new())
+}
+
+#[cfg(not(all(feature = "ggml-probe", mesh_llm_gpu_bench_has_ggml_probe)))]
+fn run_model_dense_full_token_probe_impl(
+    _backend: BenchmarkBackend,
+    _block_tensor_type: &str,
+    _output_tensor_type: &str,
+    _shape: DenseFullTokenProbeShape,
+) -> Result<Vec<crate::DecodeKernelProbe>> {
+    Ok(Vec::new())
+}
+
+#[cfg(not(all(feature = "ggml-probe", mesh_llm_gpu_bench_has_ggml_probe)))]
+fn run_model_dense_full_token_handoff_probe_impl(
+    _backend: BenchmarkBackend,
+    _block_tensor_type: &str,
+    _output_tensor_type: &str,
+    _shape: DenseFullTokenProbeShape,
+) -> Result<Vec<crate::DecodeKernelProbe>> {
+    Ok(Vec::new())
+}
+
+#[cfg(not(all(feature = "ggml-probe", mesh_llm_gpu_bench_has_ggml_probe)))]
+fn run_model_dense_decode_submission_probe_impl(
+    _backend: BenchmarkBackend,
+    _block_tensor_type: &str,
+    _output_tensor_type: &str,
+    _shape: DenseFullTokenProbeShape,
+) -> Result<Vec<crate::DecodeKernelProbe>> {
+    Ok(Vec::new())
+}
+
+#[cfg(not(all(feature = "ggml-probe", mesh_llm_gpu_bench_has_ggml_probe)))]
+fn run_model_dense_source_sampled_token_probe_impl(
+    _backend: BenchmarkBackend,
+    _block_tensor_type: &str,
+    _output_tensor_type: &str,
+    _shape: DenseFullTokenProbeShape,
+) -> Result<Vec<crate::DecodeKernelProbe>> {
+    Ok(Vec::new())
+}
+
+#[cfg(not(all(feature = "ggml-probe", mesh_llm_gpu_bench_has_ggml_probe)))]
+fn run_model_attention_runtime_probe_impl(
+    _backend: BenchmarkBackend,
+    _shape: AttentionRuntimeProbeShape,
+) -> Result<Vec<crate::DecodeKernelProbe>> {
+    Ok(Vec::new())
+}
+
+#[cfg(not(all(feature = "ggml-probe", mesh_llm_gpu_bench_has_ggml_probe)))]
+fn run_model_logits_readback_probe_impl(
+    _backend: BenchmarkBackend,
+    _shape: LogitsReadbackProbeShape,
+) -> Result<Vec<crate::DecodeKernelProbe>> {
+    Ok(Vec::new())
+}
+
+#[cfg(not(all(feature = "ggml-probe", mesh_llm_gpu_bench_has_ggml_probe)))]
+fn run_model_logits_sync_probe_impl(
+    _backend: BenchmarkBackend,
+    _shape: LogitsReadbackProbeShape,
+) -> Result<Vec<crate::DecodeKernelProbe>> {
+    Ok(Vec::new())
+}
+
+#[cfg(not(all(feature = "ggml-probe", mesh_llm_gpu_bench_has_ggml_probe)))]
+fn run_model_logits_output_handoff_probe_impl(
+    _backend: BenchmarkBackend,
+    _shape: LogitsReadbackProbeShape,
 ) -> Result<Vec<crate::DecodeKernelProbe>> {
     Ok(Vec::new())
 }
@@ -462,6 +810,10 @@ fn measure_decode_runtime_overhead_once_ms() -> f64 {
 }
 
 fn measure_sampler_probe() -> SamplerProbe {
+    if let Some(probe) = measure_native_source_sampler_probe() {
+        return probe;
+    }
+
     let mut history_samples = Vec::with_capacity(SAMPLER_PROBE_RUNS);
     let mut vocab_samples = Vec::with_capacity(SAMPLER_PROBE_RUNS);
     for _ in 0..SAMPLER_PROBE_RUNS {
@@ -470,10 +822,86 @@ fn measure_sampler_probe() -> SamplerProbe {
     }
     history_samples.sort_by(|left, right| left.total_cmp(right));
     vocab_samples.sort_by(|left, right| left.total_cmp(right));
+    // The sampler probe is deterministic CPU work: build/sort/filter a fixed
+    // synthetic candidate set and accept a fixed token-history shape. Unlike
+    // the GPU bandwidth probes, repeated sampler samples are not estimating a
+    // device throughput distribution; they are trying to isolate a small
+    // single-thread CPU cost that can be badly inflated by OS scheduling,
+    // thermal transitions, or another process preempting the benchmark thread.
+    //
+    // Those disturbances only add time. If we take the median, a short burst of
+    // host noise can become a bogus `us_per_vocab_entry` fact, and model-fit
+    // then multiplies that bad measurement by GGUF vocab size. That is how a
+    // noisy sampler probe turns into a multi-ms/token decode prediction miss
+    // even when the source-shaped GGML graph probes and real Skippy decode
+    // agree. Use the fastest finite positive repeat as the least-contaminated
+    // lower-bound measurement, the same principle microbenchmarks use when the
+    // measured work is deterministic and external interference is additive.
     SamplerProbe {
-        history_us_per_token: history_samples[SAMPLER_PROBE_RUNS / 2],
-        vocab_us_per_token: vocab_samples[SAMPLER_PROBE_RUNS / 2],
+        history_us_per_token: fastest_positive_sample(&history_samples),
+        vocab_us_per_token: fastest_positive_sample(&vocab_samples),
     }
+}
+
+#[cfg(all(feature = "ggml-probe", mesh_llm_gpu_bench_has_ggml_probe))]
+fn measure_native_source_sampler_probe() -> Option<SamplerProbe> {
+    // Prefer the native C++ sampler probe when it is linked because it follows
+    // the source-visible Skippy/llama.cpp sampled decode path more closely
+    // than the Rust fallback below:
+    //
+    //   * Skippy builds a fresh full-vocab `std::vector<llama_token_data>` from
+    //     `llama_get_logits_ith()`.
+    //   * llama.cpp's default top-k sampler uses `std::partial_sort` over that
+    //     candidate array for k <= 128.
+    //   * The chain then applies top-p, min-p, temperature, and distribution
+    //     sampling with source-shaped CPU data structures.
+    //
+    // Tiny models expose this term brutally: once transformer decode is only a
+    // few milliseconds, a too-cheap sampler probe can double the predicted
+    // tok/s. This is not calibration from any fitted model's observed speed;
+    // it is a machine-local measurement of a source-shaped runtime primitive
+    // that model-fit later scales by GGUF vocabulary size.
+    match crate::ggml_probe::run_sampler_probe(
+        SAMPLER_PROBE_VOCAB_TOKENS,
+        SAMPLER_PROBE_PROMPT_TOKENS,
+    ) {
+        Ok(probe)
+            if probe.history_us_per_token.is_finite()
+                && probe.vocab_us_per_token.is_finite()
+                && probe.history_us_per_token > 0.0
+                && probe.vocab_us_per_token > 0.0 =>
+        {
+            Some(SamplerProbe {
+                history_us_per_token: probe.history_us_per_token,
+                vocab_us_per_token: probe.vocab_us_per_token,
+            })
+        }
+        Ok(probe) => {
+            tracing::warn!(
+                history_us_per_token = probe.history_us_per_token,
+                vocab_us_per_token = probe.vocab_us_per_token,
+                "GGML source-shaped sampler probe returned non-positive output; using Rust fallback"
+            );
+            None
+        }
+        Err(error) => {
+            tracing::warn!("GGML source-shaped sampler probe failed: {error:#}");
+            None
+        }
+    }
+}
+
+#[cfg(not(all(feature = "ggml-probe", mesh_llm_gpu_bench_has_ggml_probe)))]
+fn measure_native_source_sampler_probe() -> Option<SamplerProbe> {
+    None
+}
+
+fn fastest_positive_sample(samples: &[f64]) -> f64 {
+    samples
+        .iter()
+        .copied()
+        .find(|sample| sample.is_finite() && *sample > 0.0)
+        .unwrap_or(0.0)
 }
 
 fn measure_sampler_history_us_per_token() -> f64 {
@@ -496,32 +924,125 @@ fn measure_sampler_history_us_per_token() -> f64 {
 }
 
 fn measure_sampler_vocab_us_per_token() -> f64 {
-    #[derive(Clone, Copy)]
-    struct Candidate {
-        id: u32,
-        logit: f32,
-        p: f32,
-    }
-
     let started = std::time::Instant::now();
-    let mut candidates = Vec::with_capacity(SAMPLER_PROBE_VOCAB_TOKENS);
-    let mut max_logit = f32::NEG_INFINITY;
-    let mut max_id = 0u32;
-    for id in 0..SAMPLER_PROBE_VOCAB_TOKENS as u32 {
-        let logit =
-            ((id.wrapping_mul(1_664_525).wrapping_add(1_013_904_223) & 0xffff) as f32) / 65_536.0;
-        if logit > max_logit {
-            max_logit = logit;
-            max_id = id;
-        }
-        candidates.push(Candidate { id, logit, p: 0.0 });
-    }
-    let selected = candidates
-        .get(max_id as usize % candidates.len())
-        .copied()
-        .map(|candidate| (candidate.id, candidate.logit, candidate.p));
+    let mut candidates = sampler_probe_candidates();
+    apply_sampler_probe_top_k(&mut candidates, SAMPLER_PROBE_TOP_K);
+    apply_sampler_probe_top_p(&mut candidates, SAMPLER_PROBE_TOP_P);
+    apply_sampler_probe_min_p(&mut candidates, SAMPLER_PROBE_MIN_P);
+    apply_sampler_probe_temperature(&mut candidates, SAMPLER_PROBE_TEMPERATURE);
+    let selected = sampler_probe_select(&candidates);
     black_box((selected, candidates.len()));
     started.elapsed().as_secs_f64() * 1_000_000.0 / SAMPLER_PROBE_VOCAB_TOKENS as f64
+}
+
+#[derive(Clone, Copy)]
+struct SamplerProbeCandidate {
+    id: u32,
+    logit: f32,
+    p: f32,
+}
+
+fn sampler_probe_candidates() -> Vec<SamplerProbeCandidate> {
+    (0..SAMPLER_PROBE_VOCAB_TOKENS as u32)
+        .map(|id| {
+            let logit = ((id.wrapping_mul(1_664_525).wrapping_add(1_013_904_223) & 0xffff) as f32)
+                / 65_536.0;
+            SamplerProbeCandidate { id, logit, p: 0.0 }
+        })
+        .collect()
+}
+
+fn apply_sampler_probe_top_k(candidates: &mut Vec<SamplerProbeCandidate>, k: usize) {
+    // Skippy's chat sampler follows the llama.cpp sampler chain. With current
+    // server defaults, sampled decode first applies top-k before top-p/min-p
+    // and temperature. The old benchmark used a greedy max scan, which missed
+    // the source-visible candidate ranking work that dominates very small
+    // models. This probe stays model-independent: it measures host/runtime
+    // work per vocab entry and model-fit scales it by GGUF vocab size.
+    if k == 0 || candidates.len() <= k {
+        return;
+    }
+    let target = k - 1;
+    candidates.select_nth_unstable_by(target, compare_sampler_probe_candidate_desc);
+    candidates.truncate(k);
+    candidates.sort_unstable_by(compare_sampler_probe_candidate_desc);
+}
+
+fn apply_sampler_probe_top_p(candidates: &mut Vec<SamplerProbeCandidate>, top_p: f32) {
+    if !(0.0..1.0).contains(&top_p) || candidates.is_empty() {
+        return;
+    }
+    sampler_probe_softmax(candidates);
+    let mut cumulative = 0.0f32;
+    let mut keep = candidates.len();
+    for (index, candidate) in candidates.iter().enumerate() {
+        cumulative += candidate.p;
+        if cumulative >= top_p {
+            keep = index + 1;
+            break;
+        }
+    }
+    candidates.truncate(keep.max(1));
+}
+
+fn apply_sampler_probe_min_p(candidates: &mut Vec<SamplerProbeCandidate>, min_p: f32) {
+    if min_p <= 0.0 || candidates.is_empty() {
+        return;
+    }
+    let max_logit = candidates
+        .iter()
+        .map(|candidate| candidate.logit)
+        .fold(f32::NEG_INFINITY, f32::max);
+    let min_logit = max_logit + min_p.ln();
+    candidates.retain(|candidate| candidate.logit >= min_logit);
+    if candidates.is_empty() {
+        candidates.push(SamplerProbeCandidate {
+            id: 0,
+            logit: max_logit,
+            p: 1.0,
+        });
+    }
+}
+
+fn apply_sampler_probe_temperature(candidates: &mut [SamplerProbeCandidate], temperature: f32) {
+    if temperature <= 0.0 {
+        return;
+    }
+    for candidate in candidates {
+        candidate.logit /= temperature;
+    }
+}
+
+fn sampler_probe_select(candidates: &[SamplerProbeCandidate]) -> Option<(u32, f32, f32)> {
+    candidates
+        .iter()
+        .max_by(|left, right| left.logit.total_cmp(&right.logit))
+        .map(|candidate| (candidate.id, candidate.logit, candidate.p))
+}
+
+fn sampler_probe_softmax(candidates: &mut [SamplerProbeCandidate]) {
+    let max_logit = candidates
+        .iter()
+        .map(|candidate| candidate.logit)
+        .fold(f32::NEG_INFINITY, f32::max);
+    let mut total = 0.0f32;
+    for candidate in candidates.iter_mut() {
+        candidate.p = (candidate.logit - max_logit).exp();
+        total += candidate.p;
+    }
+    if total <= 0.0 {
+        return;
+    }
+    for candidate in candidates {
+        candidate.p /= total;
+    }
+}
+
+fn compare_sampler_probe_candidate_desc(
+    left: &SamplerProbeCandidate,
+    right: &SamplerProbeCandidate,
+) -> std::cmp::Ordering {
+    right.logit.total_cmp(&left.logit)
 }
 
 #[cfg(target_os = "macos")]

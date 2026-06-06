@@ -24,6 +24,7 @@ target/release/model-fit-validate \
 target/release/model-fit-check-validation \
   --scenario steady_decode \
   --min-models 5 \
+  --min-accuracy-models 3 \
   --max-median-absolute-error 0.10 \
   --max-individual-error 0.10 \
   --max-noisy 2 \
@@ -107,6 +108,12 @@ agreement:
   the residual as a concrete diagnostic class such as
   `metadata_estimate_miss`, `probe_not_representative`, or
   `runtime_path_mismatch`. The markdown report still prints the miss.
+- `--min-accuracy-models` requires rows that actually participate in the
+  throughput accuracy gate after noisy, request-unstable, probe-unstable, or
+  otherwise diagnostic-only rows are excluded. Without this, a smoke run can
+  cover the right models but prove zero `±10%` tok/s accuracy. The binary
+  defaults to one accuracy-gated row for non-`--report-only` checks; the smoke
+  command above requires three out of the five model rows.
 
 This shape is intentional. The smoke should catch structural regressions and
 unclassified surprises while still letting known, visible residuals stay in the

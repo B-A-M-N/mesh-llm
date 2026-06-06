@@ -14,6 +14,7 @@ pub use hf_cache::{HfCacheModelProfile, profile_hf_cache};
 pub use profile::profile_gguf_path;
 pub use scoring::{
     estimate_kv_cache_bytes, estimate_runtime_memory_bytes, rank_models, score_model,
+    score_model_for_context_tokens,
 };
 pub use types::{
     AcceleratorKind, AcceleratorProfile, BackendEfficiencyConfig, BackendKind, CapabilityEvidence,

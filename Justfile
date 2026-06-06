@@ -227,6 +227,17 @@ model-fit-release backend="" llama_build_dir="":
         cargo build --release --locked -p model-fit --bins
     fi
 
+# Build the skippy benchmark binary used by model-fit validation. This mirrors
+# `model-fit-release` instead of going through `with-lld` because CUDA lab hosts
+# may have a working native toolchain without `ld.lld` installed.
+skippy-bench-release llama_build_dir="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [[ -n "{{ llama_build_dir }}" ]]; then
+        export LLAMA_STAGE_BUILD_DIR="{{ llama_build_dir }}"
+    fi
+    cargo build --release --locked -p skippy-bench
+
 # Build the binaries copied into the Skippy WAN Docker lab image.
 [linux]
 skippy-wan-lab-build-bins:

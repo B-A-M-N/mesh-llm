@@ -105,6 +105,13 @@ pub struct TokenLengthsArgs {
     pub n_gpu_layers: i32,
     #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
     pub enable_thinking: bool,
+    #[arg(
+        long,
+        default_value_t = false,
+        action = clap::ArgAction::SetTrue,
+        help = "Tokenize prompt text directly instead of applying the model chat template."
+    )]
+    pub raw_prompt: bool,
     #[arg(long)]
     pub output_tsv: PathBuf,
     #[arg(long)]

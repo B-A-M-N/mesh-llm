@@ -78,6 +78,8 @@ pub fn abi_decode_probe(args: AbiDecodeProbeArgs) -> Result<()> {
             "decode_call_tokens_per_second": result.decode_call_tokens_per_second,
             "sampling_ms": result.sampling_ms,
             "sampling_tokens_per_second": result.sampling_tokens_per_second,
+            "logits_ready_ms": result.logits_ready_ms,
+            "logits_scan_ms": result.logits_scan_ms,
             "graph_node_count": result.graph_node_count,
             "graph_inventory_bucket_overflow_count": result.graph_inventory_bucket_overflow_count,
             "graph_inventory": result.graph_inventory.iter().map(|bucket| json!({

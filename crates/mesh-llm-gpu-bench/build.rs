@@ -195,10 +195,59 @@ fn build_cuda() {
         command
     });
     archive_static_lib(&object, "mesh_llm_gpu_bench_cuda");
+    for dir in cuda_library_search_dirs() {
+        println!("cargo:rustc-link-search=native={}", dir.display());
+    }
     println!("cargo:rustc-link-lib=dylib=cudart");
     println!("cargo:rustc-link-lib=dylib=cublas");
     if !cfg!(windows) {
         println!("cargo:rustc-link-lib=dylib=stdc++");
+    }
+}
+
+fn cuda_library_search_dirs() -> Vec<std::path::PathBuf> {
+    let mut roots = Vec::new();
+    for key in ["CUDA_PATH", "CUDA_HOME"] {
+        if let Some(root) = std::env::var_os(key).map(std::path::PathBuf::from) {
+            roots.push(root);
+        }
+    }
+    if let Some(root) = cuda_root_from_nvcc() {
+        roots.push(root);
+    }
+
+    let target_arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+    let mut dirs = Vec::new();
+    for root in roots {
+        push_existing_cuda_lib_dir(&mut dirs, root.join("lib64"));
+        push_existing_cuda_lib_dir(&mut dirs, root.join("lib"));
+        if target_arch == "x86_64" {
+            push_existing_cuda_lib_dir(&mut dirs, root.join("targets/x86_64-linux/lib"));
+        }
+        if target_arch == "aarch64" {
+            push_existing_cuda_lib_dir(&mut dirs, root.join("targets/aarch64-linux/lib"));
+        }
+    }
+    dirs
+}
+
+fn cuda_root_from_nvcc() -> Option<std::path::PathBuf> {
+    let nvcc = std::env::var_os("NVCC")
+        .map(std::path::PathBuf::from)
+        .or_else(|| which_in_path("nvcc"))?;
+    nvcc.parent()?.parent().map(std::path::Path::to_path_buf)
+}
+
+fn which_in_path(binary: &str) -> Option<std::path::PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|dir| dir.join(binary))
+        .find(|candidate| candidate.is_file())
+}
+
+fn push_existing_cuda_lib_dir(dirs: &mut Vec<std::path::PathBuf>, dir: std::path::PathBuf) {
+    if dir.is_dir() && !dirs.iter().any(|existing| existing == &dir) {
+        dirs.push(dir);
     }
 }
 

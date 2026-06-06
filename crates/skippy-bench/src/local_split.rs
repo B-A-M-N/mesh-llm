@@ -594,7 +594,7 @@ fn activation_layout(
     }
     let width = activation_width as usize;
     let elements = payload.len() / 4;
-    if elements % width != 0 {
+    if !elements.is_multiple_of(width) {
         bail!("activation payload is not a whole number of activation rows");
     }
     let row_count = elements / width;

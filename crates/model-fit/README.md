@@ -37,11 +37,19 @@ target/release/model-fit-validate \
   --output-json "$HOME/tmp/model-fit-validation.json"
 
 target/release/model-fit-check-validation \
-  --min-models 8 \
+  --scenario steady_decode \
+  --min-models 5 \
+  --min-accuracy-models 3 \
+  --max-median-absolute-error 0.10 \
+  --max-individual-error 0.10 \
+  --max-noisy 2 \
+  --require-graph-inventory-match \
+  --allow-classified-individual-misses \
   "$HOME/tmp/model-fit-validation.json"
 
 target/release/model-fit-check-validation \
   --scenario all \
+  --report-only \
   --markdown-out "$HOME/tmp/model-fit-validation.md" \
   "$HOME/tmp/model-fit-validation.json"
 ```
@@ -49,6 +57,11 @@ target/release/model-fit-check-validation \
 The validation report is JSON so later agents can analyze hardware facts, model
 profiles, recommendations, benchmark observations, the estimator input
 contract, and scenario-level agreement.
+
+The gate separates coverage from evidence: `--min-models` checks that the smoke
+set ran, while `--min-accuracy-models` checks that enough rows survived the
+validator's noise/probe/context exclusions to count as actual throughput
+accuracy evidence.
 
 For manual dense-depth investigations, add `--dense-probe-depth deep`. That
 keeps regular smoke runs short while allowing an extra `l16` source-shaped dense

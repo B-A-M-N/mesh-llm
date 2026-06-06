@@ -43,6 +43,7 @@ struct TokenLengthSummary {
     ctx_size: u32,
     generation_limit: u32,
     enable_thinking: bool,
+    raw_prompt: bool,
     row_count: usize,
     fits_context: usize,
     exceeds_context: usize,
@@ -96,21 +97,25 @@ pub fn token_lengths(args: TokenLengthsArgs) -> Result<()> {
 
     let mut rows = Vec::with_capacity(cases.len());
     for prompt_case in &cases {
-        let rendered = model
-            .apply_chat_template_with_options(
-                &prompt_case.messages,
-                ChatTemplateOptions {
-                    add_assistant: true,
-                    enable_thinking: Some(args.enable_thinking),
-                },
-            )
-            .with_context(|| {
-                format!(
-                    "apply chat template for row {} ({})",
-                    prompt_case.sequence,
-                    prompt_case.prompt_id.as_deref().unwrap_or("no-id")
+        let rendered = if args.raw_prompt {
+            raw_prompt_text(&prompt_case.messages)
+        } else {
+            model
+                .apply_chat_template_with_options(
+                    &prompt_case.messages,
+                    ChatTemplateOptions {
+                        add_assistant: true,
+                        enable_thinking: Some(args.enable_thinking),
+                    },
                 )
-            })?;
+                .with_context(|| {
+                    format!(
+                        "apply chat template for row {} ({})",
+                        prompt_case.sequence,
+                        prompt_case.prompt_id.as_deref().unwrap_or("no-id")
+                    )
+                })?
+        };
         let tokens = model.tokenize(&rendered, true).with_context(|| {
             format!(
                 "tokenize row {} ({})",
@@ -236,6 +241,14 @@ fn messages_from_value(messages: &[Value]) -> Result<Vec<ChatTemplateMessage>> {
     Ok(rendered)
 }
 
+fn raw_prompt_text(messages: &[ChatTemplateMessage]) -> String {
+    messages
+        .iter()
+        .map(|message| message.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn message_content_to_text(content: &Value) -> Result<String> {
     if let Some(text) = content.as_str() {
         return Ok(text.to_string());
@@ -301,6 +314,7 @@ fn summarize(args: &TokenLengthsArgs, rows: &[TokenLengthRow]) -> TokenLengthSum
         ctx_size: args.ctx_size,
         generation_limit: args.generation_limit,
         enable_thinking: args.enable_thinking,
+        raw_prompt: args.raw_prompt,
         row_count: rows.len(),
         fits_context,
         exceeds_context: rows.len().saturating_sub(fits_context),
@@ -378,6 +392,7 @@ mod tests {
             layer_end: 40,
             n_gpu_layers: 0,
             enable_thinking: false,
+            raw_prompt: false,
             output_tsv: PathBuf::from("prompt-lengths.tsv"),
             summary_json: None,
         };

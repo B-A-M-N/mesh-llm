@@ -180,6 +180,24 @@ fn dense_model(id: &str, bytes: u64, layers: u32, hidden: u32, context: u32) -> 
     }
 }
 
+fn retag_dense_model_as_q8(model: &mut ModelProfile) {
+    model.quantization = Some("Q8_0".into());
+    model.tensor_group_bytes.embedding_type_bytes.q8_0_bytes =
+        model.tensor_group_bytes.embedding_type_bytes.q4_k_bytes;
+    model.tensor_group_bytes.embedding_type_bytes.q4_k_bytes = 0;
+    model.tensor_matmul.base_type_bytes.q8_0_bytes = model.tensor_matmul.base_type_bytes.q4_k_bytes;
+    model.tensor_matmul.base_type_bytes.q4_k_bytes = 0;
+    model.tensor_matmul.attention.type_bytes.q8_0_bytes =
+        model.tensor_matmul.attention.type_bytes.q4_k_bytes;
+    model.tensor_matmul.attention.type_bytes.q4_k_bytes = 0;
+    model.tensor_matmul.feed_forward.type_bytes.q8_0_bytes =
+        model.tensor_matmul.feed_forward.type_bytes.q4_k_bytes;
+    model.tensor_matmul.feed_forward.type_bytes.q4_k_bytes = 0;
+    model.tensor_matmul.output.type_bytes.q8_0_bytes =
+        model.tensor_matmul.output.type_bytes.q4_k_bytes;
+    model.tensor_matmul.output.type_bytes.q4_k_bytes = 0;
+}
+
 fn qwen3_30b_a3b_q4_moe() -> ModelProfile {
     let file_bytes = 18_556_686_912;
     let attention_bytes = 1_700_000_000;
@@ -589,6 +607,51 @@ fn decode_estimate_reports_uncertainty_range() {
 }
 
 #[test]
+fn decode_estimate_reports_context_tokens_used_for_kv_pressure() {
+    let mut hardware = m1_ultra();
+    hardware.accelerators[0].decode_kernel_probes = vec![DecodeKernelProbe {
+        name: "ggml_decode_q4_k_llama_graph_l8_4096_16384".into(),
+        tensor_type: "q4_k".into(),
+        rows: 16_384,
+        cols: 4096,
+        batch_tokens: 1,
+        graph_features: 0,
+        graph_node_count: None,
+        effective_gbps: 180.0,
+        tflops: Some(0.8),
+        elapsed_ms: None,
+        min_elapsed_ms: None,
+        max_elapsed_ms: None,
+        spread_pct: None,
+        graph_inventory: Vec::new(),
+        runs: 3,
+    }];
+    let mut config = SelectionConfig {
+        workload: WorkloadProfile::chat(),
+        ..SelectionConfig::default()
+    };
+    config.weights = config.workload.default_weights();
+    let model = dense_model("dense", 4 * GIB, 32, 4096, 32_768);
+
+    let default_rec = score_model(&hardware, &model, &config);
+    assert_eq!(default_rec.estimated_decode_context_tokens, Some(4096));
+    assert_eq!(
+        default_rec
+            .decode_cost_breakdown
+            .as_ref()
+            .and_then(|breakdown| breakdown.context_tokens),
+        Some(4096)
+    );
+
+    let prompt_rec = score_model_for_context_tokens(&hardware, &model, &config, 148);
+    assert_eq!(prompt_rec.estimated_decode_context_tokens, Some(148));
+    assert!(
+        prompt_rec.estimated_decode_tokens_per_sec.unwrap()
+            > default_rec.estimated_decode_tokens_per_sec.unwrap()
+    );
+}
+
+#[test]
 fn prefill_estimate_reports_first_token_latency_range() {
     let hardware = m1_ultra();
     let mut config = SelectionConfig {
@@ -891,9 +954,14 @@ fn tied_output_projection_charges_embedding_bytes() {
         cols: 4096,
         batch_tokens: 1,
         graph_features: 0,
+        graph_node_count: None,
         effective_gbps: 180.0,
         tflops: Some(0.8),
         elapsed_ms: None,
+        min_elapsed_ms: None,
+        max_elapsed_ms: None,
+        spread_pct: None,
+        graph_inventory: Vec::new(),
         runs: 3,
     }];
     let mut config = SelectionConfig {
@@ -940,6 +1008,224 @@ fn tied_output_projection_charges_embedding_bytes() {
 }
 
 #[test]
+fn sampled_decode_charges_sampler_even_with_logits_readback_probe() {
+    let mut hardware = m1_ultra();
+    hardware.accelerators[0].sampler_history_us_per_token = Some(1.0);
+    hardware.accelerators[0].sampler_vocab_us_per_token = Some(10.0);
+    hardware.accelerators[0].decode_kernel_probes = vec![
+        DecodeKernelProbe {
+            name: "ggml_decode_q4_k_llama_graph_l8_4096_16384".into(),
+            tensor_type: "q4_k".into(),
+            rows: 16_384,
+            cols: 4096,
+            batch_tokens: 1,
+            graph_features: 0,
+            graph_node_count: None,
+            effective_gbps: 180.0,
+            tflops: Some(0.8),
+            elapsed_ms: None,
+            min_elapsed_ms: None,
+            max_elapsed_ms: None,
+            spread_pct: None,
+            graph_inventory: Vec::new(),
+            runs: 3,
+        },
+        DecodeKernelProbe {
+            name: "ggml_decode_logits_readback_vocab32000".into(),
+            tensor_type: "f32".into(),
+            rows: 32_000,
+            cols: 1,
+            batch_tokens: 1,
+            graph_features: 0,
+            graph_node_count: None,
+            effective_gbps: 0.5,
+            tflops: None,
+            elapsed_ms: Some(0.25),
+            min_elapsed_ms: None,
+            max_elapsed_ms: None,
+            spread_pct: None,
+            graph_inventory: Vec::new(),
+            runs: 3,
+        },
+    ];
+    let mut config = SelectionConfig {
+        workload: WorkloadProfile::chat(),
+        ..SelectionConfig::default()
+    };
+    config.weights = config.workload.default_weights();
+
+    let model = dense_model("sampled-decode", 8 * GIB, 32, 4096, 32_768);
+    let rec = score_model(&hardware, &model, &config);
+    let breakdown = rec.decode_cost_breakdown.expect("decode cost breakdown");
+
+    assert!(
+        breakdown
+            .groups
+            .iter()
+            .any(|group| group.group == "logits_readback")
+    );
+    assert!(breakdown.sampled_decode_sampler_ms >= 320.0);
+}
+
+#[test]
+fn logits_sync_probe_replaces_plain_readback_when_available() {
+    let mut hardware = m1_ultra();
+    hardware.accelerators[0].decode_kernel_probes = vec![
+        DecodeKernelProbe {
+            name: "ggml_decode_q4_k_llama_graph_l8_4096_16384".into(),
+            tensor_type: "q4_k".into(),
+            rows: 16_384,
+            cols: 4096,
+            batch_tokens: 1,
+            graph_features: 0,
+            graph_node_count: None,
+            effective_gbps: 180.0,
+            tflops: Some(0.8),
+            elapsed_ms: None,
+            min_elapsed_ms: None,
+            max_elapsed_ms: None,
+            spread_pct: None,
+            graph_inventory: Vec::new(),
+            runs: 3,
+        },
+        DecodeKernelProbe {
+            name: "ggml_decode_logits_readback_vocab32000".into(),
+            tensor_type: "f32".into(),
+            rows: 32_000,
+            cols: 1,
+            batch_tokens: 1,
+            graph_features: 0,
+            graph_node_count: None,
+            effective_gbps: 0.5,
+            tflops: None,
+            elapsed_ms: Some(0.25),
+            min_elapsed_ms: None,
+            max_elapsed_ms: None,
+            spread_pct: None,
+            graph_inventory: Vec::new(),
+            runs: 3,
+        },
+        DecodeKernelProbe {
+            name: "ggml_decode_logits_sync_vocab32000".into(),
+            tensor_type: "runtime".into(),
+            rows: 32_000,
+            cols: 1,
+            batch_tokens: 1,
+            graph_features: 0,
+            graph_node_count: None,
+            effective_gbps: 0.02,
+            tflops: None,
+            elapsed_ms: Some(4.0),
+            min_elapsed_ms: None,
+            max_elapsed_ms: None,
+            spread_pct: None,
+            graph_inventory: Vec::new(),
+            runs: 12,
+        },
+    ];
+    let mut config = SelectionConfig {
+        workload: WorkloadProfile::chat(),
+        ..SelectionConfig::default()
+    };
+    config.weights = config.workload.default_weights();
+
+    let model = dense_model("sampled-decode", 8 * GIB, 32, 4096, 32_768);
+    let rec = score_model(&hardware, &model, &config);
+    let breakdown = rec.decode_cost_breakdown.expect("decode cost breakdown");
+    let logits = breakdown
+        .groups
+        .iter()
+        .find(|group| group.group == "logits_readback")
+        .expect("logits handoff group");
+
+    assert_eq!(
+        logits.probe_name.as_deref(),
+        Some("ggml_decode_logits_sync_vocab32000")
+    );
+    assert_eq!(logits.source, "probe_logits_sync_elapsed");
+    assert!(logits.bandwidth_ms >= 4.0);
+}
+
+#[test]
+fn logits_output_handoff_probe_replaces_sync_when_available() {
+    let mut hardware = m1_ultra();
+    hardware.accelerators[0].decode_kernel_probes = vec![
+        DecodeKernelProbe {
+            name: "ggml_decode_q4_k_llama_graph_l8_4096_16384".into(),
+            tensor_type: "q4_k".into(),
+            rows: 16_384,
+            cols: 4096,
+            batch_tokens: 1,
+            graph_features: 0,
+            graph_node_count: None,
+            effective_gbps: 180.0,
+            tflops: Some(0.8),
+            elapsed_ms: None,
+            min_elapsed_ms: None,
+            max_elapsed_ms: None,
+            spread_pct: None,
+            graph_inventory: Vec::new(),
+            runs: 3,
+        },
+        DecodeKernelProbe {
+            name: "ggml_decode_logits_sync_vocab32000".into(),
+            tensor_type: "runtime".into(),
+            rows: 32_000,
+            cols: 1,
+            batch_tokens: 1,
+            graph_features: 0,
+            graph_node_count: None,
+            effective_gbps: 0.02,
+            tflops: None,
+            elapsed_ms: Some(4.0),
+            min_elapsed_ms: None,
+            max_elapsed_ms: None,
+            spread_pct: None,
+            graph_inventory: Vec::new(),
+            runs: 12,
+        },
+        DecodeKernelProbe {
+            name: "ggml_decode_logits_output_handoff_vocab32000".into(),
+            tensor_type: "runtime".into(),
+            rows: 32_000,
+            cols: 1,
+            batch_tokens: 1,
+            graph_features: 0,
+            graph_node_count: None,
+            effective_gbps: 0.01,
+            tflops: None,
+            elapsed_ms: Some(7.0),
+            min_elapsed_ms: None,
+            max_elapsed_ms: None,
+            spread_pct: None,
+            graph_inventory: Vec::new(),
+            runs: 12,
+        },
+    ];
+    let mut config = SelectionConfig {
+        workload: WorkloadProfile::chat(),
+        ..SelectionConfig::default()
+    };
+    config.weights = config.workload.default_weights();
+
+    let model = dense_model("sampled-decode", 8 * GIB, 32, 4096, 32_768);
+    let rec = score_model(&hardware, &model, &config);
+    let breakdown = rec.decode_cost_breakdown.expect("decode cost breakdown");
+    let logits = breakdown
+        .groups
+        .iter()
+        .find(|group| group.group == "logits_readback")
+        .expect("logits handoff group");
+
+    assert_eq!(
+        logits.probe_name.as_deref(),
+        Some("ggml_decode_logits_output_handoff_vocab32000")
+    );
+    assert_eq!(logits.source, "probe_logits_output_handoff_elapsed");
+    assert!(logits.bandwidth_ms >= 7.0);
+}
+
+#[test]
 fn ggml_decode_kernel_probe_is_required_for_medium_confidence() {
     let mut hardware = m1_ultra();
     hardware.accelerators[0].decode_kernel_probes = vec![DecodeKernelProbe {
@@ -949,9 +1235,14 @@ fn ggml_decode_kernel_probe_is_required_for_medium_confidence() {
         cols: 4096,
         batch_tokens: 1,
         graph_features: 0,
+        graph_node_count: None,
         effective_gbps: 240.0,
         tflops: Some(4.0),
         elapsed_ms: None,
+        min_elapsed_ms: None,
+        max_elapsed_ms: None,
+        spread_pct: None,
+        graph_inventory: Vec::new(),
         runs: 20,
     }];
 
@@ -992,9 +1283,14 @@ fn ggml_decode_kernel_probe_is_required_for_medium_confidence() {
             cols: 4096,
             batch_tokens: 1,
             graph_features: 0,
+            graph_node_count: None,
             effective_gbps: 280.0,
             tflops: Some(4.5),
             elapsed_ms: None,
+            min_elapsed_ms: None,
+            max_elapsed_ms: None,
+            spread_pct: None,
+            graph_inventory: Vec::new(),
             runs: 20,
         });
     let f16_rec = score_model(&hardware, &f16, &config);
@@ -1027,9 +1323,14 @@ fn decode_kernel_probe_must_match_dominant_matmul_shape() {
         cols: 4096,
         batch_tokens: 1,
         graph_features: 0,
+        graph_node_count: None,
         effective_gbps: 25.0,
         tflops: Some(0.1),
         elapsed_ms: None,
+        min_elapsed_ms: None,
+        max_elapsed_ms: None,
+        spread_pct: None,
+        graph_inventory: Vec::new(),
         runs: 20,
     }];
 
@@ -1064,9 +1365,14 @@ fn decode_kernel_probe_must_match_dominant_matmul_shape() {
             cols: 4096,
             batch_tokens: 1,
             graph_features: 0,
+            graph_node_count: None,
             effective_gbps: 120.0,
             tflops: Some(0.5),
             elapsed_ms: None,
+            min_elapsed_ms: None,
+            max_elapsed_ms: None,
+            spread_pct: None,
+            graph_inventory: Vec::new(),
             runs: 20,
         });
     let matvec_rec = score_model(&hardware, &model, &config);
@@ -1093,9 +1399,14 @@ fn decode_kernel_probe_must_match_dominant_matmul_shape() {
             cols: 4096,
             batch_tokens: 1,
             graph_features: 0,
+            graph_node_count: None,
             effective_gbps: 120.0,
             tflops: Some(0.5),
             elapsed_ms: None,
+            min_elapsed_ms: None,
+            max_elapsed_ms: None,
+            spread_pct: None,
+            graph_inventory: Vec::new(),
             runs: 20,
         });
     let representative_rec = score_model(&hardware, &model, &config);
@@ -1125,9 +1436,14 @@ fn decode_kernel_probe_must_match_dominant_matmul_shape() {
             cols: 4096,
             batch_tokens: 1,
             graph_features: 0,
+            graph_node_count: None,
             effective_gbps: 160.0,
             tflops: Some(0.7),
             elapsed_ms: Some(0.9),
+            min_elapsed_ms: None,
+            max_elapsed_ms: None,
+            spread_pct: None,
+            graph_inventory: Vec::new(),
             runs: 20,
         });
     let stack_rec = score_model(&hardware, &model, &config);
@@ -1137,6 +1453,925 @@ fn decode_kernel_probe_must_match_dominant_matmul_shape() {
             - representative_rec.estimated_decode_tokens_per_sec.unwrap())
         .abs()
             < f32::EPSILON
+    );
+}
+
+#[test]
+fn unprobed_quantized_transformer_bytes_use_shape_surrogate_with_low_confidence() {
+    let mut hardware = m1_ultra();
+    hardware.accelerators[0].decode_effective_bandwidth_bytes_per_sec = Some(400_000_000_000);
+    hardware.accelerators[0].decode_kernel_probes = vec![DecodeKernelProbe {
+        name: "ggml_decode_q8_0_llama_graph_ffn".into(),
+        tensor_type: "q8_0".into(),
+        rows: 16_384,
+        cols: 4096,
+        batch_tokens: 1,
+        graph_features: 0,
+        graph_node_count: None,
+        effective_gbps: 8.0,
+        tflops: Some(0.2),
+        elapsed_ms: None,
+        min_elapsed_ms: None,
+        max_elapsed_ms: None,
+        spread_pct: None,
+        graph_inventory: Vec::new(),
+        runs: 20,
+    }];
+
+    let mut config = SelectionConfig {
+        workload: WorkloadProfile::chat(),
+        ..SelectionConfig::default()
+    };
+    config.weights = config.workload.default_weights();
+    let mut model = dense_model("unprobed-other-quant", 8 * GIB, 32, 4096, 32_768);
+    model.quantization = Some("Q4_K_M".into());
+    for group in [
+        &mut model.tensor_matmul.attention,
+        &mut model.tensor_matmul.feed_forward,
+    ] {
+        group.type_bytes = TensorTypeBytes {
+            other_quantized_bytes: group.bytes,
+            ..TensorTypeBytes::default()
+        };
+    }
+
+    let rec = score_model(&hardware, &model, &config);
+    let breakdown = rec.decode_cost_breakdown.expect("decode cost breakdown");
+    let surrogate_groups = breakdown
+        .groups
+        .iter()
+        .filter(|group| {
+            matches!(
+                group.group.as_str(),
+                "attention_matmul" | "feed_forward_matmul"
+            ) && group.tensor_type == "other_quantized"
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(rec.estimate_confidence, EstimateConfidence::Low);
+    assert_eq!(surrogate_groups.len(), 2, "groups={:#?}", breakdown.groups);
+    assert!(
+        surrogate_groups
+            .iter()
+            .all(|group| group.source == "probe_shape_surrogate"
+                && group.probe_name.as_deref() == Some("ggml_decode_q8_0_llama_graph_ffn")),
+        "groups={surrogate_groups:#?}"
+    );
+    assert!(breakdown.fallback_bytes > 0);
+    assert!(
+        rec.warnings
+            .iter()
+            .any(|warning| warning.contains("dominant tensor type other_quantized"))
+    );
+}
+
+#[test]
+fn exact_dense_full_token_probe_replaces_separate_block_output_and_kv_groups() {
+    let mut hardware = m1_ultra();
+    hardware.accelerators[0].decode_fixed_overhead_ms = Some(0.25);
+    hardware.accelerators[0].decode_kernel_probes = vec![
+        DecodeKernelProbe {
+            name: "ggml_decode_q4_k_full_token_l32_gqa_4096_kv1024_16384_vocab32000_ctx4096_h128_qh32_kvh8".into(),
+            tensor_type: "q4_k".into(),
+            rows: 32_000,
+            cols: 4096,
+            batch_tokens: 1,
+            graph_features: 0,
+            graph_node_count: None,
+            effective_gbps: 200.0,
+            tflops: Some(1.0),
+            elapsed_ms: Some(4.25),
+            min_elapsed_ms: None,
+            max_elapsed_ms: None,
+            spread_pct: None,
+            graph_inventory: Vec::new(),
+            runs: 3,
+        },
+        DecodeKernelProbe {
+            name: "ggml_decode_logits_sync_vocab32000".into(),
+            tensor_type: "f32".into(),
+            rows: 32_000,
+            cols: 1,
+            batch_tokens: 1,
+            graph_features: 0,
+            graph_node_count: None,
+            effective_gbps: 1.0,
+            tflops: None,
+            elapsed_ms: Some(0.5),
+            min_elapsed_ms: None,
+            max_elapsed_ms: None,
+            spread_pct: None,
+            graph_inventory: Vec::new(),
+            runs: 3,
+        },
+    ];
+
+    let mut config = SelectionConfig {
+        workload: WorkloadProfile::chat(),
+        ..SelectionConfig::default()
+    };
+    config.workload.interaction.expected_prompt_tokens = Some(4096);
+    config.weights = config.workload.default_weights();
+    let mut model = dense_model("full-token-q4", 8 * GIB, 32, 4096, 32_768);
+    model.value_length = model.key_length;
+
+    let rec = score_model(&hardware, &model, &config);
+    let groups = &rec
+        .decode_cost_breakdown
+        .as_ref()
+        .expect("decode breakdown")
+        .groups;
+
+    assert!(
+        groups.iter().any(|group| {
+            group.group == "full_token_graph"
+                && group.source == "probe_full_token_elapsed"
+                && group.probe_name.as_deref().is_some_and(|name| {
+                    name.contains("_full_token_l32_gqa_4096_kv1024_16384_")
+                        && name.contains("_ctx4096_h128_qh32_kvh8")
+                })
+        }),
+        "groups={groups:#?}"
+    );
+    assert!(
+        groups.iter().all(|group| {
+            !matches!(
+                group.group.as_str(),
+                "transformer_block" | "output_matmul" | "kv_and_activation" | "logits_readback"
+            )
+        }),
+        "groups={groups:#?}"
+    );
+    let breakdown = rec
+        .decode_cost_breakdown
+        .as_ref()
+        .expect("decode breakdown");
+    assert!(
+        breakdown.sampled_decode_sampler_ms >= 0.0,
+        "sampled decode still reports sampler term"
+    );
+    assert_eq!(rec.estimate_confidence, EstimateConfidence::Low);
+    assert!(
+        rec.warnings
+            .iter()
+            .any(|warning| warning.contains("logits output/sampler handoff")),
+        "warnings={:#?}",
+        rec.warnings
+    );
+}
+
+#[test]
+fn dense_full_token_probe_charges_source_shaped_logits_output_handoff() {
+    let mut hardware = m1_ultra();
+    hardware.accelerators[0].decode_fixed_overhead_ms = Some(0.25);
+    hardware.accelerators[0].decode_kernel_probes = vec![
+        DecodeKernelProbe {
+            name: "ggml_decode_q4_k_full_token_l32_gqa_4096_kv1024_16384_vocab32000_ctx4096_h128_qh32_kvh8".into(),
+            tensor_type: "q4_k".into(),
+            rows: 32_000,
+            cols: 4096,
+            batch_tokens: 1,
+            graph_features: 0,
+            graph_node_count: None,
+            effective_gbps: 200.0,
+            tflops: Some(1.0),
+            elapsed_ms: Some(4.25),
+            min_elapsed_ms: None,
+            max_elapsed_ms: None,
+            spread_pct: None,
+            graph_inventory: Vec::new(),
+            runs: 3,
+        },
+        DecodeKernelProbe {
+            name: "ggml_decode_logits_output_handoff_vocab32000".into(),
+            tensor_type: "runtime".into(),
+            rows: 32_000,
+            cols: 1,
+            batch_tokens: 1,
+            graph_features: 0,
+            graph_node_count: None,
+            effective_gbps: 1.0,
+            tflops: None,
+            elapsed_ms: Some(0.75),
+            min_elapsed_ms: None,
+            max_elapsed_ms: None,
+            spread_pct: None,
+            graph_inventory: Vec::new(),
+            runs: 12,
+        },
+    ];
+
+    let mut config = SelectionConfig {
+        workload: WorkloadProfile::chat(),
+        ..SelectionConfig::default()
+    };
+    config.workload.interaction.expected_prompt_tokens = Some(4096);
+    config.weights = config.workload.default_weights();
+    let mut model = dense_model("full-token-q4", 8 * GIB, 32, 4096, 32_768);
+    model.value_length = model.key_length;
+
+    let rec = score_model(&hardware, &model, &config);
+    let groups = &rec
+        .decode_cost_breakdown
+        .as_ref()
+        .expect("decode breakdown")
+        .groups;
+    let logits = groups
+        .iter()
+        .find(|group| group.group == "logits_readback")
+        .expect("source-shaped logits handoff group");
+
+    assert_eq!(
+        logits.probe_name.as_deref(),
+        Some("ggml_decode_logits_output_handoff_vocab32000")
+    );
+    assert_eq!(logits.source, "probe_logits_output_handoff_elapsed");
+    assert_eq!(rec.estimate_confidence, EstimateConfidence::Medium);
+}
+
+#[test]
+fn dense_full_token_handoff_probe_replaces_separate_logits_output_handoff() {
+    let mut hardware = m1_ultra();
+    hardware.accelerators[0].decode_fixed_overhead_ms = Some(0.25);
+    hardware.accelerators[0].decode_kernel_probes = vec![
+        DecodeKernelProbe {
+            name: "ggml_decode_q4_k_full_token_l32_gqa_4096_kv1024_16384_vocab32000_ctx4096_h128_qh32_kvh8".into(),
+            tensor_type: "q4_k".into(),
+            rows: 32_000,
+            cols: 4096,
+            batch_tokens: 1,
+            graph_features: 0,
+            graph_node_count: None,
+            effective_gbps: 200.0,
+            tflops: Some(1.0),
+            elapsed_ms: Some(4.25),
+            min_elapsed_ms: None,
+            max_elapsed_ms: None,
+            spread_pct: None,
+            graph_inventory: Vec::new(),
+            runs: 3,
+        },
+        DecodeKernelProbe {
+            name: "ggml_decode_q4_k_full_token_handoff_l32_gqa_4096_kv1024_16384_vocab32000_ctx4096_h128_qh32_kvh8".into(),
+            tensor_type: "q4_k".into(),
+            rows: 32_000,
+            cols: 4096,
+            batch_tokens: 1,
+            graph_features: 0,
+            graph_node_count: None,
+            effective_gbps: 180.0,
+            tflops: Some(0.9),
+            elapsed_ms: Some(5.25),
+            min_elapsed_ms: None,
+            max_elapsed_ms: None,
+            spread_pct: None,
+            graph_inventory: Vec::new(),
+            runs: 3,
+        },
+        DecodeKernelProbe {
+            name: "ggml_decode_logits_output_handoff_vocab32000".into(),
+            tensor_type: "runtime".into(),
+            rows: 32_000,
+            cols: 1,
+            batch_tokens: 1,
+            graph_features: 0,
+            graph_node_count: None,
+            effective_gbps: 1.0,
+            tflops: None,
+            elapsed_ms: Some(0.75),
+            min_elapsed_ms: None,
+            max_elapsed_ms: None,
+            spread_pct: None,
+            graph_inventory: Vec::new(),
+            runs: 12,
+        },
+    ];
+
+    let mut config = SelectionConfig {
+        workload: WorkloadProfile::chat(),
+        ..SelectionConfig::default()
+    };
+    config.workload.interaction.expected_prompt_tokens = Some(4096);
+    config.weights = config.workload.default_weights();
+    let mut model = dense_model("full-token-handoff-q4", 8 * GIB, 32, 4096, 32_768);
+    model.value_length = model.key_length;
+
+    let rec = score_model(&hardware, &model, &config);
+    let groups = &rec
+        .decode_cost_breakdown
+        .as_ref()
+        .expect("decode breakdown")
+        .groups;
+    let full_token = groups
+        .iter()
+        .find(|group| group.group == "full_token_graph")
+        .expect("full-token group");
+
+    assert_eq!(full_token.source, "probe_full_token_handoff_elapsed");
+    assert_eq!(
+        full_token.probe_name.as_deref(),
+        Some(
+            "ggml_decode_q4_k_full_token_handoff_l32_gqa_4096_kv1024_16384_vocab32000_ctx4096_h128_qh32_kvh8"
+        )
+    );
+    assert!(
+        groups.iter().all(|group| group.group != "logits_readback"),
+        "inclusive full-token handoff probe already includes the source-shaped logits output handoff: {groups:#?}"
+    );
+    assert!(
+        rec.warnings.iter().any(|warning| warning
+            .contains("not the full llama.cpp/Skippy decode submission path")),
+        "warnings={:#?}",
+        rec.warnings
+    );
+    assert_eq!(rec.estimate_confidence, EstimateConfidence::Low);
+}
+
+#[test]
+fn dense_submission_probe_adds_cost_but_keeps_confidence_low() {
+    let mut hardware = m1_ultra();
+    hardware.accelerators[0].decode_fixed_overhead_ms = Some(0.25);
+    hardware.accelerators[0].decode_kernel_probes = vec![
+        DecodeKernelProbe {
+            name: "ggml_decode_q4_k_full_token_handoff_l32_gqa_4096_kv1024_16384_vocab32000_ctx4096_h128_qh32_kvh8".into(),
+            tensor_type: "q4_k".into(),
+            rows: 32_000,
+            cols: 4096,
+            batch_tokens: 1,
+            graph_features: 0,
+            graph_node_count: None,
+            effective_gbps: 180.0,
+            tflops: Some(0.9),
+            elapsed_ms: Some(5.25),
+            min_elapsed_ms: None,
+            max_elapsed_ms: None,
+            spread_pct: None,
+            graph_inventory: Vec::new(),
+            runs: 3,
+        },
+        DecodeKernelProbe {
+            name: "ggml_decode_q4_k_submission_l32_gqa_4096_kv1024_16384_vocab32000_ctx4096_h128_qh32_kvh8".into(),
+            tensor_type: "q4_k".into(),
+            rows: 32_000,
+            cols: 4096,
+            batch_tokens: 1,
+            graph_features: 0,
+            graph_node_count: None,
+            effective_gbps: 0.2,
+            tflops: Some(0.01),
+            elapsed_ms: Some(1.50),
+            min_elapsed_ms: None,
+            max_elapsed_ms: None,
+            spread_pct: None,
+            graph_inventory: Vec::new(),
+            runs: 3,
+        },
+    ];
+
+    let mut config = SelectionConfig {
+        workload: WorkloadProfile::chat(),
+        ..SelectionConfig::default()
+    };
+    config.workload.interaction.expected_prompt_tokens = Some(4096);
+    config.weights = config.workload.default_weights();
+    let mut model = dense_model("full-token-submission-q4", 8 * GIB, 32, 4096, 32_768);
+    model.value_length = model.key_length;
+
+    let rec = score_model(&hardware, &model, &config);
+    let groups = &rec
+        .decode_cost_breakdown
+        .as_ref()
+        .expect("decode breakdown")
+        .groups;
+    let submission = groups
+        .iter()
+        .find(|group| group.group == "decode_submission")
+        .expect("decode submission group");
+
+    assert_eq!(
+        submission.probe_name.as_deref(),
+        Some(
+            "ggml_decode_q4_k_submission_l32_gqa_4096_kv1024_16384_vocab32000_ctx4096_h128_qh32_kvh8"
+        )
+    );
+    assert_eq!(
+        submission.source,
+        "probe_decode_submission_elapsed_minus_fixed"
+    );
+    assert!((submission.bandwidth_ms - 1.25).abs() < 0.001);
+    assert!(
+        rec.warnings
+            .iter()
+            .any(|warning| warning.contains("thin GGML submission probe")),
+        "warnings={:#?}",
+        rec.warnings
+    );
+    assert_eq!(rec.estimate_confidence, EstimateConfidence::Low);
+}
+
+#[test]
+fn smol_q8_full_token_handoff_probe_beats_graph_only_probe() {
+    let mut hardware = m1_ultra();
+    hardware.accelerators[0].decode_fixed_overhead_ms = Some(0.1823);
+    hardware.accelerators[0].decode_kernel_probes = vec![
+        DecodeKernelProbe {
+            name: "ggml_decode_q8_0_full_token_l30_gqa_576_kv192_1536_vocab49152_ctx4096_h64_qh9_kvh3".into(),
+            tensor_type: "q8_0".into(),
+            rows: 49_152,
+            cols: 576,
+            batch_tokens: 1,
+            graph_features: 0,
+            graph_node_count: None,
+            effective_gbps: 62.916,
+            tflops: Some(0.9),
+            elapsed_ms: Some(3.77496),
+            min_elapsed_ms: Some(3.77279),
+            max_elapsed_ms: Some(5.00038),
+            spread_pct: Some(32.5191),
+            graph_inventory: Vec::new(),
+            runs: 3,
+        },
+        DecodeKernelProbe {
+            name: "ggml_decode_q8_0_full_token_handoff_l30_gqa_576_kv192_1536_vocab49152_ctx4096_h64_qh9_kvh3".into(),
+            tensor_type: "q8_0".into(),
+            rows: 49_152,
+            cols: 576,
+            batch_tokens: 1,
+            graph_features: 0,
+            graph_node_count: Some(811),
+            effective_gbps: 68.0,
+            tflops: Some(0.9),
+            elapsed_ms: Some(3.44019),
+            min_elapsed_ms: Some(3.31288),
+            max_elapsed_ms: Some(3.88271),
+            spread_pct: Some(20.0),
+            graph_inventory: Vec::new(),
+            runs: 3,
+        },
+    ];
+
+    let mut config = SelectionConfig {
+        workload: WorkloadProfile::chat(),
+        ..SelectionConfig::default()
+    };
+    config.workload.interaction.expected_prompt_tokens = Some(4096);
+    config.weights = config.workload.default_weights();
+    let mut model = dense_model("smol-q8-shape", 144_811_072, 30, 576, 8192);
+    retag_dense_model_as_q8(&mut model);
+    model.ffn_size = Some(1536);
+    model.tokenizer.vocab_size = Some(49_152);
+    model.attention_heads = Some(9);
+    model.kv_heads = Some(3);
+    model.key_length = Some(64);
+    model.value_length = Some(64);
+    model.context_length = Some(8192);
+    model.tensor_group_bytes.attention_bytes = 28_200_960;
+    model.tensor_group_bytes.feed_forward_bytes = 84_602_880;
+    model.tensor_group_bytes.embedding_bytes = 30_081_024;
+    model.tensor_group_bytes.embedding_type_bytes = TensorTypeBytes {
+        q8_0_bytes: 30_081_024,
+        ..TensorTypeBytes::default()
+    };
+    model.tensor_group_bytes.output_bytes = 0;
+    model.tensor_matmul.attention.bytes = 28_200_960;
+    model.tensor_matmul.attention.type_bytes = TensorTypeBytes {
+        q8_0_bytes: 28_200_960,
+        ..TensorTypeBytes::default()
+    };
+    model.tensor_matmul.feed_forward.bytes = 84_602_880;
+    model.tensor_matmul.feed_forward.type_bytes = TensorTypeBytes {
+        q8_0_bytes: 84_602_880,
+        ..TensorTypeBytes::default()
+    };
+    model.tensor_matmul.output = TensorMatmulGroupProfile::default();
+
+    let rec = score_model(&hardware, &model, &config);
+    let full_token = rec
+        .decode_cost_breakdown
+        .as_ref()
+        .expect("decode breakdown")
+        .groups
+        .iter()
+        .find(|group| group.group == "full_token_graph")
+        .expect("full-token group");
+
+    assert_eq!(
+        full_token.probe_name.as_deref(),
+        Some(
+            "ggml_decode_q8_0_full_token_handoff_l30_gqa_576_kv192_1536_vocab49152_ctx4096_h64_qh9_kvh3"
+        )
+    );
+    assert!(
+        full_token.bandwidth_ms >= 3.59,
+        "handoff probe is a source-visible superset of the graph-only probe, \
+         so scoring must not use the impossible faster handoff median: {full_token:#?}"
+    );
+    assert!(
+        rec.warnings
+            .iter()
+            .any(|warning| warning.contains("source-visible dense decode nodes")),
+        "warnings={:#?}",
+        rec.warnings
+    );
+    let point = rec
+        .estimated_decode_tokens_per_sec
+        .expect("decode point estimate");
+    let range = rec
+        .estimated_decode_tokens_per_sec_range
+        .expect("decode range");
+    assert!(range.lower <= point * 0.56, "point={point} range={range:?}");
+}
+
+#[test]
+fn dense_source_sampled_probe_replaces_split_boundary_probes() {
+    let mut hardware = m1_ultra();
+    hardware.accelerators[0].decode_fixed_overhead_ms = Some(0.25);
+    hardware.accelerators[0].decode_kernel_probes = vec![
+        DecodeKernelProbe {
+            name: "ggml_decode_q8_0_full_token_handoff_l30_gqa_576_kv192_1536_vocab49152_ctx4096_h64_qh9_kvh3".into(),
+            tensor_type: "q8_0".into(),
+            rows: 49_152,
+            cols: 576,
+            batch_tokens: 1,
+            graph_features: 0,
+            graph_node_count: Some(936),
+            effective_gbps: 72.0,
+            tflops: Some(0.9),
+            elapsed_ms: Some(4.0),
+            min_elapsed_ms: Some(3.9),
+            max_elapsed_ms: Some(4.1),
+            spread_pct: Some(5.0),
+            graph_inventory: Vec::new(),
+            runs: 3,
+        },
+        DecodeKernelProbe {
+            name: "ggml_decode_q8_0_full_token_source_sampled_l30_gqa_576_kv192_1536_vocab49152_ctx4096_h64_qh9_kvh3".into(),
+            tensor_type: "q8_0".into(),
+            rows: 49_152,
+            cols: 576,
+            batch_tokens: 1,
+            graph_features: 0,
+            graph_node_count: Some(936),
+            effective_gbps: 48.0,
+            tflops: Some(0.7),
+            elapsed_ms: Some(3.0),
+            min_elapsed_ms: Some(2.9),
+            max_elapsed_ms: Some(3.1),
+            spread_pct: Some(4.0),
+            graph_inventory: Vec::new(),
+            runs: 3,
+        },
+        DecodeKernelProbe {
+            name: "ggml_decode_q8_0_submission_l30_gqa_576_kv192_1536_vocab49152_ctx4096_h64_qh9_kvh3".into(),
+            tensor_type: "q8_0".into(),
+            rows: 49_152,
+            cols: 576,
+            batch_tokens: 1,
+            graph_features: 0,
+            graph_node_count: Some(936),
+            effective_gbps: 0.5,
+            tflops: Some(0.1),
+            elapsed_ms: Some(0.7),
+            min_elapsed_ms: Some(0.7),
+            max_elapsed_ms: Some(0.7),
+            spread_pct: Some(0.0),
+            graph_inventory: Vec::new(),
+            runs: 3,
+        },
+        DecodeKernelProbe {
+            name: "ggml_decode_q8_0_source_input_l30_gqa_576_kv192_1536_vocab49152_ctx4096_h64_qh9_kvh3".into(),
+            tensor_type: "q8_0".into(),
+            rows: 49_152,
+            cols: 576,
+            batch_tokens: 1,
+            graph_features: 0,
+            graph_node_count: Some(936),
+            effective_gbps: 0.4,
+            tflops: Some(0.1),
+            elapsed_ms: Some(0.8),
+            min_elapsed_ms: Some(0.78),
+            max_elapsed_ms: Some(0.82),
+            spread_pct: Some(5.0),
+            graph_inventory: Vec::new(),
+            runs: 3,
+        },
+    ];
+
+    let mut config = SelectionConfig {
+        workload: WorkloadProfile::chat(),
+        ..SelectionConfig::default()
+    };
+    config.workload.interaction.expected_prompt_tokens = Some(4096);
+    config.weights = config.workload.default_weights();
+    let mut model = dense_model("smol-source-sampled-q8", 144_811_072, 30, 576, 8192);
+    retag_dense_model_as_q8(&mut model);
+    model.ffn_size = Some(1536);
+    model.tokenizer.vocab_size = Some(49_152);
+    model.attention_heads = Some(9);
+    model.kv_heads = Some(3);
+    model.key_length = Some(64);
+    model.value_length = Some(64);
+    model.context_length = Some(8192);
+    model.tensor_group_bytes.attention_bytes = 28_200_960;
+    model.tensor_group_bytes.feed_forward_bytes = 84_602_880;
+    model.tensor_group_bytes.embedding_bytes = 30_081_024;
+    model.tensor_group_bytes.embedding_type_bytes = TensorTypeBytes {
+        q8_0_bytes: 30_081_024,
+        ..TensorTypeBytes::default()
+    };
+    model.tensor_group_bytes.output_bytes = 0;
+    model.tensor_matmul.attention.bytes = 28_200_960;
+    model.tensor_matmul.attention.type_bytes = TensorTypeBytes {
+        q8_0_bytes: 28_200_960,
+        ..TensorTypeBytes::default()
+    };
+    model.tensor_matmul.feed_forward.bytes = 84_602_880;
+    model.tensor_matmul.feed_forward.type_bytes = TensorTypeBytes {
+        q8_0_bytes: 84_602_880,
+        ..TensorTypeBytes::default()
+    };
+    model.tensor_matmul.output = TensorMatmulGroupProfile::default();
+
+    let rec = score_model(&hardware, &model, &config);
+    let groups = &rec
+        .decode_cost_breakdown
+        .as_ref()
+        .expect("decode breakdown")
+        .groups;
+    let full_token = groups
+        .iter()
+        .find(|group| group.group == "full_token_graph")
+        .expect("full-token group");
+
+    assert_eq!(
+        full_token.probe_name.as_deref(),
+        Some(
+            "ggml_decode_q8_0_full_token_source_sampled_l30_gqa_576_kv192_1536_vocab49152_ctx4096_h64_qh9_kvh3"
+        )
+    );
+    assert_eq!(full_token.source, "probe_full_token_source_sampled_elapsed");
+    assert!(
+        full_token.bandwidth_ms >= 4.55,
+        "source-sampled probe is a source-visible superset of handoff plus \
+         pre-submit source input work, so scoring must not use an impossible \
+         faster source-sampled median: {full_token:#?}"
+    );
+    assert!(
+        groups
+            .iter()
+            .all(|group| group.group != "decode_submission"),
+        "source-sampled full-token probe already includes the source submission boundary: {groups:#?}"
+    );
+    assert_eq!(rec.estimate_confidence, EstimateConfidence::Low);
+    assert!(
+        rec.warnings
+            .iter()
+            .any(|warning| warning.contains("source-sampled synthetic full-token GGML graph")),
+        "warnings={:#?}",
+        rec.warnings
+    );
+}
+
+#[test]
+fn dense_full_token_probe_uses_attention_runtime_delta_for_nearby_context() {
+    let mut hardware = m1_ultra();
+    hardware.accelerators[0].decode_fixed_overhead_ms = Some(0.25);
+    hardware.accelerators[0].decode_kernel_probes = vec![
+        DecodeKernelProbe {
+            name: "ggml_decode_q4_k_full_token_l32_gqa_4096_kv1024_16384_vocab32000_ctx4096_h128_qh32_kvh8".into(),
+            tensor_type: "q4_k".into(),
+            rows: 32_000,
+            cols: 4096,
+            batch_tokens: 1,
+            graph_features: 0,
+            graph_node_count: None,
+            effective_gbps: 200.0,
+            tflops: Some(1.0),
+            elapsed_ms: Some(4.25),
+            min_elapsed_ms: Some(4.0),
+            max_elapsed_ms: Some(4.5),
+            spread_pct: Some(12.5),
+            graph_inventory: Vec::new(),
+            runs: 3,
+        },
+        DecodeKernelProbe {
+            name: "ggml_decode_flash_attn_ext_l32_h128_qh32_kvh8_ctx4096".into(),
+            tensor_type: "runtime".into(),
+            rows: 4096,
+            cols: 1,
+            batch_tokens: 1,
+            graph_features: 0,
+            graph_node_count: None,
+            effective_gbps: 100.0,
+            tflops: Some(0.1),
+            elapsed_ms: Some(1.25),
+            min_elapsed_ms: None,
+            max_elapsed_ms: None,
+            spread_pct: None,
+            graph_inventory: Vec::new(),
+            runs: 3,
+        },
+    ];
+
+    let mut config = SelectionConfig {
+        workload: WorkloadProfile::chat(),
+        ..SelectionConfig::default()
+    };
+    config.workload.interaction.expected_prompt_tokens = Some(4256);
+    config.weights = config.workload.default_weights();
+    let mut model = dense_model("context-adjusted-full-token-q4", 8 * GIB, 32, 4096, 32_768);
+    model.value_length = model.key_length;
+
+    let rec = score_model(&hardware, &model, &config);
+    let groups = &rec
+        .decode_cost_breakdown
+        .as_ref()
+        .expect("decode breakdown")
+        .groups;
+    let full_token = groups
+        .iter()
+        .find(|group| group.group == "full_token_graph")
+        .expect("full-token group");
+
+    assert_eq!(
+        full_token.source,
+        "probe_full_token_elapsed_context_adjusted"
+    );
+    assert_eq!(full_token.probe_spread_pct, Some(12.5));
+    assert!(
+        full_token.probe_shape_distance.unwrap_or_default() > 0.0,
+        "group={full_token:#?}"
+    );
+    assert!(
+        groups.iter().all(|group| {
+            !matches!(
+                group.group.as_str(),
+                "transformer_block" | "output_matmul" | "kv_and_activation" | "logits_readback"
+            )
+        }),
+        "groups={groups:#?}"
+    );
+}
+
+#[test]
+fn dense_full_token_probe_is_rejected_when_context_shape_is_far() {
+    let mut hardware = m1_ultra();
+    hardware.accelerators[0].decode_fixed_overhead_ms = Some(0.25);
+    hardware.accelerators[0].decode_kernel_probes = vec![
+        DecodeKernelProbe {
+            name: "ggml_decode_q4_k_full_token_l32_gqa_4096_kv1024_16384_vocab32000_ctx8192_h128_qh32_kvh8".into(),
+            tensor_type: "q4_k".into(),
+            rows: 32_000,
+            cols: 4096,
+            batch_tokens: 1,
+            graph_features: 0,
+            graph_node_count: None,
+            effective_gbps: 200.0,
+            tflops: Some(1.0),
+            elapsed_ms: Some(12.0),
+            min_elapsed_ms: Some(11.5),
+            max_elapsed_ms: Some(12.5),
+            spread_pct: Some(8.0),
+            graph_inventory: Vec::new(),
+            runs: 3,
+        },
+        DecodeKernelProbe {
+            name: "ggml_decode_q4_k_llama_graph_ffn".into(),
+            tensor_type: "q4_k".into(),
+            rows: 16_384,
+            cols: 4096,
+            batch_tokens: 1,
+            graph_features: 0,
+            graph_node_count: None,
+            effective_gbps: 120.0,
+            tflops: Some(0.5),
+            elapsed_ms: None,
+            min_elapsed_ms: None,
+            max_elapsed_ms: None,
+            spread_pct: None,
+            graph_inventory: Vec::new(),
+            runs: 20,
+        },
+    ];
+
+    let mut config = SelectionConfig {
+        workload: WorkloadProfile::chat(),
+        ..SelectionConfig::default()
+    };
+    config.workload.interaction.expected_prompt_tokens = Some(149);
+    config.weights = config.workload.default_weights();
+    let mut model = dense_model("far-context-full-token-q4", 8 * GIB, 32, 4096, 32_768);
+    model.value_length = model.key_length;
+
+    let rec = score_model(&hardware, &model, &config);
+    let groups = &rec
+        .decode_cost_breakdown
+        .as_ref()
+        .expect("decode breakdown")
+        .groups;
+
+    assert!(
+        groups.iter().all(|group| group.group != "full_token_graph"),
+        "far-context full-token probe must not be used as a short-context decode estimate: {groups:#?}"
+    );
+    assert!(
+        groups
+            .iter()
+            .any(|group| group.group == "attention_matmul" && group.source == "probe")
+            && groups
+                .iter()
+                .any(|group| group.group == "feed_forward_matmul" && group.source == "probe"),
+        "representative decomposed matmul probes should be used instead: {groups:#?}"
+    );
+}
+
+#[test]
+fn dense_full_token_probe_charges_mixed_block_residual_types_separately() {
+    let mut hardware = m1_ultra();
+    hardware.accelerators[0].decode_fixed_overhead_ms = Some(0.25);
+    hardware.accelerators[0].decode_kernel_probes = vec![
+        DecodeKernelProbe {
+            name: "ggml_decode_q4_k_full_token_outq6_k_l32_gqa_4096_kv1024_16384_vocab32000_ctx4096_h128_qh32_kvh8".into(),
+            tensor_type: "q4_k".into(),
+            rows: 32_000,
+            cols: 4096,
+            batch_tokens: 1,
+            graph_features: 0,
+            graph_node_count: None,
+            effective_gbps: 200.0,
+            tflops: Some(1.0),
+            elapsed_ms: Some(4.25),
+            min_elapsed_ms: None,
+            max_elapsed_ms: None,
+            spread_pct: None,
+            graph_inventory: Vec::new(),
+            runs: 3,
+        },
+        DecodeKernelProbe {
+            name: "ggml_decode_logits_sync_vocab32000".into(),
+            tensor_type: "f32".into(),
+            rows: 32_000,
+            cols: 1,
+            batch_tokens: 1,
+            graph_features: 0,
+            graph_node_count: None,
+            effective_gbps: 1.0,
+            tflops: None,
+            elapsed_ms: Some(0.5),
+            min_elapsed_ms: None,
+            max_elapsed_ms: None,
+            spread_pct: None,
+            graph_inventory: Vec::new(),
+            runs: 3,
+        },
+    ];
+
+    let mut config = SelectionConfig {
+        workload: WorkloadProfile::chat(),
+        ..SelectionConfig::default()
+    };
+    config.workload.interaction.expected_prompt_tokens = Some(4096);
+    config.weights = config.workload.default_weights();
+    let mut model = dense_model("mixed-full-token-q4", 8 * GIB, 32, 4096, 32_768);
+    model.value_length = model.key_length;
+    let residual_bytes = model.tensor_matmul.feed_forward.type_bytes.q4_k_bytes / 5;
+    model.tensor_matmul.feed_forward.type_bytes.q4_k_bytes -= residual_bytes;
+    model.tensor_matmul.feed_forward.type_bytes.q6_k_bytes = residual_bytes;
+    model.tensor_matmul.output.type_bytes.q6_k_bytes =
+        model.tensor_matmul.output.type_bytes.q4_k_bytes;
+    model.tensor_matmul.output.type_bytes.q4_k_bytes = 0;
+
+    let rec = score_model(&hardware, &model, &config);
+    let groups = &rec
+        .decode_cost_breakdown
+        .as_ref()
+        .expect("decode breakdown")
+        .groups;
+
+    assert!(
+        groups.iter().any(|group| {
+            group.group == "full_token_graph"
+                && group.source == "probe_full_token_elapsed"
+                && group.tensor_type == "q4_k"
+        }),
+        "groups={groups:#?}"
+    );
+    assert!(
+        groups.iter().any(|group| {
+            group.group == "feed_forward_matmul"
+                && group.tensor_type == "q6_k"
+                && group.traffic_bytes > 0
+        }),
+        "groups={groups:#?}"
+    );
+    assert!(
+        groups.iter().all(|group| {
+            !matches!(
+                group.group.as_str(),
+                "output_matmul" | "kv_and_activation" | "logits_readback"
+            )
+        }),
+        "groups={groups:#?}"
     );
 }
 
@@ -1153,9 +2388,14 @@ fn recurrent_attention_requires_linear_attention_graph_probe() {
         graph_features: mesh_llm_gpu_bench::GRAPH_FEATURE_ATTENTION_Q_NORM
             | mesh_llm_gpu_bench::GRAPH_FEATURE_ATTENTION_K_NORM
             | mesh_llm_gpu_bench::GRAPH_FEATURE_ATTENTION_POST_NORM,
+        graph_node_count: None,
         effective_gbps: 220.0,
         tflops: Some(0.4),
         elapsed_ms: Some(6.0),
+        min_elapsed_ms: None,
+        max_elapsed_ms: None,
+        spread_pct: None,
+        graph_inventory: Vec::new(),
         runs: 3,
     }];
     let mut config = SelectionConfig {
@@ -1225,9 +2465,14 @@ fn recurrent_attention_requires_linear_attention_graph_probe() {
             graph_features: mesh_llm_gpu_bench::GRAPH_FEATURE_ATTENTION_Q_NORM
                 | mesh_llm_gpu_bench::GRAPH_FEATURE_ATTENTION_K_NORM
                 | mesh_llm_gpu_bench::GRAPH_FEATURE_ATTENTION_POST_NORM,
+            graph_node_count: None,
             effective_gbps: 180.0,
             tflops: Some(0.35),
             elapsed_ms: Some(9.0),
+            min_elapsed_ms: None,
+            max_elapsed_ms: None,
+            spread_pct: None,
+            graph_inventory: Vec::new(),
             runs: 3,
         });
 
@@ -1266,9 +2511,14 @@ fn dense_decode_uses_measured_block_graph_depth_curve() {
         cols: 4096,
         batch_tokens: 1,
         graph_features: 0,
+        graph_node_count: None,
         effective_gbps: 140.0,
         tflops: Some(0.7),
         elapsed_ms: None,
+        min_elapsed_ms: None,
+        max_elapsed_ms: None,
+        spread_pct: None,
+        graph_inventory: Vec::new(),
         runs: 3,
     }];
 
@@ -1289,9 +2539,14 @@ fn dense_decode_uses_measured_block_graph_depth_curve() {
             cols: 4096,
             batch_tokens: 1,
             graph_features: 0,
+            graph_node_count: None,
             effective_gbps: 100.0,
             tflops: Some(0.5),
             elapsed_ms: None,
+            min_elapsed_ms: None,
+            max_elapsed_ms: None,
+            spread_pct: None,
+            graph_inventory: Vec::new(),
             runs: 3,
         });
     let depth_curve = score_model(&hardware, &model, &config);
@@ -1323,9 +2578,14 @@ fn exact_dense_decode_elapsed_uses_measured_depth_slope() {
             cols: 3072,
             batch_tokens: 1,
             graph_features: 0,
+            graph_node_count: None,
             effective_gbps: 100.0,
             tflops: Some(0.5),
             elapsed_ms: Some(2.25),
+            min_elapsed_ms: None,
+            max_elapsed_ms: None,
+            spread_pct: None,
+            graph_inventory: Vec::new(),
             runs: 3,
         },
         DecodeKernelProbe {
@@ -1335,9 +2595,14 @@ fn exact_dense_decode_elapsed_uses_measured_depth_slope() {
             cols: 3072,
             batch_tokens: 1,
             graph_features: 0,
+            graph_node_count: None,
             effective_gbps: 154.0,
             tflops: Some(0.7),
             elapsed_ms: Some(3.0),
+            min_elapsed_ms: None,
+            max_elapsed_ms: None,
+            spread_pct: None,
+            graph_inventory: Vec::new(),
             runs: 3,
         },
     ];
@@ -1368,6 +2633,175 @@ fn exact_dense_decode_elapsed_uses_measured_depth_slope() {
 }
 
 #[test]
+fn repeated_q8_dense_graph_probes_score_block_but_keep_low_confidence() {
+    let mut hardware = m1_ultra();
+    hardware.accelerators[0].decode_fixed_overhead_ms = Some(0.25);
+    hardware.accelerators[0].decode_kernel_probes = vec![
+        DecodeKernelProbe {
+            name: "ggml_decode_q8_0_llama_graph_2304_576".into(),
+            tensor_type: "q8_0".into(),
+            rows: 2304,
+            cols: 576,
+            batch_tokens: 1,
+            graph_features: 0,
+            graph_node_count: None,
+            effective_gbps: 12.0,
+            tflops: Some(0.1),
+            elapsed_ms: Some(10.25),
+            min_elapsed_ms: None,
+            max_elapsed_ms: None,
+            spread_pct: None,
+            graph_inventory: Vec::new(),
+            runs: 3,
+        },
+        DecodeKernelProbe {
+            name: "ggml_decode_q8_0_llama_graph_l30_2304_576".into(),
+            tensor_type: "q8_0".into(),
+            rows: 2304,
+            cols: 576,
+            batch_tokens: 1,
+            graph_features: 0,
+            graph_node_count: None,
+            effective_gbps: 120.0,
+            tflops: Some(0.5),
+            elapsed_ms: Some(1.25),
+            min_elapsed_ms: None,
+            max_elapsed_ms: None,
+            spread_pct: None,
+            graph_inventory: Vec::new(),
+            runs: 3,
+        },
+    ];
+
+    let mut config = SelectionConfig {
+        workload: WorkloadProfile::chat(),
+        ..SelectionConfig::default()
+    };
+    config.weights = config.workload.default_weights();
+    let mut model = dense_model("narrow-q8", 512 * 1024 * 1024, 30, 576, 8192);
+    retag_dense_model_as_q8(&mut model);
+
+    let rec = score_model(&hardware, &model, &config);
+    assert_eq!(rec.estimate_confidence, EstimateConfidence::Low);
+    assert!(
+        rec.warnings
+            .iter()
+            .any(|warning| warning.contains("Q8 dense block graph without a full-token/logits"))
+    );
+    assert!(
+        rec.warnings
+            .iter()
+            .all(|warning| !warning.contains("tok/s confidence is medium"))
+    );
+    let block = rec
+        .decode_cost_breakdown
+        .as_ref()
+        .expect("decode breakdown")
+        .groups
+        .iter()
+        .find(|group| group.group == "transformer_block")
+        .expect("transformer block group");
+
+    assert_eq!(
+        block.probe_name.as_deref(),
+        Some("ggml_decode_q8_0_llama_graph_l30_2304_576")
+    );
+    assert_eq!(block.source, "probe_block_elapsed");
+}
+
+#[test]
+fn sampled_token_probe_stays_diagnostic_until_real_llama_sample_path_is_proven() {
+    let mut hardware = m1_ultra();
+    hardware.accelerators[0].decode_fixed_overhead_ms = Some(0.25);
+    hardware.accelerators[0].decode_kernel_probes = vec![
+        DecodeKernelProbe {
+            name: "ggml_decode_q8_0_llama_graph_2304_576".into(),
+            tensor_type: "q8_0".into(),
+            rows: 2304,
+            cols: 576,
+            batch_tokens: 1,
+            graph_features: 0,
+            graph_node_count: None,
+            effective_gbps: 12.0,
+            tflops: Some(0.1),
+            elapsed_ms: Some(10.25),
+            min_elapsed_ms: None,
+            max_elapsed_ms: None,
+            spread_pct: None,
+            graph_inventory: Vec::new(),
+            runs: 3,
+        },
+        DecodeKernelProbe {
+            name: "ggml_decode_q8_0_sampled_token_l30_576_2304_vocab32000".into(),
+            tensor_type: "q8_0".into(),
+            rows: 32_000,
+            cols: 576,
+            batch_tokens: 1,
+            graph_features: 0,
+            graph_node_count: None,
+            effective_gbps: 20.0,
+            tflops: Some(0.1),
+            elapsed_ms: Some(6.25),
+            min_elapsed_ms: None,
+            max_elapsed_ms: None,
+            spread_pct: None,
+            graph_inventory: Vec::new(),
+            runs: 3,
+        },
+        DecodeKernelProbe {
+            name: "ggml_decode_logits_readback_vocab32000".into(),
+            tensor_type: "f32".into(),
+            rows: 32_000,
+            cols: 1,
+            batch_tokens: 1,
+            graph_features: 0,
+            graph_node_count: None,
+            effective_gbps: 0.5,
+            tflops: None,
+            elapsed_ms: Some(0.25),
+            min_elapsed_ms: None,
+            max_elapsed_ms: None,
+            spread_pct: None,
+            graph_inventory: Vec::new(),
+            runs: 3,
+        },
+    ];
+
+    let mut config = SelectionConfig {
+        workload: WorkloadProfile::chat(),
+        ..SelectionConfig::default()
+    };
+    config.weights = config.workload.default_weights();
+    let mut model = dense_model("sampled-q8", 512 * 1024 * 1024, 30, 576, 8192);
+    retag_dense_model_as_q8(&mut model);
+
+    let rec = score_model(&hardware, &model, &config);
+    let breakdown = rec
+        .decode_cost_breakdown
+        .as_ref()
+        .expect("decode breakdown");
+
+    assert!(
+        breakdown
+            .groups
+            .iter()
+            .all(|group| group.group != "sampled_token_graph"),
+        "synthetic sampled-token probes are collected by validation, but do not drive scoring"
+    );
+    assert!(breakdown.groups.iter().any(|group| {
+        group.group == "transformer_block"
+            && group.source == "probe_block_elapsed"
+            && group.probe_name.as_deref() == Some("ggml_decode_q8_0_llama_graph_2304_576")
+    }));
+    assert!(
+        breakdown
+            .groups
+            .iter()
+            .any(|group| group.group == "logits_readback")
+    );
+}
+
+#[test]
 fn deep_dense_elapsed_extrapolation_uses_measured_envelope() {
     let mut hardware = m1_ultra();
     hardware.accelerators[0].decode_fixed_overhead_ms = Some(0.25);
@@ -1379,9 +2813,14 @@ fn deep_dense_elapsed_extrapolation_uses_measured_envelope() {
             cols: 3072,
             batch_tokens: 1,
             graph_features: 0,
+            graph_node_count: None,
             effective_gbps: 100.0,
             tflops: Some(0.5),
             elapsed_ms: Some(3.25),
+            min_elapsed_ms: None,
+            max_elapsed_ms: None,
+            spread_pct: None,
+            graph_inventory: Vec::new(),
             runs: 3,
         },
         DecodeKernelProbe {
@@ -1391,9 +2830,14 @@ fn deep_dense_elapsed_extrapolation_uses_measured_envelope() {
             cols: 3072,
             batch_tokens: 1,
             graph_features: 0,
+            graph_node_count: None,
             effective_gbps: 154.0,
             tflops: Some(0.7),
             elapsed_ms: Some(6.25),
+            min_elapsed_ms: None,
+            max_elapsed_ms: None,
+            spread_pct: None,
+            graph_inventory: Vec::new(),
             runs: 3,
         },
         DecodeKernelProbe {
@@ -1403,9 +2847,14 @@ fn deep_dense_elapsed_extrapolation_uses_measured_envelope() {
             cols: 3072,
             batch_tokens: 1,
             graph_features: 0,
+            graph_node_count: None,
             effective_gbps: 220.0,
             tflops: Some(1.0),
             elapsed_ms: Some(8.25),
+            min_elapsed_ms: None,
+            max_elapsed_ms: None,
+            spread_pct: None,
+            graph_inventory: Vec::new(),
             runs: 3,
         },
     ];
@@ -1447,9 +2896,14 @@ fn exact_dense_block_graph_covers_mixed_residual_tensor_types() {
             cols: 3072,
             batch_tokens: 1,
             graph_features: 0,
+            graph_node_count: None,
             effective_gbps: 100.0,
             tflops: Some(0.5),
             elapsed_ms: Some(2.25),
+            min_elapsed_ms: None,
+            max_elapsed_ms: None,
+            spread_pct: None,
+            graph_inventory: Vec::new(),
             runs: 3,
         },
         DecodeKernelProbe {
@@ -1459,9 +2913,14 @@ fn exact_dense_block_graph_covers_mixed_residual_tensor_types() {
             cols: 3072,
             batch_tokens: 1,
             graph_features: 0,
+            graph_node_count: None,
             effective_gbps: 154.0,
             tflops: Some(0.7),
             elapsed_ms: Some(3.0),
+            min_elapsed_ms: None,
+            max_elapsed_ms: None,
+            spread_pct: None,
+            graph_inventory: Vec::new(),
             runs: 3,
         },
     ];
@@ -1506,7 +2965,7 @@ fn exact_dense_block_graph_covers_mixed_residual_tensor_types() {
 }
 
 #[test]
-fn sparse_moe_requires_composite_routed_expert_decode_probe_for_medium_confidence() {
+fn sparse_moe_routed_expert_probe_stays_low_confidence_when_runtime_falls_back() {
     let mut hardware = m1_ultra();
     hardware.accelerators[0].decode_effective_bandwidth_bytes_per_sec = Some(400_000_000_000);
     hardware.accelerators[0].decode_kernel_probes = vec![DecodeKernelProbe {
@@ -1516,9 +2975,14 @@ fn sparse_moe_requires_composite_routed_expert_decode_probe_for_medium_confidenc
         cols: 2048,
         batch_tokens: 1,
         graph_features: 0,
+        graph_node_count: None,
         effective_gbps: 80.0,
         tflops: Some(0.4),
         elapsed_ms: None,
+        min_elapsed_ms: None,
+        max_elapsed_ms: None,
+        spread_pct: None,
+        graph_inventory: Vec::new(),
         runs: 20,
     }];
 
@@ -1550,9 +3014,14 @@ fn sparse_moe_requires_composite_routed_expert_decode_probe_for_medium_confidenc
             cols: 2048,
             batch_tokens: 1,
             graph_features: 0,
+            graph_node_count: None,
             effective_gbps: 120.0,
             tflops: Some(0.8),
             elapsed_ms: None,
+            min_elapsed_ms: None,
+            max_elapsed_ms: None,
+            spread_pct: None,
+            graph_inventory: Vec::new(),
             runs: 20,
         });
 
@@ -1568,22 +3037,27 @@ fn sparse_moe_requires_composite_routed_expert_decode_probe_for_medium_confidenc
             cols: 2048,
             batch_tokens: 1,
             graph_features: 0,
+            graph_node_count: None,
             effective_gbps: 120.0,
             tflops: Some(0.8),
             elapsed_ms: None,
+            min_elapsed_ms: None,
+            max_elapsed_ms: None,
+            spread_pct: None,
+            graph_inventory: Vec::new(),
             runs: 20,
         });
 
     let routed_probe_rec = score_model(&hardware, &model, &config);
     assert_eq!(
         routed_probe_rec.estimate_confidence,
-        EstimateConfidence::Medium
+        EstimateConfidence::Low
     );
     assert!(
         routed_probe_rec
             .warnings
             .iter()
-            .any(|warning| warning.contains("metadata-only estimates are not yet validated"))
+            .any(|warning| warning.contains("unmeasured KV/activation runtime fallback"))
     );
     assert!(
         routed_probe_rec
@@ -1604,9 +3078,14 @@ fn sparse_moe_decode_uses_measured_moe_graph_depth_curve() {
         cols: 2048,
         batch_tokens: 1,
         graph_features: 0,
+        graph_node_count: None,
         effective_gbps: 80.0,
         tflops: Some(0.4),
         elapsed_ms: None,
+        min_elapsed_ms: None,
+        max_elapsed_ms: None,
+        spread_pct: None,
+        graph_inventory: Vec::new(),
         runs: 3,
     }];
 
@@ -1627,9 +3106,14 @@ fn sparse_moe_decode_uses_measured_moe_graph_depth_curve() {
             cols: 2048,
             batch_tokens: 1,
             graph_features: 0,
+            graph_node_count: None,
             effective_gbps: 200.0,
             tflops: Some(1.2),
             elapsed_ms: None,
+            min_elapsed_ms: None,
+            max_elapsed_ms: None,
+            spread_pct: None,
+            graph_inventory: Vec::new(),
             runs: 3,
         });
     hardware.accelerators[0]
@@ -1641,9 +3125,14 @@ fn sparse_moe_decode_uses_measured_moe_graph_depth_curve() {
             cols: 2048,
             batch_tokens: 1,
             graph_features: 0,
+            graph_node_count: None,
             effective_gbps: 120.0,
             tflops: Some(0.7),
             elapsed_ms: None,
+            min_elapsed_ms: None,
+            max_elapsed_ms: None,
+            spread_pct: None,
+            graph_inventory: Vec::new(),
             runs: 3,
         });
     hardware.accelerators[0]
@@ -1655,9 +3144,14 @@ fn sparse_moe_decode_uses_measured_moe_graph_depth_curve() {
             cols: 2048,
             batch_tokens: 1,
             graph_features: 0,
+            graph_node_count: None,
             effective_gbps: 150.0,
             tflops: Some(0.9),
             elapsed_ms: None,
+            min_elapsed_ms: None,
+            max_elapsed_ms: None,
+            spread_pct: None,
+            graph_inventory: Vec::new(),
             runs: 3,
         });
     let depth_curve = score_model(&hardware, &model, &config);
@@ -1680,6 +3174,98 @@ fn sparse_moe_decode_uses_measured_moe_graph_depth_curve() {
                         .probe_name
                         .as_deref()
                         .is_some_and(|name| name.contains("_l8_"))
+            })
+    );
+}
+
+#[test]
+fn sparse_moe_block_probe_treats_missing_topology_as_confidence_risk() {
+    let mut model = qwen3_30b_a3b_q4_moe();
+    model.layer_count = Some(16);
+    model.ffn_size = Some(768);
+    model.kv_heads = None;
+    model.key_length = None;
+    model.value_length = None;
+
+    let mut config = SelectionConfig {
+        workload: WorkloadProfile::chat(),
+        ..SelectionConfig::default()
+    };
+    config.weights = config.workload.default_weights();
+
+    let mut thin_hardware = m1_ultra();
+    thin_hardware.accelerators[0].decode_fixed_overhead_ms = Some(0.25);
+    thin_hardware.accelerators[0].decode_kernel_probes = vec![DecodeKernelProbe {
+        name: "ggml_decode_moe_block_graph_l8_q4_k_64x8_768x2048".into(),
+        tensor_type: "q4_k".into(),
+        rows: 768,
+        cols: 2048,
+        batch_tokens: 1,
+        graph_features: 0,
+        graph_node_count: Some(280),
+        effective_gbps: 120.0,
+        tflops: Some(0.8),
+        elapsed_ms: Some(5.0),
+        min_elapsed_ms: Some(4.9),
+        max_elapsed_ms: Some(5.1),
+        spread_pct: Some(4.0),
+        graph_inventory: Vec::new(),
+        runs: 3,
+    }];
+
+    let thin = score_model(&thin_hardware, &model, &config);
+    assert!(
+        thin.decode_cost_breakdown
+            .as_ref()
+            .expect("decode cost breakdown")
+            .groups
+            .iter()
+            .any(|group| {
+                group.group == "sparse_transformer_block"
+                    && group.source.starts_with("probe_sparse_block")
+                    && !group.source.ends_with("_node_adjusted")
+            })
+    );
+    assert_eq!(thin.estimate_confidence, EstimateConfidence::Low);
+    assert!(thin.warnings.iter().any(|warning| warning.contains(
+        "graph-node count is treated as confidence evidence, not as a fitted timing multiplier"
+    )));
+
+    let mut submission_hardware = thin_hardware.clone();
+    submission_hardware.accelerators[0]
+        .decode_kernel_probes
+        .push(DecodeKernelProbe {
+            name: "ggml_decode_moe_block_submission_l16_q4_k_128x8_768x2048_ctx4096".into(),
+            tensor_type: "q4_k".into(),
+            rows: 2048,
+            cols: 2048,
+            batch_tokens: 1,
+            graph_features: 0,
+            graph_node_count: Some(620),
+            effective_gbps: 0.02,
+            tflops: Some(0.0),
+            elapsed_ms: Some(0.75),
+            min_elapsed_ms: Some(0.74),
+            max_elapsed_ms: Some(0.76),
+            spread_pct: Some(2.0),
+            graph_inventory: Vec::new(),
+            runs: 3,
+        });
+    let with_submission = score_model(&submission_hardware, &model, &config);
+    assert!(
+        with_submission.estimated_decode_tokens_per_sec.unwrap()
+            < thin.estimated_decode_tokens_per_sec.unwrap()
+    );
+    assert!(
+        with_submission
+            .decode_cost_breakdown
+            .as_ref()
+            .expect("decode cost breakdown")
+            .groups
+            .iter()
+            .any(|group| {
+                group.group == "moe_decode_submission"
+                    && group.source == "probe_moe_decode_submission_elapsed_minus_fixed"
             })
     );
 }

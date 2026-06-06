@@ -1,0 +1,115 @@
+From c388abae9faa71d5ba027dd81e5d6d23633664d3 Mon Sep 17 00:00:00 2001
+From: Mesh-LLM CI <ci@mesh-llm.local>
+Date: Sun, 7 Jun 2026 06:48:59 +1000
+Subject: [PATCH 84/84] Expose skippy decode logits readiness timings
+
+---
+ include/skippy.h        |  2 ++
+ include/skippy/common.h |  2 +-
+ src/skippy.cpp          | 30 ++++++++++++++++++++++++++++--
+ 3 files changed, 31 insertions(+), 3 deletions(-)
+
+diff --git a/include/skippy.h b/include/skippy.h
+index 5ca162d5..fd847b1c 100644
+--- a/include/skippy.h
++++ b/include/skippy.h
+@@ -162,6 +162,8 @@ struct skippy_decode_benchmark_result {
+     double decode_call_tokens_per_second;
+     double sampling_ms;
+     double sampling_tokens_per_second;
++    double logits_ready_ms;
++    double logits_scan_ms;
+     uint32_t graph_node_count;
+     uint32_t graph_inventory_bucket_count;
+     uint32_t graph_inventory_bucket_overflow_count;
+diff --git a/include/skippy/common.h b/include/skippy/common.h
+index 6e0dfb5b..c2838087 100644
+--- a/include/skippy/common.h
++++ b/include/skippy/common.h
+@@ -26,7 +26,7 @@ extern "C" {
+ 
+ #define SKIPPY_ABI_VERSION_MAJOR 0
+ #define SKIPPY_ABI_VERSION_MINOR 1
+-#define SKIPPY_ABI_VERSION_PATCH 27
++#define SKIPPY_ABI_VERSION_PATCH 28
+ 
+ enum skippy_feature {
+     SKIPPY_FEATURE_RUNTIME_SLICE          = 1 << 0,
+diff --git a/src/skippy.cpp b/src/skippy.cpp
+index c6cc893d..800edb06 100644
+--- a/src/skippy.cpp
++++ b/src/skippy.cpp
+@@ -1250,10 +1250,15 @@ static enum skippy_status skippy_verify_token_batch(
+     return status;
+ }
+ 
+-static llama_token skippy_greedy_sample(skippy_session * session) {
++static llama_token skippy_greedy_sample_timed(
++        skippy_session * session,
++        double * logits_ready_elapsed_ms,
++        double * logits_scan_elapsed_ms) {
+     const llama_vocab * vocab = llama_model_get_vocab(session->stage_model->model);
+     const int32_t n_vocab = llama_vocab_n_tokens(vocab);
++    const auto ready_started = std::chrono::steady_clock::now();
+     const float * logits = llama_get_logits_ith(session->ctx, -1);
++    const auto scan_started = std::chrono::steady_clock::now();
+ 
+     llama_token best = 0;
+     float best_logit = -std::numeric_limits<float>::infinity();
+@@ -1264,9 +1269,23 @@ static llama_token skippy_greedy_sample(skippy_session * session) {
+         }
+     }
+ 
++    const auto scan_finished = std::chrono::steady_clock::now();
++    if (logits_ready_elapsed_ms != nullptr) {
++        *logits_ready_elapsed_ms += std::chrono::duration<double, std::milli>(
++                scan_started - ready_started).count();
++    }
++    if (logits_scan_elapsed_ms != nullptr) {
++        *logits_scan_elapsed_ms += std::chrono::duration<double, std::milli>(
++                scan_finished - scan_started).count();
++    }
++
+     return best;
+ }
+ 
++static llama_token skippy_greedy_sample(skippy_session * session) {
++    return skippy_greedy_sample_timed(session, nullptr, nullptr);
++}
++
+ static llama_token skippy_greedy_sample_ith(skippy_session * session, int32_t index) {
+     const llama_vocab * vocab = llama_model_get_vocab(session->stage_model->model);
+     const int32_t n_vocab = llama_vocab_n_tokens(vocab);
+@@ -2771,6 +2790,8 @@ enum skippy_status skippy_session_benchmark_decode(
+     llama_perf_context_reset(session->ctx);
+     double decode_call_elapsed_ms = 0.0;
+     double sampling_elapsed_ms = 0.0;
++    double logits_ready_elapsed_ms = 0.0;
++    double logits_scan_elapsed_ms = 0.0;
+     const auto started = std::chrono::steady_clock::now();
+     for (uint32_t i = 0; i < measured_tokens; ++i) {
+         const auto decode_started = std::chrono::steady_clock::now();
+@@ -2781,7 +2802,10 @@ enum skippy_status skippy_session_benchmark_decode(
+             return status;
+         }
+         const auto sampling_started = std::chrono::steady_clock::now();
+-        token = skippy_greedy_sample(session);
++        token = skippy_greedy_sample_timed(
++                session,
++                &logits_ready_elapsed_ms,
++                &logits_scan_elapsed_ms);
+         sampling_elapsed_ms += std::chrono::duration<double, std::milli>(
+                 std::chrono::steady_clock::now() - sampling_started).count();
+     }
+@@ -2811,6 +2835,8 @@ enum skippy_status skippy_session_benchmark_decode(
+     out_result->decode_call_tokens_per_second = decode_call_tokens_per_second;
+     out_result->sampling_ms = sampling_elapsed_ms;
+     out_result->sampling_tokens_per_second = sampling_tokens_per_second;
++    out_result->logits_ready_ms = logits_ready_elapsed_ms;
++    out_result->logits_scan_ms = logits_scan_elapsed_ms;
+     skippy_graph_inventory_collect(session->ctx, out_result);
+     return skippy_success(out_error);
+ }
+-- 
+2.50.1 (Apple Git-155)
+

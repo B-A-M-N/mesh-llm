@@ -602,6 +602,15 @@ pub struct ModelRecommendation {
     pub estimated_runtime_memory_bytes: u64,
     pub estimated_kv_cache_bytes: u64,
     pub estimated_active_decode_bytes_per_token: Option<u64>,
+    /// Context length charged by `estimated_decode_tokens_per_sec`.
+    ///
+    /// Decode tok/s is not context-free: one-token decode still reads KV rows
+    /// and runs attention/runtime work over the active sequence. This field
+    /// records the prompt/context token count used for the estimate so callers
+    /// can distinguish a workload-shaped chat/agent estimate from a short
+    /// benchmark steady-decode estimate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated_decode_context_tokens: Option<u32>,
     pub estimated_decode_tokens_per_sec: Option<f32>,
     pub estimated_decode_tokens_per_sec_range: Option<DecodeEstimateRange>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -620,6 +629,9 @@ pub struct ModelRecommendation {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DecodeCostBreakdown {
+    /// Context length used for KV/runtime pressure in this decode cost.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_tokens: Option<u32>,
     pub bandwidth_ms: f32,
     pub compute_ms: f32,
     pub fixed_overhead_ms: f32,
@@ -652,6 +664,12 @@ pub struct DecodeCostGroupBreakdown {
     pub probe_cols: Option<u32>,
     pub probe_batch_tokens: Option<u32>,
     pub probe_effective_gbps: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub probe_min_elapsed_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub probe_max_elapsed_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub probe_spread_pct: Option<f64>,
     pub probe_shape_distance: Option<f64>,
 }
 

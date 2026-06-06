@@ -12,12 +12,16 @@
 #endif
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <iterator>
 #include <limits>
+#include <numeric>
+#include <random>
 #include <sstream>
 #include <string>
 #include <unordered_map>
@@ -29,6 +33,7 @@ constexpr int WARMUP_RUNS = 3;
 constexpr int TIMED_RUNS = 12;
 constexpr int GRAPH_WARMUP_RUNS = 1;
 constexpr int GRAPH_TIMED_RUNS = 3;
+constexpr int SOURCE_BOUNDARY_TIMED_RUNS = 7;
 constexpr int64_t MAX_MODEL_SHAPED_MOE_EXPERTS = 128;
 constexpr int64_t DEEP_LLAMA_GRAPH_LAYERS[] = {4, 8};
 constexpr int GRAPH_FEATURE_ATTENTION_Q_NORM = 1 << 0;
@@ -54,14 +59,31 @@ enum ProbeTensorType {
     PROBE_TENSOR_F16 = 3,
 };
 
+struct GraphInventoryBucket {
+    std::string family;
+    int64_t ggml_op;
+    uint64_t ggml_type;
+    uint64_t node_count;
+    uint64_t element_count;
+    uint64_t output_bytes;
+    uint64_t src0_bytes;
+    uint64_t src1_bytes;
+    std::array<int64_t, 4> ne;
+};
+
 struct ProbeResult {
     std::string name;
     std::string tensor_type;
     int64_t rows;
     int64_t cols;
+    int64_t graph_node_count;
+    std::vector<GraphInventoryBucket> graph_inventory;
     double effective_gbps;
     double tflops;
     double elapsed_ms;
+    double min_elapsed_ms;
+    double max_elapsed_ms;
+    double spread_pct;
     int graph_features;
     int runs;
 };
@@ -70,6 +92,20 @@ struct ProbeShape {
     const char * suffix;
     int64_t rows;
     int64_t cols;
+};
+
+struct SamplerProbeResult {
+    double history_us_per_token;
+    double vocab_us_per_token;
+    int64_t history_tokens;
+    int64_t vocab_tokens;
+    int runs;
+};
+
+struct SourceSamplerCandidate {
+    int32_t id;
+    float logit;
+    float p;
 };
 
 struct ScheduledGraph {
@@ -220,6 +256,581 @@ std::vector<float> deterministic_f32(int64_t count, uint32_t salt) {
     return values;
 }
 
+int64_t graph_node_count(ggml_cgraph * graph) {
+    return graph != nullptr ? static_cast<int64_t>(ggml_graph_n_nodes(graph)) : 0;
+}
+
+bool graph_name_contains(const char * name, const char * needle) {
+    return name != nullptr && needle != nullptr && std::strstr(name, needle) != nullptr;
+}
+
+bool graph_is_attention_weight_name(const char * name) {
+    return graph_name_contains(name, "attn_q") || graph_name_contains(name, "attn_k") ||
+        graph_name_contains(name, "attn_v") || graph_name_contains(name, "attn_output") ||
+        graph_name_contains(name, "attn_qkv") || graph_name_contains(name, "attn_out");
+}
+
+bool graph_is_feed_forward_weight_name(const char * name) {
+    return graph_name_contains(name, "ffn_gate") || graph_name_contains(name, "ffn_up") ||
+        graph_name_contains(name, "ffn_down");
+}
+
+const char * graph_inventory_family(const ggml_tensor * node) {
+    if (node == nullptr) {
+        return "unknown";
+    }
+    const char * name = node->name;
+    const char * src0_name = node->src[0] != nullptr ? node->src[0]->name : nullptr;
+    if (node->op == GGML_OP_MUL_MAT_ID) {
+        return "moe_matmul_id";
+    }
+    if (graph_name_contains(name, "ffn_moe") || graph_name_contains(name, "expert")) {
+        return "moe_runtime";
+    }
+    if (node->op == GGML_OP_MUL_MAT) {
+        if (graph_name_contains(name, "Qcur") || graph_name_contains(name, "Kcur") ||
+            graph_name_contains(name, "Vcur") || graph_name_contains(name, "wqkv") ||
+            graph_name_contains(name, "kqv") || graph_name_contains(name, "attn") ||
+            graph_is_attention_weight_name(src0_name)) {
+            return "attention_matmul";
+        }
+        if (graph_name_contains(name, "ffn_") || graph_is_feed_forward_weight_name(src0_name)) {
+            return "ffn_matmul";
+        }
+        if (graph_name_contains(name, "result_output") || graph_name_contains(name, "output") ||
+            graph_name_contains(name, "logits")) {
+            return "output_matmul";
+        }
+        return "matmul";
+    }
+    if (graph_name_contains(name, "kq") || graph_name_contains(name, "fattn") ||
+        node->op == GGML_OP_FLASH_ATTN_EXT || node->op == GGML_OP_SOFT_MAX) {
+        return "attention_runtime";
+    }
+    if (graph_name_contains(name, "cache") || graph_name_contains(name, "kv") ||
+        graph_name_contains(name, "k_idxs") || graph_name_contains(name, "v_idxs")) {
+        return "kv_cache";
+    }
+    if (graph_name_contains(name, "ffn_")) {
+        return "ffn_runtime";
+    }
+    if (graph_name_contains(name, "norm") || node->op == GGML_OP_RMS_NORM ||
+        node->op == GGML_OP_NORM) {
+        return "normalization";
+    }
+    if (graph_name_contains(name, "result_output") || graph_name_contains(name, "logits")) {
+        return "output_runtime";
+    }
+    return "other";
+}
+
+std::vector<GraphInventoryBucket> collect_graph_inventory(ggml_cgraph * graph) {
+    std::vector<GraphInventoryBucket> buckets;
+    if (graph == nullptr) {
+        return buckets;
+    }
+    for (int i = 0; i < ggml_graph_n_nodes(graph); ++i) {
+        const ggml_tensor * node = ggml_graph_node(graph, i);
+        if (node == nullptr) {
+            continue;
+        }
+        const char * family = graph_inventory_family(node);
+        auto bucket = std::find_if(
+            buckets.begin(),
+            buckets.end(),
+            [&](const GraphInventoryBucket & existing) {
+                return existing.ggml_op == static_cast<int64_t>(node->op) &&
+                    existing.ggml_type == static_cast<uint64_t>(node->type) &&
+                    existing.family == family &&
+                    existing.ne == std::array<int64_t, 4>{node->ne[0], node->ne[1], node->ne[2], node->ne[3]};
+            });
+        if (bucket == buckets.end()) {
+            GraphInventoryBucket created{};
+            created.family = family;
+            created.ggml_op = static_cast<int64_t>(node->op);
+            created.ggml_type = static_cast<uint64_t>(node->type);
+            for (int dim = 0; dim < 4; ++dim) {
+                created.ne[dim] = node->ne[dim];
+            }
+            buckets.push_back(created);
+            bucket = std::prev(buckets.end());
+        }
+        bucket->node_count++;
+        bucket->element_count += static_cast<uint64_t>(std::max<int64_t>(0, ggml_nelements(node)));
+        bucket->output_bytes += static_cast<uint64_t>(ggml_nbytes(node));
+        if (node->src[0] != nullptr) {
+            bucket->src0_bytes += static_cast<uint64_t>(ggml_nbytes(node->src[0]));
+        }
+        if (node->src[1] != nullptr) {
+            bucket->src1_bytes += static_cast<uint64_t>(ggml_nbytes(node->src[1]));
+        }
+    }
+    return buckets;
+}
+
+bool kq_mask_type_supported(enum ggml_type type) {
+    return type == GGML_TYPE_F16 || type == GGML_TYPE_F32;
+}
+
+int64_t source_decode_position_for_run(int64_t context_tokens, int run_index) {
+    const int64_t context = std::max<int64_t>(1, context_tokens);
+    return std::max<int64_t>(0, context - 1 - static_cast<int64_t>(run_index & 3));
+}
+
+std::vector<uint8_t> empty_kq_mask_bytes(const ggml_tensor * mask) {
+    if (mask == nullptr || !kq_mask_type_supported(mask->type)) {
+        return {};
+    }
+    return std::vector<uint8_t>(ggml_nbytes(mask), 0);
+}
+
+void fill_source_shaped_kq_mask_bytes(
+    const ggml_tensor * mask,
+    std::vector<uint8_t> & encoded,
+    int64_t active_position,
+    int run_index) {
+    if (mask == nullptr || encoded.empty()) {
+        return;
+    }
+    const int64_t elements = ggml_nelements(mask);
+    if (elements <= 0 || encoded.size() < ggml_nbytes(mask)) {
+        return;
+    }
+
+    const int64_t keep_until = std::clamp<int64_t>(active_position, 0, elements - 1);
+    const int64_t perturb_cell = std::clamp<int64_t>(keep_until - (run_index & 3), 0, elements - 1);
+    const float perturb = static_cast<float>((run_index & 7) + 1) * 0.0001f;
+
+    // llama.cpp rebuilds KQ mask tensors in `set_input_kq_mask()` before each
+    // decode graph submit. That work is source-visible even though the exact
+    // backend kernels are not part of the transformer matmuls: the host walks
+    // the active KV cells, writes keep/drop values, then uploads the whole mask
+    // input. Tiny models are dominated by these fixed per-token source-boundary
+    // costs, so mutating a single byte of a prebuilt mask would make the probe
+    // claim confidence it has not earned. This loop intentionally follows the
+    // same coarse source shape, while still avoiding model-observed tok/s or
+    // backend-name constants.
+    //
+    // The extra sequence/cell bookkeeping below mirrors the shape of
+    // llama.cpp's current `set_input_kq_mask_impl`: initialize the sequence
+    // position table, create per-stream reuse maps/vectors, then walk KV cells
+    // deciding keep/drop from sequence membership and position. For a synthetic
+    // one-token decode the data are simple, but the source-visible work is not
+    // free. Paying for it in the submission probe is especially important for
+    // tiny models where this CPU-side path can rival the submitted matmul graph.
+    std::array<int32_t, 1024> seq_pos_min{};
+    seq_pos_min.fill(std::numeric_limits<int32_t>::max());
+    seq_pos_min[0] = static_cast<int32_t>(keep_until);
+    std::unordered_map<int32_t, uint32_t> seq_srct;
+    std::unordered_map<int32_t, std::vector<uint32_t>> seq_idxs;
+    seq_srct.reserve(1);
+    seq_idxs.reserve(1);
+    auto & idxs = seq_idxs[0];
+    idxs.reserve(static_cast<size_t>(std::min<int64_t>(elements, 64)));
+    seq_srct[0] = 0;
+
+    if (mask->type == GGML_TYPE_F16) {
+        auto * values = reinterpret_cast<ggml_fp16_t *>(encoded.data());
+        const ggml_fp16_t keep = ggml_fp32_to_fp16(0.0f);
+        const ggml_fp16_t drop = ggml_fp32_to_fp16(-INFINITY);
+        for (int64_t i = 0; i < elements; ++i) {
+            const bool cell_is_empty = i > keep_until;
+            const bool same_sequence = !cell_is_empty;
+            const int32_t pos = static_cast<int32_t>(std::min<int64_t>(i, keep_until));
+            if (same_sequence && pos + 32 >= seq_pos_min[0]) {
+                idxs.push_back(static_cast<uint32_t>(i));
+            }
+            values[i] = same_sequence && pos <= static_cast<int32_t>(keep_until) ? keep : drop;
+        }
+        values[perturb_cell] = ggml_fp32_to_fp16(perturb);
+        volatile size_t source_bookkeeping_sink = idxs.size() + seq_srct.size();
+        (void) source_bookkeeping_sink;
+        return;
+    }
+
+    if (mask->type == GGML_TYPE_F32) {
+        auto * values = reinterpret_cast<float *>(encoded.data());
+        for (int64_t i = 0; i < elements; ++i) {
+            const bool cell_is_empty = i > keep_until;
+            const bool same_sequence = !cell_is_empty;
+            const int32_t pos = static_cast<int32_t>(std::min<int64_t>(i, keep_until));
+            if (same_sequence && pos + 32 >= seq_pos_min[0]) {
+                idxs.push_back(static_cast<uint32_t>(i));
+            }
+            values[i] = same_sequence && pos <= static_cast<int32_t>(keep_until) ? 0.0f : -INFINITY;
+        }
+        values[perturb_cell] = perturb;
+        volatile size_t source_bookkeeping_sink = idxs.size() + seq_srct.size();
+        (void) source_bookkeeping_sink;
+    }
+}
+
+struct SourceDecodeBookkeepingScratch {
+    std::vector<uint64_t> input_descriptor_hashes;
+    std::vector<uint32_t> rollback_cells;
+    std::vector<int32_t> output_ids;
+    std::vector<int64_t> out_ids;
+    std::vector<int32_t> seq_output_count;
+    std::vector<int32_t> seq_pos_max_rm;
+    std::vector<int32_t> token_history;
+};
+
+void run_source_decode_bookkeeping(
+    ggml_cgraph * graph,
+    int64_t layers,
+    int64_t context_tokens,
+    int64_t hidden,
+    int64_t vocab,
+    int run_index,
+    SourceDecodeBookkeepingScratch & scratch,
+    volatile uint64_t & sink) {
+    const int64_t context = std::max<int64_t>(1, context_tokens);
+    const int64_t active_position = source_decode_position_for_run(context, run_index);
+
+    // This intentionally models source-visible work around a reused
+    // `llama_context::decode()` call, not a backend kernel:
+    //
+    // - output bookkeeping scans output flags and computes buffer offsets;
+    // - memory-context preparation finds a KV slot and preserves enough cell
+    //   state to roll back on failure;
+    // - graph reuse walks input descriptors before `set_inputs()`;
+    // - sampled decode keeps per-sequence output ids around logits extraction.
+    //
+    // The real objects live inside llama.cpp, so this probe cannot call them
+    // without loading the GGUF model. Instead it mirrors the memory-write shape
+    // from `llama_context::decode()`, `llama_kv_cache::prepare()`,
+    // `llm_graph_result::can_reuse()`, and Skippy's token-history append using
+    // only GGUF-derived dimensions. Keep reusable scratch outside this helper:
+    // llama.cpp reuses batch/output/session storage across generated tokens too,
+    // so per-token heap allocation would be the wrong source model.
+    scratch.seq_output_count.assign(1024, 0);
+    scratch.seq_output_count[0] = 1;
+
+    scratch.seq_pos_max_rm.assign(1024, -1);
+
+    const uint32_t graph_nodes =
+        graph != nullptr ? static_cast<uint32_t>(std::max(0, ggml_graph_n_nodes(graph))) : 0;
+    uint64_t local = static_cast<uint64_t>(run_index + 1);
+    local += static_cast<uint64_t>(std::max<int64_t>(1, vocab));
+    local += static_cast<uint64_t>(std::max<int64_t>(1, hidden));
+    local += static_cast<uint64_t>(scratch.seq_output_count[0]);
+
+    const uint32_t input_descriptors = graph_nodes > 0
+        ? std::min<uint32_t>(graph_nodes, static_cast<uint32_t>(layers * 8 + 16))
+        : static_cast<uint32_t>(layers * 8 + 16);
+    scratch.input_descriptor_hashes.resize(input_descriptors);
+    for (uint32_t i = 0; i < input_descriptors; ++i) {
+        const uint64_t expected_tokens = 1;
+        const uint64_t expected_outputs = 1;
+        const uint64_t shape_hash =
+            (static_cast<uint64_t>(i + 1) * 1315423911ULL) ^
+            static_cast<uint64_t>(context) ^
+            (static_cast<uint64_t>(active_position) << 7);
+        scratch.input_descriptor_hashes[i] = shape_hash + expected_tokens + expected_outputs;
+        local ^= scratch.input_descriptor_hashes[i];
+    }
+
+    scratch.rollback_cells.clear();
+    scratch.rollback_cells.reserve(static_cast<size_t>(std::min<int64_t>(context, layers + 4)));
+    uint32_t head_cur = static_cast<uint32_t>(active_position % context);
+    const uint32_t n_test = 1;
+    uint32_t n_tested = 0;
+    while (n_tested < static_cast<uint32_t>(std::min<int64_t>(context, layers + 4))) {
+        if (head_cur + n_test > static_cast<uint32_t>(context)) {
+            head_cur = 0;
+            continue;
+        }
+        scratch.rollback_cells.push_back(head_cur);
+        local += head_cur;
+        head_cur++;
+        n_tested++;
+    }
+
+    for (uint32_t cell : scratch.rollback_cells) {
+        scratch.seq_pos_max_rm[0] = std::max(scratch.seq_pos_max_rm[0], static_cast<int32_t>(cell));
+    }
+
+    scratch.output_ids.resize(1);
+    scratch.out_ids.resize(1);
+    scratch.output_ids[0] = -1;
+    scratch.out_ids[0] = 0;
+    for (size_t i = 0; i < scratch.out_ids.size(); ++i) {
+        const int64_t out_id = scratch.out_ids[i];
+        scratch.output_ids[static_cast<size_t>(out_id)] = static_cast<int32_t>(i);
+        local += static_cast<uint64_t>(scratch.output_ids[static_cast<size_t>(out_id)] + 1);
+    }
+
+    if (scratch.token_history.capacity() < static_cast<size_t>(context)) {
+        scratch.token_history.reserve(static_cast<size_t>(context));
+    }
+    if (scratch.token_history.size() >= static_cast<size_t>(context)) {
+        scratch.token_history.clear();
+    }
+    scratch.token_history.push_back(static_cast<int32_t>((active_position + run_index) & 0x7fffffff));
+    local += static_cast<uint64_t>(scratch.token_history.back());
+
+    const size_t logits_bytes =
+        static_cast<size_t>(std::max<int64_t>(1, vocab)) * sizeof(float);
+    const size_t output_id_bytes = sizeof(int32_t);
+    local += static_cast<uint64_t>(logits_bytes + output_id_bytes);
+    local += static_cast<uint64_t>(scratch.seq_pos_max_rm[0] + 1);
+    sink += local;
+}
+
+bool graph_supported_by_backend(ggml_backend_t backend, ggml_cgraph * graph) {
+    // Probe timings are only useful to model-fit when they measure the same
+    // backend boundary that llama.cpp would use for a source-visible decode
+    // graph. Checking only the final output tensor is too weak for synthetic
+    // graphs that include Flash Attention, KV-cache writes, RoPE, MoE routing,
+    // or logits handoff nodes: the final tensor can look supportable while an
+    // interior op is unsupported, delegated differently, or rejected by the
+    // backend planner. In that case the honest result is "no probe evidence",
+    // not a partial timing that model-fit could mistake for hardware truth.
+    if (backend == nullptr || graph == nullptr) {
+        return false;
+    }
+    for (int i = 0; i < ggml_graph_n_nodes(graph); ++i) {
+        ggml_tensor * node = ggml_graph_node(graph, i);
+        if (node == nullptr) {
+            return false;
+        }
+        if (!ggml_backend_supports_op(backend, node)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool source_sampler_candidate_desc(
+    const SourceSamplerCandidate & left,
+    const SourceSamplerCandidate & right) {
+    return left.logit > right.logit;
+}
+
+double median(std::vector<double> values) {
+    if (values.empty()) {
+        return 0.0;
+    }
+    std::sort(values.begin(), values.end());
+    const size_t middle = values.size() / 2;
+    if (values.size() % 2 == 1) {
+        return values[middle];
+    }
+    return (values[middle - 1] + values[middle]) * 0.5;
+}
+
+void source_sampler_top_k(std::vector<SourceSamplerCandidate> & candidates, int32_t k, bool & sorted) {
+    if (k <= 0 || candidates.empty()) {
+        return;
+    }
+    const size_t keep = std::min<size_t>(static_cast<size_t>(k), candidates.size());
+    if (!sorted) {
+        // Keep this intentionally close to llama.cpp's `llama_sampler_top_k_impl`.
+        // For the default top_k=40 path, llama.cpp uses `std::partial_sort`
+        // over the full vocabulary candidate array. A cheaper nth-element
+        // surrogate under-measures tiny models because sampler work dominates
+        // once the transformer graph is only a few milliseconds.
+        std::partial_sort(
+            candidates.begin(),
+            candidates.begin() + static_cast<std::ptrdiff_t>(keep),
+            candidates.end(),
+            source_sampler_candidate_desc);
+        sorted = true;
+    }
+    candidates.resize(keep);
+}
+
+void source_sampler_softmax(std::vector<SourceSamplerCandidate> & candidates, bool sorted) {
+    if (candidates.empty()) {
+        return;
+    }
+    float max_logit = candidates[0].logit;
+    if (!sorted) {
+        for (size_t i = 1; i < candidates.size(); ++i) {
+            max_logit = std::max(max_logit, candidates[i].logit);
+        }
+    }
+    float total = 0.0f;
+    for (auto & candidate : candidates) {
+        candidate.p = std::exp(candidate.logit - max_logit);
+        total += candidate.p;
+    }
+    if (total <= 0.0f) {
+        return;
+    }
+    for (auto & candidate : candidates) {
+        candidate.p /= total;
+    }
+}
+
+void source_sampler_top_p(std::vector<SourceSamplerCandidate> & candidates, float top_p, bool & sorted) {
+    if (top_p >= 1.0f || top_p <= 0.0f || candidates.empty()) {
+        return;
+    }
+    source_sampler_softmax(candidates, sorted);
+    if (!sorted) {
+        std::partial_sort(
+            candidates.begin(),
+            candidates.end(),
+            candidates.end(),
+            source_sampler_candidate_desc);
+        sorted = true;
+    }
+    float cumulative = 0.0f;
+    size_t keep = candidates.size();
+    for (size_t i = 0; i < candidates.size(); ++i) {
+        cumulative += candidates[i].p;
+        if (cumulative >= top_p) {
+            keep = i + 1;
+            break;
+        }
+    }
+    candidates.resize(std::max<size_t>(keep, 1));
+}
+
+void source_sampler_min_p(std::vector<SourceSamplerCandidate> & candidates, float min_p, bool & sorted) {
+    if (min_p <= 0.0f || candidates.empty()) {
+        return;
+    }
+    if (!sorted) {
+        std::partial_sort(
+            candidates.begin(),
+            candidates.end(),
+            candidates.end(),
+            source_sampler_candidate_desc);
+        sorted = true;
+    }
+    const float min_logit = candidates[0].logit + std::log(min_p);
+    size_t keep = 1;
+    for (; keep < candidates.size(); ++keep) {
+        if (candidates[keep].logit < min_logit) {
+            break;
+        }
+    }
+    candidates.resize(std::max<size_t>(keep, 1));
+}
+
+void source_sampler_temperature(std::vector<SourceSamplerCandidate> & candidates, float temperature) {
+    if (temperature <= 0.0f) {
+        return;
+    }
+    for (auto & candidate : candidates) {
+        candidate.logit /= temperature;
+    }
+}
+
+int32_t source_sampler_dist(std::vector<SourceSamplerCandidate> & candidates, bool sorted, std::mt19937 & rng) {
+    if (candidates.empty()) {
+        return -1;
+    }
+    float max_logit = candidates[0].logit;
+    if (!sorted) {
+        for (size_t i = 1; i < candidates.size(); ++i) {
+            max_logit = std::max(max_logit, candidates[i].logit);
+        }
+    }
+    double total = 0.0;
+    for (auto & candidate : candidates) {
+        candidate.p = std::exp(candidate.logit - max_logit);
+        total += candidate.p;
+    }
+    std::uniform_real_distribution<double> dist(0.0, 1.0);
+    const double target = total * dist(rng);
+    double running = 0.0;
+    for (auto & candidate : candidates) {
+        running += candidate.p;
+        candidate.p = total > 0.0 ? static_cast<float>(candidate.p / total) : 0.0f;
+        if (running >= target) {
+            return candidate.id;
+        }
+    }
+    return candidates.back().id;
+}
+
+double measure_source_sampler_history_once(int64_t history_tokens) {
+    std::vector<int32_t> tokens;
+    tokens.reserve(static_cast<size_t>(history_tokens));
+    for (int64_t i = 0; i < history_tokens; ++i) {
+        tokens.push_back(static_cast<int32_t>((i * 1103 + 17) & 0xffff));
+    }
+    std::unordered_map<int32_t, int32_t> accepted;
+    accepted.reserve(static_cast<size_t>(std::min<int64_t>(history_tokens, 65536)));
+    uint64_t state = 0;
+    const auto started = std::chrono::steady_clock::now();
+    for (const int32_t token : tokens) {
+        // Default Skippy chat sampling has top-k/top-p/min-p/temp/dist in the
+        // chain and no repeat penalties. Most `llama_sampler_accept()` calls are
+        // therefore cheap no-ops, but the source path still walks token history
+        // before first-token sampling. This loop keeps a deterministic
+        // stateful accept-shaped lower bound without charging model-specific
+        // prompt content.
+        const int32_t count = ++accepted[token];
+        state = state * 1099511628211ull + static_cast<uint32_t>(token) + static_cast<uint32_t>(count);
+    }
+    const auto finished = std::chrono::steady_clock::now();
+    volatile uint64_t sink = state;
+    (void) sink;
+    return std::chrono::duration<double>(finished - started).count()
+        * 1000000.0
+        / static_cast<double>(std::max<int64_t>(history_tokens, 1));
+}
+
+double measure_source_sampler_vocab_once(int64_t vocab_tokens) {
+    const std::vector<float> logits = deterministic_f32(vocab_tokens, 947);
+    std::mt19937 rng(0x5eed1234u);
+    const auto started = std::chrono::steady_clock::now();
+    std::vector<SourceSamplerCandidate> candidates;
+    candidates.reserve(static_cast<size_t>(vocab_tokens));
+    for (int64_t token = 0; token < vocab_tokens; ++token) {
+        candidates.push_back({
+            static_cast<int32_t>(token),
+            logits[static_cast<size_t>(token)],
+            0.0f,
+        });
+    }
+    bool sorted = false;
+    source_sampler_top_k(candidates, 40, sorted);
+    source_sampler_top_p(candidates, 0.95f, sorted);
+    source_sampler_min_p(candidates, 0.05f, sorted);
+    source_sampler_temperature(candidates, 0.8f);
+    const int32_t selected = source_sampler_dist(candidates, sorted, rng);
+    const auto finished = std::chrono::steady_clock::now();
+    volatile int32_t sink = selected;
+    (void) sink;
+    return std::chrono::duration<double>(finished - started).count()
+        * 1000000.0
+        / static_cast<double>(std::max<int64_t>(vocab_tokens, 1));
+}
+
+bool run_source_sampler_probe(
+    int64_t vocab_tokens,
+    int64_t history_tokens,
+    SamplerProbeResult & result) {
+    if (vocab_tokens <= 0 || history_tokens <= 0) {
+        return false;
+    }
+    for (int i = 0; i < WARMUP_RUNS; ++i) {
+        (void) measure_source_sampler_history_once(history_tokens);
+        (void) measure_source_sampler_vocab_once(vocab_tokens);
+    }
+    std::vector<double> history_samples;
+    std::vector<double> vocab_samples;
+    history_samples.reserve(TIMED_RUNS);
+    vocab_samples.reserve(TIMED_RUNS);
+    for (int i = 0; i < TIMED_RUNS; ++i) {
+        history_samples.push_back(measure_source_sampler_history_once(history_tokens));
+        vocab_samples.push_back(measure_source_sampler_vocab_once(vocab_tokens));
+    }
+    result = {
+        median(history_samples),
+        median(vocab_samples),
+        history_tokens,
+        vocab_tokens,
+        TIMED_RUNS,
+    };
+    return result.history_us_per_token > 0.0 && result.vocab_us_per_token > 0.0;
+}
+
 std::vector<uint8_t> encode_weights(
     enum ggml_type type,
     const std::vector<float> & weights,
@@ -271,16 +882,40 @@ const std::vector<uint8_t> & cached_encoded_weights(
     return inserted.first->second;
 }
 
-double median(std::vector<double> values) {
-    if (values.empty()) {
-        return 0.0;
-    }
-    std::sort(values.begin(), values.end());
-    const size_t middle = values.size() / 2;
-    if (values.size() % 2 == 1) {
-        return values[middle];
-    }
-    return (values[middle - 1] + values[middle]) * 0.5;
+ProbeResult make_probe_result(
+    const std::string & name,
+    const std::string & tensor_type,
+    int64_t rows,
+    int64_t cols,
+    int64_t graph_node_count,
+    double effective_gbps,
+    double tflops,
+    double median_seconds,
+    const std::vector<double> & seconds,
+    int graph_features,
+    int runs) {
+    const auto [min_it, max_it] = std::minmax_element(seconds.begin(), seconds.end());
+    const double elapsed_ms = median_seconds * 1000.0;
+    const double min_elapsed_ms = seconds.empty() ? elapsed_ms : *min_it * 1000.0;
+    const double max_elapsed_ms = seconds.empty() ? elapsed_ms : *max_it * 1000.0;
+    const double spread_pct =
+        elapsed_ms > 0.0 ? ((max_elapsed_ms - min_elapsed_ms) / elapsed_ms) * 100.0 : 0.0;
+    return ProbeResult{
+        name,
+        tensor_type,
+        rows,
+        cols,
+        graph_node_count,
+        std::vector<GraphInventoryBucket>{},
+        effective_gbps,
+        tflops,
+        elapsed_ms,
+        min_elapsed_ms,
+        max_elapsed_ms,
+        spread_pct,
+        graph_features,
+        runs,
+    };
 }
 
 bool run_probe(
@@ -313,7 +948,7 @@ bool run_probe(
 
     ggml_cgraph * graph = ggml_new_graph(ctx);
     ggml_build_forward_expand(graph, output);
-    if (!ggml_backend_supports_op(backend, output)) {
+    if (!graph_supported_by_backend(backend, graph)) {
         ggml_free(ctx);
         return false;
     }
@@ -409,17 +1044,19 @@ bool run_probe(
         ggml_free(ctx);
         return false;
     }
-    result = ProbeResult{
+    result = make_probe_result(
         name,
         tensor_type,
         shape.rows,
         shape.cols,
+        graph_node_count(graph),
         effective_gbps,
         tflops,
-        elapsed_ms,
+        median_seconds,
+        seconds,
         0,
-        TIMED_RUNS,
-    };
+        TIMED_RUNS);
+    result.graph_inventory = collect_graph_inventory(graph);
 
     ggml_backend_sched_free(sched);
     ggml_backend_free(cpu_backend);
@@ -521,18 +1158,752 @@ bool compute_graph_timed(
         free_scheduled_graph(scheduled);
         return false;
     }
-    result = ProbeResult{
+    result = make_probe_result(
         name,
         tensor_type,
         rows,
         cols,
+        graph_node_count(graph),
         effective_gbps,
         tflops,
-        elapsed_ms,
+        median_seconds,
+        seconds,
         graph_features,
-        timed_runs,
+        timed_runs);
+    result.graph_inventory = collect_graph_inventory(graph);
+
+    free_scheduled_graph(scheduled);
+    return true;
+}
+
+bool compute_graph_output_handoff_timed(
+    ggml_backend_t backend,
+    ggml_cgraph * graph,
+    ggml_tensor * input,
+    ggml_tensor * positions,
+    ggml_tensor * logits,
+    const std::vector<ggml_tensor *> & key_indices,
+    const std::vector<ggml_tensor *> & value_indices,
+    const std::vector<ggml_tensor *> & masks,
+    ScheduledGraph scheduled,
+    ProbeResult & result,
+    const std::string & name,
+    const std::string & tensor_type,
+    int64_t rows,
+    int64_t cols,
+    int64_t context_tokens,
+    double bytes,
+    double flops,
+    int graph_features = 0,
+    int warmup_runs = WARMUP_RUNS,
+    int timed_runs = TIMED_RUNS) {
+    if (scheduled.sched == nullptr || logits == nullptr) {
+        return false;
+    }
+
+    ggml_backend_dev_t device = ggml_backend_get_device(backend);
+    ggml_backend_buffer_type_t output_buft = ggml_backend_cpu_buffer_type();
+    if (device != nullptr) {
+        ggml_backend_buffer_type_t host_buft = ggml_backend_dev_host_buffer_type(device);
+        if (host_buft != nullptr) {
+            output_buft = host_buft;
+        }
+    }
+
+    const size_t output_bytes = static_cast<size_t>(std::max<int64_t>(1, rows)) * sizeof(float);
+    ggml_backend_buffer_t output_buffer = ggml_backend_buft_alloc_buffer(output_buft, output_bytes);
+    if (output_buffer == nullptr) {
+        free_scheduled_graph(scheduled);
+        return false;
+    }
+    ggml_backend_buffer_clear(output_buffer, 0);
+    float * output_base = static_cast<float *>(ggml_backend_buffer_get_base(output_buffer));
+    if (output_base == nullptr) {
+        ggml_backend_buffer_free(output_buffer);
+        free_scheduled_graph(scheduled);
+        return false;
+    }
+
+    const int64_t input_elements = input != nullptr ? ggml_nelements(input) : 0;
+    const bool input_is_f32 = input != nullptr && input->type == GGML_TYPE_F32;
+    const bool input_is_i32 = input != nullptr && input->type == GGML_TYPE_I32;
+    std::vector<float> input_f32 = input_is_f32 && input_elements > 0
+        ? deterministic_f32(input_elements, 4201)
+        : std::vector<float>{};
+    std::vector<int32_t> input_i32(input_is_i32 && input_elements > 0 ? 1 : 0, 0);
+    std::vector<int32_t> position_i32(positions != nullptr ? 1 : 0, 0);
+    const int64_t row_count = std::max<int64_t>(1, context_tokens);
+    std::vector<int64_t> index_value(1, 0);
+    std::vector<std::vector<uint8_t>> mask_inputs;
+    mask_inputs.reserve(masks.size());
+    for (size_t i = 0; i < masks.size(); ++i) {
+        mask_inputs.push_back(empty_kq_mask_bytes(masks[i]));
+    }
+
+    volatile int32_t best_token_sink = 0;
+    volatile float input_sink = 0.0f;
+    auto compute_once = [&](int run_index) -> double {
+        // Real llama.cpp decode does not repeatedly submit a byte-identical
+        // graph. `llm_graph_result::set_inputs()` changes token/input tensors
+        // and the KV write row advances as generation grows. A synthetic probe
+        // that replays the same input/KV index can accidentally measure a
+        // backend's best reuse path instead of the source-visible sampled decode
+        // boundary. Mutate the input and row indices before starting the timer:
+        // the dedicated submission probe charges input population; this probe
+        // only needs fresh graph data so the timed graph+logits-sync path cannot
+        // look artificially cached.
+        //
+        // llama.cpp's `llm_graph_input_attn_kv::set_input()` also rewrites the
+        // KQ mask input (`set_input_kq_mask`) before decode. Leaving the mask
+        // byte-identical let tiny synthetic graphs exercise a backend reuse path
+        // that the real llama.cpp sampled-token boundary does not take. Keep
+        // mask writes outside the timer for the same reason as token/KV input
+        // writes: setup is charged by the submission probe, while this probe
+        // times graph drain, logits visibility, and CPU logits scan.
+        if (input_is_f32 && !input_f32.empty()) {
+            const size_t changed =
+                static_cast<size_t>(run_index % std::max<int64_t>(input_elements, 1));
+            input_f32[changed] += 0.0001f;
+            input_sink += input_f32[0];
+            ggml_backend_tensor_set(input, input_f32.data(), 0, input_f32.size() * sizeof(float));
+        } else if (input_is_i32 && !input_i32.empty()) {
+            input_i32[0] = static_cast<int32_t>(run_index % std::max<int64_t>(rows, 1));
+            input_sink += static_cast<float>(input_i32[0]);
+            ggml_backend_tensor_set(input, input_i32.data(), 0, input_i32.size() * sizeof(int32_t));
+        }
+        if (!key_indices.empty() || !value_indices.empty()) {
+            index_value[0] = source_decode_position_for_run(row_count, run_index);
+            if (positions != nullptr && !position_i32.empty()) {
+                position_i32[0] = static_cast<int32_t>(index_value[0]);
+                ggml_backend_tensor_set(positions, position_i32.data(), 0, sizeof(int32_t));
+            }
+            for (ggml_tensor * key_index : key_indices) {
+                ggml_backend_tensor_set(key_index, index_value.data(), 0, sizeof(int64_t));
+            }
+            for (ggml_tensor * value_index : value_indices) {
+                ggml_backend_tensor_set(value_index, index_value.data(), 0, sizeof(int64_t));
+            }
+        }
+        for (size_t i = 0; i < masks.size(); ++i) {
+            auto & encoded = mask_inputs[i];
+            if (!encoded.empty()) {
+                fill_source_shaped_kq_mask_bytes(masks[i], encoded, index_value[0], run_index);
+                ggml_backend_tensor_set(masks[i], encoded.data(), 0, encoded.size());
+            }
+        }
+        const auto started = std::chrono::steady_clock::now();
+        enum ggml_status status = ggml_backend_sched_graph_compute_async(scheduled.sched, graph);
+        if (status != GGML_STATUS_SUCCESS) {
+            return 0.0;
+        }
+        ggml_backend_t logits_backend = ggml_backend_sched_get_tensor_backend(scheduled.sched, logits);
+        if (logits_backend == nullptr) {
+            return 0.0;
+        }
+        // This is the source-shaped boundary used by llama.cpp sampled decode:
+        // the token graph is submitted asynchronously, logits are requested from
+        // the backend output tensor, and the context is synchronized before the
+        // CPU sampler can scan candidates. Timing this together with the full
+        // token graph is important for tiny models, where graph drain/output
+        // handoff can be the dominant per-token term. The dimensions still come
+        // only from GGUF metadata; no observed model throughput is used here.
+        ggml_backend_tensor_get_async(logits_backend, logits, output_base, 0, output_bytes);
+        ggml_backend_sched_synchronize(scheduled.sched);
+        int32_t best = 0;
+        float best_logit = -std::numeric_limits<float>::infinity();
+        for (int32_t token = 0; token < static_cast<int32_t>(rows); ++token) {
+            if (output_base[token] > best_logit) {
+                best_logit = output_base[token];
+                best = token;
+            }
+        }
+        best_token_sink = best;
+        const auto finished = std::chrono::steady_clock::now();
+        return std::chrono::duration<double>(finished - started).count();
     };
 
+    for (int i = 0; i < warmup_runs; ++i) {
+        if (compute_once(i) <= 0.0) {
+            ggml_backend_buffer_free(output_buffer);
+            free_scheduled_graph(scheduled);
+            return false;
+        }
+    }
+
+    std::vector<double> seconds;
+    seconds.reserve(timed_runs);
+    for (int i = 0; i < timed_runs; ++i) {
+        const double elapsed = compute_once(warmup_runs + i);
+        if (elapsed <= 0.0) {
+            ggml_backend_buffer_free(output_buffer);
+            free_scheduled_graph(scheduled);
+            return false;
+        }
+        seconds.push_back(elapsed);
+    }
+    (void) best_token_sink;
+    (void) input_sink;
+
+    const double median_seconds = median(seconds);
+    if (!std::isfinite(median_seconds) || median_seconds <= 0.0) {
+        ggml_backend_buffer_free(output_buffer);
+        free_scheduled_graph(scheduled);
+        return false;
+    }
+    const double effective_gbps = (bytes + static_cast<double>(output_bytes)) / median_seconds / 1e9;
+    const double tflops = flops / median_seconds / 1e12;
+    const double elapsed_ms = median_seconds * 1000.0;
+    if (!std::isfinite(effective_gbps) || !std::isfinite(tflops) || !std::isfinite(elapsed_ms)) {
+        ggml_backend_buffer_free(output_buffer);
+        free_scheduled_graph(scheduled);
+        return false;
+    }
+    result = make_probe_result(
+        name,
+        tensor_type,
+        rows,
+        cols,
+        graph_node_count(graph),
+        effective_gbps,
+        tflops,
+        median_seconds,
+        seconds,
+        graph_features,
+        timed_runs);
+    result.graph_inventory = collect_graph_inventory(graph);
+
+    ggml_backend_buffer_free(output_buffer);
+    free_scheduled_graph(scheduled);
+    return true;
+}
+
+bool compute_graph_submission_timed(
+    ggml_backend_t backend,
+    ggml_cgraph * graph,
+    ggml_tensor * input,
+    ggml_tensor * positions,
+    ggml_tensor * logits,
+    const std::vector<ggml_tensor *> & key_indices,
+    const std::vector<ggml_tensor *> & value_indices,
+    const std::vector<ggml_tensor *> & masks,
+    ScheduledGraph scheduled,
+    ProbeResult & result,
+    const std::string & name,
+    const std::string & tensor_type,
+    int64_t rows,
+    int64_t cols,
+    int64_t layers,
+    int64_t context_tokens,
+    double bytes,
+    double flops,
+    int graph_features = 0,
+    int warmup_runs = WARMUP_RUNS,
+    int timed_runs = TIMED_RUNS) {
+    if (scheduled.sched == nullptr || input == nullptr || logits == nullptr) {
+        return false;
+    }
+
+    ggml_backend_dev_t device = ggml_backend_get_device(backend);
+    ggml_backend_buffer_type_t output_buft = ggml_backend_cpu_buffer_type();
+    if (device != nullptr) {
+        ggml_backend_buffer_type_t host_buft = ggml_backend_dev_host_buffer_type(device);
+        if (host_buft != nullptr) {
+            output_buft = host_buft;
+        }
+    }
+
+    const size_t output_bytes = static_cast<size_t>(std::max<int64_t>(1, rows)) * sizeof(float);
+    ggml_backend_buffer_t output_buffer = ggml_backend_buft_alloc_buffer(output_buft, output_bytes);
+    if (output_buffer == nullptr) {
+        free_scheduled_graph(scheduled);
+        return false;
+    }
+    ggml_backend_buffer_clear(output_buffer, 0);
+    float * output_base = static_cast<float *>(ggml_backend_buffer_get_base(output_buffer));
+    if (output_base == nullptr) {
+        ggml_backend_buffer_free(output_buffer);
+        free_scheduled_graph(scheduled);
+        return false;
+    }
+
+    const int64_t input_elements = ggml_nelements(input);
+    const bool input_is_f32 = input->type == GGML_TYPE_F32;
+    const bool input_is_i32 = input->type == GGML_TYPE_I32;
+    std::vector<float> input_f32 = input_is_f32 ? deterministic_f32(input_elements, 2203) : std::vector<float>{};
+    std::vector<int32_t> input_i32(input_is_i32 && input_elements > 0 ? 1 : 0, 0);
+    std::vector<int32_t> position_i32(positions != nullptr ? 1 : 0, 0);
+    std::vector<int64_t> index_value(1, std::max<int64_t>(0, context_tokens - 1));
+    std::vector<std::vector<uint8_t>> mask_inputs;
+    mask_inputs.reserve(masks.size());
+    for (size_t i = 0; i < masks.size(); ++i) {
+        mask_inputs.push_back(empty_kq_mask_bytes(masks[i]));
+    }
+    volatile float input_sink = 0.0f;
+    volatile uint64_t source_decode_sink = 0;
+    SourceDecodeBookkeepingScratch source_decode_scratch;
+    auto submit_once = [&](int run_index) -> double {
+        // This probe intentionally times the source-visible submission half of
+        // sampled decode, not graph completion. In llama.cpp, a reused decode
+        // step calls `llm_graph_result::set_inputs()`, submits
+        // `ggml_backend_sched_graph_compute_async()`, then schedules async
+        // logits extraction before `llama_decode()` returns. The sampler call
+        // that follows waits for graph/logits visibility. That is why the
+        // synchronization below happens after the timestamp: it drains work so
+        // the next sample is clean, but it is not part of the decode-call
+        // submission interval we are trying to model.
+        const auto started = std::chrono::steady_clock::now();
+        run_source_decode_bookkeeping(
+            graph,
+            layers,
+            context_tokens,
+            cols,
+            rows,
+            run_index,
+            source_decode_scratch,
+            source_decode_sink);
+        if (input_is_f32 && !input_f32.empty()) {
+            input_f32[static_cast<size_t>(run_index % std::max<int64_t>(input_elements, 1))] += 0.0001f;
+            input_sink += input_f32[0];
+            ggml_backend_tensor_set(input, input_f32.data(), 0, input_f32.size() * sizeof(float));
+        } else if (input_is_i32 && !input_i32.empty()) {
+            input_i32[0] = static_cast<int32_t>(run_index % std::max<int64_t>(rows, 1));
+            input_sink += static_cast<float>(input_i32[0]);
+            ggml_backend_tensor_set(input, input_i32.data(), 0, input_i32.size() * sizeof(int32_t));
+        }
+        index_value[0] = source_decode_position_for_run(context_tokens, run_index);
+        if (positions != nullptr && !position_i32.empty()) {
+            position_i32[0] = static_cast<int32_t>(index_value[0]);
+            ggml_backend_tensor_set(positions, position_i32.data(), 0, sizeof(int32_t));
+        }
+        for (ggml_tensor * key_index : key_indices) {
+            ggml_backend_tensor_set(key_index, index_value.data(), 0, sizeof(int64_t));
+        }
+        for (ggml_tensor * value_index : value_indices) {
+            ggml_backend_tensor_set(value_index, index_value.data(), 0, sizeof(int64_t));
+        }
+        for (size_t i = 0; i < masks.size(); ++i) {
+            auto & encoded = mask_inputs[i];
+            if (!encoded.empty()) {
+                fill_source_shaped_kq_mask_bytes(masks[i], encoded, index_value[0], run_index);
+                ggml_backend_tensor_set(masks[i], encoded.data(), 0, encoded.size());
+            }
+        }
+        enum ggml_status status = ggml_backend_sched_graph_compute_async(scheduled.sched, graph);
+        if (status != GGML_STATUS_SUCCESS) {
+            return 0.0;
+        }
+        ggml_backend_t logits_backend = ggml_backend_sched_get_tensor_backend(scheduled.sched, logits);
+        if (logits_backend == nullptr) {
+            return 0.0;
+        }
+        ggml_backend_tensor_get_async(logits_backend, logits, output_base, 0, output_bytes);
+        const auto submitted = std::chrono::steady_clock::now();
+        ggml_backend_sched_synchronize(scheduled.sched);
+        return std::chrono::duration<double>(submitted - started).count();
+    };
+
+    for (int i = 0; i < warmup_runs; ++i) {
+        if (submit_once(i) <= 0.0) {
+            ggml_backend_buffer_free(output_buffer);
+            free_scheduled_graph(scheduled);
+            return false;
+        }
+    }
+
+    std::vector<double> seconds;
+    seconds.reserve(timed_runs);
+    for (int i = 0; i < timed_runs; ++i) {
+        const double elapsed = submit_once(warmup_runs + i);
+        if (elapsed <= 0.0) {
+            ggml_backend_buffer_free(output_buffer);
+            free_scheduled_graph(scheduled);
+            return false;
+        }
+        seconds.push_back(elapsed);
+    }
+    (void) input_sink;
+    (void) source_decode_sink;
+
+    const double median_seconds = median(seconds);
+    if (!std::isfinite(median_seconds) || median_seconds <= 0.0) {
+        ggml_backend_buffer_free(output_buffer);
+        free_scheduled_graph(scheduled);
+        return false;
+    }
+    const double submitted_bytes = static_cast<double>(input_f32.size() * sizeof(float))
+        + static_cast<double>(input_i32.size() * sizeof(int32_t))
+        + static_cast<double>(position_i32.size() * sizeof(int32_t))
+        + static_cast<double>((key_indices.size() + value_indices.size()) * sizeof(int64_t))
+        + std::accumulate(
+            mask_inputs.begin(),
+            mask_inputs.end(),
+            0.0,
+            [](double acc, const std::vector<uint8_t> & encoded) {
+                return acc + static_cast<double>(encoded.size());
+            })
+        + static_cast<double>(output_bytes);
+    const double effective_gbps = submitted_bytes / median_seconds / 1e9;
+    const double tflops = flops / median_seconds / 1e12;
+    if (!std::isfinite(effective_gbps) || !std::isfinite(tflops)) {
+        ggml_backend_buffer_free(output_buffer);
+        free_scheduled_graph(scheduled);
+        return false;
+    }
+    result = make_probe_result(
+        name,
+        tensor_type,
+        rows,
+        cols,
+        graph_node_count(graph),
+        effective_gbps,
+        tflops,
+        median_seconds,
+        seconds,
+        graph_features,
+        timed_runs);
+    result.graph_inventory = collect_graph_inventory(graph);
+
+    (void) bytes;
+    ggml_backend_buffer_free(output_buffer);
+    free_scheduled_graph(scheduled);
+    return true;
+}
+
+bool compute_graph_source_input_timed(
+    ggml_cgraph * graph,
+    ggml_tensor * input,
+    ggml_tensor * positions,
+    const std::vector<ggml_tensor *> & key_indices,
+    const std::vector<ggml_tensor *> & value_indices,
+    const std::vector<ggml_tensor *> & masks,
+    ScheduledGraph scheduled,
+    ProbeResult & result,
+    const std::string & name,
+    const std::string & tensor_type,
+    int64_t rows,
+    int64_t cols,
+    int64_t layers,
+    int64_t context_tokens,
+    double flops,
+    int graph_features = 0,
+    int warmup_runs = WARMUP_RUNS,
+    int timed_runs = TIMED_RUNS) {
+    if (scheduled.sched == nullptr || input == nullptr) {
+        return false;
+    }
+
+    const int64_t input_elements = ggml_nelements(input);
+    const bool input_is_f32 = input->type == GGML_TYPE_F32;
+    const bool input_is_i32 = input->type == GGML_TYPE_I32;
+    std::vector<float> input_f32 = input_is_f32 ? deterministic_f32(input_elements, 2303) : std::vector<float>{};
+    std::vector<int32_t> input_i32(input_is_i32 && input_elements > 0 ? 1 : 0, 0);
+    std::vector<int32_t> position_i32(positions != nullptr ? 1 : 0, 0);
+    std::vector<int64_t> index_value(1, std::max<int64_t>(0, context_tokens - 1));
+    std::vector<std::vector<uint8_t>> mask_inputs;
+    mask_inputs.reserve(masks.size());
+    for (size_t i = 0; i < masks.size(); ++i) {
+        mask_inputs.push_back(empty_kq_mask_bytes(masks[i]));
+    }
+
+    volatile float input_sink = 0.0f;
+    volatile uint64_t source_decode_sink = 0;
+    SourceDecodeBookkeepingScratch source_decode_scratch;
+    auto input_once = [&](int run_index) -> double {
+        // This is the part of `llama_context::decode()` that happens before the
+        // backend graph is submitted. It is deliberately narrower than the
+        // submission probe: no `ggml_backend_sched_graph_compute_async()`, no
+        // async logits request, and no scheduler synchronization. That makes it
+        // usable as a non-overlapping lower bound beside a full-token handoff
+        // probe. The work itself mirrors source-visible llama.cpp tasks:
+        // output/session bookkeeping, graph-input compatibility checks, token
+        // and position input updates, KV write indices, and KQ mask rebuilds.
+        const auto started = std::chrono::steady_clock::now();
+        run_source_decode_bookkeeping(
+            graph,
+            layers,
+            context_tokens,
+            cols,
+            rows,
+            run_index,
+            source_decode_scratch,
+            source_decode_sink);
+        if (input_is_f32 && !input_f32.empty()) {
+            input_f32[static_cast<size_t>(run_index % std::max<int64_t>(input_elements, 1))] += 0.0001f;
+            input_sink += input_f32[0];
+            ggml_backend_tensor_set(input, input_f32.data(), 0, input_f32.size() * sizeof(float));
+        } else if (input_is_i32 && !input_i32.empty()) {
+            input_i32[0] = static_cast<int32_t>(run_index % std::max<int64_t>(rows, 1));
+            input_sink += static_cast<float>(input_i32[0]);
+            ggml_backend_tensor_set(input, input_i32.data(), 0, input_i32.size() * sizeof(int32_t));
+        }
+        index_value[0] = source_decode_position_for_run(context_tokens, run_index);
+        if (positions != nullptr && !position_i32.empty()) {
+            position_i32[0] = static_cast<int32_t>(index_value[0]);
+            ggml_backend_tensor_set(positions, position_i32.data(), 0, sizeof(int32_t));
+        }
+        for (ggml_tensor * key_index : key_indices) {
+            ggml_backend_tensor_set(key_index, index_value.data(), 0, sizeof(int64_t));
+        }
+        for (ggml_tensor * value_index : value_indices) {
+            ggml_backend_tensor_set(value_index, index_value.data(), 0, sizeof(int64_t));
+        }
+        for (size_t i = 0; i < masks.size(); ++i) {
+            auto & encoded = mask_inputs[i];
+            if (!encoded.empty()) {
+                fill_source_shaped_kq_mask_bytes(masks[i], encoded, index_value[0], run_index);
+                ggml_backend_tensor_set(masks[i], encoded.data(), 0, encoded.size());
+            }
+        }
+        const auto finished = std::chrono::steady_clock::now();
+        const double elapsed = std::chrono::duration<double>(finished - started).count();
+        enum ggml_status status = ggml_backend_sched_graph_compute_async(scheduled.sched, graph);
+        if (status != GGML_STATUS_SUCCESS) {
+            return 0.0;
+        }
+        ggml_backend_sched_synchronize(scheduled.sched);
+        return elapsed;
+    };
+
+    for (int i = 0; i < warmup_runs; ++i) {
+        if (input_once(i) <= 0.0) {
+            return false;
+        }
+    }
+
+    std::vector<double> seconds;
+    seconds.reserve(timed_runs);
+    for (int i = 0; i < timed_runs; ++i) {
+        const double elapsed = input_once(warmup_runs + i);
+        if (elapsed <= 0.0) {
+            return false;
+        }
+        seconds.push_back(elapsed);
+    }
+    (void) input_sink;
+    (void) source_decode_sink;
+
+    const double median_seconds = median(seconds);
+    if (!std::isfinite(median_seconds) || median_seconds <= 0.0) {
+        return false;
+    }
+    const double input_bytes = static_cast<double>(input_f32.size() * sizeof(float))
+        + static_cast<double>(input_i32.size() * sizeof(int32_t))
+        + static_cast<double>(position_i32.size() * sizeof(int32_t))
+        + static_cast<double>((key_indices.size() + value_indices.size()) * sizeof(int64_t))
+        + std::accumulate(
+            mask_inputs.begin(),
+            mask_inputs.end(),
+            0.0,
+            [](double acc, const std::vector<uint8_t> & encoded) {
+                return acc + static_cast<double>(encoded.size());
+            });
+    const double effective_gbps = input_bytes / median_seconds / 1e9;
+    const double tflops = flops / median_seconds / 1e12;
+    if (!std::isfinite(effective_gbps) || !std::isfinite(tflops)) {
+        return false;
+    }
+    result = make_probe_result(
+        name,
+        tensor_type,
+        rows,
+        cols,
+        graph_node_count(graph),
+        effective_gbps,
+        tflops,
+        median_seconds,
+        seconds,
+        graph_features,
+        timed_runs);
+    result.graph_inventory = collect_graph_inventory(graph);
+    return true;
+}
+
+bool compute_graph_source_sampled_timed(
+    ggml_backend_t backend,
+    ggml_cgraph * graph,
+    ggml_tensor * input,
+    ggml_tensor * positions,
+    ggml_tensor * logits,
+    const std::vector<ggml_tensor *> & key_indices,
+    const std::vector<ggml_tensor *> & value_indices,
+    const std::vector<ggml_tensor *> & masks,
+    ScheduledGraph scheduled,
+    ProbeResult & result,
+    const std::string & name,
+    const std::string & tensor_type,
+    int64_t rows,
+    int64_t cols,
+    int64_t layers,
+    int64_t context_tokens,
+    double bytes,
+    double flops,
+    int graph_features = 0,
+    int warmup_runs = WARMUP_RUNS,
+    int timed_runs = TIMED_RUNS) {
+    if (scheduled.sched == nullptr || input == nullptr || logits == nullptr) {
+        return false;
+    }
+
+    ggml_backend_dev_t device = ggml_backend_get_device(backend);
+    ggml_backend_buffer_type_t output_buft = ggml_backend_cpu_buffer_type();
+    if (device != nullptr) {
+        ggml_backend_buffer_type_t host_buft = ggml_backend_dev_host_buffer_type(device);
+        if (host_buft != nullptr) {
+            output_buft = host_buft;
+        }
+    }
+
+    const size_t output_bytes = static_cast<size_t>(std::max<int64_t>(1, rows)) * sizeof(float);
+    ggml_backend_buffer_t output_buffer = ggml_backend_buft_alloc_buffer(output_buft, output_bytes);
+    if (output_buffer == nullptr) {
+        free_scheduled_graph(scheduled);
+        return false;
+    }
+    ggml_backend_buffer_clear(output_buffer, 0);
+    float * output_base = static_cast<float *>(ggml_backend_buffer_get_base(output_buffer));
+    if (output_base == nullptr) {
+        ggml_backend_buffer_free(output_buffer);
+        free_scheduled_graph(scheduled);
+        return false;
+    }
+
+    const int64_t input_elements = ggml_nelements(input);
+    const bool input_is_f32 = input->type == GGML_TYPE_F32;
+    const bool input_is_i32 = input->type == GGML_TYPE_I32;
+    std::vector<float> input_f32 = input_is_f32 ? deterministic_f32(input_elements, 3203) : std::vector<float>{};
+    std::vector<int32_t> input_i32(input_is_i32 && input_elements > 0 ? 1 : 0, 0);
+    std::vector<int32_t> position_i32(positions != nullptr ? 1 : 0, 0);
+    std::vector<int64_t> index_value(1, std::max<int64_t>(0, context_tokens - 1));
+    std::vector<std::vector<uint8_t>> mask_inputs;
+    mask_inputs.reserve(masks.size());
+    for (size_t i = 0; i < masks.size(); ++i) {
+        mask_inputs.push_back(empty_kq_mask_bytes(masks[i]));
+    }
+
+    volatile int32_t best_token_sink = 0;
+    volatile float input_sink = 0.0f;
+    volatile uint64_t source_decode_sink = 0;
+    SourceDecodeBookkeepingScratch source_decode_scratch;
+    auto sample_once = [&](int run_index) -> double {
+        // This is the broadest synthetic source-boundary probe. It intentionally
+        // starts where llama.cpp's reused sampled decode token starts to become
+        // visible to source code: batch/graph bookkeeping, graph input updates,
+        // scheduler submission, async logits extraction, scheduler
+        // synchronization, and a CPU scan of the vocab row. Tiny models expose
+        // this boundary because their matmul graph is cheap; measuring it as one
+        // interval avoids fitting separate backend constants or borrowing
+        // observed model tok/s.
+        const auto started = std::chrono::steady_clock::now();
+        run_source_decode_bookkeeping(
+            graph,
+            layers,
+            context_tokens,
+            cols,
+            rows,
+            run_index,
+            source_decode_scratch,
+            source_decode_sink);
+        if (input_is_f32 && !input_f32.empty()) {
+            input_f32[static_cast<size_t>(run_index % std::max<int64_t>(input_elements, 1))] += 0.0001f;
+            input_sink += input_f32[0];
+            ggml_backend_tensor_set(input, input_f32.data(), 0, input_f32.size() * sizeof(float));
+        } else if (input_is_i32 && !input_i32.empty()) {
+            input_i32[0] = static_cast<int32_t>(run_index % std::max<int64_t>(rows, 1));
+            input_sink += static_cast<float>(input_i32[0]);
+            ggml_backend_tensor_set(input, input_i32.data(), 0, input_i32.size() * sizeof(int32_t));
+        }
+        index_value[0] = source_decode_position_for_run(context_tokens, run_index);
+        if (positions != nullptr && !position_i32.empty()) {
+            position_i32[0] = static_cast<int32_t>(index_value[0]);
+            ggml_backend_tensor_set(positions, position_i32.data(), 0, sizeof(int32_t));
+        }
+        for (ggml_tensor * key_index : key_indices) {
+            ggml_backend_tensor_set(key_index, index_value.data(), 0, sizeof(int64_t));
+        }
+        for (ggml_tensor * value_index : value_indices) {
+            ggml_backend_tensor_set(value_index, index_value.data(), 0, sizeof(int64_t));
+        }
+        for (size_t i = 0; i < masks.size(); ++i) {
+            auto & encoded = mask_inputs[i];
+            if (!encoded.empty()) {
+                fill_source_shaped_kq_mask_bytes(masks[i], encoded, index_value[0], run_index);
+                ggml_backend_tensor_set(masks[i], encoded.data(), 0, encoded.size());
+            }
+        }
+        enum ggml_status status = ggml_backend_sched_graph_compute_async(scheduled.sched, graph);
+        if (status != GGML_STATUS_SUCCESS) {
+            return 0.0;
+        }
+        ggml_backend_t logits_backend = ggml_backend_sched_get_tensor_backend(scheduled.sched, logits);
+        if (logits_backend == nullptr) {
+            return 0.0;
+        }
+        ggml_backend_tensor_get_async(logits_backend, logits, output_base, 0, output_bytes);
+        ggml_backend_sched_synchronize(scheduled.sched);
+        int32_t best = 0;
+        float best_logit = -std::numeric_limits<float>::infinity();
+        for (int32_t token = 0; token < static_cast<int32_t>(rows); ++token) {
+            if (output_base[token] > best_logit) {
+                best_logit = output_base[token];
+                best = token;
+            }
+        }
+        best_token_sink = best;
+        const auto finished = std::chrono::steady_clock::now();
+        return std::chrono::duration<double>(finished - started).count();
+    };
+
+    for (int i = 0; i < warmup_runs; ++i) {
+        if (sample_once(i) <= 0.0) {
+            ggml_backend_buffer_free(output_buffer);
+            free_scheduled_graph(scheduled);
+            return false;
+        }
+    }
+
+    std::vector<double> seconds;
+    seconds.reserve(timed_runs);
+    for (int i = 0; i < timed_runs; ++i) {
+        const double elapsed = sample_once(warmup_runs + i);
+        if (elapsed <= 0.0) {
+            ggml_backend_buffer_free(output_buffer);
+            free_scheduled_graph(scheduled);
+            return false;
+        }
+        seconds.push_back(elapsed);
+    }
+    (void) best_token_sink;
+    (void) input_sink;
+    (void) source_decode_sink;
+
+    const double median_seconds = median(seconds);
+    if (!std::isfinite(median_seconds) || median_seconds <= 0.0) {
+        ggml_backend_buffer_free(output_buffer);
+        free_scheduled_graph(scheduled);
+        return false;
+    }
+    const double effective_gbps = (bytes + static_cast<double>(output_bytes)) / median_seconds / 1e9;
+    const double tflops = flops / median_seconds / 1e12;
+    if (!std::isfinite(effective_gbps) || !std::isfinite(tflops)) {
+        ggml_backend_buffer_free(output_buffer);
+        free_scheduled_graph(scheduled);
+        return false;
+    }
+    result = make_probe_result(
+        name,
+        tensor_type,
+        rows,
+        cols,
+        graph_node_count(graph),
+        effective_gbps,
+        tflops,
+        median_seconds,
+        seconds,
+        graph_features,
+        timed_runs);
+    result.graph_inventory = collect_graph_inventory(graph);
+
+    ggml_backend_buffer_free(output_buffer);
     free_scheduled_graph(scheduled);
     return true;
 }
@@ -748,6 +2119,10 @@ bool run_llama_graph_probe(
     ggml_set_output(output);
 
     ggml_build_forward_expand(graph, output);
+    if (!graph_supported_by_backend(backend, graph)) {
+        ggml_free(ctx);
+        return false;
+    }
 
     ScheduledGraph scheduled = alloc_sched_for_graph(backend, graph);
     if (scheduled.sched == nullptr) {
@@ -789,6 +2164,1218 @@ bool run_llama_graph_probe(
         graph_features,
         GRAPH_WARMUP_RUNS,
         GRAPH_TIMED_RUNS);
+    ggml_free(ctx);
+    return ok;
+}
+
+bool set_f16_tensor(
+    ggml_tensor * tensor,
+    int64_t elements,
+    uint32_t salt,
+    double & bytes) {
+    std::vector<float> values = deterministic_f32(elements, salt);
+    std::vector<uint8_t> encoded = encode_weights(GGML_TYPE_F16, values, elements, 1);
+    if (encoded.size() > ggml_nbytes(tensor)) {
+        return false;
+    }
+    ggml_backend_tensor_set(tensor, encoded.data(), 0, encoded.size());
+    bytes += static_cast<double>(encoded.size());
+    return true;
+}
+
+bool set_f32_tensor(
+    ggml_tensor * tensor,
+    int64_t elements,
+    uint32_t salt,
+    double & bytes) {
+    std::vector<float> values = deterministic_f32(elements, salt);
+    const size_t encoded_bytes = values.size() * sizeof(float);
+    if (encoded_bytes > ggml_nbytes(tensor)) {
+        return false;
+    }
+    ggml_backend_tensor_set(tensor, values.data(), 0, encoded_bytes);
+    bytes += static_cast<double>(encoded_bytes);
+    return true;
+}
+
+bool set_i64_tensor(
+    ggml_tensor * tensor,
+    int64_t elements,
+    int64_t value,
+    double & bytes) {
+    std::vector<int64_t> values(static_cast<size_t>(elements), value);
+    ggml_backend_tensor_set(tensor, values.data(), 0, values.size() * sizeof(int64_t));
+    bytes += static_cast<double>(values.size() * sizeof(int64_t));
+    return true;
+}
+
+bool set_i32_tensor(
+    ggml_tensor * tensor,
+    int64_t elements,
+    int32_t value,
+    double & bytes) {
+    std::vector<int32_t> values(static_cast<size_t>(elements), value);
+    ggml_backend_tensor_set(tensor, values.data(), 0, values.size() * sizeof(int32_t));
+    bytes += static_cast<double>(values.size() * sizeof(int32_t));
+    return true;
+}
+
+bool run_attention_runtime_probe(
+    ggml_backend_t backend,
+    const char * name,
+    int64_t head_dim,
+    int64_t query_heads,
+    int64_t kv_heads,
+    int64_t context_tokens,
+    int64_t repeat_layers,
+    ProbeResult & result) {
+    const int64_t layers = std::max<int64_t>(1, repeat_layers);
+    if (head_dim <= 0 || query_heads <= 0 || kv_heads <= 0 || context_tokens <= 0) {
+        return false;
+    }
+    if (query_heads % kv_heads != 0) {
+        return false;
+    }
+    const size_t context_bytes =
+        ggml_tensor_overhead() * static_cast<size_t>(16 * layers) + ggml_graph_overhead();
+    ggml_init_params params{};
+    params.mem_size = context_bytes;
+    params.mem_buffer = nullptr;
+    params.no_alloc = true;
+    ggml_context * ctx = ggml_init(params);
+    if (ctx == nullptr) {
+        return false;
+    }
+
+    ggml_tensor * input = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_dim, 1, query_heads, 1);
+    ggml_tensor * cur = input;
+    std::vector<ggml_tensor *> keys;
+    std::vector<ggml_tensor *> values;
+    std::vector<ggml_tensor *> masks;
+    keys.reserve(static_cast<size_t>(layers));
+    values.reserve(static_cast<size_t>(layers));
+    masks.reserve(static_cast<size_t>(layers));
+    for (int64_t layer = 0; layer < layers; ++layer) {
+        ggml_tensor * key = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, head_dim, context_tokens, kv_heads, 1);
+        ggml_tensor * value = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, head_dim, context_tokens, kv_heads, 1);
+        ggml_tensor * mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, context_tokens, 1, 1, 1);
+        ggml_tensor * attn = ggml_flash_attn_ext(
+            ctx,
+            cur,
+            key,
+            value,
+            mask,
+            1.0f / std::sqrt(static_cast<float>(head_dim)),
+            0.0f,
+            0.0f);
+        ggml_flash_attn_ext_set_prec(attn, GGML_PREC_F32);
+        cur = ggml_permute(ctx, attn, 0, 2, 1, 3);
+        keys.push_back(key);
+        values.push_back(value);
+        masks.push_back(mask);
+    }
+    ggml_set_name(input, "ggml_decode_flash_attn_runtime_input");
+    ggml_set_name(cur, "ggml_decode_flash_attn_runtime_output");
+    ggml_set_output(cur);
+
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, cur);
+    if (!graph_supported_by_backend(backend, graph)) {
+        ggml_free(ctx);
+        return false;
+    }
+
+    ScheduledGraph scheduled = alloc_sched_for_graph(backend, graph);
+    if (scheduled.sched == nullptr) {
+        ggml_free(ctx);
+        return false;
+    }
+
+    double bytes = 0.0;
+    double flops = 0.0;
+    std::vector<float> input_f32 = deterministic_f32(head_dim * query_heads, 613);
+    ggml_backend_tensor_set(input, input_f32.data(), 0, input_f32.size() * sizeof(float));
+    bytes += static_cast<double>(input_f32.size() * sizeof(float));
+    for (size_t layer = 0; layer < keys.size(); ++layer) {
+        const int64_t kv_elements = head_dim * context_tokens * kv_heads;
+        const int64_t mask_elements = context_tokens;
+        if (!set_f16_tensor(keys[layer], kv_elements, 631 + static_cast<uint32_t>(layer), bytes)
+            || !set_f16_tensor(values[layer], kv_elements, 733 + static_cast<uint32_t>(layer), bytes)
+            || !set_f16_tensor(masks[layer], mask_elements, 839 + static_cast<uint32_t>(layer), bytes)) {
+            free_scheduled_graph(scheduled);
+            ggml_free(ctx);
+            return false;
+        }
+        flops += 4.0 * static_cast<double>(query_heads)
+            * static_cast<double>(context_tokens)
+            * static_cast<double>(head_dim);
+    }
+    bytes += static_cast<double>(layers * head_dim * query_heads * sizeof(float));
+    ggml_backend_synchronize(backend);
+
+    const bool ok = compute_graph_timed(
+        graph,
+        scheduled,
+        result,
+        name,
+        "runtime",
+        context_tokens,
+        head_dim,
+        bytes,
+        flops,
+        0,
+        GRAPH_WARMUP_RUNS,
+        GRAPH_TIMED_RUNS);
+    ggml_free(ctx);
+    return ok;
+}
+
+bool run_logits_readback_probe(
+    ggml_backend_t backend,
+    const char * name,
+    int64_t vocab,
+    ProbeResult & result) {
+    // This probe models the source-visible logits handoff shape, not another
+    // transformer matmul. llama.cpp's decode graph can leave accelerator work
+    // queued until logits are requested by the CPU-side sampler. The fit crate
+    // already has separate probes for transformer blocks and output projection;
+    // here we allocate a vocab-sized F32 tensor on the selected backend, read it
+    // back through ggml_backend_tensor_get, and perform the same kind of
+    // vocabulary scan a greedy sampler must do. Keeping this as a direct backend
+    // tensor probe avoids constructing an artificial graph whose scheduler
+    // behavior would be more about the probe than the logits handoff we need to
+    // charge.
+    if (vocab <= 0) {
+        return false;
+    }
+    const size_t context_bytes = ggml_tensor_overhead() * 4 + ggml_graph_overhead();
+    ggml_init_params params{};
+    params.mem_size = context_bytes;
+    params.mem_buffer = nullptr;
+    params.no_alloc = true;
+    ggml_context * ctx = ggml_init(params);
+    if (ctx == nullptr) {
+        return false;
+    }
+
+    ggml_tensor * logits = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, vocab);
+    ggml_set_name(logits, "ggml_decode_logits_readback");
+    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    if (buffer == nullptr) {
+        ggml_free(ctx);
+        return false;
+    }
+
+    std::vector<float> logits_f32 = deterministic_f32(vocab, 947);
+    ggml_backend_tensor_set(logits, logits_f32.data(), 0, logits_f32.size() * sizeof(float));
+    ggml_backend_synchronize(backend);
+
+    std::vector<float> cpu_logits(static_cast<size_t>(vocab));
+    volatile int32_t best_token_sink = 0;
+    auto read_once = [&]() -> double {
+        const auto started = std::chrono::steady_clock::now();
+        ggml_backend_tensor_get(logits, cpu_logits.data(), 0, cpu_logits.size() * sizeof(float));
+        int32_t best = 0;
+        float best_logit = -std::numeric_limits<float>::infinity();
+        for (int32_t token = 0; token < static_cast<int32_t>(vocab); ++token) {
+            if (cpu_logits[static_cast<size_t>(token)] > best_logit) {
+                best_logit = cpu_logits[static_cast<size_t>(token)];
+                best = token;
+            }
+        }
+        best_token_sink = best;
+        const auto finished = std::chrono::steady_clock::now();
+        return std::chrono::duration<double>(finished - started).count();
+    };
+
+    for (int i = 0; i < WARMUP_RUNS; ++i) {
+        if (read_once() <= 0.0) {
+            ggml_backend_buffer_free(buffer);
+            ggml_free(ctx);
+            return false;
+        }
+    }
+
+    std::vector<double> seconds;
+    seconds.reserve(TIMED_RUNS);
+    for (int i = 0; i < TIMED_RUNS; ++i) {
+        const double elapsed = read_once();
+        if (elapsed <= 0.0) {
+            ggml_backend_buffer_free(buffer);
+            ggml_free(ctx);
+            return false;
+        }
+        seconds.push_back(elapsed);
+    }
+    (void) best_token_sink;
+
+    const double median_seconds = median(seconds);
+    if (!std::isfinite(median_seconds) || median_seconds <= 0.0) {
+        ggml_backend_buffer_free(buffer);
+        ggml_free(ctx);
+        return false;
+    }
+    const double bytes = static_cast<double>(cpu_logits.size() * sizeof(float));
+    const double effective_gbps = bytes / median_seconds / 1e9;
+    const double elapsed_ms = median_seconds * 1000.0;
+    if (!std::isfinite(effective_gbps) || !std::isfinite(elapsed_ms)) {
+        ggml_backend_buffer_free(buffer);
+        ggml_free(ctx);
+        return false;
+    }
+    result = make_probe_result(
+        name,
+        "runtime",
+        vocab,
+        1,
+        0,
+        effective_gbps,
+        0.0,
+        median_seconds,
+        seconds,
+        0,
+        TIMED_RUNS);
+
+    ggml_backend_buffer_free(buffer);
+    ggml_free(ctx);
+    return true;
+}
+
+bool run_logits_sync_probe(
+    ggml_backend_t backend,
+    const char * name,
+    int64_t vocab,
+    ProbeResult & result) {
+    // llama.cpp's sampled decode path eventually calls `llama_get_logits_ith()`.
+    // That accessor synchronizes the context before the sampler can see logits.
+    // A plain tensor readback probe measures the CPU-visible copy/scan once the
+    // tensor is ready; it does not measure a queued backend graph becoming
+    // ready at the logits boundary. This probe submits a tiny vocab-shaped
+    // graph, then immediately asks for the output tensor and scans it. It is
+    // deliberately not a transformer graph and it does not use model weights:
+    // the only GGUF-scaled fact is vocabulary size.
+    if (vocab <= 0) {
+        return false;
+    }
+    const size_t context_bytes = ggml_tensor_overhead() * 8 + ggml_graph_overhead();
+    ggml_init_params params{};
+    params.mem_size = context_bytes;
+    params.mem_buffer = nullptr;
+    params.no_alloc = true;
+    ggml_context * ctx = ggml_init(params);
+    if (ctx == nullptr) {
+        return false;
+    }
+
+    ggml_tensor * input = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, vocab);
+    ggml_tensor * bias = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, vocab);
+    ggml_tensor * logits = ggml_add(ctx, input, bias);
+    ggml_set_name(input, "ggml_decode_logits_sync_input");
+    ggml_set_name(bias, "ggml_decode_logits_sync_bias");
+    ggml_set_name(logits, "ggml_decode_logits_sync");
+    ggml_set_output(logits);
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, logits);
+    if (!graph_supported_by_backend(backend, graph)) {
+        ggml_free(ctx);
+        return false;
+    }
+
+    ScheduledGraph scheduled = alloc_sched_for_graph(backend, graph);
+    if (scheduled.sched == nullptr) {
+        ggml_free(ctx);
+        return false;
+    }
+
+    std::vector<float> logits_f32 = deterministic_f32(vocab, 1949);
+    ggml_backend_tensor_set(input, logits_f32.data(), 0, logits_f32.size() * sizeof(float));
+    std::vector<float> bias_f32(static_cast<size_t>(vocab), 0.0f);
+    ggml_backend_tensor_set(bias, bias_f32.data(), 0, bias_f32.size() * sizeof(float));
+    ggml_backend_synchronize(backend);
+
+    std::vector<float> cpu_logits(static_cast<size_t>(vocab));
+    volatile int32_t best_token_sink = 0;
+    auto sync_once = [&]() -> double {
+        const auto started = std::chrono::steady_clock::now();
+        enum ggml_status status = ggml_backend_sched_graph_compute_async(scheduled.sched, graph);
+        if (status != GGML_STATUS_SUCCESS) {
+            return 0.0;
+        }
+        ggml_backend_sched_synchronize(scheduled.sched);
+        ggml_backend_tensor_get(logits, cpu_logits.data(), 0, cpu_logits.size() * sizeof(float));
+        int32_t best = 0;
+        float best_logit = -std::numeric_limits<float>::infinity();
+        for (int32_t token = 0; token < static_cast<int32_t>(vocab); ++token) {
+            if (cpu_logits[static_cast<size_t>(token)] > best_logit) {
+                best_logit = cpu_logits[static_cast<size_t>(token)];
+                best = token;
+            }
+        }
+        best_token_sink = best;
+        const auto finished = std::chrono::steady_clock::now();
+        return std::chrono::duration<double>(finished - started).count();
+    };
+
+    for (int i = 0; i < WARMUP_RUNS; ++i) {
+        if (sync_once() <= 0.0) {
+            free_scheduled_graph(scheduled);
+            ggml_free(ctx);
+            return false;
+        }
+    }
+
+    std::vector<double> seconds;
+    seconds.reserve(TIMED_RUNS);
+    for (int i = 0; i < TIMED_RUNS; ++i) {
+        const double elapsed = sync_once();
+        if (elapsed <= 0.0) {
+            free_scheduled_graph(scheduled);
+            ggml_free(ctx);
+            return false;
+        }
+        seconds.push_back(elapsed);
+    }
+    (void) best_token_sink;
+
+    const double median_seconds = median(seconds);
+    if (!std::isfinite(median_seconds) || median_seconds <= 0.0) {
+        free_scheduled_graph(scheduled);
+        ggml_free(ctx);
+        return false;
+    }
+    const double bytes = static_cast<double>(cpu_logits.size() * sizeof(float));
+    const double effective_gbps = bytes / median_seconds / 1e9;
+    const double elapsed_ms = median_seconds * 1000.0;
+    if (!std::isfinite(effective_gbps) || !std::isfinite(elapsed_ms)) {
+        free_scheduled_graph(scheduled);
+        ggml_free(ctx);
+        return false;
+    }
+    result = make_probe_result(
+        name,
+        "runtime",
+        vocab,
+        1,
+        graph_node_count(graph),
+        effective_gbps,
+        0.0,
+        median_seconds,
+        seconds,
+        0,
+        TIMED_RUNS);
+    result.graph_inventory = collect_graph_inventory(graph);
+
+    free_scheduled_graph(scheduled);
+    ggml_free(ctx);
+    return true;
+}
+
+bool run_logits_output_handoff_probe(
+    ggml_backend_t backend,
+    const char * name,
+    int64_t vocab,
+    ProbeResult & result) {
+    // This is intentionally shaped after the llama.cpp sampled decode boundary,
+    // not after a generic tensor copy benchmark. In `llama_context::decode()`,
+    // the graph is submitted, then llama.cpp extracts the vocab-sized logits row
+    // with `ggml_backend_tensor_get_async()` into an output buffer allocated from
+    // the model output device's host buffer type when one exists, falling back to
+    // a CPU buffer otherwise. Later, `llama_get_logits_ith()` synchronizes the
+    // context before Skippy's greedy sampler scans the row. Tiny models can spend
+    // a material fraction of token time here because their transformer matmuls are
+    // cheap; treating this source-visible handoff as "just bandwidth" hides that
+    // miss class. The only GGUF-scaled input is vocabulary size.
+    if (vocab <= 0) {
+        return false;
+    }
+    const size_t context_bytes = ggml_tensor_overhead() * 8 + ggml_graph_overhead();
+    ggml_init_params params{};
+    params.mem_size = context_bytes;
+    params.mem_buffer = nullptr;
+    params.no_alloc = true;
+    ggml_context * ctx = ggml_init(params);
+    if (ctx == nullptr) {
+        return false;
+    }
+
+    ggml_tensor * input = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, vocab);
+    ggml_tensor * bias = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, vocab);
+    ggml_tensor * logits = ggml_add(ctx, input, bias);
+    ggml_set_name(input, "ggml_decode_logits_output_handoff_input");
+    ggml_set_name(bias, "ggml_decode_logits_output_handoff_bias");
+    ggml_set_name(logits, "ggml_decode_logits_output_handoff");
+    ggml_set_output(logits);
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, logits);
+    if (!graph_supported_by_backend(backend, graph)) {
+        ggml_free(ctx);
+        return false;
+    }
+
+    ScheduledGraph scheduled = alloc_sched_for_graph(backend, graph);
+    if (scheduled.sched == nullptr) {
+        ggml_free(ctx);
+        return false;
+    }
+
+    ggml_backend_dev_t device = ggml_backend_get_device(backend);
+    ggml_backend_buffer_type_t output_buft = ggml_backend_cpu_buffer_type();
+    if (device != nullptr) {
+        ggml_backend_buffer_type_t host_buft = ggml_backend_dev_host_buffer_type(device);
+        if (host_buft != nullptr) {
+            output_buft = host_buft;
+        }
+    }
+    const size_t output_bytes = static_cast<size_t>(vocab) * sizeof(float);
+    ggml_backend_buffer_t output_buffer = ggml_backend_buft_alloc_buffer(output_buft, output_bytes);
+    if (output_buffer == nullptr) {
+        free_scheduled_graph(scheduled);
+        ggml_free(ctx);
+        return false;
+    }
+    ggml_backend_buffer_clear(output_buffer, 0);
+    float * output_base = static_cast<float *>(ggml_backend_buffer_get_base(output_buffer));
+    if (output_base == nullptr) {
+        ggml_backend_buffer_free(output_buffer);
+        free_scheduled_graph(scheduled);
+        ggml_free(ctx);
+        return false;
+    }
+
+    std::vector<float> logits_f32 = deterministic_f32(vocab, 3907);
+    ggml_backend_tensor_set(input, logits_f32.data(), 0, logits_f32.size() * sizeof(float));
+    std::vector<float> bias_f32(static_cast<size_t>(vocab), 0.0f);
+    ggml_backend_tensor_set(bias, bias_f32.data(), 0, bias_f32.size() * sizeof(float));
+    ggml_backend_synchronize(backend);
+
+    volatile int32_t best_token_sink = 0;
+    auto handoff_once = [&]() -> double {
+        const auto started = std::chrono::steady_clock::now();
+        enum ggml_status status = ggml_backend_sched_graph_compute_async(scheduled.sched, graph);
+        if (status != GGML_STATUS_SUCCESS) {
+            return 0.0;
+        }
+        ggml_backend_t logits_backend = ggml_backend_sched_get_tensor_backend(scheduled.sched, logits);
+        if (logits_backend == nullptr) {
+            return 0.0;
+        }
+        ggml_backend_tensor_get_async(logits_backend, logits, output_base, 0, output_bytes);
+        ggml_backend_sched_synchronize(scheduled.sched);
+        int32_t best = 0;
+        float best_logit = -std::numeric_limits<float>::infinity();
+        for (int32_t token = 0; token < static_cast<int32_t>(vocab); ++token) {
+            if (output_base[token] > best_logit) {
+                best_logit = output_base[token];
+                best = token;
+            }
+        }
+        best_token_sink = best;
+        const auto finished = std::chrono::steady_clock::now();
+        return std::chrono::duration<double>(finished - started).count();
+    };
+
+    for (int i = 0; i < WARMUP_RUNS; ++i) {
+        if (handoff_once() <= 0.0) {
+            ggml_backend_buffer_free(output_buffer);
+            free_scheduled_graph(scheduled);
+            ggml_free(ctx);
+            return false;
+        }
+    }
+
+    std::vector<double> seconds;
+    seconds.reserve(TIMED_RUNS);
+    for (int i = 0; i < TIMED_RUNS; ++i) {
+        const double elapsed = handoff_once();
+        if (elapsed <= 0.0) {
+            ggml_backend_buffer_free(output_buffer);
+            free_scheduled_graph(scheduled);
+            ggml_free(ctx);
+            return false;
+        }
+        seconds.push_back(elapsed);
+    }
+    (void) best_token_sink;
+
+    const double median_seconds = median(seconds);
+    if (!std::isfinite(median_seconds) || median_seconds <= 0.0) {
+        ggml_backend_buffer_free(output_buffer);
+        free_scheduled_graph(scheduled);
+        ggml_free(ctx);
+        return false;
+    }
+    const double bytes = static_cast<double>(output_bytes);
+    const double effective_gbps = bytes / median_seconds / 1e9;
+    const double elapsed_ms = median_seconds * 1000.0;
+    if (!std::isfinite(effective_gbps) || !std::isfinite(elapsed_ms)) {
+        ggml_backend_buffer_free(output_buffer);
+        free_scheduled_graph(scheduled);
+        ggml_free(ctx);
+        return false;
+    }
+    result = make_probe_result(
+        name,
+        "runtime",
+        vocab,
+        1,
+        graph_node_count(graph),
+        effective_gbps,
+        0.0,
+        median_seconds,
+        seconds,
+        0,
+        TIMED_RUNS);
+    result.graph_inventory = collect_graph_inventory(graph);
+
+    ggml_backend_buffer_free(output_buffer);
+    free_scheduled_graph(scheduled);
+    ggml_free(ctx);
+    return true;
+}
+
+bool run_dense_sampled_token_probe(
+    ggml_backend_t backend,
+    enum ggml_type type,
+    const char * name,
+    const char * tensor_type,
+    int64_t hidden,
+    int64_t kv_width,
+    int64_t ffn,
+    int64_t vocab,
+    int64_t repeat_layers,
+    int graph_features,
+    int64_t norm_head_width,
+    ProbeResult & result) {
+    const int64_t layers = std::max<int64_t>(1, repeat_layers);
+    if (vocab <= 0 || !dense_llama_shape_supported(type, hidden, kv_width, ffn)
+        || !matrix_shape_supported(type, vocab, hidden)) {
+        return false;
+    }
+    const bool use_q_norm = (graph_features & GRAPH_FEATURE_ATTENTION_Q_NORM) != 0;
+    const bool use_k_norm = (graph_features & GRAPH_FEATURE_ATTENTION_K_NORM) != 0;
+    const bool use_post_attention_norm = (graph_features & GRAPH_FEATURE_ATTENTION_POST_NORM) != 0;
+    const bool use_post_ffn_norm = (graph_features & GRAPH_FEATURE_FFN_POST_NORM) != 0;
+    const size_t context_bytes =
+        ggml_tensor_overhead() * static_cast<size_t>(84 * layers + 16) + ggml_graph_overhead();
+    ggml_init_params params{};
+    params.mem_size = context_bytes;
+    params.mem_buffer = nullptr;
+    params.no_alloc = true;
+    ggml_context * ctx = ggml_init(params);
+    if (ctx == nullptr) {
+        return false;
+    }
+
+    ggml_tensor * input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hidden, 1);
+    ggml_tensor * output = input;
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    for (int64_t layer = 0; layer < layers; ++layer) {
+        ggml_tensor * attn_input = use_post_attention_norm ? output : ggml_rms_norm(ctx, output, 1e-5f);
+        ggml_tensor * q = ggml_mul_mat(ctx, ggml_new_tensor_2d(ctx, type, hidden, hidden), attn_input);
+        ggml_tensor * k = ggml_mul_mat(ctx, ggml_new_tensor_2d(ctx, type, hidden, kv_width), attn_input);
+        ggml_tensor * v = ggml_mul_mat(ctx, ggml_new_tensor_2d(ctx, type, hidden, kv_width), attn_input);
+        if (use_q_norm) {
+            q = rms_norm_attention_projection(ctx, q, hidden, norm_head_width);
+        }
+        if (use_k_norm) {
+            k = rms_norm_attention_projection(ctx, k, kv_width, norm_head_width);
+        }
+        ggml_build_forward_expand(graph, q);
+        ggml_build_forward_expand(graph, k);
+        ggml_build_forward_expand(graph, v);
+        ggml_tensor * attn = ggml_mul_mat(ctx, ggml_new_tensor_2d(ctx, type, hidden, hidden), q);
+        ggml_tensor * ffn_input;
+        ggml_tensor * residual_after_attn;
+        if (use_post_attention_norm) {
+            ggml_tensor * attn_norm = ggml_rms_norm(ctx, attn, 1e-5f);
+            ffn_input = ggml_add(ctx, output, attn_norm);
+            residual_after_attn = ffn_input;
+        } else {
+            residual_after_attn = ggml_add(ctx, output, attn);
+            ffn_input = ggml_rms_norm(ctx, residual_after_attn, 1e-5f);
+        }
+        ggml_tensor * gate = ggml_mul_mat(ctx, ggml_new_tensor_2d(ctx, type, hidden, ffn), ffn_input);
+        ggml_tensor * up = ggml_mul_mat(ctx, ggml_new_tensor_2d(ctx, type, hidden, ffn), ffn_input);
+        ggml_tensor * gated = ggml_swiglu_split(ctx, gate, up);
+        ggml_tensor * down = ggml_mul_mat(ctx, ggml_new_tensor_2d(ctx, type, ffn, hidden), gated);
+        if (use_post_ffn_norm) {
+            down = ggml_rms_norm(ctx, down, 1e-5f);
+        }
+        output = ggml_add(ctx, residual_after_attn, down);
+    }
+    ggml_tensor * logits = ggml_mul_mat(ctx, ggml_new_tensor_2d(ctx, type, hidden, vocab), output);
+    ggml_set_name(input, "ggml_decode_sampled_token_input");
+    ggml_set_name(logits, "ggml_decode_sampled_token_logits");
+    ggml_set_output(logits);
+    ggml_build_forward_expand(graph, logits);
+    if (!graph_supported_by_backend(backend, graph)) {
+        ggml_free(ctx);
+        return false;
+    }
+
+    ScheduledGraph scheduled = alloc_sched_for_graph(backend, graph);
+    if (scheduled.sched == nullptr) {
+        ggml_free(ctx);
+        return false;
+    }
+
+    double bytes = 0.0;
+    double flops = 0.0;
+    std::vector<float> input_f32 = deterministic_f32(hidden, 101);
+    ggml_backend_tensor_set(input, input_f32.data(), 0, input_f32.size() * sizeof(float));
+    bytes += static_cast<double>(input_f32.size() * sizeof(float));
+    EncodedWeightCache weight_cache;
+    for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+        if (t->type != type || t->op != GGML_OP_NONE) {
+            continue;
+        }
+        const int64_t rows = t->ne[1];
+        const int64_t cols = t->ne[0];
+        if (!set_encoded_weights(t, type, rows, cols, weight_cache, bytes, flops)) {
+            free_scheduled_graph(scheduled);
+            ggml_free(ctx);
+            return false;
+        }
+    }
+    bytes += static_cast<double>((layers * (4 * hidden + ffn) + vocab) * sizeof(float));
+    std::vector<float> cpu_logits(static_cast<size_t>(vocab));
+    volatile int32_t best_token_sink = 0;
+    ggml_backend_synchronize(backend);
+
+    auto compute_and_sample_once = [&]() -> double {
+        const auto started = std::chrono::steady_clock::now();
+        enum ggml_status status = ggml_backend_sched_graph_compute_async(scheduled.sched, graph);
+        if (status != GGML_STATUS_SUCCESS) {
+            return 0.0;
+        }
+        ggml_backend_tensor_get(logits, cpu_logits.data(), 0, cpu_logits.size() * sizeof(float));
+        int32_t best = 0;
+        float best_logit = -std::numeric_limits<float>::infinity();
+        for (int32_t token = 0; token < static_cast<int32_t>(vocab); ++token) {
+            if (cpu_logits[static_cast<size_t>(token)] > best_logit) {
+                best_logit = cpu_logits[static_cast<size_t>(token)];
+                best = token;
+            }
+        }
+        best_token_sink = best;
+        const auto finished = std::chrono::steady_clock::now();
+        return std::chrono::duration<double>(finished - started).count();
+    };
+
+    for (int i = 0; i < GRAPH_WARMUP_RUNS; ++i) {
+        if (compute_and_sample_once() <= 0.0) {
+            free_scheduled_graph(scheduled);
+            ggml_free(ctx);
+            return false;
+        }
+    }
+
+    std::vector<double> seconds;
+    seconds.reserve(GRAPH_TIMED_RUNS);
+    for (int i = 0; i < GRAPH_TIMED_RUNS; ++i) {
+        const double elapsed = compute_and_sample_once();
+        if (elapsed <= 0.0) {
+            free_scheduled_graph(scheduled);
+            ggml_free(ctx);
+            return false;
+        }
+        seconds.push_back(elapsed);
+    }
+    (void) best_token_sink;
+
+    const double median_seconds = median(seconds);
+    if (!std::isfinite(median_seconds) || median_seconds <= 0.0) {
+        free_scheduled_graph(scheduled);
+        ggml_free(ctx);
+        return false;
+    }
+    const double effective_gbps = bytes / median_seconds / 1e9;
+    const double tflops = flops / median_seconds / 1e12;
+    const double elapsed_ms = median_seconds * 1000.0;
+    if (!std::isfinite(effective_gbps) || !std::isfinite(tflops) || !std::isfinite(elapsed_ms)) {
+        free_scheduled_graph(scheduled);
+        ggml_free(ctx);
+        return false;
+    }
+    result = make_probe_result(
+        name,
+        tensor_type,
+        vocab,
+        hidden,
+        graph_node_count(graph),
+        effective_gbps,
+        tflops,
+        median_seconds,
+        seconds,
+        graph_features,
+        GRAPH_TIMED_RUNS);
+    result.graph_inventory = collect_graph_inventory(graph);
+
+    free_scheduled_graph(scheduled);
+    ggml_free(ctx);
+    return true;
+}
+
+bool run_dense_full_token_probe(
+    ggml_backend_t backend,
+    enum ggml_type block_type,
+    enum ggml_type output_type,
+    const char * name,
+    const char * tensor_type,
+    int64_t hidden,
+    int64_t kv_width,
+    int64_t ffn,
+    int64_t vocab,
+    int64_t repeat_layers,
+    int graph_features,
+    int64_t norm_head_width,
+    int64_t head_dim,
+    int64_t query_heads,
+    int64_t kv_heads,
+    int64_t context_tokens,
+    int64_t active_context_tokens,
+    bool include_output_handoff,
+    bool measure_submission,
+    bool measure_source_sampled,
+    bool measure_source_input,
+    ProbeResult & result) {
+    const int64_t layers = std::max<int64_t>(1, repeat_layers);
+    const int64_t query_width = head_dim * query_heads;
+    const int64_t kv_capacity_tokens = std::max<int64_t>(1, context_tokens);
+    const int64_t n_kv = std::clamp<int64_t>(
+        std::max<int64_t>(1, active_context_tokens),
+        1,
+        kv_capacity_tokens);
+    if (vocab <= 0 || head_dim <= 0 || query_heads <= 0 || kv_heads <= 0 || context_tokens <= 0
+        || kv_width != head_dim * kv_heads
+        || !matrix_shape_supported(block_type, query_width, hidden)
+        || !matrix_shape_supported(block_type, kv_width, hidden)
+        || !matrix_shape_supported(block_type, hidden, query_width)
+        || !matrix_shape_supported(block_type, ffn, hidden)
+        || !matrix_shape_supported(block_type, hidden, ffn)
+        || !matrix_shape_supported(output_type, vocab, hidden)) {
+        return false;
+    }
+    const bool use_q_norm = (graph_features & GRAPH_FEATURE_ATTENTION_Q_NORM) != 0;
+    const bool use_k_norm = (graph_features & GRAPH_FEATURE_ATTENTION_K_NORM) != 0;
+    const bool use_post_attention_norm = (graph_features & GRAPH_FEATURE_ATTENTION_POST_NORM) != 0;
+    const bool use_post_ffn_norm = (graph_features & GRAPH_FEATURE_FFN_POST_NORM) != 0;
+    const size_t context_bytes =
+        ggml_tensor_overhead() * static_cast<size_t>(138 * layers + 16) + ggml_graph_overhead();
+    ggml_init_params params{};
+    params.mem_size = context_bytes;
+    params.mem_buffer = nullptr;
+    params.no_alloc = true;
+    ggml_context * ctx = ggml_init(params);
+    if (ctx == nullptr) {
+        return false;
+    }
+
+    // llama.cpp decode starts from token ids, not a pre-materialized hidden
+    // vector. The graph first performs `get_rows(token_embd.weight, token_id)`
+    // and feeds that embedding row into layer 0. This is a small amount of
+    // graph topology for large models, but it is a real source-visible decode
+    // operation and the token embedding table can be comparable to the whole
+    // transformer block for tiny models. Keep it inside the full-token probe so
+    // model-fit does not need a backend or family correction for small GGUFs.
+    ggml_tensor * input = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
+    ggml_tensor * token_embedding =
+        ggml_new_tensor_2d(ctx, output_type, hidden, vocab);
+    ggml_tensor * positions = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
+    ggml_tensor * output_index = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_tensor * output = ggml_get_rows(ctx, token_embedding, input);
+    std::vector<ggml_tensor *> keys;
+    std::vector<ggml_tensor *> values;
+    std::vector<ggml_tensor *> masks;
+    std::vector<ggml_tensor *> key_indices;
+    std::vector<ggml_tensor *> value_indices;
+    std::vector<ggml_tensor *> f32_weights;
+    keys.reserve(static_cast<size_t>(layers));
+    values.reserve(static_cast<size_t>(layers));
+    masks.reserve(static_cast<size_t>(layers));
+    key_indices.reserve(static_cast<size_t>(layers));
+    value_indices.reserve(static_cast<size_t>(layers));
+
+    for (int64_t layer = 0; layer < layers; ++layer) {
+        ggml_tensor * attn_norm_weight = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hidden);
+        ggml_tensor * ffn_norm_weight = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hidden);
+        f32_weights.push_back(attn_norm_weight);
+        f32_weights.push_back(ffn_norm_weight);
+
+        ggml_tensor * attn_input = output;
+        if (!use_post_attention_norm) {
+            // llama.cpp's `build_norm()` is not just `GGML_OP_RMS_NORM`: when
+            // the model has a learned norm tensor, source graph construction
+            // immediately multiplies the normalized activation by that weight.
+            // The synthetic full-token probe used to skip these per-layer
+            // norm-weight multiplies, leaving the matmul byte inventory correct
+            // but the decode graph 2 nodes/layer thinner than llama.cpp. Tiny
+            // models are exactly where those non-matmul nodes are visible, so
+            // keep them in the GGML graph rather than hiding them behind a
+            // scalar latency correction.
+            attn_input = ggml_rms_norm(ctx, output, 1e-5f);
+            attn_input = ggml_mul(ctx, attn_input, attn_norm_weight);
+            ggml_set_name(attn_input, "attn_norm_weighted");
+        }
+        ggml_tensor * q = ggml_mul_mat(ctx, ggml_new_tensor_2d(ctx, block_type, hidden, query_width), attn_input);
+        ggml_tensor * k = ggml_mul_mat(ctx, ggml_new_tensor_2d(ctx, block_type, hidden, kv_width), attn_input);
+        ggml_tensor * v = ggml_mul_mat(ctx, ggml_new_tensor_2d(ctx, block_type, hidden, kv_width), attn_input);
+        if (use_q_norm) {
+            q = rms_norm_attention_projection(ctx, q, query_width, norm_head_width);
+        }
+        if (use_k_norm) {
+            k = rms_norm_attention_projection(ctx, k, kv_width, norm_head_width);
+        }
+        // Source llama.cpp reshapes Q/K/V projections into
+        // [head_dim, heads, n_tokens] before RoPE and KV-cache handling:
+        //
+        //   Qcur = ggml_reshape_3d(...);
+        //   Kcur = ggml_reshape_3d(...);
+        //   Vcur = ggml_reshape_3d(...);
+        //
+        // Earlier synthetic probe versions jumped straight from 2-D projection
+        // output to RoPE/cache writes. That preserved matmul bytes but missed
+        // two source-visible reshape nodes per layer after accounting for the
+        // synthetic-only q reshape below. Tiny models are sensitive to this
+        // topology because these non-matmul nodes sit on the sampled-token
+        // boundary. Keep the real GGML nodes here so the probe is source-shaped
+        // rather than corrected with a backend or model-family constant.
+        q = ggml_reshape_3d(ctx, q, head_dim, query_heads, 1);
+        k = ggml_reshape_3d(ctx, k, head_dim, kv_heads, 1);
+        v = ggml_reshape_3d(ctx, v, head_dim, kv_heads, 1);
+        // Source llama.cpp applies RoPE to the current Q/K projections before
+        // the token's K row is written into the layer KV cache. The synthetic
+        // full-token probe used to skip this because RoPE is not a matmul and
+        // contributes no model weight bytes. That made the probe's matmul
+        // inventory look correct while its GGML graph topology was too thin,
+        // especially for tiny models where non-matmul graph nodes dominate the
+        // token latency. Keep this as a real GGML op rather than a scalar
+        // penalty: the backend planner sees the same kind of source-visible
+        // work llama.cpp submits for decode.
+        q = ggml_rope(ctx, q, positions, static_cast<int>(head_dim), GGML_ROPE_TYPE_NEOX);
+        k = ggml_rope(ctx, k, positions, static_cast<int>(head_dim), GGML_ROPE_TYPE_NEOX);
+        ggml_build_forward_expand(graph, q);
+        ggml_build_forward_expand(graph, v);
+        ggml_build_forward_expand(graph, k);
+
+        // llama.cpp decode does not attend over immutable synthetic K/V inputs.
+        // Each token writes the current K and V rows into the layer KV cache with
+        // GGML_OP_SET_ROWS, then attention reads from the updated cache view. For
+        // small models, those cache-write/runtime nodes are large compared with
+        // the matmuls, so the full-token probe must include them instead of
+        // handing Flash Attention already-populated cache tensors.
+        // llama.cpp separates KV allocation capacity from active attention
+        // length. `llama_kv_cache::cpy_k/cpy_v()` writes into buffers sized by
+        // `--ctx-size`, while `llama_kv_cache::get_n_kv()` pads the currently
+        // used cells and `get_k/get_v()` expose only that active n_kv view to
+        // Flash Attention. Tiny-model estimates were too optimistic when this
+        // synthetic graph used one `context_tokens` value for both ideas: it
+        // matched some total bytes but exercised a different backend attention
+        // layout than the source graph. Keep the capacity-shaped SET_ROWS nodes
+        // and use n_kv-shaped K/V/mask views for the attention path.
+        ggml_tensor * key_cache = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, kv_width, kv_capacity_tokens);
+        ggml_tensor * value_cache = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, kv_width, kv_capacity_tokens);
+        ggml_tensor * key_index = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, 1);
+        ggml_tensor * value_index = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, 1);
+        // llama.cpp's KV cache write path (`cpy_k`/`cpy_v`) uses
+        // `ggml_view_2d()` to merge the current head dimensions before
+        // `ggml_set_rows()`. A reshape has the same logical dimensions for our
+        // synthetic single-token tensor, but it does not produce the same
+        // source-visible GGML op topology. Use a view here so graph inventory
+        // lines up with the real decode graph without changing any bytes or
+        // fitting to observed throughput.
+        ggml_tensor * key_current = ggml_view_2d(ctx, k, kv_width, 1, k->nb[2], 0);
+        ggml_tensor * value_current = ggml_view_2d(ctx, v, kv_width, 1, v->nb[2], 0);
+        ggml_tensor * key_written = ggml_set_rows(ctx, key_cache, key_current, key_index);
+        ggml_tensor * value_written = ggml_set_rows(ctx, value_cache, value_current, value_index);
+        const size_t kv_element_size = ggml_element_size(key_written);
+        ggml_tensor * key = ggml_view_4d(
+            ctx,
+            key_written,
+            head_dim,
+            kv_heads,
+            n_kv,
+            1,
+            static_cast<size_t>(head_dim) * kv_element_size,
+            key_written->nb[1],
+            key_written->nb[1] * static_cast<size_t>(kv_capacity_tokens),
+            0);
+        ggml_tensor * value = ggml_view_4d(
+            ctx,
+            value_written,
+            head_dim,
+            kv_heads,
+            n_kv,
+            1,
+            static_cast<size_t>(head_dim) * kv_element_size,
+            value_written->nb[1],
+            value_written->nb[1] * static_cast<size_t>(kv_capacity_tokens),
+            0);
+        ggml_tensor * mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, n_kv, 1, 1, 1);
+        // `build_attn_mha()` views the already-3D Q tensor as 4D to split
+        // streams, then permutes it into Flash Attention layout. Using a
+        // reshape here would add a synthetic-only node and hide the source
+        // topology delta we are trying to measure.
+        ggml_tensor * q4 = ggml_view_4d(
+            ctx,
+            q,
+            q->ne[0],
+            q->ne[1],
+            q->ne[2],
+            1,
+            q->nb[1],
+            q->nb[2],
+            q->nb[3],
+            0);
+        q4 = ggml_permute(ctx, q4, 0, 2, 1, 3);
+        key = ggml_permute(ctx, key, 0, 2, 1, 3);
+        value = ggml_permute(ctx, value, 0, 2, 1, 3);
+        ggml_tensor * attn = ggml_flash_attn_ext(
+            ctx,
+            q4,
+            key,
+            value,
+            mask,
+            1.0f / std::sqrt(static_cast<float>(head_dim)),
+            0.0f,
+            0.0f);
+        ggml_flash_attn_ext_set_prec(attn, GGML_PREC_F32);
+        attn = ggml_reshape_2d(ctx, attn, query_width, 1);
+        ggml_tensor * attn_out = ggml_mul_mat(ctx, ggml_new_tensor_2d(ctx, block_type, query_width, hidden), attn);
+        ggml_tensor * residual_source = output;
+        if (layer == layers - 1) {
+            // llama.cpp gathers only requested output rows on the final layer:
+            //
+            //   cur   = ggml_get_rows(cur,   inp_out_ids);
+            //   inpSA = ggml_get_rows(inpSA, inp_out_ids);
+            //
+            // Decode uses one requested output token, but these two source
+            // `GGML_OP_GET_ROWS` nodes are still present in the graph. They are
+            // small, yet they are exactly the kind of non-matmul topology that
+            // made tiny models look too fast when the synthetic probe only
+            // matched weight bytes.
+            attn_out = ggml_get_rows(ctx, attn_out, output_index);
+            residual_source = ggml_get_rows(ctx, residual_source, output_index);
+        }
+        ggml_tensor * ffn_input;
+        ggml_tensor * residual_after_attn;
+        if (use_post_attention_norm) {
+            ggml_tensor * attn_norm = ggml_rms_norm(ctx, attn_out, 1e-5f);
+            attn_norm = ggml_mul(ctx, attn_norm, attn_norm_weight);
+            ggml_set_name(attn_norm, "attn_post_norm_weighted");
+            ffn_input = ggml_add(ctx, residual_source, attn_norm);
+            residual_after_attn = ffn_input;
+        } else {
+            residual_after_attn = ggml_add(ctx, residual_source, attn_out);
+            ffn_input = ggml_rms_norm(ctx, residual_after_attn, 1e-5f);
+            ffn_input = ggml_mul(ctx, ffn_input, ffn_norm_weight);
+            ggml_set_name(ffn_input, "ffn_norm_weighted");
+        }
+        ggml_tensor * gate = ggml_mul_mat(ctx, ggml_new_tensor_2d(ctx, block_type, hidden, ffn), ffn_input);
+        ggml_tensor * up = ggml_mul_mat(ctx, ggml_new_tensor_2d(ctx, block_type, hidden, ffn), ffn_input);
+        ggml_tensor * gated = ggml_swiglu_split(ctx, gate, up);
+        ggml_tensor * down = ggml_mul_mat(ctx, ggml_new_tensor_2d(ctx, block_type, ffn, hidden), gated);
+        if (use_post_ffn_norm) {
+            down = ggml_rms_norm(ctx, down, 1e-5f);
+        }
+        output = ggml_add(ctx, residual_after_attn, down);
+        keys.push_back(key_cache);
+        values.push_back(value_cache);
+        masks.push_back(mask);
+        key_indices.push_back(key_index);
+        value_indices.push_back(value_index);
+    }
+    ggml_tensor * final_norm_weight = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hidden);
+    ggml_tensor * logits_input = ggml_rms_norm(ctx, output, 1e-5f);
+    logits_input = ggml_mul(ctx, logits_input, final_norm_weight);
+    ggml_tensor * logits = ggml_mul_mat(ctx, ggml_new_tensor_2d(ctx, output_type, hidden, vocab), logits_input);
+    f32_weights.push_back(final_norm_weight);
+    ggml_set_name(input, "ggml_decode_full_token_input");
+    ggml_set_name(final_norm_weight, "ggml_decode_full_token_output_norm");
+    ggml_set_name(logits, "ggml_decode_full_token_logits");
+    ggml_set_output(logits);
+    ggml_build_forward_expand(graph, logits);
+    if (!graph_supported_by_backend(backend, graph)) {
+        ggml_free(ctx);
+        return false;
+    }
+
+    ScheduledGraph scheduled = alloc_sched_for_graph(backend, graph);
+    if (scheduled.sched == nullptr) {
+        ggml_free(ctx);
+        return false;
+    }
+
+    double bytes = 0.0;
+    double flops = 0.0;
+    if (!set_i32_tensor(input, 1, 0, bytes)) {
+        free_scheduled_graph(scheduled);
+        ggml_free(ctx);
+        return false;
+    }
+    if (!set_i32_tensor(
+        positions,
+        1,
+        static_cast<int32_t>(std::max<int64_t>(0, n_kv - 1)),
+        bytes)) {
+        free_scheduled_graph(scheduled);
+        ggml_free(ctx);
+        return false;
+    }
+    if (!set_i32_tensor(output_index, 1, 0, bytes)) {
+        free_scheduled_graph(scheduled);
+        ggml_free(ctx);
+        return false;
+    }
+    EncodedWeightCache weight_cache;
+    for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+        if (t->op != GGML_OP_NONE) {
+            continue;
+        }
+        const int64_t rows = t->ne[1];
+        const int64_t cols = t->ne[0];
+        if (t->type == block_type || t->type == output_type) {
+            if (!set_encoded_weights(t, t->type, rows, cols, weight_cache, bytes, flops)) {
+                free_scheduled_graph(scheduled);
+                ggml_free(ctx);
+                return false;
+            }
+        }
+    }
+    for (size_t i = 0; i < f32_weights.size(); ++i) {
+        if (!set_f32_tensor(f32_weights[i], hidden, 2801 + static_cast<uint32_t>(i), bytes)) {
+            free_scheduled_graph(scheduled);
+            ggml_free(ctx);
+            return false;
+        }
+    }
+    for (size_t layer = 0; layer < keys.size(); ++layer) {
+        const int64_t kv_elements = head_dim * kv_capacity_tokens * kv_heads;
+        const int64_t mask_elements = n_kv;
+        if (!set_f16_tensor(keys[layer], kv_elements, 1409 + static_cast<uint32_t>(layer), bytes)
+            || !set_f16_tensor(values[layer], kv_elements, 1601 + static_cast<uint32_t>(layer), bytes)
+            || !set_f16_tensor(masks[layer], mask_elements, 1801 + static_cast<uint32_t>(layer), bytes)
+            || !set_i64_tensor(
+                key_indices[layer],
+                1,
+                std::max<int64_t>(0, n_kv - 1),
+                bytes)
+            || !set_i64_tensor(
+                value_indices[layer],
+                1,
+                std::max<int64_t>(0, n_kv - 1),
+                bytes)) {
+            free_scheduled_graph(scheduled);
+            ggml_free(ctx);
+            return false;
+        }
+        flops += 4.0 * static_cast<double>(query_heads)
+            * static_cast<double>(n_kv)
+            * static_cast<double>(head_dim);
+    }
+
+    const bool ok = measure_source_input
+        ? compute_graph_source_input_timed(
+            graph,
+            input,
+            positions,
+            key_indices,
+            value_indices,
+            masks,
+            scheduled,
+            result,
+            name,
+            tensor_type,
+            vocab,
+            hidden,
+            repeat_layers,
+            n_kv,
+            flops,
+            graph_features,
+            GRAPH_WARMUP_RUNS,
+            SOURCE_BOUNDARY_TIMED_RUNS)
+        : measure_source_sampled
+        ? compute_graph_source_sampled_timed(
+            backend,
+            graph,
+            input,
+            positions,
+            logits,
+            key_indices,
+            value_indices,
+            masks,
+            scheduled,
+            result,
+            name,
+            tensor_type,
+            vocab,
+            hidden,
+            repeat_layers,
+            n_kv,
+            bytes,
+            flops,
+            graph_features,
+            GRAPH_WARMUP_RUNS,
+            SOURCE_BOUNDARY_TIMED_RUNS)
+        : measure_submission
+        ? compute_graph_submission_timed(
+            backend,
+            graph,
+            input,
+            positions,
+            logits,
+            key_indices,
+            value_indices,
+            masks,
+            scheduled,
+            result,
+            name,
+            tensor_type,
+            vocab,
+            hidden,
+            repeat_layers,
+            n_kv,
+            bytes,
+            flops,
+            graph_features,
+            GRAPH_WARMUP_RUNS,
+            SOURCE_BOUNDARY_TIMED_RUNS)
+        : include_output_handoff
+        ? compute_graph_output_handoff_timed(
+            backend,
+            graph,
+            input,
+            positions,
+            logits,
+            key_indices,
+            value_indices,
+            masks,
+            scheduled,
+            result,
+            name,
+            tensor_type,
+            vocab,
+            hidden,
+            n_kv,
+            bytes,
+            flops,
+            graph_features,
+            GRAPH_WARMUP_RUNS,
+            SOURCE_BOUNDARY_TIMED_RUNS)
+        : compute_graph_timed(
+            graph,
+            scheduled,
+            result,
+            name,
+            tensor_type,
+            vocab,
+            hidden,
+            bytes,
+            flops,
+            graph_features,
+            GRAPH_WARMUP_RUNS,
+            SOURCE_BOUNDARY_TIMED_RUNS);
     ggml_free(ctx);
     return ok;
 }
@@ -949,6 +3536,10 @@ bool run_linear_attention_graph_probe(
     ggml_set_name(output, "ggml_decode_linear_attn_graph_output");
     ggml_set_output(output);
     ggml_build_forward_expand(graph, output);
+    if (!graph_supported_by_backend(backend, graph)) {
+        ggml_free(ctx);
+        return false;
+    }
 
     ScheduledGraph scheduled = alloc_sched_for_graph(backend, graph);
     if (scheduled.sched == nullptr) {
@@ -1030,7 +3621,7 @@ bool run_moe_mul_mat_id_probe(
 
     ggml_cgraph * graph = ggml_new_graph(ctx);
     ggml_build_forward_expand(graph, output);
-    if (!ggml_backend_supports_op(backend, output)) {
+    if (!graph_supported_by_backend(backend, graph)) {
         ggml_free(ctx);
         return false;
     }
@@ -1187,7 +3778,7 @@ bool run_moe_graph_probe(
 
     ggml_cgraph * graph = ggml_new_graph(ctx);
     ggml_build_forward_expand(graph, output);
-    if (!ggml_backend_supports_op(backend, output)) {
+    if (!graph_supported_by_backend(backend, graph)) {
         ggml_free(ctx);
         return false;
     }
@@ -1297,6 +3888,8 @@ bool run_moe_block_graph_probe(
     int64_t hidden,
     int64_t kv_width,
     int64_t repeat_layers,
+    bool submission_only,
+    int64_t context_tokens,
     ProbeResult & result) {
     const int64_t layers = std::max<int64_t>(1, repeat_layers);
     constexpr int64_t tokens = 1;
@@ -1415,7 +4008,7 @@ bool run_moe_block_graph_probe(
     ggml_set_output(output);
 
     ggml_build_forward_expand(graph, output);
-    if (!ggml_backend_supports_op(backend, output)) {
+    if (!graph_supported_by_backend(backend, graph)) {
         ggml_free(ctx);
         return false;
     }
@@ -1493,19 +4086,47 @@ bool run_moe_block_graph_probe(
             + experts_used * sizeof(int32_t));
     ggml_backend_synchronize(backend);
 
-    const bool ok = compute_graph_timed(
-        graph,
-        scheduled,
-        result,
-        name,
-        tensor_type,
-        expert_width,
-        hidden,
-        bytes,
-        flops,
-        0,
-        GRAPH_WARMUP_RUNS,
-        GRAPH_TIMED_RUNS);
+    bool ok = false;
+    if (submission_only) {
+        const std::vector<ggml_tensor *> empty_indices;
+        const std::vector<ggml_tensor *> empty_masks;
+        ok = compute_graph_submission_timed(
+            backend,
+            graph,
+            input,
+            nullptr,
+            output,
+            empty_indices,
+            empty_indices,
+            empty_masks,
+            scheduled,
+            result,
+            name,
+            tensor_type,
+            hidden,
+            hidden,
+            layers,
+            std::max<int64_t>(1, context_tokens),
+            bytes,
+            flops,
+            0,
+            GRAPH_WARMUP_RUNS,
+            GRAPH_TIMED_RUNS);
+    } else {
+        ok = compute_graph_timed(
+            graph,
+            scheduled,
+            result,
+            name,
+            tensor_type,
+            expert_width,
+            hidden,
+            bytes,
+            flops,
+            0,
+            GRAPH_WARMUP_RUNS,
+            GRAPH_TIMED_RUNS);
+    }
     ggml_free(ctx);
     return ok;
 }
@@ -1524,16 +4145,72 @@ std::string results_json(const std::vector<ProbeResult> & results) {
             << "\"cols\":" << result.cols << ","
             << "\"batch_tokens\":1,"
             << "\"graph_features\":" << result.graph_features << ","
+            << "\"graph_node_count\":" << result.graph_node_count << ","
             << "\"effective_gbps\":" << result.effective_gbps << ","
             << "\"tflops\":" << result.tflops << ","
             << "\"elapsed_ms\":" << result.elapsed_ms << ","
+            << "\"min_elapsed_ms\":" << result.min_elapsed_ms << ","
+            << "\"max_elapsed_ms\":" << result.max_elapsed_ms << ","
+            << "\"spread_pct\":" << result.spread_pct << ","
+            << "\"graph_inventory\":[";
+        for (size_t bucket_index = 0; bucket_index < result.graph_inventory.size(); ++bucket_index) {
+            const GraphInventoryBucket & bucket = result.graph_inventory[bucket_index];
+            if (bucket_index > 0) {
+                out << ",";
+            }
+            out << "{\"family\":\"" << bucket.family << "\","
+                << "\"ggml_op\":" << bucket.ggml_op << ","
+                << "\"ggml_type\":" << bucket.ggml_type << ","
+                << "\"node_count\":" << bucket.node_count << ","
+                << "\"element_count\":" << bucket.element_count << ","
+                << "\"output_bytes\":" << bucket.output_bytes << ","
+                << "\"src0_bytes\":" << bucket.src0_bytes << ","
+                << "\"src1_bytes\":" << bucket.src1_bytes << ","
+                << "\"ne\":["
+                << bucket.ne[0] << ","
+                << bucket.ne[1] << ","
+                << bucket.ne[2] << ","
+                << bucket.ne[3] << "]}";
+        }
+        out << "],"
             << "\"runs\":" << result.runs << "}";
     }
     out << "]";
     return out.str();
 }
 
+std::string sampler_probe_json(const SamplerProbeResult & result) {
+    std::ostringstream out;
+    out << "{\"history_us_per_token\":" << result.history_us_per_token
+        << ",\"vocab_us_per_token\":" << result.vocab_us_per_token
+        << ",\"history_tokens\":" << result.history_tokens
+        << ",\"vocab_tokens\":" << result.vocab_tokens
+        << ",\"runs\":" << result.runs
+        << "}";
+    return out.str();
+}
+
 } // namespace
+
+extern "C" char * mesh_llm_gpu_bench_ggml_sampler_probe_json(
+    int64_t vocab_tokens,
+    int64_t history_tokens,
+    char ** error_out) {
+    if (error_out != nullptr) {
+        *error_out = nullptr;
+    }
+    if (vocab_tokens <= 0 || history_tokens <= 0) {
+        set_error(error_out, "sampler probe dimensions must be positive");
+        return nullptr;
+    }
+
+    SamplerProbeResult result{};
+    if (!run_source_sampler_probe(vocab_tokens, history_tokens, result)) {
+        set_error(error_out, "source-shaped sampler probe did not produce a supported result");
+        return nullptr;
+    }
+    return copy_c_string(sampler_probe_json(result));
+}
 
 extern "C" char * mesh_llm_gpu_bench_ggml_output_projection_probe_json(
     int backend_kind,
@@ -1804,6 +4481,13 @@ extern "C" char * mesh_llm_gpu_bench_ggml_decode_probe_json(
             result)) {
         results.push_back(result);
     }
+    if (run_logits_sync_probe(
+            backend,
+            "ggml_decode_logits_sync_vocab131072",
+            131072,
+            result)) {
+        results.push_back(result);
+    }
 
     ggml_backend_free(backend);
 
@@ -1933,6 +4617,8 @@ extern "C" char * mesh_llm_gpu_bench_ggml_moe_block_graph_probe_json(
             hidden,
             kv_width,
             repeat_layers,
+            false,
+            1,
             result)) {
         results.push_back(result);
     }
@@ -1940,6 +4626,79 @@ extern "C" char * mesh_llm_gpu_bench_ggml_moe_block_graph_probe_json(
 
     if (results.empty()) {
         set_error(error_out, "GGML MoE block graph probe did not produce a supported result");
+        return nullptr;
+    }
+    return copy_c_string(results_json(results));
+}
+
+extern "C" char * mesh_llm_gpu_bench_ggml_moe_block_decode_submission_probe_json(
+    int backend_kind,
+    int tensor_type_kind,
+    int64_t expert_count,
+    int64_t experts_used,
+    int64_t expert_width,
+    int64_t hidden,
+    int64_t kv_width,
+    int64_t repeat_layers,
+    int64_t context_tokens,
+    char ** error_out) {
+    if (error_out != nullptr) {
+        *error_out = nullptr;
+    }
+    enum ggml_type type = probe_tensor_type(tensor_type_kind);
+    if (type == GGML_TYPE_COUNT) {
+        set_error(error_out, "unsupported MoE block submission probe tensor type");
+        return nullptr;
+    }
+
+    ggml_backend_t backend = init_backend(backend_kind);
+    if (backend == nullptr) {
+        set_error(error_out, "GGML decode probe backend is not available");
+        return nullptr;
+    }
+
+    std::ostringstream name;
+    name << "ggml_decode_moe_block_submission_"
+         << "l"
+         << std::max<int64_t>(1, repeat_layers)
+         << "_"
+         << probe_tensor_type_name(tensor_type_kind)
+         << "_"
+         << expert_count
+         << "x"
+         << experts_used
+         << "_"
+         << expert_width
+         << "x"
+         << hidden
+         << "_ctx"
+         << std::max<int64_t>(1, context_tokens);
+    if (kv_width > 0 && kv_width < hidden) {
+        name << "_kv" << kv_width;
+    }
+
+    ProbeResult result{};
+    std::vector<ProbeResult> results;
+    if (run_moe_block_graph_probe(
+            backend,
+            type,
+            name.str().c_str(),
+            probe_tensor_type_name(tensor_type_kind),
+            expert_count,
+            experts_used,
+            expert_width,
+            hidden,
+            kv_width,
+            repeat_layers,
+            true,
+            context_tokens,
+            result)) {
+        results.push_back(result);
+    }
+    ggml_backend_free(backend);
+
+    if (results.empty()) {
+        set_error(error_out, "GGML MoE block submission probe did not produce a supported result");
         return nullptr;
     }
     return copy_c_string(results_json(results));
@@ -2018,6 +4777,714 @@ extern "C" char * mesh_llm_gpu_bench_ggml_dense_graph_probe_json(
 
     if (results.empty()) {
         set_error(error_out, "GGML dense graph probe did not produce a supported result");
+        return nullptr;
+    }
+    return copy_c_string(results_json(results));
+}
+
+extern "C" char * mesh_llm_gpu_bench_ggml_attention_runtime_probe_json(
+    int backend_kind,
+    int64_t head_dim,
+    int64_t query_heads,
+    int64_t kv_heads,
+    int64_t context_tokens,
+    int64_t repeat_layers,
+    char ** error_out) {
+    if (error_out != nullptr) {
+        *error_out = nullptr;
+    }
+    if (head_dim <= 0 || query_heads <= 0 || kv_heads <= 0 || context_tokens <= 0) {
+        set_error(error_out, "attention runtime probe dimensions must be positive");
+        return nullptr;
+    }
+
+    ggml_backend_t backend = init_backend(backend_kind);
+    if (backend == nullptr) {
+        set_error(error_out, "GGML attention runtime probe backend is not available");
+        return nullptr;
+    }
+
+    std::ostringstream name;
+    name << "ggml_decode_flash_attn_ext";
+    if (repeat_layers > 1) {
+        name << "_l" << repeat_layers;
+    }
+    name << "_h" << head_dim
+         << "_qh" << query_heads
+         << "_kvh" << kv_heads
+         << "_ctx" << context_tokens;
+
+    ProbeResult result{};
+    std::vector<ProbeResult> results;
+    if (run_attention_runtime_probe(
+            backend,
+            name.str().c_str(),
+            head_dim,
+            query_heads,
+            kv_heads,
+            context_tokens,
+            repeat_layers,
+            result)) {
+        results.push_back(result);
+    }
+    ggml_backend_free(backend);
+
+    if (results.empty()) {
+        set_error(error_out, "GGML attention runtime probe did not produce a supported result");
+        return nullptr;
+    }
+    return copy_c_string(results_json(results));
+}
+
+extern "C" char * mesh_llm_gpu_bench_ggml_logits_readback_probe_json(
+    int backend_kind,
+    int64_t vocab,
+    char ** error_out) {
+    if (error_out != nullptr) {
+        *error_out = nullptr;
+    }
+    if (vocab <= 0) {
+        set_error(error_out, "logits readback probe vocabulary size must be positive");
+        return nullptr;
+    }
+
+    ggml_backend_t backend = init_backend(backend_kind);
+    if (backend == nullptr) {
+        set_error(error_out, "GGML logits readback probe backend is not available");
+        return nullptr;
+    }
+
+    std::ostringstream name;
+    name << "ggml_decode_logits_readback_vocab" << vocab;
+
+    ProbeResult result{};
+    std::vector<ProbeResult> results;
+    if (run_logits_readback_probe(backend, name.str().c_str(), vocab, result)) {
+        results.push_back(result);
+    }
+    ggml_backend_free(backend);
+
+    if (results.empty()) {
+        set_error(error_out, "GGML logits readback probe did not produce a supported result");
+        return nullptr;
+    }
+    return copy_c_string(results_json(results));
+}
+
+extern "C" char * mesh_llm_gpu_bench_ggml_logits_sync_probe_json(
+    int backend_kind,
+    int64_t vocab,
+    char ** error_out) {
+    if (error_out != nullptr) {
+        *error_out = nullptr;
+    }
+    if (vocab <= 0) {
+        set_error(error_out, "logits sync probe vocabulary size must be positive");
+        return nullptr;
+    }
+
+    ggml_backend_t backend = init_backend(backend_kind);
+    if (backend == nullptr) {
+        set_error(error_out, "GGML logits sync probe backend is not available");
+        return nullptr;
+    }
+
+    std::ostringstream name;
+    name << "ggml_decode_logits_sync_vocab" << vocab;
+
+    ProbeResult result{};
+    std::vector<ProbeResult> results;
+    if (run_logits_sync_probe(backend, name.str().c_str(), vocab, result)) {
+        results.push_back(result);
+    }
+    ggml_backend_free(backend);
+
+    if (results.empty()) {
+        set_error(error_out, "GGML logits sync probe did not produce a supported result");
+        return nullptr;
+    }
+    return copy_c_string(results_json(results));
+}
+
+extern "C" char * mesh_llm_gpu_bench_ggml_logits_output_handoff_probe_json(
+    int backend_kind,
+    int64_t vocab,
+    char ** error_out) {
+    if (error_out != nullptr) {
+        *error_out = nullptr;
+    }
+    if (vocab <= 0) {
+        set_error(error_out, "logits output handoff probe vocabulary size must be positive");
+        return nullptr;
+    }
+
+    ggml_backend_t backend = init_backend(backend_kind);
+    if (backend == nullptr) {
+        set_error(error_out, "GGML logits output handoff probe backend is not available");
+        return nullptr;
+    }
+
+    std::ostringstream name;
+    name << "ggml_decode_logits_output_handoff_vocab" << vocab;
+
+    ProbeResult result{};
+    std::vector<ProbeResult> results;
+    if (run_logits_output_handoff_probe(backend, name.str().c_str(), vocab, result)) {
+        results.push_back(result);
+    }
+    ggml_backend_free(backend);
+
+    if (results.empty()) {
+        set_error(error_out, "GGML logits output handoff probe did not produce a supported result");
+        return nullptr;
+    }
+    return copy_c_string(results_json(results));
+}
+
+extern "C" char * mesh_llm_gpu_bench_ggml_dense_sampled_token_probe_json(
+    int backend_kind,
+    int tensor_type_kind,
+    int64_t hidden,
+    int64_t kv_width,
+    int64_t ffn,
+    int64_t vocab,
+    int64_t repeat_layers,
+    int graph_features,
+    int64_t norm_head_width,
+    char ** error_out) {
+    if (error_out != nullptr) {
+        *error_out = nullptr;
+    }
+    enum ggml_type type = probe_tensor_type(tensor_type_kind);
+    if (type == GGML_TYPE_COUNT) {
+        set_error(error_out, "unsupported tensor type for dense sampled-token probe");
+        return nullptr;
+    }
+    if (hidden <= 0 || kv_width <= 0 || ffn <= 0 || vocab <= 0) {
+        set_error(error_out, "dense sampled-token probe dimensions must be positive");
+        return nullptr;
+    }
+
+    ggml_backend_t backend = init_backend(backend_kind);
+    if (backend == nullptr) {
+        set_error(error_out, "GGML dense sampled-token probe backend is not available");
+        return nullptr;
+    }
+
+    std::ostringstream name;
+    name << "ggml_decode_"
+         << probe_tensor_type_name(tensor_type_kind)
+         << "_sampled_token";
+    if (repeat_layers > 1) {
+        name << "_l" << repeat_layers;
+    }
+    if ((graph_features & GRAPH_FEATURE_ATTENTION_Q_NORM) != 0 &&
+        (graph_features & GRAPH_FEATURE_ATTENTION_K_NORM) != 0) {
+        name << "_qknorm";
+    } else if ((graph_features & GRAPH_FEATURE_ATTENTION_Q_NORM) != 0) {
+        name << "_qnorm";
+    } else if ((graph_features & GRAPH_FEATURE_ATTENTION_K_NORM) != 0) {
+        name << "_knorm";
+    }
+    if ((graph_features & GRAPH_FEATURE_ATTENTION_POST_NORM) != 0 ||
+        (graph_features & GRAPH_FEATURE_FFN_POST_NORM) != 0) {
+        name << "_postnorm";
+    }
+    if (kv_width < hidden) {
+        name << "_gqa_" << hidden << "_kv" << kv_width << "_" << ffn;
+    } else {
+        name << "_" << hidden << "_" << ffn;
+    }
+    name << "_vocab" << vocab;
+
+    ProbeResult result{};
+    std::vector<ProbeResult> results;
+    if (run_dense_sampled_token_probe(
+            backend,
+            type,
+            name.str().c_str(),
+            probe_tensor_type_name(tensor_type_kind),
+            hidden,
+            std::min(kv_width, hidden),
+            ffn,
+            vocab,
+            repeat_layers,
+            graph_features,
+            norm_head_width,
+            result)) {
+        results.push_back(result);
+    }
+    ggml_backend_free(backend);
+
+    if (results.empty()) {
+        set_error(error_out, "GGML dense sampled-token probe did not produce a supported result");
+        return nullptr;
+    }
+    return copy_c_string(results_json(results));
+}
+
+extern "C" char * mesh_llm_gpu_bench_ggml_dense_full_token_probe_json(
+    int backend_kind,
+    int block_tensor_type_kind,
+    int output_tensor_type_kind,
+    int64_t hidden,
+    int64_t kv_width,
+    int64_t ffn,
+    int64_t vocab,
+    int64_t repeat_layers,
+    int graph_features,
+    int64_t norm_head_width,
+    int64_t head_dim,
+    int64_t query_heads,
+    int64_t kv_heads,
+    int64_t context_tokens,
+    int64_t active_context_tokens,
+    char ** error_out) {
+    if (error_out != nullptr) {
+        *error_out = nullptr;
+    }
+    enum ggml_type block_type = probe_tensor_type(block_tensor_type_kind);
+    enum ggml_type output_type = probe_tensor_type(output_tensor_type_kind);
+    if (block_type == GGML_TYPE_COUNT || output_type == GGML_TYPE_COUNT) {
+        set_error(error_out, "unsupported tensor type for dense full-token probe");
+        return nullptr;
+    }
+    if (hidden <= 0 || kv_width <= 0 || ffn <= 0 || vocab <= 0 || head_dim <= 0
+        || query_heads <= 0 || kv_heads <= 0 || context_tokens <= 0 || active_context_tokens <= 0) {
+        set_error(error_out, "dense full-token probe dimensions must be positive");
+        return nullptr;
+    }
+    active_context_tokens = std::min(active_context_tokens, context_tokens);
+
+    ggml_backend_t backend = init_backend(backend_kind);
+    if (backend == nullptr) {
+        set_error(error_out, "GGML dense full-token probe backend is not available");
+        return nullptr;
+    }
+
+    std::ostringstream name;
+    name << "ggml_decode_"
+         << probe_tensor_type_name(block_tensor_type_kind)
+         << "_full_token";
+    if (output_tensor_type_kind != block_tensor_type_kind) {
+        name << "_out" << probe_tensor_type_name(output_tensor_type_kind);
+    }
+    if (repeat_layers > 1) {
+        name << "_l" << repeat_layers;
+    }
+    if ((graph_features & GRAPH_FEATURE_ATTENTION_Q_NORM) != 0 &&
+        (graph_features & GRAPH_FEATURE_ATTENTION_K_NORM) != 0) {
+        name << "_qknorm";
+    } else if ((graph_features & GRAPH_FEATURE_ATTENTION_Q_NORM) != 0) {
+        name << "_qnorm";
+    } else if ((graph_features & GRAPH_FEATURE_ATTENTION_K_NORM) != 0) {
+        name << "_knorm";
+    }
+    if ((graph_features & GRAPH_FEATURE_ATTENTION_POST_NORM) != 0 ||
+        (graph_features & GRAPH_FEATURE_FFN_POST_NORM) != 0) {
+        name << "_postnorm";
+    }
+    if (kv_width < hidden) {
+        name << "_gqa_" << hidden << "_kv" << kv_width << "_" << ffn;
+    } else {
+        name << "_" << hidden << "_" << ffn;
+    }
+    name << "_vocab" << vocab
+         << "_ctx" << context_tokens
+         << "_nkv" << active_context_tokens
+         << "_h" << head_dim
+         << "_qh" << query_heads
+         << "_kvh" << kv_heads;
+
+    ProbeResult result{};
+    std::vector<ProbeResult> results;
+    if (run_dense_full_token_probe(
+            backend,
+            block_type,
+            output_type,
+            name.str().c_str(),
+            probe_tensor_type_name(block_tensor_type_kind),
+            hidden,
+            std::min(kv_width, hidden),
+            ffn,
+            vocab,
+            repeat_layers,
+            graph_features,
+            norm_head_width,
+            head_dim,
+            query_heads,
+            kv_heads,
+            context_tokens,
+            active_context_tokens,
+            false,
+            false,
+            false,
+            false,
+            result)) {
+        results.push_back(result);
+    }
+    ggml_backend_free(backend);
+
+    if (results.empty()) {
+        set_error(error_out, "GGML dense full-token probe did not produce a supported result");
+        return nullptr;
+    }
+    return copy_c_string(results_json(results));
+}
+
+extern "C" char * mesh_llm_gpu_bench_ggml_dense_full_token_handoff_probe_json(
+    int backend_kind,
+    int block_tensor_type_kind,
+    int output_tensor_type_kind,
+    int64_t hidden,
+    int64_t kv_width,
+    int64_t ffn,
+    int64_t vocab,
+    int64_t repeat_layers,
+    int graph_features,
+    int64_t norm_head_width,
+    int64_t head_dim,
+    int64_t query_heads,
+    int64_t kv_heads,
+    int64_t context_tokens,
+    int64_t active_context_tokens,
+    char ** error_out) {
+    if (error_out != nullptr) {
+        *error_out = nullptr;
+    }
+    enum ggml_type block_type = probe_tensor_type(block_tensor_type_kind);
+    enum ggml_type output_type = probe_tensor_type(output_tensor_type_kind);
+    if (block_type == GGML_TYPE_COUNT || output_type == GGML_TYPE_COUNT) {
+        set_error(error_out, "unsupported tensor type for dense full-token handoff probe");
+        return nullptr;
+    }
+    if (hidden <= 0 || kv_width <= 0 || ffn <= 0 || vocab <= 0 || head_dim <= 0
+        || query_heads <= 0 || kv_heads <= 0 || context_tokens <= 0 || active_context_tokens <= 0) {
+        set_error(error_out, "dense full-token handoff probe dimensions must be positive");
+        return nullptr;
+    }
+    active_context_tokens = std::min(active_context_tokens, context_tokens);
+
+    ggml_backend_t backend = init_backend(backend_kind);
+    if (backend == nullptr) {
+        set_error(error_out, "GGML dense full-token handoff probe backend is not available");
+        return nullptr;
+    }
+
+    std::ostringstream name;
+    name << "ggml_decode_"
+         << probe_tensor_type_name(block_tensor_type_kind)
+         << "_full_token_handoff";
+    if (output_tensor_type_kind != block_tensor_type_kind) {
+        name << "_out" << probe_tensor_type_name(output_tensor_type_kind);
+    }
+    if (repeat_layers > 1) {
+        name << "_l" << repeat_layers;
+    }
+    if ((graph_features & GRAPH_FEATURE_ATTENTION_Q_NORM) != 0 &&
+        (graph_features & GRAPH_FEATURE_ATTENTION_K_NORM) != 0) {
+        name << "_qknorm";
+    } else if ((graph_features & GRAPH_FEATURE_ATTENTION_Q_NORM) != 0) {
+        name << "_qnorm";
+    } else if ((graph_features & GRAPH_FEATURE_ATTENTION_K_NORM) != 0) {
+        name << "_knorm";
+    }
+    if ((graph_features & GRAPH_FEATURE_ATTENTION_POST_NORM) != 0 ||
+        (graph_features & GRAPH_FEATURE_FFN_POST_NORM) != 0) {
+        name << "_postnorm";
+    }
+    if (kv_width < hidden) {
+        name << "_gqa_" << hidden << "_kv" << kv_width << "_" << ffn;
+    } else {
+        name << "_" << hidden << "_" << ffn;
+    }
+    name << "_vocab" << vocab
+         << "_ctx" << context_tokens
+         << "_nkv" << active_context_tokens
+         << "_h" << head_dim
+         << "_qh" << query_heads
+         << "_kvh" << kv_heads;
+
+    ProbeResult result{};
+    std::vector<ProbeResult> results;
+    if (run_dense_full_token_probe(
+            backend,
+            block_type,
+            output_type,
+            name.str().c_str(),
+            probe_tensor_type_name(block_tensor_type_kind),
+            hidden,
+            std::min(kv_width, hidden),
+            ffn,
+            vocab,
+            repeat_layers,
+            graph_features,
+            norm_head_width,
+            head_dim,
+            query_heads,
+            kv_heads,
+            context_tokens,
+            active_context_tokens,
+            true,
+            false,
+            false,
+            false,
+            result)) {
+        results.push_back(result);
+    }
+    ggml_backend_free(backend);
+
+    if (results.empty()) {
+        set_error(error_out, "GGML dense full-token handoff probe did not produce a supported result");
+        return nullptr;
+    }
+    return copy_c_string(results_json(results));
+}
+
+extern "C" char * mesh_llm_gpu_bench_ggml_dense_decode_submission_probe_json(
+    int backend_kind,
+    int block_tensor_type_kind,
+    int output_tensor_type_kind,
+    int64_t hidden,
+    int64_t kv_width,
+    int64_t ffn,
+    int64_t vocab,
+    int64_t repeat_layers,
+    int graph_features,
+    int64_t norm_head_width,
+    int64_t head_dim,
+    int64_t query_heads,
+    int64_t kv_heads,
+    int64_t context_tokens,
+    int64_t active_context_tokens,
+    char ** error_out) {
+    if (error_out != nullptr) {
+        *error_out = nullptr;
+    }
+    enum ggml_type block_type = probe_tensor_type(block_tensor_type_kind);
+    enum ggml_type output_type = probe_tensor_type(output_tensor_type_kind);
+    if (block_type == GGML_TYPE_COUNT || output_type == GGML_TYPE_COUNT) {
+        set_error(error_out, "unsupported tensor type for dense decode submission probe");
+        return nullptr;
+    }
+    if (hidden <= 0 || kv_width <= 0 || ffn <= 0 || vocab <= 0 || head_dim <= 0
+        || query_heads <= 0 || kv_heads <= 0 || context_tokens <= 0 || active_context_tokens <= 0) {
+        set_error(error_out, "dense decode submission probe dimensions must be positive");
+        return nullptr;
+    }
+    active_context_tokens = std::min(active_context_tokens, context_tokens);
+
+    ggml_backend_t backend = init_backend(backend_kind);
+    if (backend == nullptr) {
+        set_error(error_out, "GGML dense decode submission probe backend is not available");
+        return nullptr;
+    }
+
+    std::ostringstream name;
+    name << "ggml_decode_"
+         << probe_tensor_type_name(block_tensor_type_kind)
+         << "_submission";
+    if (output_tensor_type_kind != block_tensor_type_kind) {
+        name << "_out" << probe_tensor_type_name(output_tensor_type_kind);
+    }
+    if (repeat_layers > 1) {
+        name << "_l" << repeat_layers;
+    }
+    if ((graph_features & GRAPH_FEATURE_ATTENTION_Q_NORM) != 0 &&
+        (graph_features & GRAPH_FEATURE_ATTENTION_K_NORM) != 0) {
+        name << "_qknorm";
+    } else if ((graph_features & GRAPH_FEATURE_ATTENTION_Q_NORM) != 0) {
+        name << "_qnorm";
+    } else if ((graph_features & GRAPH_FEATURE_ATTENTION_K_NORM) != 0) {
+        name << "_knorm";
+    }
+    if ((graph_features & GRAPH_FEATURE_ATTENTION_POST_NORM) != 0 ||
+        (graph_features & GRAPH_FEATURE_FFN_POST_NORM) != 0) {
+        name << "_postnorm";
+    }
+    if (kv_width < hidden) {
+        name << "_gqa_" << hidden << "_kv" << kv_width << "_" << ffn;
+    } else {
+        name << "_" << hidden << "_" << ffn;
+    }
+    name << "_vocab" << vocab
+         << "_ctx" << context_tokens
+         << "_nkv" << active_context_tokens
+         << "_h" << head_dim
+         << "_qh" << query_heads
+         << "_kvh" << kv_heads;
+
+    ProbeResult result{};
+    std::vector<ProbeResult> results;
+    if (run_dense_full_token_probe(
+            backend,
+            block_type,
+            output_type,
+            name.str().c_str(),
+            probe_tensor_type_name(block_tensor_type_kind),
+            hidden,
+            std::min(kv_width, hidden),
+            ffn,
+            vocab,
+            repeat_layers,
+            graph_features,
+            norm_head_width,
+            head_dim,
+            query_heads,
+            kv_heads,
+            context_tokens,
+            active_context_tokens,
+            false,
+            true,
+            false,
+            false,
+            result)) {
+        results.push_back(result);
+    }
+    ggml_backend_free(backend);
+
+    if (results.empty()) {
+        set_error(error_out, "GGML dense decode submission probe did not produce a supported result");
+        return nullptr;
+    }
+    return copy_c_string(results_json(results));
+}
+
+extern "C" char * mesh_llm_gpu_bench_ggml_dense_source_sampled_token_probe_json(
+    int backend_kind,
+    int block_tensor_type_kind,
+    int output_tensor_type_kind,
+    int64_t hidden,
+    int64_t kv_width,
+    int64_t ffn,
+    int64_t vocab,
+    int64_t repeat_layers,
+    int graph_features,
+    int64_t norm_head_width,
+    int64_t head_dim,
+    int64_t query_heads,
+    int64_t kv_heads,
+    int64_t context_tokens,
+    int64_t active_context_tokens,
+    char ** error_out) {
+    if (error_out != nullptr) {
+        *error_out = nullptr;
+    }
+    enum ggml_type block_type = probe_tensor_type(block_tensor_type_kind);
+    enum ggml_type output_type = probe_tensor_type(output_tensor_type_kind);
+    if (block_type == GGML_TYPE_COUNT || output_type == GGML_TYPE_COUNT) {
+        set_error(error_out, "unsupported tensor type for dense source sampled-token probe");
+        return nullptr;
+    }
+    if (hidden <= 0 || kv_width <= 0 || ffn <= 0 || vocab <= 0 || head_dim <= 0
+        || query_heads <= 0 || kv_heads <= 0 || context_tokens <= 0 || active_context_tokens <= 0) {
+        set_error(error_out, "dense source sampled-token probe dimensions must be positive");
+        return nullptr;
+    }
+    active_context_tokens = std::min(active_context_tokens, context_tokens);
+
+    ggml_backend_t backend = init_backend(backend_kind);
+    if (backend == nullptr) {
+        set_error(error_out, "GGML dense source sampled-token probe backend is not available");
+        return nullptr;
+    }
+
+    std::ostringstream name;
+    name << "ggml_decode_"
+         << probe_tensor_type_name(block_tensor_type_kind)
+         << "_full_token_source_sampled";
+    if (output_tensor_type_kind != block_tensor_type_kind) {
+        name << "_out" << probe_tensor_type_name(output_tensor_type_kind);
+    }
+    if (repeat_layers > 1) {
+        name << "_l" << repeat_layers;
+    }
+    if ((graph_features & GRAPH_FEATURE_ATTENTION_Q_NORM) != 0 &&
+        (graph_features & GRAPH_FEATURE_ATTENTION_K_NORM) != 0) {
+        name << "_qknorm";
+    } else if ((graph_features & GRAPH_FEATURE_ATTENTION_Q_NORM) != 0) {
+        name << "_qnorm";
+    } else if ((graph_features & GRAPH_FEATURE_ATTENTION_K_NORM) != 0) {
+        name << "_knorm";
+    }
+    if ((graph_features & GRAPH_FEATURE_ATTENTION_POST_NORM) != 0 ||
+        (graph_features & GRAPH_FEATURE_FFN_POST_NORM) != 0) {
+        name << "_postnorm";
+    }
+    if (kv_width < hidden) {
+        name << "_gqa_" << hidden << "_kv" << kv_width << "_" << ffn;
+    } else {
+        name << "_" << hidden << "_" << ffn;
+    }
+    name << "_vocab" << vocab
+         << "_ctx" << context_tokens
+         << "_nkv" << active_context_tokens
+         << "_h" << head_dim
+         << "_qh" << query_heads
+         << "_kvh" << kv_heads;
+
+    ProbeResult result{};
+    std::vector<ProbeResult> results;
+    if (run_dense_full_token_probe(
+            backend,
+            block_type,
+            output_type,
+            name.str().c_str(),
+            probe_tensor_type_name(block_tensor_type_kind),
+            hidden,
+            std::min(kv_width, hidden),
+            ffn,
+            vocab,
+            repeat_layers,
+            graph_features,
+            norm_head_width,
+            head_dim,
+            query_heads,
+            kv_heads,
+            context_tokens,
+            active_context_tokens,
+            false,
+            false,
+            true,
+            false,
+            result)) {
+        results.push_back(result);
+    }
+    ProbeResult source_input_result{};
+    std::string source_input_name = name.str();
+    const size_t source_sampled_marker = source_input_name.find("_full_token_source_sampled");
+    if (source_sampled_marker != std::string::npos) {
+        source_input_name.replace(source_sampled_marker, 26, "_source_input");
+    }
+    if (run_dense_full_token_probe(
+            backend,
+            block_type,
+            output_type,
+            source_input_name.c_str(),
+            probe_tensor_type_name(block_tensor_type_kind),
+            hidden,
+            std::min(kv_width, hidden),
+            ffn,
+            vocab,
+            repeat_layers,
+            graph_features,
+            norm_head_width,
+            head_dim,
+            query_heads,
+            kv_heads,
+            context_tokens,
+            active_context_tokens,
+            false,
+            false,
+            false,
+            true,
+            source_input_result)) {
+        results.push_back(source_input_result);
+    }
+    ggml_backend_free(backend);
+
+    if (results.empty()) {
+        set_error(error_out, "GGML dense source sampled-token probe did not produce a supported result");
         return nullptr;
     }
     return copy_c_string(results_json(results));

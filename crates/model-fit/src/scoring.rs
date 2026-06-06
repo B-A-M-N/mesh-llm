@@ -13,6 +13,7 @@ const MIB: u64 = 1024 * 1024;
 const GIB: u64 = 1024 * MIB;
 const LLAMA_DEFAULT_UBATCH_TOKENS: u32 = 512;
 const MAX_REPRESENTATIVE_DECODE_PROBE_LOG_DISTANCE: f64 = 0.75;
+const HIGH_CONFIDENCE_RELATIVE_TOLERANCE: f32 = 0.10;
 
 #[derive(Clone, Debug)]
 struct ExecutionBudget {
@@ -47,6 +48,7 @@ struct DecodeProbeTarget {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DecodeGroupKind {
     TransformerBlock,
+    TokenEmbeddingLookup,
     AttentionMatmul,
     FeedForwardMatmul,
     OutputMatmul,
@@ -73,6 +75,17 @@ struct GroupedDecodeCost {
 struct DecodeProbeSelection<'a> {
     probe: &'a DecodeKernelProbe,
     shape_distance: f64,
+}
+
+struct DecodeGroupBreakdownInput<'a> {
+    group: DecodeTrafficGroup,
+    tensor_type: &'static str,
+    resident_bytes: u64,
+    traffic_bytes: u64,
+    bandwidth: u64,
+    bandwidth_ms: f32,
+    selection: Option<DecodeProbeSelection<'a>>,
+    source: &'static str,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -151,6 +164,24 @@ pub fn score_model(
     recommendations.remove(0)
 }
 
+pub fn score_model_for_context_tokens(
+    hardware: &HardwareProfile,
+    model: &ModelProfile,
+    config: &SelectionConfig,
+    context_tokens: u32,
+) -> ModelRecommendation {
+    // `score_model` intentionally returns the estimate implied by the workload:
+    // a chat/agent profile may charge a long active context, while a short
+    // validation run should charge only the prompt plus the average generated
+    // prefix exercised by that scenario. Make that context override explicit
+    // instead of asking callers to know that `expected_prompt_tokens` is the
+    // field consumed by the decode-cost model. This is still metadata-only
+    // fitting: the caller supplies the workload shape, not observed tok/s.
+    let mut context_config = config.clone();
+    context_config.workload.interaction.expected_prompt_tokens = Some(context_tokens.max(1));
+    score_model(hardware, model, &context_config)
+}
+
 pub fn rank_models(
     hardware: &HardwareProfile,
     models: &[ModelProfile],
@@ -170,6 +201,7 @@ fn score_for_budget(
     budget: &ExecutionBudget,
 ) -> ModelRecommendation {
     let memory = runtime_memory_estimate(model, config);
+    let decode_context_tokens = decode_context_tokens(model, config);
     let active_decode_bytes = active_decode_bytes_per_token(model, config);
     let active_decode_flops = active_decode_flops_per_token(model);
     let estimated_decode_tps = decode_tokens_per_sec(
@@ -180,8 +212,13 @@ fn score_for_budget(
         model,
     );
     let decode_cost_breakdown = decode_cost_breakdown(active_decode_flops, budget, config, model);
-    let estimated_decode_range =
-        decode_tokens_per_sec_range(estimated_decode_tps, active_decode_bytes, model, budget);
+    let estimated_decode_range = decode_tokens_per_sec_range(
+        estimated_decode_tps,
+        active_decode_bytes,
+        model,
+        budget,
+        decode_cost_breakdown.as_ref(),
+    );
     let estimated_prefill_tps = prefill_tokens_per_sec(model, config, budget, estimated_decode_tps);
     let first_token = first_token_estimate(
         model,
@@ -235,6 +272,33 @@ fn score_for_budget(
                 .into(),
         );
     }
+    let shallow_dense_warning =
+        shallow_dense_graph_probe_warning(model, budget, decode_cost_breakdown.as_ref());
+    let q8_block_source_boundary_risk = q8_dense_block_source_boundary_confidence_risk(
+        model,
+        budget,
+        decode_cost_breakdown.as_ref(),
+    );
+    let unmeasured_sparse_moe_runtime_fallback = model.architecture_class
+        == ModelArchitectureClass::SparseMoeTransformer
+        && decode_cost_breakdown
+            .as_ref()
+            .is_some_and(decode_cost_uses_unmeasured_runtime_fallback);
+    let sampled_output_handoff_risk =
+        sampled_output_handoff_confidence_risk(model, budget, decode_cost_breakdown.as_ref());
+    let source_sampled_synthetic_boundary_risk = source_sampled_synthetic_boundary_confidence_risk(
+        model,
+        budget,
+        decode_cost_breakdown.as_ref(),
+    );
+    let thin_decode_submission_risk =
+        thin_decode_submission_confidence_risk(model, budget, decode_cost_breakdown.as_ref());
+    let full_token_topology_risk =
+        full_token_source_topology_confidence_risk(model, budget, decode_cost_breakdown.as_ref());
+    let sparse_moe_topology_risk =
+        sparse_moe_source_topology_confidence_risk(model, budget, decode_cost_breakdown.as_ref());
+    let selected_probe_spread_risk =
+        selected_decode_probe_spread_confidence_risk(decode_cost_breakdown.as_ref());
     if measured_gpu_budget(budget) && budget.decode_kernel_probes.is_empty() {
         warnings.push(
             "measured GPU profile is missing llama-shaped decode kernel probes; tok/s confidence cannot be high"
@@ -246,14 +310,69 @@ fn score_for_budget(
         ));
     } else if measured_gpu_budget(budget) && !has_high_confidence_decode_probe(model, budget) {
         warnings.push(high_confidence_decode_probe_warning(model));
-    } else if measured_gpu_budget(budget) && has_high_confidence_decode_probe(model, budget) {
+    } else if measured_gpu_budget(budget) && unmeasured_sparse_moe_runtime_fallback {
+        warnings.push(
+            "sparse MoE decode estimate includes unmeasured KV/activation runtime fallback; tok/s confidence cannot be medium"
+                .into(),
+        );
+    } else if measured_gpu_budget(budget)
+        && has_high_confidence_decode_probe(model, budget)
+        && !q8_block_source_boundary_risk
+        && !thin_decode_submission_risk
+        && selected_probe_spread_risk.is_none()
+    {
         warnings.push(
             "tok/s confidence is medium; composite decode probes are hardware evidence, but metadata-only estimates are not yet validated to +/-10% observed tok/s across model shapes"
                 .into(),
         );
     }
-    if let Some(warning) = shallow_q8_graph_probe_warning(model, budget) {
+    if let Some(warning) = shallow_dense_warning {
         warnings.push(warning);
+    }
+    if q8_block_source_boundary_risk {
+        warnings.push(
+            "decode estimate uses a Q8 dense block graph without a full-token/logits source-boundary probe; transformer timing is source-shaped, but sampled decode tok/s remains low-confidence until logits handoff and sampler-visible sync are proven for this shape"
+                .into(),
+        );
+    }
+    if sampled_output_handoff_risk {
+        warnings.push(
+            "decode estimate uses a full-token GGML graph probe, but llama.cpp sampled decode still has a source-visible logits output/sampler handoff large enough to affect +/-10% tok/s confidence"
+                .into(),
+        );
+    }
+    if source_sampled_synthetic_boundary_risk {
+        warnings.push(
+            "decode estimate uses a source-sampled synthetic full-token GGML graph; it follows llama.cpp source order, but it does not load a real llama_context, so tiny/narrow models remain low-confidence until the decode/logits-readiness boundary is represented by a real-context probe"
+                .into(),
+        );
+    }
+    if full_token_handoff_submission_gap_warning(model, budget, decode_cost_breakdown.as_ref()) {
+        warnings.push(
+            "decode estimate uses a full-token handoff probe; it measures graph completion and logits visibility, but not the full llama.cpp/Skippy decode submission path, so narrow/tiny models remain low-confidence until a submission-shaped probe exists"
+                .into(),
+        );
+    }
+    if thin_decode_submission_risk {
+        warnings.push(
+            "decode estimate includes a thin GGML submission probe; it times scheduler submission and async logits request, but source inspection shows llama.cpp decode also runs batch allocation, memory-context preparation, graph-input population, and output bookkeeping before returning"
+                .into(),
+        );
+    }
+    if let Some((probe_nodes, expected_nodes)) = full_token_topology_risk {
+        warnings.push(format!(
+            "selected full-token GGML probe has {probe_nodes} graph nodes, below the {expected_nodes} source-visible dense decode nodes implied by llama.cpp metadata; tok/s confidence stays low until the probe covers the missing decode topology"
+        ));
+    }
+    if let Some((probe_nodes, expected_nodes)) = sparse_moe_topology_risk {
+        warnings.push(format!(
+            "selected sparse MoE GGML probe has {probe_nodes} projected graph nodes, below the {expected_nodes} source-visible sparse decode nodes implied by llama.cpp metadata; graph-node count is treated as confidence evidence, not as a fitted timing multiplier"
+        ));
+    }
+    if let Some(spread) = selected_probe_spread_risk {
+        warnings.push(format!(
+            "selected decode timing probes varied by {spread:.1}% across measured runs; tok/s confidence cannot claim +/-10% until probe timing is stable"
+        ));
     }
     if budget.unified_memory {
         reasons.push("using unified-memory budget for model weights, KV cache, and scratch".into());
@@ -273,7 +392,12 @@ fn score_for_budget(
         selected_backend: budget.backend,
         selected_accelerator: budget.accelerator_name.clone(),
         architecture_class: model.architecture_class,
-        estimate_confidence: estimate_confidence(model, budget, fit_status),
+        estimate_confidence: estimate_confidence(
+            model,
+            budget,
+            fit_status,
+            decode_cost_breakdown.as_ref(),
+        ),
         fit_status,
         total_score,
         memory_score,
@@ -284,6 +408,7 @@ fn score_for_budget(
         estimated_runtime_memory_bytes: memory.runtime_bytes,
         estimated_kv_cache_bytes: memory.kv_cache_bytes,
         estimated_active_decode_bytes_per_token: active_decode_bytes,
+        estimated_decode_context_tokens: local_fit_value(fit_status, Some(decode_context_tokens)),
         estimated_decode_tokens_per_sec: local_fit_value(fit_status, estimated_decode_tps),
         estimated_decode_tokens_per_sec_range: local_fit_value(fit_status, estimated_decode_range),
         decode_cost_breakdown: local_fit_value(fit_status, decode_cost_breakdown),
@@ -572,11 +697,7 @@ fn active_decode_bytes_per_token(model: &ModelProfile, config: &SelectionConfig)
         }
         _ => active_dense_decode_weight_traffic(model),
     };
-    let context = config
-        .workload
-        .interaction
-        .expected_prompt_tokens
-        .unwrap_or_else(|| target_context_tokens(model, config) / 2);
+    let context = decode_context_tokens(model, config);
     let kv_read_bytes = kv_cache_bytes_for_context(model, config, context)
         .saturating_mul((config.kv_read_scale * 1000.0).round() as u64)
         / 1000;
@@ -586,6 +707,15 @@ fn active_decode_bytes_per_token(model: &ModelProfile, config: &SelectionConfig)
             .saturating_add(kv_read_bytes)
             .saturating_add(activation_overhead),
     )
+}
+
+fn decode_context_tokens(model: &ModelProfile, config: &SelectionConfig) -> u32 {
+    config
+        .workload
+        .interaction
+        .expected_prompt_tokens
+        .unwrap_or_else(|| target_context_tokens(model, config) / 2)
+        .max(1)
 }
 
 fn active_dense_decode_weight_traffic(model: &ModelProfile) -> u64 {
@@ -1035,6 +1165,7 @@ fn decode_cost_breakdown(
         + architecture_overhead_ms
         + sampled_decode_sampler_ms;
     Some(DecodeCostBreakdown {
+        context_tokens: Some(decode_context_tokens(model, config)),
         bandwidth_ms: grouped_cost.bandwidth_ms,
         compute_ms,
         fixed_overhead_ms,
@@ -1089,7 +1220,8 @@ fn grouped_decode_cost(
     for group in decode_traffic_groups(model) {
         add_group_decode_cost(group, model, budget, fallback_bandwidth, &mut cost);
     }
-    add_non_weight_decode_cost(model, config, fallback_bandwidth, &mut cost);
+    add_logits_readback_decode_cost(model, budget, &mut cost);
+    add_non_weight_decode_cost(model, config, budget, fallback_bandwidth, &mut cost);
     (cost.probed_bytes > 0 || cost.fallback_bytes > 0).then_some(cost)
 }
 
@@ -1161,6 +1293,9 @@ fn sparse_moe_block_decode_cost(
         probe_cols: Some(selection.probe.cols),
         probe_batch_tokens: Some(selection.probe.batch_tokens),
         probe_effective_gbps: Some(selection.probe.effective_gbps),
+        probe_min_elapsed_ms: selection.probe.min_elapsed_ms,
+        probe_max_elapsed_ms: selection.probe.max_elapsed_ms,
+        probe_spread_pct: selection.probe.spread_pct,
         probe_shape_distance: Some(selection.shape_distance),
     });
 
@@ -1169,6 +1304,7 @@ fn sparse_moe_block_decode_cost(
             add_group_decode_cost(group, model, budget, fallback_bandwidth, &mut cost);
         }
     }
+    add_sparse_moe_decode_submission_cost(model, budget, config, selection, &mut cost);
     add_group_decode_cost(
         DecodeTrafficGroup {
             kind: DecodeGroupKind::OutputMatmul,
@@ -1184,7 +1320,8 @@ fn sparse_moe_block_decode_cost(
     if let Some(group) = tied_output_projection_group(model) {
         add_group_decode_cost(group, model, budget, fallback_bandwidth, &mut cost);
     }
-    add_non_weight_decode_cost(model, config, fallback_bandwidth, &mut cost);
+    add_logits_readback_decode_cost(model, budget, &mut cost);
+    add_non_weight_decode_cost(model, config, budget, fallback_bandwidth, &mut cost);
     (cost.probed_bytes > 0 || cost.fallback_bytes > 0).then_some(cost)
 }
 
@@ -1224,6 +1361,44 @@ fn select_sparse_moe_block_probe<'a>(
             tensor_type,
             shape_distance,
             bandwidth_bytes_per_sec: decode_probe_bandwidth_bytes_per_sec(probe, budget),
+        })
+}
+
+fn select_sparse_moe_decode_submission_probe<'a>(
+    model: &ModelProfile,
+    budget: &'a ExecutionBudget,
+    config: &SelectionConfig,
+    block_selection: DenseBlockProbeSelection<'_>,
+) -> Option<&'a DecodeKernelProbe> {
+    let hidden = model.hidden_size?;
+    let model_layers = model.layer_count.unwrap_or(1).max(1);
+    let target_context = decode_context_tokens(model, config);
+    budget
+        .decode_kernel_probes
+        .iter()
+        .filter(|probe| {
+            probe.batch_tokens == 1
+                && probe.elapsed_ms.is_some_and(|elapsed| elapsed > 0.0)
+                && probe
+                    .tensor_type
+                    .eq_ignore_ascii_case(block_selection.tensor_type)
+                && is_sparse_moe_decode_submission_probe(probe)
+                && probe.rows == hidden
+                && probe.cols == hidden
+                && sparse_moe_submission_probe_layers(probe) == model_layers
+                && sparse_moe_submission_probe_shape_matches_model(probe, model)
+                && sparse_moe_submission_probe_kv_matches_model(probe, model)
+                && sparse_moe_submission_probe_context(probe).is_some_and(|context| {
+                    context_distance(Some(context), target_context)
+                        <= MAX_REPRESENTATIVE_DECODE_PROBE_LOG_DISTANCE
+                })
+        })
+        .min_by(|left, right| {
+            let left_context = sparse_moe_submission_probe_context(left).unwrap_or(target_context);
+            let right_context =
+                sparse_moe_submission_probe_context(right).unwrap_or(target_context);
+            context_distance(Some(left_context), target_context)
+                .total_cmp(&context_distance(Some(right_context), target_context))
         })
 }
 
@@ -1342,6 +1517,86 @@ fn exact_sparse_moe_block_probe_time_ms(
     })
 }
 
+fn add_sparse_moe_decode_submission_cost(
+    model: &ModelProfile,
+    budget: &ExecutionBudget,
+    config: &SelectionConfig,
+    selection: DenseBlockProbeSelection<'_>,
+    cost: &mut GroupedDecodeCost,
+) {
+    let Some(probe) = select_sparse_moe_decode_submission_probe(model, budget, config, selection)
+    else {
+        return;
+    };
+    let Some(elapsed_ms) = decode_probe_elapsed_ms_for_scoring(probe) else {
+        return;
+    };
+    let fixed_ms = fixed_decode_overhead_ms(budget, config);
+    let submission_ms = (elapsed_ms - fixed_ms).max(0.0);
+    if submission_ms <= 0.0 {
+        return;
+    }
+    let hidden = u64::from(model.hidden_size.unwrap_or_default().max(1));
+    let layers = u64::from(model.layer_count.unwrap_or_default().max(1));
+    let traffic_bytes = hidden
+        .saturating_mul(4)
+        .saturating_add(layers.saturating_mul(2).saturating_mul(8));
+    let bandwidth = (traffic_bytes as f32 / (submission_ms / 1000.0))
+        .round()
+        .max(1.0) as u64;
+    cost.probed_bytes = cost.probed_bytes.saturating_add(traffic_bytes);
+    cost.bandwidth_ms += submission_ms;
+    cost.groups.push(DecodeCostGroupBreakdown {
+        group: "moe_decode_submission".into(),
+        tensor_type: "runtime".into(),
+        resident_bytes: 0,
+        traffic_bytes,
+        expert_scaled: true,
+        shape_input_width: hidden,
+        shape_output_width: hidden,
+        source: "probe_moe_decode_submission_elapsed_minus_fixed".into(),
+        bandwidth_bytes_per_sec: bandwidth,
+        bandwidth_ms: submission_ms,
+        probe_name: Some(probe.name.clone()),
+        probe_rows: Some(probe.rows),
+        probe_cols: Some(probe.cols),
+        probe_batch_tokens: Some(probe.batch_tokens),
+        probe_effective_gbps: Some(probe.effective_gbps),
+        probe_min_elapsed_ms: probe.min_elapsed_ms,
+        probe_max_elapsed_ms: probe.max_elapsed_ms,
+        probe_spread_pct: probe.spread_pct,
+        probe_shape_distance: Some(0.0),
+    });
+}
+
+fn sparse_moe_source_visible_block_node_count(model: &ModelProfile, layers: u32) -> u32 {
+    let layers = layers.max(1);
+    let experts_used = model.expert_used_count.unwrap_or(1).max(1);
+
+    // Count a source-visible sparse decode lower bound per repeated layer. This
+    // is not a timing constant; it is a topology count derived from the same
+    // llama.cpp operations the synthetic sparse probe is trying to represent:
+    //
+    // - attention norm/weighting, q/k/v/o projections, q/k/v reshapes, q/k
+    //   RoPE, KV set_rows/views, Flash Attention layout permutes, attention
+    //   output reshape, and the attention residual;
+    // - FFN norm/weighting, router logits, softmax, top-k, routed weight
+    //   gather, input reshape, `GGML_OP_MUL_MAT_ID` up/gate/down, SWIGLU,
+    //   expert weighting, one view per active expert, expert reductions, and
+    //   the sparse residual.
+    //
+    // The final decode layer has two extra source-visible get_rows operations
+    // for requested output rows. Output projection/logits are charged by
+    // separate groups, so they are intentionally not counted here.
+    let attention_nodes = 24u32;
+    let moe_fixed_nodes = 14u32;
+    let routed_expert_view_and_reduce_nodes = experts_used.saturating_mul(2).saturating_sub(1);
+    let nodes_per_layer = attention_nodes
+        .saturating_add(moe_fixed_nodes)
+        .saturating_add(routed_expert_view_and_reduce_nodes);
+    nodes_per_layer.saturating_mul(layers).saturating_add(2)
+}
+
 fn moe_block_graph_depth_extrapolated_elapsed_ms(
     selection: DenseBlockProbeSelection<'_>,
     model: &ModelProfile,
@@ -1410,6 +1665,9 @@ fn dense_block_decode_cost(
     {
         return None;
     }
+    if let Some(cost) = dense_full_token_decode_cost(model, budget, config, fallback_bandwidth) {
+        return Some(cost);
+    }
     let block = dense_transformer_block_group(model)?;
     let selection = select_dense_block_probe(block, model, budget)?;
     let mut cost = GroupedDecodeCost::default();
@@ -1436,8 +1694,425 @@ fn dense_block_decode_cost(
     if let Some(group) = tied_output_projection_group(model) {
         add_group_decode_cost(group, model, budget, fallback_bandwidth, &mut cost);
     }
-    add_non_weight_decode_cost(model, config, fallback_bandwidth, &mut cost);
+    add_logits_readback_decode_cost(model, budget, &mut cost);
+    add_non_weight_decode_cost(model, config, budget, fallback_bandwidth, &mut cost);
     (cost.probed_bytes > 0 || cost.fallback_bytes > 0).then_some(cost)
+}
+
+fn dense_full_token_decode_cost(
+    model: &ModelProfile,
+    budget: &ExecutionBudget,
+    config: &SelectionConfig,
+    fallback_bandwidth: u64,
+) -> Option<GroupedDecodeCost> {
+    let block = dense_transformer_block_group(model)?;
+    let block_tensor_type = dominant_tensor_type_for_bytes(block.type_bytes)?;
+    let output_group = dense_full_token_output_group(model)?;
+    let output_tensor_type = dominant_tensor_type_for_bytes(output_group.type_bytes)?;
+    if !tensor_type_bytes_are_only(output_group.type_bytes, output_tensor_type) {
+        return None;
+    }
+    let token_embedding_group = dense_decode_token_embedding_group(model, output_tensor_type);
+    let probe = select_dense_full_token_probe(
+        model,
+        budget,
+        config,
+        block_tensor_type,
+        output_tensor_type,
+    )?;
+    // The full-token probe is a scheduled GGML graph shaped like one llama.cpp
+    // decode token: transformer block matmuls, Flash Attention over the chosen
+    // context, output projection, and the non-weight graph work around them.
+    // That makes it much closer to the source path than summing isolated
+    // matvec probes. It is still parameterized by one block tensor type,
+    // however. Many GGUF K-quants use a dominant type for most transformer
+    // matmuls and a higher-precision residual type for a subset of tensors.
+    // Treating such a model as "all dominant type" would make the probe look
+    // exact when it is not. Instead, the full-token group covers only the
+    // dominant block bytes plus the exact output tensor type and non-weight
+    // decode work; any remaining block tensor bytes are charged below through
+    // the same residual-group path used by the dense block estimator.
+    let block_graph_covers_residual_types =
+        tensor_type_bytes_are_only(block.type_bytes, block_tensor_type);
+    let block_resident = if block_graph_covers_residual_types {
+        tensor_type_total_bytes(block.type_bytes)
+    } else {
+        tensor_type_bytes_for_kind(block.type_bytes, block_tensor_type)
+    };
+    let block_traffic = if block_graph_covers_residual_types {
+        tensor_type_kernel_traffic_bytes(block.type_bytes)
+    } else {
+        tensor_type_kernel_traffic_bytes_for_kind(block_resident, block_tensor_type)
+    };
+    let output_traffic = tensor_type_kernel_traffic_bytes(output_group.type_bytes);
+    let token_embedding_traffic =
+        tensor_type_kernel_traffic_bytes(token_embedding_group.type_bytes);
+    let target_context = decode_context_tokens(model, config);
+    let non_weight_bytes = non_weight_decode_bytes_for_context(model, config, target_context);
+    let traffic_bytes = block_traffic
+        .saturating_add(output_traffic)
+        .saturating_add(token_embedding_traffic)
+        .saturating_add(non_weight_bytes);
+    if traffic_bytes == 0 {
+        return None;
+    }
+    let fixed_ms = fixed_decode_overhead_ms(budget, config);
+    let elapsed_ms = dense_full_token_elapsed_ms_for_scoring(model, budget, probe)?;
+    let probe_context = dense_full_token_probe_context(probe).unwrap_or(target_context);
+    let probe_context_distance = context_distance(Some(probe_context), target_context);
+    if probe_context_distance > MAX_REPRESENTATIVE_DECODE_PROBE_LOG_DISTANCE {
+        return None;
+    }
+    let bandwidth_ms = dense_full_token_bandwidth_ms(
+        model,
+        budget,
+        config,
+        fixed_ms,
+        elapsed_ms,
+        probe_context,
+        target_context,
+    )?;
+    let bandwidth = (traffic_bytes as f32 / (bandwidth_ms / 1000.0))
+        .round()
+        .max(1.0) as u64;
+    let source = full_token_probe_source(probe, probe_context, target_context);
+    let mut cost = GroupedDecodeCost::default();
+    cost.probed_bytes = cost.probed_bytes.saturating_add(traffic_bytes);
+    cost.bandwidth_ms += bandwidth_ms;
+    cost.groups.push(DecodeCostGroupBreakdown {
+        group: "full_token_graph".into(),
+        tensor_type: block_tensor_type.into(),
+        resident_bytes: block_resident
+            .saturating_add(tensor_type_total_bytes(output_group.type_bytes))
+            .saturating_add(tensor_type_total_bytes(token_embedding_group.type_bytes))
+            .saturating_add(non_weight_bytes),
+        traffic_bytes,
+        expert_scaled: false,
+        shape_input_width: u64::from(model.hidden_size.unwrap_or_default()),
+        shape_output_width: u64::from(model.tokenizer.vocab_size.unwrap_or_default()),
+        source: source.into(),
+        bandwidth_bytes_per_sec: bandwidth,
+        bandwidth_ms,
+        probe_name: Some(probe.name.clone()),
+        probe_rows: Some(probe.rows),
+        probe_cols: Some(probe.cols),
+        probe_batch_tokens: Some(probe.batch_tokens),
+        probe_effective_gbps: Some(probe.effective_gbps),
+        probe_min_elapsed_ms: probe.min_elapsed_ms,
+        probe_max_elapsed_ms: probe.max_elapsed_ms,
+        probe_spread_pct: probe.spread_pct,
+        probe_shape_distance: Some(probe_context_distance),
+    });
+    if !is_dense_full_token_source_sampled_probe(probe) {
+        add_dense_decode_submission_cost(
+            model,
+            budget,
+            block_tensor_type,
+            output_tensor_type,
+            fixed_ms,
+            target_context,
+            &mut cost,
+        );
+    }
+    if !block_graph_covers_residual_types {
+        for group in dense_block_residual_groups(model, block_tensor_type) {
+            add_group_decode_cost(group, model, budget, fallback_bandwidth, &mut cost);
+        }
+    }
+    // Do not add the older standalone logits-sync/readback groups here. The
+    // full-token probe is timed with `ggml_backend_sched_synchronize()` on the
+    // graph that produces the vocab logits, so a generic "sync a tiny graph"
+    // measurement double-counts part of the readiness boundary and still misses
+    // llama.cpp's real output-buffer extraction order.
+    //
+    // A `logits_output_handoff` probe is different: it mirrors the source order
+    // around `llama_context::decode()` and `llama_get_logits_ith()`:
+    //
+    //   graph_compute_async(...)
+    //   ggml_backend_tensor_get_async(..., logits, context_output_buffer, ...)
+    //   ggml_backend_sched_synchronize(...)
+    //   sampler scans the CPU-visible vocab row
+    //
+    // When that source-shaped probe exists, charge it explicitly as a separate
+    // logits handoff group. This is not a backend- or model-family correction and
+    // it does not use observed model tok/s; it is measured hardware behavior
+    // parameterized only by GGUF vocabulary size.
+    if !is_dense_full_token_handoff_probe(probe)
+        && !is_dense_full_token_source_sampled_probe(probe)
+        && select_logits_handoff_probe(model, budget).is_some_and(is_logits_output_handoff_probe)
+    {
+        add_logits_readback_decode_cost(model, budget, &mut cost);
+    }
+    Some(cost)
+}
+
+fn full_token_probe_source(
+    probe: &DecodeKernelProbe,
+    probe_context: u32,
+    target_context: u32,
+) -> &'static str {
+    match (
+        is_dense_full_token_source_sampled_probe(probe),
+        is_dense_full_token_handoff_probe(probe),
+        probe_context == target_context,
+    ) {
+        (true, _, true) => "probe_full_token_source_sampled_elapsed",
+        (true, _, false) => "probe_full_token_source_sampled_elapsed_context_adjusted",
+        (false, true, true) => "probe_full_token_handoff_elapsed",
+        (false, true, false) => "probe_full_token_handoff_elapsed_context_adjusted",
+        (false, false, true) => "probe_full_token_elapsed",
+        (false, false, false) => "probe_full_token_elapsed_context_adjusted",
+    }
+}
+
+fn add_dense_decode_submission_cost(
+    model: &ModelProfile,
+    budget: &ExecutionBudget,
+    block_tensor_type: &str,
+    output_tensor_type: &str,
+    fixed_ms: f32,
+    target_context: u32,
+    cost: &mut GroupedDecodeCost,
+) {
+    let Some(probe) = select_dense_decode_submission_probe(
+        model,
+        budget,
+        block_tensor_type,
+        output_tensor_type,
+        target_context,
+    ) else {
+        return;
+    };
+    let Some(elapsed_ms) = decode_probe_elapsed_ms_for_scoring(probe) else {
+        return;
+    };
+    let submission_ms = (elapsed_ms - fixed_ms).max(0.0);
+    if submission_ms <= 0.0 {
+        return;
+    }
+
+    // This probe is intentionally narrower than the full `llama_context::decode`
+    // call. It times the source-visible scheduler boundary that sits between
+    // graph construction/input population and sampler-visible logits:
+    //
+    //   ggml_backend_tensor_set(...) for synthetic token/KV inputs
+    //   ggml_backend_sched_graph_compute_async(...)
+    //   ggml_backend_tensor_get_async(... logits ...)
+    //
+    // That is useful evidence because the cost is measured on the target
+    // hardware and shaped by GGUF metadata rather than by model names or
+    // observed tok/s. It is not enough evidence for +/-10% confidence by
+    // itself. In llama.cpp the caller reaches this point through
+    // `llama_context::decode()`, which also runs batch allocation, memory-cache
+    // preparation, `llm_graph_result::can_reuse()`, `set_inputs()` across the
+    // graph input set, output-buffer reservation, and output-id bookkeeping.
+    // Narrow/tiny models expose that source-side work because the matmul graph
+    // is small; larger bandwidth-bound models tend to hide it under the graph
+    // cost. Keep this group in the estimate, but let confidence rules below
+    // report that a full llama-source submission probe is still missing.
+    let probe_context = dense_decode_submission_probe_context(probe).unwrap_or(target_context);
+    let hidden = u64::from(model.hidden_size.unwrap_or_default());
+    let vocab = u64::from(model.tokenizer.vocab_size.unwrap_or_default());
+    let layers = u64::from(model.layer_count.unwrap_or_default().max(1));
+    let traffic_bytes = hidden
+        .saturating_mul(4)
+        .saturating_add(vocab.saturating_mul(4))
+        .saturating_add(layers.saturating_mul(2).saturating_mul(8));
+    let bandwidth = (traffic_bytes as f32 / (submission_ms / 1000.0))
+        .round()
+        .max(1.0) as u64;
+
+    cost.probed_bytes = cost.probed_bytes.saturating_add(traffic_bytes);
+    cost.bandwidth_ms += submission_ms;
+    cost.groups.push(DecodeCostGroupBreakdown {
+        group: "decode_submission".into(),
+        tensor_type: "runtime".into(),
+        resident_bytes: 0,
+        traffic_bytes,
+        expert_scaled: false,
+        shape_input_width: hidden,
+        shape_output_width: vocab,
+        source: "probe_decode_submission_elapsed_minus_fixed".into(),
+        bandwidth_bytes_per_sec: bandwidth,
+        bandwidth_ms: submission_ms,
+        probe_name: Some(probe.name.clone()),
+        probe_rows: Some(probe.rows),
+        probe_cols: Some(probe.cols),
+        probe_batch_tokens: Some(probe.batch_tokens),
+        probe_effective_gbps: Some(probe.effective_gbps),
+        probe_min_elapsed_ms: probe.min_elapsed_ms,
+        probe_max_elapsed_ms: probe.max_elapsed_ms,
+        probe_spread_pct: probe.spread_pct,
+        probe_shape_distance: Some(context_distance(Some(probe_context), target_context)),
+    });
+}
+
+fn dense_full_token_bandwidth_ms(
+    model: &ModelProfile,
+    budget: &ExecutionBudget,
+    config: &SelectionConfig,
+    fixed_ms: f32,
+    elapsed_ms: f32,
+    probe_context: u32,
+    target_context: u32,
+) -> Option<f32> {
+    let variable_ms = (elapsed_ms - fixed_ms.max(0.0)).max(0.001);
+    if probe_context == target_context {
+        return Some(variable_ms);
+    }
+
+    // A full-token probe times the whole scheduled decode graph at one context:
+    // block/output matmuls plus Flash Attention/KV/runtime work. When the
+    // workload context differs from the probe context, using the raw full-token
+    // elapsed time would silently treat context-sensitive attention work as
+    // constant. Falling back to isolated matvec groups is also wrong because it
+    // throws away the source-shaped full graph. Split the measured full-token
+    // variable time into:
+    //
+    //   context-independent base ~= full-token graph - attention runtime at P
+    //   target time              ~= base + attention runtime at T
+    //
+    // Both attention terms come from the same GGML Flash Attention runtime
+    // probe family that `add_non_weight_decode_cost()` uses. Observed model
+    // benchmark throughput is not used here; this is a graph-shape adjustment
+    // from one measured synthetic context to another.
+    let probe_runtime = select_attention_runtime_probe(model, config, budget, probe_context)
+        .map(|probe| attention_runtime_probe_variable_ms(probe, probe_context, fixed_ms))?;
+    let target_runtime = select_attention_runtime_probe(model, config, budget, target_context)
+        .map(|probe| attention_runtime_probe_variable_ms(probe, target_context, fixed_ms))?;
+    let base_ms = (variable_ms - probe_runtime).max(0.001);
+    Some((base_ms + target_runtime).max(0.001))
+}
+
+fn dense_full_token_elapsed_ms_for_scoring(
+    model: &ModelProfile,
+    budget: &ExecutionBudget,
+    probe: &DecodeKernelProbe,
+) -> Option<f32> {
+    let elapsed_ms = decode_probe_elapsed_ms_for_scoring(probe)?;
+    if is_dense_full_token_source_sampled_probe(probe) {
+        let source_lower_bound_ms = paired_full_token_handoff_elapsed_ms(model, budget, probe)
+            .map(|handoff_ms| {
+                handoff_ms
+                    + paired_dense_source_input_elapsed_ms(model, budget, probe).unwrap_or(0.0)
+            })
+            .or_else(|| paired_dense_source_input_elapsed_ms(model, budget, probe));
+        return Some(
+            source_lower_bound_ms
+                .map(|subset_ms| elapsed_ms.max(subset_ms))
+                .unwrap_or(elapsed_ms),
+        );
+    }
+    if !is_dense_full_token_handoff_probe(probe) {
+        return Some(elapsed_ms);
+    }
+
+    // A handoff probe is the same scheduled token graph plus the source-visible
+    // logits/output handoff. For an otherwise identical GGUF-derived shape, it
+    // should not time lower than the graph-only subset. Very small graphs can
+    // jitter enough that the medians violate that physical/source ordering. Use
+    // the paired graph-only median as a lower bound for the handoff elapsed time
+    // instead of adding a fitted backend constant. Confidence still remains low
+    // when the probe spread says the measurements are noisy.
+    Some(
+        paired_full_token_graph_elapsed_ms(model, budget, probe)
+            .map(|subset_ms| elapsed_ms.max(subset_ms))
+            .unwrap_or(elapsed_ms),
+    )
+}
+
+fn paired_full_token_handoff_elapsed_ms(
+    model: &ModelProfile,
+    budget: &ExecutionBudget,
+    probe: &DecodeKernelProbe,
+) -> Option<f32> {
+    let handoff_name = probe
+        .name
+        .replace("_full_token_source_sampled", "_full_token_handoff");
+    budget
+        .decode_kernel_probes
+        .iter()
+        .find(|candidate| {
+            candidate.name == handoff_name
+                && dense_source_boundary_pair_shape_matches(candidate, probe, model)
+        })
+        .and_then(|candidate| dense_full_token_elapsed_ms_for_scoring(model, budget, candidate))
+}
+
+fn paired_dense_source_input_elapsed_ms(
+    model: &ModelProfile,
+    budget: &ExecutionBudget,
+    probe: &DecodeKernelProbe,
+) -> Option<f32> {
+    let source_input_name = probe
+        .name
+        .replace("_full_token_source_sampled", "_source_input")
+        .replace("_full_token_handoff", "_source_input");
+    budget
+        .decode_kernel_probes
+        .iter()
+        .find(|candidate| {
+            candidate.name == source_input_name
+                && is_dense_source_input_probe(candidate)
+                && dense_source_boundary_pair_shape_matches(candidate, probe, model)
+        })
+        .and_then(decode_probe_elapsed_ms_for_scoring)
+}
+
+fn paired_full_token_graph_elapsed_ms(
+    model: &ModelProfile,
+    budget: &ExecutionBudget,
+    probe: &DecodeKernelProbe,
+) -> Option<f32> {
+    let graph_only_name = probe.name.replace("_full_token_handoff", "_full_token");
+    budget
+        .decode_kernel_probes
+        .iter()
+        .find(|candidate| {
+            candidate.name == graph_only_name
+                && dense_source_boundary_pair_shape_matches(candidate, probe, model)
+        })
+        .and_then(decode_probe_elapsed_ms_for_scoring)
+}
+
+fn dense_source_boundary_pair_shape_matches(
+    candidate: &DecodeKernelProbe,
+    probe: &DecodeKernelProbe,
+    model: &ModelProfile,
+) -> bool {
+    candidate
+        .tensor_type
+        .eq_ignore_ascii_case(&probe.tensor_type)
+        && candidate.rows == probe.rows
+        && candidate.cols == probe.cols
+        && candidate.batch_tokens == probe.batch_tokens
+        && candidate.graph_features == probe.graph_features
+        && dense_source_boundary_probe_layers(candidate)
+            == dense_source_boundary_probe_layers(probe)
+        && dense_source_boundary_probe_context(candidate)
+            == dense_source_boundary_probe_context(probe)
+        && dense_full_token_probe_shape_matches_model(
+            candidate,
+            model.hidden_size.unwrap_or_default(),
+            model.ffn_size.unwrap_or_default(),
+            model,
+        )
+}
+
+fn dense_source_boundary_probe_layers(probe: &DecodeKernelProbe) -> u32 {
+    if is_dense_source_input_probe(probe) {
+        dense_source_input_probe_layers(probe)
+    } else {
+        dense_full_token_probe_layers(probe)
+    }
+}
+
+fn dense_source_boundary_probe_context(probe: &DecodeKernelProbe) -> Option<u32> {
+    if is_dense_source_input_probe(probe) {
+        dense_source_input_probe_context(probe)
+    } else {
+        dense_full_token_probe_context(probe)
+    }
 }
 
 fn linear_attention_block_decode_cost(
@@ -1479,7 +2154,8 @@ fn linear_attention_block_decode_cost(
     if let Some(group) = tied_output_projection_group(model) {
         add_group_decode_cost(group, model, budget, fallback_bandwidth, &mut cost);
     }
-    add_non_weight_decode_cost(model, config, fallback_bandwidth, &mut cost);
+    add_logits_readback_decode_cost(model, budget, &mut cost);
+    add_non_weight_decode_cost(model, config, budget, fallback_bandwidth, &mut cost);
     (cost.probed_bytes > 0 || cost.fallback_bytes > 0).then_some(cost)
 }
 
@@ -1564,6 +2240,9 @@ fn add_linear_attention_block_cost(
         probe_cols: Some(selection.probe.cols),
         probe_batch_tokens: Some(selection.probe.batch_tokens),
         probe_effective_gbps: Some(selection.probe.effective_gbps),
+        probe_min_elapsed_ms: selection.probe.min_elapsed_ms,
+        probe_max_elapsed_ms: selection.probe.max_elapsed_ms,
+        probe_spread_pct: selection.probe.spread_pct,
         probe_shape_distance: Some(selection.shape_distance),
     });
 }
@@ -1628,6 +2307,7 @@ fn select_dense_block_probe<'a>(
                 && probe.tensor_type.eq_ignore_ascii_case(tensor_type)
                 && is_composite_llama_graph_decode_probe(probe)
                 && is_supported_dense_layer_graph_probe(probe)
+                && dense_layer_graph_probe_is_scoring_evidence(probe)
                 && dense_layer_graph_probe_features_match_model(probe, model)
                 && dense_layer_graph_probe_depth_matches_model(probe, model)
                 && dense_graph_probe_kv_matches_model(probe, model)
@@ -1719,6 +2399,9 @@ fn add_dense_block_cost(
         probe_cols: Some(selection.probe.cols),
         probe_batch_tokens: Some(selection.probe.batch_tokens),
         probe_effective_gbps: Some(selection.probe.effective_gbps),
+        probe_min_elapsed_ms: selection.probe.min_elapsed_ms,
+        probe_max_elapsed_ms: selection.probe.max_elapsed_ms,
+        probe_spread_pct: selection.probe.spread_pct,
         probe_shape_distance: Some(selection.shape_distance),
     });
     block_graph_covers_residual_types
@@ -1820,6 +2503,7 @@ fn dense_graph_depth_extrapolated_elapsed_ms(
                     .eq_ignore_ascii_case(selection.tensor_type)
                 && is_composite_llama_graph_decode_probe(probe)
                 && is_supported_dense_layer_graph_probe(probe)
+                && dense_layer_graph_probe_is_scoring_evidence(probe)
                 && dense_layer_graph_probe_features_match_model(probe, model)
                 && dense_layer_graph_probe_depth_matches_model(probe, model)
                 && dense_graph_probe_kv_matches_model(probe, model)
@@ -2214,6 +2898,99 @@ fn tied_output_projection_flops(model: &ModelProfile) -> u64 {
     hidden.saturating_mul(vocab).saturating_mul(2)
 }
 
+fn dense_full_token_output_group(model: &ModelProfile) -> Option<DecodeTrafficGroup> {
+    let output = DecodeTrafficGroup {
+        kind: DecodeGroupKind::OutputMatmul,
+        type_bytes: model.tensor_matmul.output.type_bytes,
+        shape: model.tensor_matmul.output.shape,
+        expert_scaled: false,
+    };
+    if tensor_type_kernel_traffic_bytes(output.type_bytes) > 0 {
+        return Some(output);
+    }
+    tied_output_projection_group(model)
+}
+
+fn dense_decode_token_embedding_group(
+    model: &ModelProfile,
+    full_token_embedding_tensor_type: &str,
+) -> DecodeTrafficGroup {
+    let bytes = model.tensor_group_bytes.embedding_bytes;
+    if bytes == 0 {
+        return DecodeTrafficGroup {
+            kind: DecodeGroupKind::TokenEmbeddingLookup,
+            type_bytes: TensorTypeBytes::default(),
+            shape: MatmulShapeProfile::default(),
+            expert_scaled: false,
+        };
+    }
+
+    // llama.cpp's token-generation graph consumes a token id and performs
+    // `ggml_get_rows(token_embd.weight, token_id)` before layer 0. The
+    // synthetic full-token probe now includes that source-visible lookup using
+    // the same tensor type as its embedding/output projection matrix. Only mark
+    // the embedding bytes as covered by the probe when GGUF tensor metadata says
+    // the real token embedding tensor is entirely that same type. If older
+    // profiles lack embedding type evidence, or a model stores embeddings in a
+    // different precision from the output projection, keep the timing probe but
+    // do not claim its byte accounting covers the embedding tensor. The elapsed
+    // full-token probe still charges a source-shaped embedding lookup; this
+    // distinction only affects reported covered bytes and confidence evidence.
+    let embedding_types = model.tensor_group_bytes.embedding_type_bytes;
+    if !tensor_type_bytes_are_only(embedding_types, full_token_embedding_tensor_type) {
+        return DecodeTrafficGroup {
+            kind: DecodeGroupKind::TokenEmbeddingLookup,
+            type_bytes: TensorTypeBytes::default(),
+            shape: token_embedding_lookup_shape(model),
+            expert_scaled: false,
+        };
+    }
+
+    DecodeTrafficGroup {
+        kind: DecodeGroupKind::TokenEmbeddingLookup,
+        type_bytes: embedding_types,
+        shape: token_embedding_lookup_shape(model),
+        expert_scaled: false,
+    }
+}
+
+fn token_embedding_lookup_shape(model: &ModelProfile) -> MatmulShapeProfile {
+    let hidden = u64::from(model.hidden_size.unwrap_or_default());
+    let vocab = u64::from(model.tokenizer.vocab_size.unwrap_or_default());
+    let total_elements = hidden.saturating_mul(vocab);
+    MatmulShapeProfile {
+        tensor_count: 1,
+        logical_matrix_count: 1,
+        total_elements,
+        min_input_width: 1,
+        max_input_width: 1,
+        min_output_width: hidden,
+        max_output_width: hidden,
+        weighted_avg_input_width: 1,
+        weighted_avg_output_width: hidden,
+    }
+}
+
+fn tensor_type_bytes_are_only(bytes: TensorTypeBytes, tensor_type: &str) -> bool {
+    let selected = tensor_type_bytes_for_kind(bytes, tensor_type);
+    selected > 0 && selected == tensor_type_total_bytes(bytes)
+}
+
+fn non_weight_decode_bytes(model: &ModelProfile, config: &SelectionConfig) -> u64 {
+    non_weight_decode_bytes_for_context(model, config, decode_context_tokens(model, config))
+}
+
+fn non_weight_decode_bytes_for_context(
+    model: &ModelProfile,
+    config: &SelectionConfig,
+    context: u32,
+) -> u64 {
+    let kv_read_bytes = kv_cache_bytes_for_context(model, config, context)
+        .saturating_mul((config.kv_read_scale * 1000.0).round() as u64)
+        / 1000;
+    kv_read_bytes.saturating_add(activation_overhead_bytes(model))
+}
+
 fn add_group_decode_cost(
     group: DecodeTrafficGroup,
     model: &ModelProfile,
@@ -2232,6 +3009,11 @@ fn add_group_decode_cost(
             continue;
         }
         let selection = select_decode_group_probe(group, tensor_type, model, budget);
+        let surrogate = if selection.is_none() {
+            select_decode_group_shape_surrogate_probe(group, tensor_type, model, budget)
+        } else {
+            None
+        };
         let bandwidth = selection
             .as_ref()
             .map(|selection| {
@@ -2242,46 +3024,87 @@ fn add_group_decode_cost(
                     budget,
                 )
             })
+            .or_else(|| {
+                surrogate.as_ref().map(|selection| {
+                    decode_group_probe_bandwidth_bytes_per_sec(
+                        selection.probe,
+                        group.kind,
+                        model,
+                        budget,
+                    )
+                })
+            })
             .unwrap_or(fallback_bandwidth);
         if selection.is_some() {
             cost.probed_bytes = cost.probed_bytes.saturating_add(traffic_bytes);
         } else {
+            // A same-shape composite llama graph for a different tensor type is
+            // better evidence than raw hardware bandwidth, but it is still not
+            // exact tensor-type evidence. Keep these bytes in the fallback
+            // bucket so warnings/confidence continue to tell callers that the
+            // model lacks a source-shaped probe for the actual GGUF tensor
+            // type. This matters for narrow GGUFs whose K-quant block shapes
+            // cannot be constructed by the portable synthetic benchmark: raw
+            // bandwidth makes the missing transformer work look free, while a
+            // same-shape scheduled GGML graph at least preserves llama.cpp's
+            // graph/scheduler cost scale without branching on backend, model
+            // family, filename, or observed tok/s.
             cost.fallback_bytes = cost.fallback_bytes.saturating_add(traffic_bytes);
         }
         let bandwidth_ms = traffic_bytes as f32 / bandwidth.max(1) as f32 * 1000.0;
         cost.bandwidth_ms += bandwidth_ms;
-        cost.groups.push(decode_cost_group_breakdown(
-            group,
-            tensor_type,
-            resident_bytes,
-            traffic_bytes,
-            bandwidth,
-            bandwidth_ms,
-            selection,
-        ));
+        let (breakdown_selection, source) = if selection.is_some() {
+            (selection, "probe")
+        } else if surrogate.is_some() {
+            (surrogate, "probe_shape_surrogate")
+        } else {
+            (None, "fallback")
+        };
+        cost.groups
+            .push(decode_cost_group_breakdown(DecodeGroupBreakdownInput {
+                group,
+                tensor_type,
+                resident_bytes,
+                traffic_bytes,
+                bandwidth,
+                bandwidth_ms,
+                selection: breakdown_selection,
+                source,
+            }));
     }
 }
 
 fn add_non_weight_decode_cost(
     model: &ModelProfile,
     config: &SelectionConfig,
+    budget: &ExecutionBudget,
     fallback_bandwidth: u64,
     cost: &mut GroupedDecodeCost,
 ) {
-    let context = config
-        .workload
-        .interaction
-        .expected_prompt_tokens
-        .unwrap_or_else(|| target_context_tokens(model, config) / 2);
-    let kv_read_bytes = kv_cache_bytes_for_context(model, config, context)
-        .saturating_mul((config.kv_read_scale * 1000.0).round() as u64)
-        / 1000;
-    let non_weight_bytes = kv_read_bytes.saturating_add(activation_overhead_bytes(model));
+    let context = decode_context_tokens(model, config);
+    let non_weight_bytes = non_weight_decode_bytes(model, config);
     if non_weight_bytes == 0 {
         return;
     }
-    cost.fallback_bytes = cost.fallback_bytes.saturating_add(non_weight_bytes);
-    let bandwidth_ms = non_weight_bytes as f32 / fallback_bandwidth.max(1) as f32 * 1000.0;
+    let selection = select_attention_runtime_probe(model, config, budget, context);
+    let (bandwidth_ms, bandwidth, source, probe) = if let Some(probe) = selection {
+        let fixed_ms = fixed_decode_overhead_ms(budget, config);
+        let variable_ms = attention_runtime_probe_variable_ms(probe, context, fixed_ms);
+        let bandwidth = (non_weight_bytes as f32 / (variable_ms / 1000.0).max(0.001))
+            .round()
+            .max(1.0) as u64;
+        cost.probed_bytes = cost.probed_bytes.saturating_add(non_weight_bytes);
+        (
+            variable_ms,
+            bandwidth,
+            "probe_attention_runtime_elapsed",
+            Some(probe),
+        )
+    } else {
+        cost.fallback_bytes = cost.fallback_bytes.saturating_add(non_weight_bytes);
+        let bandwidth_ms = non_weight_bytes as f32 / fallback_bandwidth.max(1) as f32 * 1000.0;
+        (bandwidth_ms, fallback_bandwidth, "fallback", None)
+    };
     cost.bandwidth_ms += bandwidth_ms;
     cost.groups.push(DecodeCostGroupBreakdown {
         group: "kv_and_activation".into(),
@@ -2291,48 +3114,627 @@ fn add_non_weight_decode_cost(
         expert_scaled: false,
         shape_input_width: u64::from(model.hidden_size.unwrap_or_default()),
         shape_output_width: u64::from(model.hidden_size.unwrap_or_default()),
-        source: "fallback".into(),
-        bandwidth_bytes_per_sec: fallback_bandwidth,
+        source: source.into(),
+        bandwidth_bytes_per_sec: bandwidth,
         bandwidth_ms,
-        probe_name: None,
-        probe_rows: None,
-        probe_cols: None,
-        probe_batch_tokens: None,
-        probe_effective_gbps: None,
+        probe_name: probe.map(|probe| probe.name.clone()),
+        probe_rows: probe.map(|probe| probe.rows),
+        probe_cols: probe.map(|probe| probe.cols),
+        probe_batch_tokens: probe.map(|probe| probe.batch_tokens),
+        probe_effective_gbps: probe.map(|probe| probe.effective_gbps),
+        probe_min_elapsed_ms: probe.and_then(|probe| probe.min_elapsed_ms),
+        probe_max_elapsed_ms: probe.and_then(|probe| probe.max_elapsed_ms),
+        probe_spread_pct: probe.and_then(|probe| probe.spread_pct),
         probe_shape_distance: None,
     });
 }
 
-fn decode_cost_group_breakdown(
-    group: DecodeTrafficGroup,
-    tensor_type: &'static str,
-    resident_bytes: u64,
-    traffic_bytes: u64,
-    bandwidth: u64,
-    bandwidth_ms: f32,
-    selection: Option<DecodeProbeSelection<'_>>,
-) -> DecodeCostGroupBreakdown {
-    DecodeCostGroupBreakdown {
-        group: decode_group_kind_name(group.kind).into(),
-        tensor_type: tensor_type.into(),
-        resident_bytes,
+fn decode_cost_uses_unmeasured_runtime_fallback(breakdown: &DecodeCostBreakdown) -> bool {
+    breakdown
+        .groups
+        .iter()
+        .any(|group| group.group == "kv_and_activation" && group.source == "fallback")
+}
+
+fn sampled_output_handoff_confidence_risk(
+    model: &ModelProfile,
+    budget: &ExecutionBudget,
+    breakdown: Option<&DecodeCostBreakdown>,
+) -> bool {
+    let Some(breakdown) = breakdown else {
+        return false;
+    };
+    if model.architecture_class != ModelArchitectureClass::DenseTransformer
+        || !measured_gpu_budget(budget)
+    {
+        return false;
+    }
+    let uses_full_token_probe = breakdown
+        .groups
+        .iter()
+        .any(|group| group.group == "full_token_graph");
+    let uses_full_token_handoff_probe = breakdown.groups.iter().any(|group| {
+        group.group == "full_token_graph" && group.source.starts_with("probe_full_token_handoff")
+    });
+    let uses_source_sampled_probe = breakdown.groups.iter().any(|group| {
+        group.group == "full_token_graph"
+            && group.source.starts_with("probe_full_token_source_sampled")
+    });
+    let has_logits_handoff_group = breakdown
+        .groups
+        .iter()
+        .any(|group| group.group == "logits_readback");
+    if !uses_full_token_probe
+        || uses_source_sampled_probe
+        || uses_full_token_handoff_probe
+        || has_logits_handoff_group
+        || breakdown.selected_time_ms <= 0.0
+    {
+        return false;
+    }
+
+    // llama.cpp's sampled decode path does not end when the transformer graph
+    // produces logits. `llama_context::decode()` asynchronously extracts the
+    // vocab-sized logits row into the context output buffer, and
+    // `llama_sampler_sample()`/Skippy's greedy sampler then forces that row to be
+    // CPU-visible and scans it. The full-token probe intentionally times the
+    // scheduled GGML graph shape; it does not prove that the llama_context output
+    // handoff is small. When the measured logits-handoff probe plus the measured
+    // sampler-vocab estimate is already at least the same size as the public
+    // +/-10% confidence bar, treating the full-token estimate as medium
+    // confidence would be overclaiming. This is an evidence rule, not a fitted
+    // correction: it uses GGUF vocab size, the measured hardware probes, and the
+    // source-visible llama.cpp sampling boundary.
+    let logits_handoff_ms = select_logits_handoff_probe(model, budget)
+        .and_then(|probe| probe.elapsed_ms)
+        .filter(|elapsed| *elapsed > 0.0)
+        .map(|elapsed| elapsed as f32)
+        .unwrap_or_default();
+    let source_visible_ms = logits_handoff_ms + breakdown.sampled_decode_sampler_ms;
+    source_visible_ms / breakdown.selected_time_ms >= HIGH_CONFIDENCE_RELATIVE_TOLERANCE
+}
+
+fn source_sampled_synthetic_boundary_confidence_risk(
+    model: &ModelProfile,
+    budget: &ExecutionBudget,
+    breakdown: Option<&DecodeCostBreakdown>,
+) -> bool {
+    let Some(breakdown) = breakdown else {
+        return false;
+    };
+    if model.architecture_class != ModelArchitectureClass::DenseTransformer
+        || !measured_gpu_budget(budget)
+    {
+        return false;
+    }
+
+    // The source-sampled full-token probe is intentionally much better evidence
+    // than isolated matvec or graph-only timings: it follows the source order
+    // around a sampled token by updating decode inputs, submitting the graph,
+    // requesting async logits extraction, synchronizing the scheduler, and
+    // scanning the CPU-visible vocab row. That still is not the same boundary as
+    // the real Skippy/llama.cpp path:
+    //
+    //   skippy_decode_tokens() -> llama_decode()
+    //   skippy_greedy_sample() -> llama_get_logits_ith() -> ctx->synchronize()
+    //
+    // The synthetic graph owns its scheduler, tensors, output buffer, and input
+    // lifetime. A real `llama_context` has model-loaded tensors, context output
+    // buffers, output-id mapping, graph reuse state, and accessor synchronization.
+    // Validation on tiny dense models has shown that those source-level
+    // differences can be larger than the public +/-10% confidence bar even when
+    // the synthetic graph inventory matches the ABI graph. Do not change the
+    // point estimate here, and do not use observed tok/s as a correction. This
+    // only says the evidence is not strong enough for medium confidence until a
+    // real-context source-boundary probe exists.
+    breakdown.groups.iter().any(|group| {
+        group.group == "full_token_graph"
+            && group.source.starts_with("probe_full_token_source_sampled")
+    })
+}
+
+fn full_token_handoff_submission_gap_warning(
+    model: &ModelProfile,
+    budget: &ExecutionBudget,
+    breakdown: Option<&DecodeCostBreakdown>,
+) -> bool {
+    let Some(breakdown) = breakdown else {
+        return false;
+    };
+    model.architecture_class == ModelArchitectureClass::DenseTransformer
+        && measured_gpu_budget(budget)
+        && breakdown.groups.iter().any(|group| {
+            group.group == "full_token_graph"
+                && group.source.starts_with("probe_full_token_handoff")
+        })
+        && !breakdown
+            .groups
+            .iter()
+            .any(|group| group.group == "decode_submission")
+}
+
+fn thin_decode_submission_confidence_risk(
+    model: &ModelProfile,
+    budget: &ExecutionBudget,
+    breakdown: Option<&DecodeCostBreakdown>,
+) -> bool {
+    let Some(breakdown) = breakdown else {
+        return false;
+    };
+    model.architecture_class == ModelArchitectureClass::DenseTransformer
+        && measured_gpu_budget(budget)
+        && breakdown.groups.iter().any(|group| {
+            group.group == "decode_submission"
+                && group.source == "probe_decode_submission_elapsed_minus_fixed"
+        })
+}
+
+fn full_token_source_topology_confidence_risk(
+    model: &ModelProfile,
+    budget: &ExecutionBudget,
+    breakdown: Option<&DecodeCostBreakdown>,
+) -> Option<(u64, u64)> {
+    if model.architecture_class != ModelArchitectureClass::DenseTransformer
+        || !measured_gpu_budget(budget)
+    {
+        return None;
+    }
+    let group = breakdown?.groups.iter().find(|group| {
+        group.group == "full_token_graph" && group.source.starts_with("probe_full_token")
+    })?;
+    let probe_name = group.probe_name.as_ref()?;
+    let probe_nodes = budget
+        .decode_kernel_probes
+        .iter()
+        .find(|probe| probe.name == *probe_name)
+        .and_then(|probe| probe.graph_node_count)?;
+    let expected_nodes = dense_full_token_source_node_floor(model)?;
+    (probe_nodes < expected_nodes.saturating_mul(9) / 10).then_some((probe_nodes, expected_nodes))
+}
+
+fn sparse_moe_source_topology_confidence_risk(
+    model: &ModelProfile,
+    budget: &ExecutionBudget,
+    breakdown: Option<&DecodeCostBreakdown>,
+) -> Option<(u64, u64)> {
+    if model.architecture_class != ModelArchitectureClass::SparseMoeTransformer
+        || !measured_gpu_budget(budget)
+    {
+        return None;
+    }
+    let breakdown = breakdown?;
+    if breakdown
+        .groups
+        .iter()
+        .any(|group| group.group == "moe_decode_submission")
+    {
+        return None;
+    }
+    let group = breakdown
+        .groups
+        .iter()
+        .find(|group| group.group == "sparse_transformer_block")?;
+    let probe_name = group.probe_name.as_ref()?;
+    let probe = budget
+        .decode_kernel_probes
+        .iter()
+        .find(|probe| probe.name == *probe_name)?;
+    let probe_nodes = probe.graph_node_count?;
+    let probe_layers = u64::from(moe_block_graph_probe_layers(probe).max(1));
+    let model_layers = u64::from(model.layer_count?);
+    if model_layers == 0 || probe_layers == 0 {
+        return None;
+    }
+    let projected_probe_nodes = probe_nodes.saturating_mul(model_layers) / probe_layers;
+    let expected_nodes = u64::from(sparse_moe_source_visible_block_node_count(
+        model,
+        u32::try_from(model_layers).unwrap_or(u32::MAX),
+    ));
+    (projected_probe_nodes < expected_nodes.saturating_mul(9) / 10)
+        .then_some((projected_probe_nodes, expected_nodes))
+}
+
+fn dense_full_token_source_node_floor(model: &ModelProfile) -> Option<u64> {
+    let layers = u64::from(model.layer_count?);
+    if layers == 0 {
+        return None;
+    }
+
+    // This is not a speed multiplier and it must not become one casually. It is
+    // a confidence gate derived from llama.cpp's dense decode graph shape. The
+    // key validation failure it protects against is a synthetic "full token"
+    // probe whose matmul byte inventory is correct but whose graph topology is
+    // still thinner than the source graph that `llama_context::decode()` builds.
+    // On tiny models, those missing non-matmul nodes can dominate token time,
+    // so a fast synthetic graph is insufficient evidence for +/-10% tok/s.
+    //
+    // The terms below mirror source-visible dense decode work in
+    // `llm_graph_context::build_attn()`, `build_attn_mha()`, the FFN block, and
+    // final logits production:
+    //
+    // * 4 attention matmuls: Q, K, V, output projection
+    // * 3 FFN matmuls: gate, up, down
+    // * normalization and scale nodes around attention/FFN/final norm
+    // * Q/K RoPE
+    // * K/V cache writes plus cache view/permute nodes
+    // * Q/K/V shape/layout nodes before flash attention
+    // * flash attention and output reshape
+    // * FFN activation/runtime and residual elementwise nodes
+    // * small per-layer bookkeeping visible as GGML graph nodes
+    //
+    // The constant term covers token embedding lookup/final-logits graph setup
+    // that is not repeated once per layer. The exact graph can vary with model
+    // features such as q/k norm, sliding-window attention, or backend sampler
+    // tensors; this is intentionally a floor for confidence, not a completeness
+    // claim for scoring.
+    const ATTENTION_MATMULS: u64 = 4;
+    const FFN_MATMULS: u64 = 3;
+    const NORM_AND_SCALE: u64 = 3;
+    const ROPE_QK: u64 = 2;
+    const KV_CACHE_WRITES: u64 = 2;
+    const KV_CACHE_LAYOUT: u64 = 4;
+    const ATTENTION_LAYOUT: u64 = 5;
+    const FLASH_AND_RESHAPE: u64 = 2;
+    const FFN_RUNTIME: u64 = 3;
+    const RESIDUAL_RUNTIME: u64 = 2;
+    const PER_LAYER_BOOKKEEPING: u64 = 1;
+    const NON_LAYER_NODES: u64 = 6;
+
+    let per_layer = ATTENTION_MATMULS
+        + FFN_MATMULS
+        + NORM_AND_SCALE
+        + ROPE_QK
+        + KV_CACHE_WRITES
+        + KV_CACHE_LAYOUT
+        + ATTENTION_LAYOUT
+        + FLASH_AND_RESHAPE
+        + FFN_RUNTIME
+        + RESIDUAL_RUNTIME
+        + PER_LAYER_BOOKKEEPING;
+    Some(layers.saturating_mul(per_layer) + NON_LAYER_NODES)
+}
+
+fn selected_decode_probe_spread_confidence_risk(
+    breakdown: Option<&DecodeCostBreakdown>,
+) -> Option<f64> {
+    let max_spread = breakdown?
+        .groups
+        .iter()
+        .filter_map(|group| group.probe_spread_pct)
+        .filter(|spread| spread.is_finite())
+        .fold(None, |max: Option<f64>, spread| {
+            Some(max.map_or(spread, |current| current.max(spread)))
+        })?;
+    (max_spread / 100.0 >= f64::from(HIGH_CONFIDENCE_RELATIVE_TOLERANCE)).then_some(max_spread)
+}
+
+fn decode_probe_elapsed_ms_for_scoring(probe: &DecodeKernelProbe) -> Option<f32> {
+    let elapsed = probe.elapsed_ms.filter(|elapsed| *elapsed > 0.0)?;
+    match (
+        probe.spread_pct.filter(|spread| spread.is_finite()),
+        probe.max_elapsed_ms.filter(|elapsed| *elapsed > 0.0),
+    ) {
+        (Some(spread), Some(max_elapsed))
+            if spread / 100.0 >= f64::from(HIGH_CONFIDENCE_RELATIVE_TOLERANCE)
+                && max_elapsed > elapsed =>
+        {
+            // A model-fit recommendation is a planning answer, not a benchmark
+            // leaderboard. When the hardware probe itself varies by more than the
+            // +/-10% confidence bar, using the median as the point estimate can
+            // produce an overconfident local-fit recommendation from an optimistic
+            // backend sample. Use the slow side of the measured probe range for
+            // scoring while separately warning that confidence is low. This is not a
+            // backend, family, or observed-model correction: every input here comes
+            // from the hardware probe's own timed samples.
+            return Some(max_elapsed as f32);
+        }
+        _ => {}
+    }
+    Some(elapsed as f32)
+}
+
+fn add_logits_readback_decode_cost(
+    model: &ModelProfile,
+    budget: &ExecutionBudget,
+    cost: &mut GroupedDecodeCost,
+) {
+    // The decode graph does not end at the transformer block. llama.cpp
+    // eventually exposes a vocab-sized F32 logits row to the sampler, and on
+    // accelerator backends that means there is a CPU-visible handoff/sync point
+    // in addition to the vocab projection matmul itself. That cost is easy to
+    // miss because the main decode call can enqueue backend work asynchronously;
+    // the time may become visible when logits are copied/read and the sampler
+    // asks for candidates.
+    //
+    // This is deliberately a model-shaped hardware probe, not a correction
+    // learned from the benchmarked model. The only model facts used here are
+    // GGUF tokenizer vocabulary size and the selected measured backend. The
+    // output projection group still charges the matrix multiply that produces
+    // logits; this group charges the source-visible F32 logits handoff and any
+    // backend synchronization needed to make that row CPU-visible. The sampled
+    // decode sampler term remains separate and is still charged when this probe
+    // exists: the logits handoff gets bytes to the sampler, while the sampler
+    // term models the llama.cpp candidate-chain work that happens after the row
+    // is visible.
+    let Some(probe) = select_logits_handoff_probe(model, budget) else {
+        return;
+    };
+    let Some(elapsed_ms) = decode_probe_elapsed_ms_for_scoring(probe) else {
+        return;
+    };
+    let traffic_bytes = model
+        .tokenizer
+        .vocab_size
+        .map(|vocab| u64::from(vocab).saturating_mul(4))
+        .unwrap_or_else(|| u64::from(probe.rows).saturating_mul(4));
+    if traffic_bytes == 0 {
+        return;
+    }
+    let bandwidth = (traffic_bytes as f32 / (elapsed_ms / 1000.0).max(0.001))
+        .round()
+        .max(1.0) as u64;
+    cost.probed_bytes = cost.probed_bytes.saturating_add(traffic_bytes);
+    cost.bandwidth_ms += elapsed_ms;
+    cost.groups.push(DecodeCostGroupBreakdown {
+        group: "logits_readback".into(),
+        tensor_type: "f32".into(),
+        resident_bytes: traffic_bytes,
         traffic_bytes,
-        expert_scaled: group.expert_scaled,
-        shape_input_width: group.shape.weighted_avg_input_width,
-        shape_output_width: group.shape.weighted_avg_output_width,
-        source: if selection.is_some() {
-            "probe".into()
-        } else {
-            "fallback".into()
-        },
+        expert_scaled: false,
+        shape_input_width: u64::from(model.hidden_size.unwrap_or_default()),
+        shape_output_width: u64::from(model.tokenizer.vocab_size.unwrap_or_default()),
+        source: logits_handoff_probe_source(probe).into(),
         bandwidth_bytes_per_sec: bandwidth,
-        bandwidth_ms,
-        probe_name: selection.map(|selection| selection.probe.name.clone()),
-        probe_rows: selection.map(|selection| selection.probe.rows),
-        probe_cols: selection.map(|selection| selection.probe.cols),
-        probe_batch_tokens: selection.map(|selection| selection.probe.batch_tokens),
-        probe_effective_gbps: selection.map(|selection| selection.probe.effective_gbps),
-        probe_shape_distance: selection.map(|selection| selection.shape_distance),
+        bandwidth_ms: elapsed_ms,
+        probe_name: Some(probe.name.clone()),
+        probe_rows: Some(probe.rows),
+        probe_cols: Some(probe.cols),
+        probe_batch_tokens: Some(probe.batch_tokens),
+        probe_effective_gbps: Some(probe.effective_gbps),
+        probe_min_elapsed_ms: probe.min_elapsed_ms,
+        probe_max_elapsed_ms: probe.max_elapsed_ms,
+        probe_spread_pct: probe.spread_pct,
+        probe_shape_distance: None,
+    });
+}
+
+fn select_logits_handoff_probe<'a>(
+    model: &ModelProfile,
+    budget: &'a ExecutionBudget,
+) -> Option<&'a DecodeKernelProbe> {
+    let vocab = model.tokenizer.vocab_size.filter(|vocab| *vocab > 0)?;
+    budget
+        .decode_kernel_probes
+        .iter()
+        .filter(|probe| {
+            is_logits_handoff_probe(probe)
+                && probe.batch_tokens == 1
+                && probe.elapsed_ms.is_some_and(|elapsed| elapsed > 0.0)
+        })
+        .min_by(|left, right| {
+            let left_rank = logits_handoff_probe_rank(left);
+            let right_rank = logits_handoff_probe_rank(right);
+            let left_distance = log_dimension_ratio(left.rows.max(1), vocab);
+            let right_distance = log_dimension_ratio(right.rows.max(1), vocab);
+            left_rank
+                .cmp(&right_rank)
+                .then_with(|| left_distance.total_cmp(&right_distance))
+        })
+}
+
+fn logits_handoff_probe_source(probe: &DecodeKernelProbe) -> &'static str {
+    if is_logits_output_handoff_probe(probe) {
+        "probe_logits_output_handoff_elapsed"
+    } else if is_logits_sync_probe(probe) {
+        "probe_logits_sync_elapsed"
+    } else {
+        "probe_logits_readback_elapsed"
+    }
+}
+
+fn logits_handoff_probe_rank(probe: &DecodeKernelProbe) -> u8 {
+    if is_logits_output_handoff_probe(probe) {
+        0
+    } else if is_logits_sync_probe(probe) {
+        1
+    } else {
+        2
+    }
+}
+
+fn select_dense_full_token_probe<'a>(
+    model: &ModelProfile,
+    budget: &'a ExecutionBudget,
+    config: &SelectionConfig,
+    block_tensor_type: &str,
+    output_tensor_type: &str,
+) -> Option<&'a DecodeKernelProbe> {
+    let context = decode_context_tokens(model, config);
+    let hidden = model.hidden_size?;
+    let ffn = model.ffn_size?;
+    let vocab = model.tokenizer.vocab_size?;
+    let query_heads = model.attention_heads?;
+    let kv_heads = model.kv_heads.unwrap_or(query_heads).max(1);
+    let head_dim = model.key_length.or_else(|| {
+        (query_heads > 0 && hidden % query_heads == 0).then_some(hidden / query_heads)
+    })?;
+    budget
+        .decode_kernel_probes
+        .iter()
+        .filter(|probe| {
+            is_dense_full_token_probe(probe)
+                && probe.batch_tokens == 1
+                && probe.elapsed_ms.is_some_and(|elapsed| elapsed > 0.0)
+                && probe.tensor_type.eq_ignore_ascii_case(block_tensor_type)
+                && dense_full_token_probe_output_tensor_type(probe)
+                    .is_some_and(|tensor_type| tensor_type.eq_ignore_ascii_case(output_tensor_type))
+                && dense_full_token_probe_layers(probe) == model.layer_count.unwrap_or(1)
+                && dense_full_token_probe_context(probe).is_some()
+                && dense_full_token_probe_width(probe, "_vocab") == Some(u64::from(vocab))
+                && dense_full_token_probe_width(probe, "_h") == Some(u64::from(head_dim))
+                && dense_full_token_probe_width(probe, "_qh") == Some(u64::from(query_heads))
+                && dense_full_token_probe_width(probe, "_kvh") == Some(u64::from(kv_heads))
+                && dense_full_token_probe_shape_matches_model(probe, hidden, ffn, model)
+                && dense_layer_graph_probe_features_match_model(probe, model)
+        })
+        .min_by(|left, right| {
+            let left_distance = context_distance(dense_full_token_probe_context(left), context);
+            let right_distance = context_distance(dense_full_token_probe_context(right), context);
+            left_distance
+                .total_cmp(&right_distance)
+                .then_with(|| {
+                    // Prefer the source-more-complete row when the shape is the
+                    // same. `source_sampled` times source-side decode input
+                    // population, graph submission, logits handoff, scheduler
+                    // synchronization, and a CPU vocab scan in one interval.
+                    // `handoff` is the next-best row because it covers graph
+                    // completion plus logits visibility. Plain full-token rows
+                    // remain accepted for older benchmark JSON and diagnostics.
+                    dense_full_token_probe_source_rank(left)
+                        .cmp(&dense_full_token_probe_source_rank(right))
+                })
+                .then_with(|| {
+                    left.elapsed_ms
+                        .unwrap_or(f64::INFINITY)
+                        .total_cmp(&right.elapsed_ms.unwrap_or(f64::INFINITY))
+                })
+        })
+}
+
+fn select_dense_decode_submission_probe<'a>(
+    model: &ModelProfile,
+    budget: &'a ExecutionBudget,
+    block_tensor_type: &str,
+    output_tensor_type: &str,
+    target_context: u32,
+) -> Option<&'a DecodeKernelProbe> {
+    let hidden = model.hidden_size?;
+    let ffn = model.ffn_size?;
+    let vocab = model.tokenizer.vocab_size?;
+    let query_heads = model.attention_heads?;
+    let kv_heads = model.kv_heads.unwrap_or(query_heads).max(1);
+    let head_dim = model.key_length.or_else(|| {
+        (query_heads > 0 && hidden % query_heads == 0).then_some(hidden / query_heads)
+    })?;
+    budget
+        .decode_kernel_probes
+        .iter()
+        .filter(|probe| {
+            is_dense_decode_submission_probe(probe)
+                && probe.batch_tokens == 1
+                && probe.elapsed_ms.is_some_and(|elapsed| elapsed > 0.0)
+                && probe.tensor_type.eq_ignore_ascii_case(block_tensor_type)
+                && dense_decode_submission_probe_output_tensor_type(probe)
+                    .is_some_and(|tensor_type| tensor_type.eq_ignore_ascii_case(output_tensor_type))
+                && dense_decode_submission_probe_layers(probe) == model.layer_count.unwrap_or(1)
+                && dense_decode_submission_probe_context(probe).is_some()
+                && dense_decode_submission_probe_width(probe, "_vocab") == Some(u64::from(vocab))
+                && dense_decode_submission_probe_width(probe, "_h") == Some(u64::from(head_dim))
+                && dense_decode_submission_probe_width(probe, "_qh") == Some(u64::from(query_heads))
+                && dense_decode_submission_probe_width(probe, "_kvh") == Some(u64::from(kv_heads))
+                && dense_decode_submission_probe_shape_matches_model(probe, hidden, ffn, model)
+                && dense_layer_graph_probe_features_match_model(probe, model)
+        })
+        .min_by(|left, right| {
+            let left_distance =
+                context_distance(dense_decode_submission_probe_context(left), target_context);
+            let right_distance =
+                context_distance(dense_decode_submission_probe_context(right), target_context);
+            left_distance.total_cmp(&right_distance)
+        })
+}
+
+fn select_attention_runtime_probe<'a>(
+    model: &ModelProfile,
+    _config: &SelectionConfig,
+    budget: &'a ExecutionBudget,
+    context_tokens: u32,
+) -> Option<&'a DecodeKernelProbe> {
+    if !matches!(
+        model.architecture_class,
+        ModelArchitectureClass::DenseTransformer | ModelArchitectureClass::SparseMoeTransformer
+    ) {
+        return None;
+    }
+    let layer_count = model.layer_count.filter(|layers| *layers > 0)?;
+    let query_heads = model.attention_heads.filter(|heads| *heads > 0)?;
+    let kv_heads = model.kv_heads.unwrap_or(query_heads).max(1);
+    let head_dim = model.key_length.filter(|width| *width > 0).or_else(|| {
+        let hidden = model.hidden_size?;
+        (hidden % query_heads == 0).then_some(hidden / query_heads)
+    })?;
+    budget
+        .decode_kernel_probes
+        .iter()
+        .filter(|probe| {
+            is_attention_runtime_probe(probe)
+                && probe.elapsed_ms.is_some_and(|elapsed| elapsed > 0.0)
+                && attention_runtime_probe_layers(probe) == layer_count
+                && attention_runtime_probe_width(probe, "_h") == Some(u64::from(head_dim))
+                && attention_runtime_probe_width(probe, "_qh") == Some(u64::from(query_heads))
+                && attention_runtime_probe_width(probe, "_kvh") == Some(u64::from(kv_heads))
+        })
+        .min_by(|left, right| {
+            let left_distance =
+                context_distance(attention_runtime_probe_context(left), context_tokens);
+            let right_distance =
+                context_distance(attention_runtime_probe_context(right), context_tokens);
+            left_distance.total_cmp(&right_distance)
+        })
+}
+
+fn attention_runtime_probe_variable_ms(
+    probe: &DecodeKernelProbe,
+    target_context_tokens: u32,
+    fixed_ms: f32,
+) -> f32 {
+    let elapsed = probe.elapsed_ms.unwrap_or_default().max(0.0) as f32;
+    let variable = (elapsed - fixed_ms.max(0.0)).max(0.0);
+    let probe_context = attention_runtime_probe_context(probe).unwrap_or(target_context_tokens);
+    let scale = target_context_tokens.max(1) as f32 / probe_context.max(1) as f32;
+    (variable * scale).max(0.001)
+}
+
+fn context_distance(probe_context: Option<u32>, target_context: u32) -> f64 {
+    let Some(probe_context) = probe_context else {
+        return f64::INFINITY;
+    };
+    log_dimension_ratio(probe_context, target_context.max(1))
+}
+
+fn decode_cost_group_breakdown(input: DecodeGroupBreakdownInput<'_>) -> DecodeCostGroupBreakdown {
+    DecodeCostGroupBreakdown {
+        group: decode_group_kind_name(input.group.kind).into(),
+        tensor_type: input.tensor_type.into(),
+        resident_bytes: input.resident_bytes,
+        traffic_bytes: input.traffic_bytes,
+        expert_scaled: input.group.expert_scaled,
+        shape_input_width: input.group.shape.weighted_avg_input_width,
+        shape_output_width: input.group.shape.weighted_avg_output_width,
+        source: input.source.into(),
+        bandwidth_bytes_per_sec: input.bandwidth,
+        bandwidth_ms: input.bandwidth_ms,
+        probe_name: input
+            .selection
+            .map(|selection| selection.probe.name.clone()),
+        probe_rows: input.selection.map(|selection| selection.probe.rows),
+        probe_cols: input.selection.map(|selection| selection.probe.cols),
+        probe_batch_tokens: input
+            .selection
+            .map(|selection| selection.probe.batch_tokens),
+        probe_effective_gbps: input
+            .selection
+            .map(|selection| selection.probe.effective_gbps),
+        probe_min_elapsed_ms: input
+            .selection
+            .and_then(|selection| selection.probe.min_elapsed_ms),
+        probe_max_elapsed_ms: input
+            .selection
+            .and_then(|selection| selection.probe.max_elapsed_ms),
+        probe_spread_pct: input
+            .selection
+            .and_then(|selection| selection.probe.spread_pct),
+        probe_shape_distance: input.selection.map(|selection| selection.shape_distance),
     }
 }
 
@@ -2356,6 +3758,7 @@ fn select_decode_group_probe<'a>(
                     || !is_composite_llama_graph_decode_probe(probe))
                 && (!is_composite_llama_graph_decode_probe(probe)
                     || (dense_layer_graph_probe_features_match_model(probe, model)
+                        && dense_layer_graph_probe_is_scoring_evidence(probe)
                         && dense_layer_graph_probe_depth_matches_model(probe, model)))
         })
         .map(|probe| {
@@ -2376,9 +3779,75 @@ fn select_decode_group_probe<'a>(
         })
 }
 
+fn select_decode_group_shape_surrogate_probe<'a>(
+    group: DecodeTrafficGroup,
+    tensor_type: &'static str,
+    model: &ModelProfile,
+    budget: &'a ExecutionBudget,
+) -> Option<DecodeProbeSelection<'a>> {
+    if model.architecture_class != ModelArchitectureClass::DenseTransformer
+        || has_recurrent_attention_graph(model)
+        || !decode_group_allows_shape_surrogate(group.kind)
+        || !is_quantized_tensor_type(tensor_type)
+    {
+        return None;
+    }
+    let target = matmul_shape_target(group.shape)?;
+    budget
+        .decode_kernel_probes
+        .iter()
+        .filter(|probe| {
+            probe.batch_tokens == 1
+                && probe.effective_gbps > 0.0
+                && is_llama_decode_kernel_probe(probe)
+                && is_quantized_tensor_type(&probe.tensor_type)
+                && decode_probe_matches_group_kind(probe, group.kind)
+                && is_composite_llama_graph_decode_probe(probe)
+                && dense_layer_graph_probe_features_match_model(probe, model)
+                && dense_layer_graph_probe_is_scoring_evidence(probe)
+                && dense_layer_graph_probe_depth_matches_model(probe, model)
+                && dense_graph_probe_kv_matches_model(probe, model)
+        })
+        .map(|probe| {
+            (
+                probe,
+                decode_group_probe_shape_distance(probe, group.kind, model, tensor_type, target),
+            )
+        })
+        .filter(|(probe, distance)| decode_group_probe_is_usable(probe, group.kind, *distance))
+        .min_by(|(left, left_distance), (right, right_distance)| {
+            left_distance.total_cmp(right_distance).then_with(|| {
+                let left_bandwidth =
+                    decode_group_probe_bandwidth_bytes_per_sec(left, group.kind, model, budget);
+                let right_bandwidth =
+                    decode_group_probe_bandwidth_bytes_per_sec(right, group.kind, model, budget);
+                left_bandwidth.cmp(&right_bandwidth)
+            })
+        })
+        .map(|(probe, shape_distance)| DecodeProbeSelection {
+            probe,
+            shape_distance,
+        })
+}
+
+fn decode_group_allows_shape_surrogate(kind: DecodeGroupKind) -> bool {
+    matches!(
+        kind,
+        DecodeGroupKind::AttentionMatmul | DecodeGroupKind::FeedForwardMatmul
+    )
+}
+
+fn is_quantized_tensor_type(tensor_type: &str) -> bool {
+    matches!(
+        tensor_type.to_ascii_lowercase().as_str(),
+        "q4_0" | "q4_k" | "q5_k" | "q6_k" | "q8_0" | "iq" | "other_quantized" | "unknown"
+    )
+}
+
 fn decode_group_kind_name(kind: DecodeGroupKind) -> &'static str {
     match kind {
         DecodeGroupKind::TransformerBlock => "transformer_block",
+        DecodeGroupKind::TokenEmbeddingLookup => "token_embedding_lookup",
         DecodeGroupKind::AttentionMatmul => "attention_matmul",
         DecodeGroupKind::FeedForwardMatmul => "feed_forward_matmul",
         DecodeGroupKind::OutputMatmul => "output_matmul",
@@ -2704,6 +4173,7 @@ fn dense_layer_graph_shape_target(model: &ModelProfile) -> Option<(u32, u32)> {
 fn decode_probe_matches_group_kind(probe: &DecodeKernelProbe, kind: DecodeGroupKind) -> bool {
     match kind {
         DecodeGroupKind::TransformerBlock => false,
+        DecodeGroupKind::TokenEmbeddingLookup => false,
         DecodeGroupKind::AttentionMatmul => {
             is_composite_llama_graph_decode_probe(probe)
                 && !is_routed_moe_decode_probe(probe)
@@ -3138,6 +4608,148 @@ fn linear_attention_graph_probe_width(probe: &DecodeKernelProbe, marker: &str) -
         .flatten()
 }
 
+fn attention_runtime_probe_width(probe: &DecodeKernelProbe, marker: &str) -> Option<u64> {
+    linear_attention_graph_probe_width(probe, marker)
+}
+
+fn attention_runtime_probe_layers(probe: &DecodeKernelProbe) -> u32 {
+    attention_runtime_probe_width(probe, "_flash_attn_ext_l")
+        .and_then(|value| u32::try_from(value).ok())
+        .unwrap_or(1)
+        .max(1)
+}
+
+fn attention_runtime_probe_context(probe: &DecodeKernelProbe) -> Option<u32> {
+    attention_runtime_probe_width(probe, "_ctx").and_then(|value| u32::try_from(value).ok())
+}
+
+fn dense_full_token_probe_context(probe: &DecodeKernelProbe) -> Option<u32> {
+    dense_full_token_probe_width(probe, "_nkv")
+        .or_else(|| dense_full_token_probe_width(probe, "_ctx"))
+        .and_then(|value| u32::try_from(value).ok())
+}
+
+fn dense_full_token_probe_width(probe: &DecodeKernelProbe, marker: &str) -> Option<u64> {
+    let name = probe.name.to_ascii_lowercase();
+    probe_width_after_marker(&name, marker)
+}
+
+fn probe_width_after_marker(name: &str, marker: &str) -> Option<u64> {
+    let mut start = 0;
+    while let Some(relative_marker_index) = name[start..].find(marker) {
+        let suffix_start = start + relative_marker_index + marker.len();
+        let digits = name[suffix_start..]
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect::<String>();
+        if !digits.is_empty() {
+            return digits.parse::<u64>().ok();
+        }
+        start = suffix_start;
+    }
+    None
+}
+
+fn dense_full_token_probe_layers(probe: &DecodeKernelProbe) -> u32 {
+    let name = probe.name.to_ascii_lowercase();
+    let Some((_, suffix)) = name.split_once("_full_token") else {
+        return 1;
+    };
+    let Some((_, suffix)) = suffix.split_once("_l") else {
+        return 1;
+    };
+    let digits = suffix
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>();
+    digits.parse::<u32>().unwrap_or(1).max(1)
+}
+
+fn dense_full_token_probe_output_tensor_type(probe: &DecodeKernelProbe) -> Option<&str> {
+    let name = probe.name.as_str();
+    let (_, suffix) = name.split_once("_full_token")?;
+    let Some((_, output_suffix)) = suffix.split_once("_out") else {
+        return Some(probe.tensor_type.as_str());
+    };
+    output_suffix
+        .split_once("_l")
+        .map(|(tensor_type, _)| tensor_type)
+}
+
+fn dense_full_token_probe_shape_matches_model(
+    probe: &DecodeKernelProbe,
+    hidden: u32,
+    ffn: u32,
+    model: &ModelProfile,
+) -> bool {
+    if probe.cols != hidden || probe.rows != model.tokenizer.vocab_size.unwrap_or_default() {
+        return false;
+    }
+    let name = probe.name.to_ascii_lowercase();
+    let kv_width = model_attention_kv_width(model);
+    if kv_width < u64::from(hidden) {
+        name.contains(&format!("_gqa_{}_kv{}_{}", hidden, kv_width, ffn))
+    } else {
+        name.contains(&format!("_{}_{}", hidden, ffn))
+    }
+}
+
+fn dense_decode_submission_probe_context(probe: &DecodeKernelProbe) -> Option<u32> {
+    dense_decode_submission_probe_width(probe, "_nkv")
+        .or_else(|| dense_decode_submission_probe_width(probe, "_ctx"))
+        .and_then(|value| u32::try_from(value).ok())
+}
+
+fn dense_decode_submission_probe_width(probe: &DecodeKernelProbe, marker: &str) -> Option<u64> {
+    let name = probe.name.to_ascii_lowercase();
+    probe_width_after_marker(&name, marker)
+}
+
+fn dense_decode_submission_probe_layers(probe: &DecodeKernelProbe) -> u32 {
+    let name = probe.name.to_ascii_lowercase();
+    let Some((_, suffix)) = name.split_once("_submission") else {
+        return 1;
+    };
+    let Some((_, suffix)) = suffix.split_once("_l") else {
+        return 1;
+    };
+    let digits = suffix
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>();
+    digits.parse::<u32>().unwrap_or(1).max(1)
+}
+
+fn dense_decode_submission_probe_output_tensor_type(probe: &DecodeKernelProbe) -> Option<&str> {
+    let name = probe.name.as_str();
+    let (_, suffix) = name.split_once("_submission")?;
+    let Some((_, output_suffix)) = suffix.split_once("_out") else {
+        return Some(probe.tensor_type.as_str());
+    };
+    output_suffix
+        .split_once("_l")
+        .or_else(|| output_suffix.split_once("_gqa_"))
+        .map(|(tensor_type, _)| tensor_type)
+}
+
+fn dense_decode_submission_probe_shape_matches_model(
+    probe: &DecodeKernelProbe,
+    hidden: u32,
+    ffn: u32,
+    model: &ModelProfile,
+) -> bool {
+    if probe.cols != hidden || probe.rows != model.tokenizer.vocab_size.unwrap_or_default() {
+        return false;
+    }
+    let name = probe.name.to_ascii_lowercase();
+    let kv_width = model_attention_kv_width(model);
+    if kv_width < u64::from(hidden) {
+        name.contains(&format!("_gqa_{}_kv{}_{}", hidden, kv_width, ffn))
+    } else {
+        name.contains(&format!("_{}_{}", hidden, ffn))
+    }
+}
+
 fn linear_attention_graph_recurrent_layers(probe: &DecodeKernelProbe) -> u32 {
     linear_attention_graph_probe_width(probe, "_linear_attn_graph_r")
         .and_then(|value| u32::try_from(value).ok())
@@ -3236,6 +4848,23 @@ fn dense_layer_graph_probe_layers(probe: &DecodeKernelProbe) -> u32 {
     digits.parse::<u32>().unwrap_or(1).max(1)
 }
 
+fn dense_layer_graph_probe_is_scoring_evidence(_probe: &DecodeKernelProbe) -> bool {
+    // Repeated-depth dense graph probes are scoring evidence because llama.cpp
+    // submits decode as a scheduled graph containing all repeated transformer
+    // blocks, not as one isolated matvec per layer. That source fact applies to
+    // Q4_K, Q6_K, and Q8_0 alike. Earlier revisions kept stacked Q8 rows
+    // diagnostic-only after a tiny-model validation miss, but that threw away a
+    // better metadata-derived graph shape and forced the estimator back to a
+    // one-layer extrapolation even when an exact full-depth Q8 row existed.
+    //
+    // The confidence rule is separate: a Q8 block graph still does not prove
+    // the full sampled-token boundary (`llama_context::decode()` output
+    // extraction plus sampler-visible logits sync). Use the source-shaped block
+    // row for the point estimate, then keep confidence low when that is the
+    // strongest available evidence.
+    true
+}
+
 fn linear_attention_graph_probe_rank(probe: &DecodeKernelProbe, model: &ModelProfile) -> u16 {
     let recurrent = model.recurrent_attention.recurrent_layer_count;
     let recurrent_rank = if linear_attention_graph_recurrent_layers(probe) == recurrent {
@@ -3302,6 +4931,118 @@ fn moe_block_graph_probe_layers(probe: &DecodeKernelProbe) -> u32 {
     digits.parse::<u32>().unwrap_or(1).max(1)
 }
 
+fn dense_source_input_probe_context(probe: &DecodeKernelProbe) -> Option<u32> {
+    dense_source_input_probe_width(probe, "_nkv")
+        .or_else(|| dense_source_input_probe_width(probe, "_ctx"))
+        .and_then(|value| u32::try_from(value).ok())
+}
+
+fn dense_source_input_probe_width(probe: &DecodeKernelProbe, marker: &str) -> Option<u64> {
+    let name = probe.name.to_ascii_lowercase();
+    probe_width_after_marker(&name, marker)
+}
+
+fn dense_source_input_probe_layers(probe: &DecodeKernelProbe) -> u32 {
+    let name = probe.name.to_ascii_lowercase();
+    let Some((_, suffix)) = name.split_once("_source_input") else {
+        return 1;
+    };
+    let Some((_, suffix)) = suffix.split_once("_l") else {
+        return 1;
+    };
+    let digits = suffix
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>();
+    digits.parse::<u32>().unwrap_or(1).max(1)
+}
+
+fn sparse_moe_submission_probe_layers(probe: &DecodeKernelProbe) -> u32 {
+    let name = probe.name.to_ascii_lowercase();
+    let Some((_, suffix)) = name.split_once("_moe_block_submission_l") else {
+        return 1;
+    };
+    let digits = suffix
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>();
+    digits.parse::<u32>().unwrap_or(1).max(1)
+}
+
+fn sparse_moe_submission_probe_context(probe: &DecodeKernelProbe) -> Option<u32> {
+    let name = probe.name.to_ascii_lowercase();
+    let (_, suffix) = name.split_once("_ctx")?;
+    let digits = suffix
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>();
+    digits.parse::<u32>().ok().filter(|context| *context > 0)
+}
+
+fn sparse_moe_submission_probe_shape_matches_model(
+    probe: &DecodeKernelProbe,
+    model: &ModelProfile,
+) -> bool {
+    let name = probe.name.to_ascii_lowercase();
+    let Some((expert_count, experts_used, expert_width, hidden)) =
+        sparse_moe_submission_probe_shape(&name)
+    else {
+        return false;
+    };
+    expert_count == model.expert_count.unwrap_or_default()
+        && experts_used == model.expert_used_count.unwrap_or_default()
+        && expert_width == model.ffn_size.unwrap_or_default()
+        && hidden == model.hidden_size.unwrap_or_default()
+}
+
+fn sparse_moe_submission_probe_shape(name: &str) -> Option<(u32, u32, u32, u32)> {
+    let (_, suffix) = name.split_once("_moe_block_submission_l")?;
+    let after_layers = suffix.trim_start_matches(|ch: char| ch.is_ascii_digit());
+    let after_tensor_type = after_layers
+        .strip_prefix("_q4_k_")
+        .or_else(|| after_layers.strip_prefix("_q6_k_"))?;
+    let (experts, rest) = after_tensor_type.split_once('_')?;
+    let (expert_count, experts_used) = experts.split_once('x')?;
+    let width = rest
+        .split_once("_ctx")
+        .map(|(width, _)| width)
+        .unwrap_or(rest);
+    let width = width
+        .split_once("_kv")
+        .map(|(width, _)| width)
+        .unwrap_or(width);
+    let (expert_width, hidden) = width.split_once('x')?;
+    Some((
+        expert_count.parse().ok()?,
+        experts_used.parse().ok()?,
+        expert_width.parse().ok()?,
+        hidden.parse().ok()?,
+    ))
+}
+
+fn sparse_moe_submission_probe_kv_matches_model(
+    probe: &DecodeKernelProbe,
+    model: &ModelProfile,
+) -> bool {
+    let hidden = u64::from(model.hidden_size.unwrap_or_default());
+    if hidden == 0 {
+        return true;
+    }
+    let model_kv = model_attention_kv_width(model);
+    let probe_kv = sparse_moe_submission_probe_kv_width(probe).unwrap_or(hidden);
+    if model_kv < hidden {
+        probe_kv == model_kv
+    } else {
+        probe_kv == hidden
+    }
+}
+
+fn sparse_moe_submission_probe_kv_width(probe: &DecodeKernelProbe) -> Option<u64> {
+    let name = probe.name.to_ascii_lowercase();
+    let (_, suffix) = name.rsplit_once("_kv")?;
+    suffix.parse::<u64>().ok().filter(|width| *width > 0)
+}
+
 fn moe_graph_probe_layers(probe: &DecodeKernelProbe) -> u32 {
     let name = probe.name.to_ascii_lowercase();
     let Some((_, suffix)) = name.split_once("_moe_graph_l") else {
@@ -3328,16 +5069,22 @@ fn is_supported_dense_layer_graph_probe(probe: &DecodeKernelProbe) -> bool {
     // kernel-fusion behavior that appears when many repeated blocks are present
     // in one decode graph.
     //
-    // Earlier revisions kept stacked selection to Q4_K because a narrow Q8 row
-    // was not enough evidence to promote Q8 stacks. The skippy ABI graph
-    // inventory now lets validation compare GGUF-derived tensor groups against
-    // the actual llama.cpp decode graph. Across the Q8 held-out sweep, the
-    // inventory showed the same repeated-layer risk and the lN graph rows were
-    // the source-shaped evidence that moved estimates toward observed decode.
-    // This is still not a backend or model-name correction: a row is usable only
-    // when it is a measured llama graph probe for the same tensor type, shape,
-    // KV width, and a depth no greater than the GGUF model layer count.
-    probe.tensor_type.eq_ignore_ascii_case("q4_k") || probe.tensor_type.eq_ignore_ascii_case("q8_0")
+    // Earlier revisions kept stacked selection to Q4_K because Q6_K/Q8_0 had
+    // less held-out validation evidence. That turned out to hide a more general
+    // source fact: llama.cpp submits a repeated dense block graph for decode
+    // regardless of whether the block's dominant GGML type is Q4_K, Q6_K, or
+    // Q8_0. The validator now rejects impossible quantized row widths before
+    // graph construction, so accepting stacked rows here does not make invalid
+    // small-model synthetic layouts representative. It only lets measured
+    // source-shaped depth rows compete when tensor type, shape, KV width,
+    // graph-feature bits, and layer depth all match GGUF metadata.
+    dense_graph_tensor_type_supports_depth(&probe.tensor_type)
+}
+
+fn dense_graph_tensor_type_supports_depth(tensor_type: &str) -> bool {
+    tensor_type.eq_ignore_ascii_case("q4_k")
+        || tensor_type.eq_ignore_ascii_case("q6_k")
+        || tensor_type.eq_ignore_ascii_case("q8_0")
 }
 
 fn is_llama_decode_kernel_probe(probe: &DecodeKernelProbe) -> bool {
@@ -3408,8 +5155,28 @@ fn decode_probe_operation_rank(probe: &DecodeKernelProbe, model: &ModelProfile) 
 }
 
 fn has_high_confidence_decode_probe(model: &ModelProfile, budget: &ExecutionBudget) -> bool {
+    if has_source_shaped_decode_block_probe(model, budget) {
+        return true;
+    }
     selected_representative_decode_kernel_probe(model, budget)
         .is_some_and(|probe| high_confidence_decode_probe_matches_model(model, probe))
+}
+
+fn has_source_shaped_decode_block_probe(model: &ModelProfile, budget: &ExecutionBudget) -> bool {
+    if has_recurrent_attention_graph(model) {
+        return dense_transformer_block_group(model)
+            .and_then(|group| select_linear_attention_block_probe(group, model, budget))
+            .is_some();
+    }
+    match model.architecture_class {
+        ModelArchitectureClass::DenseTransformer => dense_transformer_block_group(model)
+            .and_then(|group| select_dense_block_probe(group, model, budget))
+            .is_some(),
+        ModelArchitectureClass::SparseMoeTransformer => {
+            select_sparse_moe_block_probe(model, budget).is_some()
+        }
+        _ => false,
+    }
 }
 
 fn high_confidence_decode_probe_matches_model(
@@ -3434,27 +5201,64 @@ fn high_confidence_decode_probe_matches_model(
     }
 }
 
-fn shallow_q8_graph_probe_warning(
+fn shallow_dense_graph_probe_warning(
     model: &ModelProfile,
     budget: &ExecutionBudget,
+    breakdown: Option<&DecodeCostBreakdown>,
 ) -> Option<String> {
     if !measured_gpu_budget(budget)
         || model.architecture_class != ModelArchitectureClass::DenseTransformer
         || model.layer_count.unwrap_or_default() < 16
+        || breakdown.is_some_and(|breakdown| {
+            breakdown
+                .groups
+                .iter()
+                .any(|group| group.group == "full_token_graph")
+        })
     {
         return None;
     }
-    let probe = selected_representative_decode_kernel_probe(model, budget)?;
-    if !probe.tensor_type.eq_ignore_ascii_case("q8_0")
-        || !is_composite_llama_graph_decode_probe(probe)
-        || dense_layer_graph_probe_layers(probe) != 1
-    {
+    let group = breakdown?
+        .groups
+        .iter()
+        .find(|group| group.group == "transformer_block")?;
+    let probe_name = group.probe_name.as_ref()?;
+    let probe = budget
+        .decode_kernel_probes
+        .iter()
+        .find(|probe| probe.name == *probe_name)?;
+    if !is_composite_llama_graph_decode_probe(probe) || dense_layer_graph_probe_layers(probe) != 1 {
         return None;
     }
-    Some(
-        "selected Q8_0 decode probe is a one-layer llama graph for a deeper dense model; tok/s estimate is reported without a depth-matched Q8 graph probe and should be validated before relying on +/-10%"
-            .into(),
-    )
+    Some(format!(
+        "selected {} decode probe is a one-layer llama graph for a deeper dense model; tok/s estimate is reported without a depth-matched graph probe and should be validated before relying on +/-10%",
+        group.tensor_type
+    ))
+}
+
+fn q8_dense_block_source_boundary_confidence_risk(
+    model: &ModelProfile,
+    budget: &ExecutionBudget,
+    breakdown: Option<&DecodeCostBreakdown>,
+) -> bool {
+    if model.architecture_class != ModelArchitectureClass::DenseTransformer
+        || !measured_gpu_budget(budget)
+    {
+        return false;
+    }
+    let Some(breakdown) = breakdown else {
+        return false;
+    };
+    let uses_q8_block_graph = breakdown.groups.iter().any(|group| {
+        group.group == "transformer_block"
+            && group.tensor_type.eq_ignore_ascii_case("q8_0")
+            && group.source.starts_with("probe_block")
+    });
+    let has_full_token_graph = breakdown
+        .groups
+        .iter()
+        .any(|group| group.group == "full_token_graph");
+    uses_q8_block_graph && !has_full_token_graph
 }
 
 fn high_confidence_decode_probe_warning(model: &ModelProfile) -> String {
@@ -3479,9 +5283,71 @@ fn is_composite_llama_graph_decode_probe(probe: &DecodeKernelProbe) -> bool {
     name.contains("llama_graph")
 }
 
+fn is_dense_full_token_probe(probe: &DecodeKernelProbe) -> bool {
+    probe.name.to_ascii_lowercase().contains("_full_token")
+}
+
+fn is_dense_full_token_handoff_probe(probe: &DecodeKernelProbe) -> bool {
+    probe
+        .name
+        .to_ascii_lowercase()
+        .contains("_full_token_handoff")
+}
+
+fn is_dense_full_token_source_sampled_probe(probe: &DecodeKernelProbe) -> bool {
+    probe
+        .name
+        .to_ascii_lowercase()
+        .contains("_full_token_source_sampled")
+}
+
+fn is_dense_source_input_probe(probe: &DecodeKernelProbe) -> bool {
+    probe.name.to_ascii_lowercase().contains("_source_input")
+}
+
+fn dense_full_token_probe_source_rank(probe: &DecodeKernelProbe) -> u8 {
+    if is_dense_full_token_source_sampled_probe(probe) {
+        0
+    } else if is_dense_full_token_handoff_probe(probe) {
+        1
+    } else {
+        2
+    }
+}
+
+fn is_dense_decode_submission_probe(probe: &DecodeKernelProbe) -> bool {
+    probe.name.to_ascii_lowercase().contains("_submission")
+}
+
 fn is_composite_linear_attention_graph_decode_probe(probe: &DecodeKernelProbe) -> bool {
     let name = probe.name.to_ascii_lowercase();
     name.contains("linear_attn_graph")
+}
+
+fn is_attention_runtime_probe(probe: &DecodeKernelProbe) -> bool {
+    let name = probe.name.to_ascii_lowercase();
+    name.contains("flash_attn_ext")
+}
+
+fn is_logits_readback_probe(probe: &DecodeKernelProbe) -> bool {
+    let name = probe.name.to_ascii_lowercase();
+    name.contains("logits_readback")
+}
+
+fn is_logits_sync_probe(probe: &DecodeKernelProbe) -> bool {
+    let name = probe.name.to_ascii_lowercase();
+    name.contains("logits_sync")
+}
+
+fn is_logits_output_handoff_probe(probe: &DecodeKernelProbe) -> bool {
+    let name = probe.name.to_ascii_lowercase();
+    name.contains("logits_output_handoff")
+}
+
+fn is_logits_handoff_probe(probe: &DecodeKernelProbe) -> bool {
+    is_logits_output_handoff_probe(probe)
+        || is_logits_sync_probe(probe)
+        || is_logits_readback_probe(probe)
 }
 
 fn is_matvec_decode_probe(probe: &DecodeKernelProbe) -> bool {
@@ -3518,12 +5384,18 @@ fn is_composite_moe_block_graph_decode_probe(probe: &DecodeKernelProbe) -> bool 
     name.contains("moe_block_graph")
 }
 
+fn is_sparse_moe_decode_submission_probe(probe: &DecodeKernelProbe) -> bool {
+    let name = probe.name.to_ascii_lowercase();
+    name.contains("moe_block_submission")
+}
+
 fn missing_exact_decode_kernel_probe_tensor_type(
     model: &ModelProfile,
     budget: &ExecutionBudget,
 ) -> Option<&'static str> {
     if !measured_gpu_budget(budget)
         || has_recurrent_attention_graph(model)
+        || has_source_shaped_decode_block_probe(model, budget)
         || selected_representative_decode_kernel_probe(model, budget).is_some()
     {
         return None;
@@ -3947,14 +5819,20 @@ fn sampler_first_token_ms(
 fn sampled_decode_sampler_ms(model: &ModelProfile, budget: &ExecutionBudget) -> f32 {
     // Steady decode in the validator and in normal chat serving is sampled
     // generation: after llama.cpp produces logits for a token, the sampler
-    // builds/scans vocabulary candidates and accepts the chosen token into the
-    // sampling history. The first-token estimator already charges the measured
-    // prompt-history sync separately because it scales with prompt length. For
-    // every subsequent generated token, source-visible sampler work is one
-    // sampled vocabulary pass plus one new-token history accept. Both inputs
-    // come from `mesh-llm gpus benchmark` as machine/runtime facts, while the
-    // vocabulary size comes from GGUF tokenizer metadata. No model benchmark
-    // observation is fed back into this estimate.
+    // builds a candidate array, applies the configured sampler chain, samples
+    // or selects a token, and accepts it into history. The first-token
+    // estimator already charges prompt-history sync separately because it
+    // scales with prompt length. For every subsequent generated token,
+    // source-visible sampler work is one sampled vocabulary pass plus one
+    // new-token history accept.
+    //
+    // Keep this separate from the logits-readback probe. Logits readback
+    // charges the accelerator/CPU handoff for the F32 vocab row produced by
+    // decode; it does not execute Skippy's llama sampler chain
+    // (top-k/top-p/min-p/temp/dist with optional penalties/grammar). The
+    // measured sampler-vocab fact comes from `mesh-llm gpus benchmark` and is
+    // scaled only by GGUF tokenizer vocabulary size, so this remains portable
+    // metadata/hardware accounting rather than target-model calibration.
     let vocab_ms = model
         .tokenizer
         .vocab_size
@@ -4028,9 +5906,10 @@ fn decode_tokens_per_sec_range(
     active_decode_bytes: Option<u64>,
     model: &ModelProfile,
     budget: &ExecutionBudget,
+    decode_cost_breakdown: Option<&DecodeCostBreakdown>,
 ) -> Option<DecodeEstimateRange> {
     let point = point?;
-    let uncertainty = decode_uncertainty(active_decode_bytes, model, budget);
+    let uncertainty = decode_uncertainty(active_decode_bytes, model, budget, decode_cost_breakdown);
     Some(DecodeEstimateRange {
         lower: point * (1.0 - uncertainty),
         upper: point * (1.0 + uncertainty),
@@ -4041,6 +5920,7 @@ fn decode_uncertainty(
     active_decode_bytes: Option<u64>,
     model: &ModelProfile,
     budget: &ExecutionBudget,
+    decode_cost_breakdown: Option<&DecodeCostBreakdown>,
 ) -> f32 {
     let mut uncertainty = 0.25f32;
     if budget.memory_bandwidth_bytes_per_sec.is_none() {
@@ -4065,7 +5945,29 @@ fn decode_uncertainty(
     {
         uncertainty += 0.05;
     }
+    if let Some(spread) = selected_decode_probe_spread_fraction(decode_cost_breakdown) {
+        // The tok/s range is an honesty boundary for planning. A selected GGML
+        // probe whose own timed samples vary by N% cannot support a narrower
+        // metadata estimate than that, even when the point estimate uses the
+        // slow side of the probe range for scoring. This is deliberately not a
+        // backend or model-family correction and it does not use observed model
+        // throughput; it propagates measured hardware/probe noise into the
+        // uncertainty interval users see.
+        uncertainty += spread.min(0.25);
+    }
     uncertainty.clamp(0.20, 0.60)
+}
+
+fn selected_decode_probe_spread_fraction(breakdown: Option<&DecodeCostBreakdown>) -> Option<f32> {
+    let spread = breakdown?
+        .groups
+        .iter()
+        .filter_map(|group| group.probe_spread_pct)
+        .filter(|spread| spread.is_finite() && *spread > 0.0)
+        .fold(None, |max: Option<f64>, spread| {
+            Some(max.map_or(spread, |current| current.max(spread)))
+        })?;
+    Some((spread / 100.0) as f32)
 }
 
 fn quantization_is_uncertain(quantization: &str) -> bool {
@@ -4528,6 +6430,10 @@ fn add_decode_estimate_reason(
     if !uses_transformer_kv_cache(model.architecture_class) {
         return;
     }
+    reasons.push(format!(
+        "decode estimate charges KV/runtime context at {} tokens; set workload expected_prompt_tokens to compare a different steady-decode context",
+        decode_context_tokens(model, config)
+    ));
     let matmul = &model.tensor_matmul;
     let grouped_matmul_bytes = matmul
         .attention
@@ -4670,6 +6576,7 @@ fn estimate_confidence(
     model: &ModelProfile,
     budget: &ExecutionBudget,
     fit_status: FitStatus,
+    decode_cost_breakdown: Option<&DecodeCostBreakdown>,
 ) -> EstimateConfidence {
     if fit_status == FitStatus::Rejected {
         return EstimateConfidence::Low;
@@ -4681,6 +6588,19 @@ fn estimate_confidence(
         || budget.memory_bandwidth_bytes_per_sec.is_none()
         || (measured_gpu_budget(budget)
             && budget.decode_effective_bandwidth_bytes_per_sec.is_none())
+        || q8_dense_block_source_boundary_confidence_risk(model, budget, decode_cost_breakdown)
+        || has_unprobed_quantized_transformer_matmul_bytes(model, budget, decode_cost_breakdown)
+        || (model.architecture_class == ModelArchitectureClass::SparseMoeTransformer
+            && decode_cost_breakdown.is_some_and(decode_cost_uses_unmeasured_runtime_fallback))
+        || sampled_output_handoff_confidence_risk(model, budget, decode_cost_breakdown)
+        || source_sampled_synthetic_boundary_confidence_risk(model, budget, decode_cost_breakdown)
+        || full_token_handoff_submission_gap_warning(model, budget, decode_cost_breakdown)
+        || thin_decode_submission_confidence_risk(model, budget, decode_cost_breakdown)
+        || full_token_source_topology_confidence_risk(model, budget, decode_cost_breakdown)
+            .is_some()
+        || sparse_moe_source_topology_confidence_risk(model, budget, decode_cost_breakdown)
+            .is_some()
+        || selected_decode_probe_spread_confidence_risk(decode_cost_breakdown).is_some()
     {
         return EstimateConfidence::Low;
     }
@@ -4696,6 +6616,67 @@ fn estimate_confidence(
     // using model names, observed throughput from the target run, or
     // backend-specific fitted constants.
     EstimateConfidence::Medium
+}
+
+fn has_unprobed_quantized_transformer_matmul_bytes(
+    model: &ModelProfile,
+    budget: &ExecutionBudget,
+    decode_cost_breakdown: Option<&DecodeCostBreakdown>,
+) -> bool {
+    if model.architecture_class != ModelArchitectureClass::DenseTransformer
+        || has_recurrent_attention_graph(model)
+        || !measured_gpu_budget(budget)
+    {
+        return false;
+    }
+    if decode_cost_breakdown.is_some_and(full_token_graph_covers_transformer_matmuls) {
+        return false;
+    }
+    [
+        DecodeTrafficGroup {
+            kind: DecodeGroupKind::AttentionMatmul,
+            type_bytes: model.tensor_matmul.attention.type_bytes,
+            shape: model.tensor_matmul.attention.shape,
+            expert_scaled: false,
+        },
+        DecodeTrafficGroup {
+            kind: DecodeGroupKind::FeedForwardMatmul,
+            type_bytes: model.tensor_matmul.feed_forward.type_bytes,
+            shape: model.tensor_matmul.feed_forward.shape,
+            expert_scaled: false,
+        },
+    ]
+    .into_iter()
+    .any(|group| group_has_unprobed_quantized_bytes(group, model, budget))
+}
+
+fn group_has_unprobed_quantized_bytes(
+    group: DecodeTrafficGroup,
+    model: &ModelProfile,
+    budget: &ExecutionBudget,
+) -> bool {
+    tensor_type_byte_entries(group.type_bytes)
+        .into_iter()
+        .filter(|(tensor_type, bytes)| *bytes > 0 && is_quantized_tensor_type(tensor_type))
+        .any(|(tensor_type, _)| {
+            select_decode_group_probe(group, tensor_type, model, budget).is_none()
+        })
+}
+
+fn full_token_graph_covers_transformer_matmuls(breakdown: &DecodeCostBreakdown) -> bool {
+    let has_full_token_graph = breakdown
+        .groups
+        .iter()
+        .any(|group| group.group == "full_token_graph");
+    if !has_full_token_graph {
+        return false;
+    }
+    !breakdown.groups.iter().any(|group| {
+        matches!(
+            group.group.as_str(),
+            "transformer_block" | "attention_matmul" | "feed_forward_matmul"
+        ) && group.source != "probe"
+    })
 }
 
 fn compare_recommendations(left: &ModelRecommendation, right: &ModelRecommendation) -> Ordering {

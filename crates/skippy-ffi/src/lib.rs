@@ -1,6 +1,6 @@
 pub const ABI_VERSION_MAJOR: u32 = 0;
 pub const ABI_VERSION_MINOR: u32 = 1;
-pub const ABI_VERSION_PATCH: u32 = 27;
+pub const ABI_VERSION_PATCH: u32 = 28;
 
 use std::ffi::{c_char, c_int, c_void};
 
@@ -244,6 +244,8 @@ pub struct DecodeBenchmarkResult {
     pub decode_call_tokens_per_second: f64,
     pub sampling_ms: f64,
     pub sampling_tokens_per_second: f64,
+    pub logits_ready_ms: f64,
+    pub logits_scan_ms: f64,
     pub graph_node_count: u32,
     pub graph_inventory_bucket_count: u32,
     pub graph_inventory_bucket_overflow_count: u32,
@@ -268,6 +270,8 @@ impl Default for DecodeBenchmarkResult {
             decode_call_tokens_per_second: 0.0,
             sampling_ms: 0.0,
             sampling_tokens_per_second: 0.0,
+            logits_ready_ms: 0.0,
+            logits_scan_ms: 0.0,
             graph_node_count: 0,
             graph_inventory_bucket_count: 0,
             graph_inventory_bucket_overflow_count: 0,
