@@ -206,10 +206,14 @@ if [[ "$USE_SCCACHE" != "0" && -n "$SCCACHE_BIN" ]] &&
 fi
 
 if [[ "$USE_SCCACHE" != "0" && -n "$SCCACHE_BIN" ]]; then
-  CMAKE_ARGS+=(
-    -DCMAKE_C_COMPILER_LAUNCHER="$SCCACHE_BIN"
-    -DCMAKE_CXX_COMPILER_LAUNCHER="$SCCACHE_BIN"
-  )
+  if [[ "$(uname -s)" == "Darwin" && "$LLAMA_BACKEND" == "metal" ]]; then
+    # The embedded Metal source is pulled into an assembly object with .incbin.
+    # sccache does not include that payload in the assembly cache key.
+    CMAKE_ARGS+=(-DCMAKE_C_COMPILER_LAUNCHER=)
+  else
+    CMAKE_ARGS+=(-DCMAKE_C_COMPILER_LAUNCHER="$SCCACHE_BIN")
+  fi
+  CMAKE_ARGS+=(-DCMAKE_CXX_COMPILER_LAUNCHER="$SCCACHE_BIN")
   case "$LLAMA_BACKEND" in
     cuda)
       CMAKE_ARGS+=(-DCMAKE_CUDA_COMPILER_LAUNCHER="$SCCACHE_BIN")
@@ -218,11 +222,23 @@ if [[ "$USE_SCCACHE" != "0" && -n "$SCCACHE_BIN" ]]; then
       CMAKE_ARGS+=(-DCMAKE_HIP_COMPILER_LAUNCHER="$SCCACHE_BIN")
       ;;
   esac
-  echo "using sccache for llama.cpp C/C++ compilation: $SCCACHE_BIN"
+  echo "using sccache for llama.cpp compilation where safe: $SCCACHE_BIN"
 elif [[ "$USE_SCCACHE" != "0" ]]; then
   echo "sccache not found; llama.cpp build will run without compiler caching" >&2
+  CMAKE_ARGS+=(
+    -DCMAKE_C_COMPILER_LAUNCHER=
+    -DCMAKE_CXX_COMPILER_LAUNCHER=
+    -DCMAKE_CUDA_COMPILER_LAUNCHER=
+    -DCMAKE_HIP_COMPILER_LAUNCHER=
+  )
 else
-  CMAKE_ARGS+=(-DGGML_CCACHE=OFF)
+  CMAKE_ARGS+=(
+    -DGGML_CCACHE=OFF
+    -DCMAKE_C_COMPILER_LAUNCHER=
+    -DCMAKE_CXX_COMPILER_LAUNCHER=
+    -DCMAKE_CUDA_COMPILER_LAUNCHER=
+    -DCMAKE_HIP_COMPILER_LAUNCHER=
+  )
 fi
 
 if [[ "$#" -gt 0 ]]; then
