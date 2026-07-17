@@ -37,13 +37,24 @@ does not prove partial downloads: a whole-model server needs all model weights.
 The integrated loader now quantizes eligible, unquantized dense source tensors
 to affine 4-bit as they load. Inkling, Nemotron-H, and checkpoints already
 declaring a quantized representation retain their native representation. The
-earlier solo-serving measurements showed that this
+automatic policy also retries the native representation when a family-specific
+strict loader rejects the optional transform. Explicit affine modes remain
+fail-closed. The earlier solo-serving measurements showed that this
 load-time representation has the same steady-state generation speed as loading
 an equivalent pre-quantized artifact; see `../../spikes/mlx-solo/FINDINGS.md`.
 
 The 135M model is adequate as a serving and protocol oracle, but its weak agent
 output is not evidence of Goose-quality model behavior. Larger single-node
 models still need quality, memory-high-water, and agent-harness measurements.
+
+The integrated path was therefore also exercised with `Qwen/Qwen3-0.6B` at a
+16K context. Its redundant tied `lm_head.weight` is incompatible with the
+pinned strict affine loader, so auto mode reported that incompatibility and
+retried the native checkpoint representation. The model then answered a basic
+arithmetic prompt correctly and completed a Goose OpenAI-provider run with the
+requested exact response. This proves the adaptive fallback preserves useful
+single-node serving rather than turning optional quantization into a startup
+requirement.
 
 ## Verified mesh split proof
 

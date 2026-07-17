@@ -87,12 +87,15 @@ mod real {
             }
             explicit => explicit.engine(),
         };
+        let allow_native_quantization_fallback =
+            matches!(cli.weight_quantization, WeightQuantization::Auto);
         let config = MlxEngineConfig {
             model_dir: cli.model.clone(),
             model_id: model_id.clone(),
             default_max_tokens: cli.default_max_tokens,
             max_tokens_cap: cli.max_tokens_cap,
             weight_quantization,
+            allow_native_quantization_fallback,
         };
 
         tracing::info!("loading MLX model from {} ...", cli.model.display());

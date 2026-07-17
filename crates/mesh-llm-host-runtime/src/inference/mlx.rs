@@ -39,6 +39,7 @@ impl MlxModelHandle {
             default_max_tokens: (context_length.max(1) as usize).min(DEFAULT_MAX_GENERATION_TOKENS),
             max_tokens_cap: context_length.max(1) as usize,
             weight_quantization,
+            allow_native_quantization_fallback: true,
         };
         let engine = MlxEngine::spawn(config)?;
         Ok(Self {

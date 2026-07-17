@@ -39,6 +39,9 @@ pub struct MlxEngineConfig {
     /// Quantize eligible dense checkpoint tensors as they are loaded. Already
     /// quantized checkpoints with matching metadata load directly.
     pub weight_quantization: Option<MlxWeightQuantization>,
+    /// Auto policy may retry native loading when a model-specific strict or
+    /// quantization check rejects the optional transform.
+    pub allow_native_quantization_fallback: bool,
 }
 
 /// Selects load-time affine-4 only for dense, unquantized model families that
@@ -198,17 +201,47 @@ fn load_engine(config: &MlxEngineConfig) -> Result<LoadedEngine> {
             ModelLoadOptions::default,
             ModelLoadOptions::with_quantization,
         );
-    let model =
-        LoadedModel::load_with_options(&config.model_dir, options, &stream, &weights_stream)
-            .map_err(|e| anyhow!("load {}: {e}", config.model_dir.display()))?;
+    let mut used_native_fallback = false;
+    let model = match LoadedModel::load_with_options(
+        &config.model_dir,
+        options,
+        &stream,
+        &weights_stream,
+    ) {
+        Ok(model) => model,
+        Err(error)
+            if config.allow_native_quantization_fallback
+                && config.weight_quantization.is_some()
+                && optional_quantization_incompatible(&error) =>
+        {
+            used_native_fallback = true;
+            tracing::warn!(
+                model = %config.model_id,
+                %error,
+                "MLX automatic quantization is incompatible; retrying native checkpoint representation"
+            );
+            let _ = stream.synchronize();
+            LoadedModel::load(&config.model_dir, &stream, &weights_stream).map_err(|native_error| {
+                anyhow!(
+                    "load {} with automatic quantization failed ({error}); native fallback also failed: {native_error}",
+                    config.model_dir.display()
+                )
+            })?
+        }
+        Err(error) => return Err(anyhow!("load {}: {error}", config.model_dir.display())),
+    };
     stream.synchronize().map_err(|e| anyhow!("sync: {e}"))?;
 
     let tokenizer = tokenizers::Tokenizer::from_file(config.model_dir.join("tokenizer.json"))
         .map_err(|e| anyhow!("tokenizer.json: {e}"))?;
     let eos = model.eos_token_ids().to_vec();
-    let quantization_label = config
-        .weight_quantization
-        .map_or_else(|| "checkpoint".to_string(), MlxWeightQuantization::label);
+    let quantization_label = if used_native_fallback {
+        "checkpoint-fallback".to_string()
+    } else {
+        config
+            .weight_quantization
+            .map_or_else(|| "checkpoint".to_string(), MlxWeightQuantization::label)
+    };
 
     tracing::info!(
         model = %config.model_id,
@@ -223,6 +256,14 @@ fn load_engine(config: &MlxEngineConfig) -> Result<LoadedEngine> {
         tokenizer,
         eos,
     })
+}
+
+fn optional_quantization_incompatible(error: &safemlx_lm::error::Error) -> bool {
+    matches!(
+        error,
+        safemlx_lm::error::Error::Quantization(_)
+            | safemlx_lm::error::Error::StrictLoadValidation { .. }
+    )
 }
 
 fn run_worker(
@@ -414,5 +455,21 @@ mod tests {
             })),
             None
         );
+    }
+
+    #[test]
+    fn automatic_quantization_retries_only_compatibility_failures() {
+        assert!(optional_quantization_incompatible(
+            &safemlx_lm::error::Error::Quantization("unsupported".to_string())
+        ));
+        assert!(optional_quantization_incompatible(
+            &safemlx_lm::error::Error::StrictLoadValidation {
+                missing: Vec::new(),
+                unused: vec!["lm_head.weight".to_string()],
+            }
+        ));
+        assert!(!optional_quantization_incompatible(
+            &safemlx_lm::error::Error::UnsupportedArchitecture("unsupported".to_string())
+        ));
     }
 }
