@@ -28,9 +28,11 @@ close to exact. For Inkling, tensors are heavily interleaved across source
 shards, so exact tensor ranges are mandatory: whole-shard selection would turn
 a 109.84 GiB four-layer stage into a 942.99 GiB download.
 
-The small dense-model path is now proven through execution. The remaining
-artifact proof is bounded-memory tensor-at-a-time MLX quantization for a source
-tensor too large to retain alongside a whole BF16 stage.
+The small dense-model path is now proven through execution, including
+tensor-at-a-time affine-4 quantization into the live MLX model. The remaining
+artifact proof is direct range-to-quantized-cache materialization with measured
+peak RSS and disk use: the current path first retains the complete BF16 stage
+slice on disk, then quantizes its tensors one at a time during model load.
 
 ## Reproduce
 
@@ -95,10 +97,36 @@ just mlx-safetensors-split-proof \
   --wire-dtype f16
 ```
 
-This proves the artifact, MLX layer-range, KV-cache, and existing binary
-activation-frame seams on one Mac. It is not yet a two-process/two-node
-`mesh-llm serve` implementation; `skippy-server` still binds directly to the
-llama.cpp `StageModel` and needs the planned engine abstraction first.
+This original harness proved the artifact, MLX layer-range, KV-cache, and
+existing binary activation-frame seams on one Mac. Subsequent commits added the
+engine abstraction, two real stage processes, and explicit host
+`StagePrepare`/`StageLoad` consumption. Automatic topology production and a
+remote two-node MLX run remain.
+
+## Small-model load-time quantization proof
+
+`MlxStageEngine` now optionally constructs quantized Llama modules and calls
+safemlx's strict tensor-streaming loader. For every selected dense tensor, that
+loader produces the packed weight/scales/biases, calls `eval`, synchronizes the
+quantization stream, installs the result, and then continues. It does not build
+a BF16-stage-sized lazy quantization graph. This is not yet a one-source-copy
+guarantee: `Array::try_from(TensorView)` and the subsequent stream copy can both
+contribute to the physical high-water mark, and mmap pages are outside MLX
+allocator counters.
+
+On the same SmolLM2 split, affine 4-bit with group size 64 produced this
+whole-model reference:
+
+```text
+[260, 2240, 314, 253, 1379, 282, 25801, 28]
+```
+
+The two separately quantized `0..15` and `15..30` processes reproduced all
+eight tokens over F16 stage residuals. Each process retained 349 MLX parameters;
+post-proof RSS was 87,392 KiB and 87,952 KiB. This is correctness and steady-RSS
+evidence, not a peak-memory claim. The next memory gate must sample the cold
+load high-water mark and remove the requirement to keep the complete BF16 stage
+slice on disk.
 
 ## Representative measurements
 
@@ -152,20 +180,33 @@ forward is not registered in upstream `mlx-lm`, logits are not numerically
 verified, and the vision/audio towers are excluded. The repository contains
 weights and tokenizer/config files but not the custom model implementation.
 
-Neither upstream `mlx-lm` nor the pinned Rust `safemlx-lm` dependency currently
-ships an Inkling family. The authoritative reference implementation is now in
+The pinned Rust dependency is commit
+`4e53c5ecd7cbd91c0dfd0992a3c731ca2c36e9c7` ("Add Thinking Machines Inkling
+support"). Its `safemlx-lm` Inkling family implements the text decoder, dMel
+audio and hMLP vision towers, native SafeTensors key transforms, heterogeneous
+KV/SConv cache, and ordinary generation; its loader intentionally skips MTP
+weights. The authoritative parity oracle remains
 [Transformers' Inkling model](https://github.com/huggingface/transformers/blob/main/src/transformers/models/inkling/modular_inkling.py).
+
+What is missing is narrower than a family port but still substantial: safemlx's
+Inkling model internals are not exposed as a layer-range stage. Its common
+`PackedSwiGluExperts` runtime already supports affine/MXFP4 grouped execution,
+but Inkling constructs those expert banks with no quantization and its custom
+weight-transform loader only installs dense arrays. The high-level loader's
+claim that grouped quantized execution is absent is stale; the real gap is
+constructor metadata plus transformed rank-3 packing/loading.
 
 ### What an Inkling MLX stage engine must implement
 
-1. Text-decoder parity first: relative-logit attention, local/global masks,
-   query scaling, sigmoid top-k routing, routed and shared experts, and all four
-   SConv paths.
-2. A stage constructor that creates only `layers[start..end]`, with embeddings
+1. Confirm the existing whole-model text decoder against Transformers on a
+   tractable fixture/reduced config before changing its visibility.
+2. Expose a stage constructor that creates only `layers[start..end]`, with embeddings
    on the first stage and final norm/readout on the last.
-3. Stage-local KV plus SConv recurrent state. Inkling cannot be treated as a
-   plain paged-KV Llama family.
-4. An Inkling-specific weight loader and quantization predicate.
+3. Split the existing heterogeneous KV plus SConv recurrent cache by stage;
+   Inkling cannot be treated as a plain paged-KV Llama family.
+4. Wire the existing packed affine/MXFP4 expert runtime into Inkling's
+   constructor and transformed loader/profile. Keep sensitive tensors dense
+   initially.
 5. Logit parity against Transformers at several layer cuts before network work.
 6. Vision/audio towers on the first stage after the text chain is certified.
 7. MTP as a separate optional capability after ordinary decode is correct.
@@ -228,10 +269,13 @@ Inkling layers 30..33:
 - largest single BF16 source tensor: 18.00 GiB.
 
 A whole-stage loader would need BF16 input plus quantized output and fail on a
-128 GB node. A tensor-streaming loader can keep the accumulated 32.22 GiB target
-plus one source tensor and quantization scratch resident. The cold path should:
+128 GB node. A carefully bounded loader targets the accumulated 32.22 GiB
+output plus one source unit and quantization scratch, but the current
+full-tensor copy path does not yet meet that contract for an 18 GiB Inkling
+expert bank. Inkling may need expert/row slabs or a zero-copy managed-array
+seam. The cold path should:
 
-1. range-fetch one tensor into a bounded temporary/mmap buffer;
+1. range-fetch one bounded tensor or expert slab into a temporary/mmap buffer;
 2. create the MLX source array;
 3. quantize according to the certified per-tensor profile;
 4. evaluate and append the packed tensor/scales/biases to the derived cache;
@@ -274,10 +318,12 @@ The measured candidates suggest this order:
 
 1. **Qwen/Llama**: finish the partial loader and two-stage correctness proof.
 2. **Nemotron 3 Ultra**: best next frontier proof because `safemlx-lm` already
-   has a Nemotron-H implementation, although its Mamba/recurrent blocks still
-   require state-boundary certification.
-3. **Inkling text backbone**: high-value new family; use the upstream
-   Transformers modular implementation as the parity oracle.
+   has a Nemotron-H implementation with public layer/cache structures and an
+   affine rank-3 expert runtime. Its public SafeTensors loader still needs the
+   matching on-load packing path and Mamba/recurrent stage-boundary certification.
+3. **Inkling text backbone**: safemlx already has whole-model text/multimodal
+   execution; expose a partial-stage surface and use Transformers as the parity
+   oracle rather than porting the family again.
 4. **Inkling multimodal + MTP**: add first-stage towers and optional predictor
    layers after text correctness.
 5. **Kimi K2.6, GLM-5.2, DeepSeek V4**: all are viable range-download targets,
@@ -300,22 +346,27 @@ source repo + immutable revision
 + model-family implementation revision
 + stage range / embedding / readout / modality ownership
 + per-stage quantization profile
-+ activation wire dtype
 = derived stage cache identity
 ```
 
 The cache is evictable derived data. The upstream checkpoint remains the source
 of truth, and a small certified quantization/profile manifest replaces a large
-published layer-package repository.
+published layer-package repository. Activation wire dtype belongs in topology /
+deployment identity and correctness evidence, not in the weight-cache key,
+because it does not alter the derived packed weights.
 
 ## Next proof
 
-1. Stream BF16 tensor -> MLX affine quant -> partial SafeTensors output one
-   tensor at a time; prove bounded RSS and disk use.
+1. Expose a sequential selected-range callback/temp-artifact seam from
+   `model-hf`, then replace BF16-stage-on-disk + live quantization with direct
+   range -> MLX affine -> bounded derived-cache shards. Prove peak RSS and disk
+   bounds using both OS physical footprint and MLX allocator counters.
 2. Measure the MLX eval/readback/codec boundary fence independently at frontier
    residual widths and prefill sizes.
 3. Introduce the engine-neutral stage interface and run the same proof through
    two real `skippy-server` processes.
-4. Repeat the loader proof with Nemotron-H before implementing Inkling.
-5. Port Inkling's text decoder to `safemlx-lm`, starting with one layer and
-   Transformers parity, then stage ranges, then network execution.
+4. First quantize one real Nemotron-H BF16 matrix reproducibly, then implement
+   one complete split-expert bank without accumulating every dense expert.
+   Prove a small family member before attempting Ultra-scale ranges.
+5. Expose the existing safemlx Inkling text decoder as one stage, prove
+   Transformers parity, then add stage ranges and network execution.

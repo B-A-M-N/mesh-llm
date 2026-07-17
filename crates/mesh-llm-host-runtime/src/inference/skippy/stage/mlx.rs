@@ -128,6 +128,7 @@ pub(super) async fn launch_stage(
             layer_start: blocking_load.layer_start,
             layer_end: blocking_load.layer_end,
             compute_dtype: MlxComputeDtype::Bf16,
+            weight_quantization: None,
             ctx_size: Some(blocking_load.ctx_size),
         })?);
         ensure!(

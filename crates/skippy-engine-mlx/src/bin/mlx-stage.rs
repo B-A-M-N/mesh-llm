@@ -11,7 +11,9 @@ mod real {
 
     use anyhow::{Context, Result, ensure};
     use clap::{Parser, Subcommand, ValueEnum};
-    use skippy_engine_mlx::{MlxComputeDtype, MlxStageEngine, MlxStageEngineConfig};
+    use skippy_engine_mlx::{
+        MlxComputeDtype, MlxStageEngine, MlxStageEngineConfig, MlxWeightQuantization,
+    };
     use skippy_protocol::binary::{
         StageStateHeader, StageWireMessage, WireActivationDType, WireMessageKind, WireReplyKind,
         recv_ready, recv_reply, write_stage_message,
@@ -47,6 +49,8 @@ mod real {
             wire_dtype: WireDtype,
             #[arg(long, value_enum, default_value_t = ComputeDtype::Bf16)]
             compute_dtype: ComputeDtype,
+            #[arg(long, value_enum)]
+            weight_quantization: Option<WeightQuantization>,
         },
         /// Drive a stage chain and assert its greedy token sequence.
         Prove {
@@ -93,6 +97,29 @@ mod real {
         }
     }
 
+    #[derive(Clone, Copy, Debug, ValueEnum)]
+    enum WeightQuantization {
+        Affine4,
+        Affine8,
+        Mxfp4,
+    }
+
+    impl From<WeightQuantization> for MlxWeightQuantization {
+        fn from(value: WeightQuantization) -> Self {
+            match value {
+                WeightQuantization::Affine4 => Self::Affine {
+                    group_size: 64,
+                    bits: 4,
+                },
+                WeightQuantization::Affine8 => Self::Affine {
+                    group_size: 64,
+                    bits: 8,
+                },
+                WeightQuantization::Mxfp4 => Self::MxFp4,
+            }
+        }
+    }
+
     pub fn main() -> Result<()> {
         match Cli::parse().command {
             Command::Serve {
@@ -105,6 +132,7 @@ mod real {
                 downstream,
                 wire_dtype,
                 compute_dtype,
+                weight_quantization,
             } => serve(
                 MlxStageEngineConfig {
                     model_dir: model,
@@ -113,6 +141,7 @@ mod real {
                     layer_start,
                     layer_end,
                     compute_dtype: compute_dtype.into(),
+                    weight_quantization: weight_quantization.map(Into::into),
                     ctx_size: None,
                 },
                 EngineStageServerOptions {
@@ -180,15 +209,15 @@ mod real {
             generated.push(send_predicted(&mut stream, &decode, wire_dtype)?);
         }
 
-        ensure!(
-            generated == expected,
-            "two-process stage tokens diverged: expected={expected:?} actual={generated:?}"
-        );
         let stop = StageWireMessage::stop_with_identity(wire_dtype, request_id, session_id);
         write_stage_message(&mut stream, &stop, wire_dtype)?;
         stream.flush().ok();
         let reply = recv_reply(&mut stream)?;
         ensure!(reply.kind == WireReplyKind::Ack, "stop did not return ACK");
+        ensure!(
+            generated == expected,
+            "two-process stage tokens diverged: expected={expected:?} actual={generated:?}"
+        );
         println!("PASS: two MLX stage processes matched the reference greedy tokens");
         println!("wire_dtype={wire_dtype:?}");
         println!("generated_tokens={generated:?}");

@@ -17,7 +17,11 @@ use safemlx_lm::{
         common::linear::project_logits_maybe_quantized,
         llama::{self, AttentionInput, TransformerBlock},
     },
-    weights::{StrictLoadConfig, StrictLoadReport, load_safetensors_strict},
+    quantization::{AffineQuantization, WeightQuantization},
+    weights::{
+        StrictLoadConfig, StrictLoadReport, load_safetensors_quantized_strict,
+        load_safetensors_strict,
+    },
 };
 use skippy_engine::{
     StageActivation, StageEngine, StageEngineInfo, StageExecutionKind, StageExecutionOutput,
@@ -42,6 +46,30 @@ impl MlxComputeDtype {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MlxWeightQuantization {
+    Affine { group_size: i32, bits: i32 },
+    MxFp4,
+}
+
+impl MlxWeightQuantization {
+    fn safemlx(self) -> Result<WeightQuantization> {
+        match self {
+            Self::Affine { group_size, bits } => {
+                Ok(AffineQuantization::new(group_size, bits)?.into())
+            }
+            Self::MxFp4 => Ok(WeightQuantization::MxFp4),
+        }
+    }
+
+    fn label(self) -> String {
+        match self {
+            Self::Affine { group_size, bits } => format!("affine-{bits}bit-g{group_size}"),
+            Self::MxFp4 => "mxfp4".to_string(),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct MlxStageEngineConfig {
     pub model_dir: PathBuf,
@@ -50,6 +78,7 @@ pub struct MlxStageEngineConfig {
     pub layer_start: u32,
     pub layer_end: u32,
     pub compute_dtype: MlxComputeDtype,
+    pub weight_quantization: Option<MlxWeightQuantization>,
     pub ctx_size: Option<u32>,
 }
 
@@ -157,7 +186,7 @@ fn run_worker(
 fn load_stage(config: MlxStageEngineConfig) -> Result<LoadedStage> {
     let stream = Stream::new_with_device(&Device::new(DeviceType::Gpu, 0));
     let weights_stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
-    let model_args = llama::get_llama_model_args(&config.model_dir)?;
+    let mut model_args = llama::get_llama_model_args(&config.model_dir)?;
     let total_layers = u32::try_from(model_args.num_hidden_layers)?;
     let info = StageEngineInfo {
         engine: "mlx".to_string(),
@@ -170,27 +199,52 @@ fn load_stage(config: MlxStageEngineConfig) -> Result<LoadedStage> {
     };
     info.validate()?;
 
+    let quantization = config
+        .weight_quantization
+        .map(MlxWeightQuantization::safemlx)
+        .transpose()?;
+    if let Some(quantization) = quantization {
+        ensure!(
+            model_args.quantization.is_none() && model_args.quantization_config.is_none(),
+            "MLX stage load-time quantization requires a dense source checkpoint"
+        );
+        model_args.quantization = Some(quantization);
+    }
     let mut model = llama::Model::new(model_args, &stream)?;
     let load_config = partial_stage_load_config(&info);
     let mut load_report = StrictLoadReport::default();
-    load_safetensors_strict(
-        &mut model,
-        weight_file(&config.model_dir),
-        &weights_stream,
-        &load_config,
-        &mut load_report,
-    )?;
+    match quantization {
+        Some(quantization) => load_safetensors_quantized_strict(
+            &mut model,
+            weight_file(&config.model_dir),
+            &weights_stream,
+            &stream,
+            quantization,
+            &load_config,
+            &mut load_report,
+        )?,
+        None => load_safetensors_strict(
+            &mut model,
+            weight_file(&config.model_dir),
+            &weights_stream,
+            &load_config,
+            &mut load_report,
+        )?,
+    }
     load_report.finish(&model, &load_config)?;
     retain_local_layers(&mut model, info.layer_start, info.layer_end)?;
     copy_stage_weights_to_compute_stream(&mut model, &info, &stream)?;
     stream.synchronize()?;
     eprintln!(
-        "MLX partial stage loaded: model={} stage={} layers={}..{} tensors={}",
+        "MLX partial stage loaded: model={} stage={} layers={}..{} tensors={} weight_quantization={}",
         info.model_id,
         info.stage_index,
         info.layer_start,
         info.layer_end,
         model.parameters().flatten().len(),
+        config
+            .weight_quantization
+            .map_or_else(|| "none".to_string(), MlxWeightQuantization::label),
     );
     Ok(LoadedStage {
         model,
@@ -445,4 +499,33 @@ fn last_argmax(logits: &Array, stream: &Stream) -> Result<i32> {
         .max_by(|(_, left), (_, right)| left.total_cmp(right))
         .context("cannot argmax empty logits")?;
     Ok(i32::try_from(index)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validates_requested_weight_quantization_before_model_load() {
+        let affine = MlxWeightQuantization::Affine {
+            group_size: 64,
+            bits: 4,
+        }
+        .safemlx()
+        .unwrap();
+        assert_eq!(affine.group_size(), 64);
+        assert_eq!(affine.bits(), 4);
+        assert!(
+            MlxWeightQuantization::Affine {
+                group_size: 48,
+                bits: 4,
+            }
+            .safemlx()
+            .is_err()
+        );
+        assert_eq!(
+            MlxWeightQuantization::MxFp4.safemlx().unwrap(),
+            WeightQuantization::MxFp4
+        );
+    }
 }

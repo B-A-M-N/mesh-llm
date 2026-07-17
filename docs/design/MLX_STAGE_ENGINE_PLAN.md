@@ -33,7 +33,9 @@ GiB of shard files; exact ranges avoid 833.15 GiB. A SmolLM2-135M proof then
 materialized two partial files (layers 0..15 and 15..30), loaded each directly
 into MLX, and matched unsplit logits exactly for prefill plus eight decode steps
 through Skippy's real F16 and F32 binary activation codec. The remaining
-artifact gate is bounded-memory quantization for frontier-sized source tensors.
+artifact gate is direct range-to-derived-cache quantization for frontier-sized
+source tensors; tensor-at-a-time quantization into a live partial model is now
+proven on SmolLM2.
 See `spikes/mlx-safetensors-stages/FINDINGS.md`.
 
 **Update — the first engine-neutral, multi-process stage chain is now proven.**
@@ -44,8 +46,9 @@ own KV cache. Two real processes, each given only one 155.28 MiB partial
 SmolLM2 artifact, reproduced the eight-token whole-model reference exactly over
 F16 residuals. Their post-proof RSS was about 189 MiB each. This closes the
 dense execution and process-boundary proof. Host topology selection, advanced
-cache/session operations, additional families, and bounded-memory quantization
-remain. See `crates/skippy-engine-mlx/STAGED_EXECUTION.md`.
+cache/session operations, additional staged families, and bounded
+range-to-derived-cache quantization remain. See
+`crates/skippy-engine-mlx/STAGED_EXECUTION.md`.
 
 **Update — host `StagePrepare` / `StageLoad` now consumes range-only MLX
 stages.** An immutable `hf-model://org/repo@<commit>` request is validated
@@ -57,8 +60,25 @@ eight reference tokens, and stopped both stages. Each node-side range plan read
 about 162.86 MB of a 269.06 MB source shard and avoided about 106.2 MB. Startup
 now fails closed on bind/topology/downstream errors, and Stop closes and joins
 active connections. Automatic MLX topology production, capability
-advertisement, remote two-node proof, and bounded-memory load-time quantization
-remain; this checkpoint proves the host consumer path, not automatic placement.
+advertisement, remote two-node proof, host quantization selection, and bounded
+range-to-derived-cache materialization remain; this checkpoint proves the host
+consumer path, not automatic placement.
+
+**Update — partial MLX stages now JIT-quantize one tensor at a time.** The
+pinned safemlx strict loader already contains the required bounded lazy-graph
+seam: visit one tensor, quantize, `eval`, synchronize, install packed parameters,
+repeat. A whole-model affine-4 reference and two independently quantized
+SmolLM2 stages generated the same eight tokens over F16 residuals. Post-proof
+RSS was about 85.3 and 85.9 MiB per stage. This bounds the lazy graph, not
+physical copies: TensorView conversion, stream copies, mmap pages, and MLX
+scratch all require explicit high-water measurement. The host does not select
+this profile yet, and the BF16 partial stage still exists on disk first.
+
+The pinned safemlx revision also already includes whole-model Inkling text,
+vision, and audio execution. Earlier notes that called for porting Inkling were
+stale. The remaining Inkling work is a partial-stage API plus wiring its
+existing quantized grouped-expert runtime into the constructor and transformed
+loader, not a model-family implementation from scratch.
 
 ---
 
@@ -670,11 +690,14 @@ Implement `prefill_chunk_frame` / `decode_step_frame` /
 `copy_output_activation_frame` producing Skippy `ActivationFrame`s. Two-stage
 single-machine parity first, then two Macs over the real network.
 
-> **Dense single-machine spike passed.** SmolLM2-135M was split 15+15 using two
-> exact-range partial SafeTensors artifacts. F16 and F32 `StageWireMessage`
-> boundaries both matched unsplit MLX with zero measured logit delta across
-> prompt prefill and eight decode steps. This proves the basic artifact and
-> activation seams, but not bounded-memory quantization or server integration.
+> **Dense and JIT-quantized process proofs passed.** SmolLM2-135M was split
+> 15+15 using two exact-range partial SafeTensors artifacts. F16 and F32
+> `StageWireMessage` boundaries matched unsplit MLX with zero measured dense
+> logit delta; two real F16-wire processes also matched the whole-model
+> affine-4 token reference after tensor-wise on-load quantization. Explicit host
+> stage control now starts the source-precision path. Direct
+> range-to-quantized-cache materialization, profile-bearing topology requests,
+> and remote two-node execution remain.
 
 **Phase 4 — KV/state codec + verify + trim/checkpoint.** Implement the
 engine-general cache codec (§5.2), `verify_tokens_frame` for speculative decode,
@@ -697,8 +720,10 @@ Apple-Silicon nodes. llama.cpp remains the cross-platform default.
 1. **Partial-loading proof (DENSE GO, QUANT PARTIAL):** remote exact-range
    selection is proven, including on 1.9 TB Inkling BF16. SmolLM2 partial files
    were materialized and loaded without a complete checkpoint. Still required:
-   confirm peak RSS is bounded by quantized stage + one source tensor and
-   scratch during tensor-at-a-time load-time quantization.
+   The live-model loader now quantizes/evaluates one tensor at a time and split
+   output matches a whole quantized reference. Still required: measure cold-load
+   high-water RSS and stream HTTP ranges directly into a derived quantized cache
+   without retaining the whole BF16 stage slice on disk.
 2. **Boundary latency breakdown (GO/NO-GO):** measure layer compute, cast,
    contiguous, **eval fence**, host readback, serialize, and receive-reconstruct
    **independently**, at hidden widths 4096/8192/16384 and token counts
@@ -770,15 +795,19 @@ Spikes 1 and 2 are more decisive than any standalone token/s benchmark.
 
 ## 10. Immediate next steps
 
-1. Add tensor-at-a-time MLX quantization to the materializer and measure peak
-   RSS against the one-source-tensor memory contract.
+1. Expose a sequential selected-range callback/temp-artifact seam, add direct
+   range-to-quantized-cache shards, and measure peak RSS/disk use with OS and
+   MLX counters. The live model loader's tensor-wise quantization and split
+   correctness are proven, but physical source copies remain unbounded evidence.
 2. Route normal `skippy-server` launch through the engine-neutral contract while
    retaining capability-gated llama-only batching/cache/MTP/multimodal paths;
    the dense llama adapter and MLX two-process binary-wire proof are complete.
 3. Run **Spike 2 (boundary fence)** at frontier residual widths and keep it as a
    go/no-go gate.
-4. Use Nemotron-H as the first frontier-family follow-up already represented in
-   `safemlx-lm`; then port Inkling text from the upstream Transformers reference.
+4. Use Nemotron-H as the first frontier-family follow-up: wire its existing
+   public layer/cache structures and affine expert runtime to public-checkpoint
+   on-load packing. Then expose safemlx's existing Inkling implementation as a
+   staged text decoder and use Transformers as the parity oracle.
 
 ---
 

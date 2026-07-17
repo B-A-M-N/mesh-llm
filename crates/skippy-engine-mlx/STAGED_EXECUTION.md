@@ -64,6 +64,24 @@ and submitted Stop through `spawn_stage_control_loop`. The runtime status does
 not mislabel the derived slice as the full source model or claim a cache pin
 that does not exist.
 
+The next engine-level proof enabled tensor-at-a-time JIT weight quantization.
+The pinned safemlx loader visits one dense tensor at a time, quantizes it, and
+eagerly evaluates and synchronizes the packed weight/scales/biases before
+visiting the next tensor. This bounds the lazy graph, but the TensorView and
+stream-copy path can temporarily hold more than one physical source copy. With
+affine 4-bit, group size 64, the whole 30-layer reference and the two
+independently loaded 15-layer stages generated the same quantized-model tokens:
+
+```text
+[260, 2240, 314, 253, 1379, 282, 25801, 28]
+```
+
+The two-stage processes retained 349 MLX parameters each and had post-proof RSS
+of 87,392 KiB and 87,952 KiB, versus roughly 189 MiB each at source precision.
+This proves deterministic per-stage quantization and quantized stage execution;
+it does not yet prove peak RSS, direct range-to-quantized-cache disk bounds, or
+host/topology selection of the quantization profile.
+
 The two partial files are the exact-range artifacts described in
 `../../spikes/mlx-safetensors-stages/FINDINGS.md`. Tied input/output embeddings
 are intentionally duplicated across the stages; that is why the sum of the two
@@ -88,6 +106,10 @@ just mlx-stage serve \
   --bind 127.0.0.1:19091 --wire-dtype f16 --compute-dtype bf16
 ```
 
+Add `--weight-quantization affine4` to both stage commands to reproduce the
+JIT-quantized proof, then pass
+`--expected 260,2240,314,253,1379,282,25801,28` to `mlx-stage prove`.
+
 Start the first stage in another terminal:
 
 ```bash
@@ -107,8 +129,9 @@ just mlx-stage prove --connect 127.0.0.1:19090 --wire-dtype f16
 
 ## Deliberate limitations of this checkpoint
 
-- Dense Llama-family checkpoints only. The engine boundary is family-neutral,
-  but the current MLX adapter is the smallest implementation that proves it.
+- Dense Llama-family checkpoints only in `MlxStageEngine`. The pinned safemlx
+  revision has whole-model Inkling and Nemotron-H implementations, but neither
+  is exposed through this partial-stage adapter yet.
 - Greedy sampling only; sampling metadata is preserved in the contract and
   rejected explicitly when enabled.
 - No KV page import/export, cache trim/checkpoint, MTP, speculative verify,
@@ -119,5 +142,7 @@ just mlx-stage prove --connect 127.0.0.1:19090 --wire-dtype f16
 - Mesh topology planning does not yet produce MLX stage assignments. The host
   can consume explicit `backend=mlx` Prepare/Load requests, but automatic
   placement, capability advertisement, coordinator model planning, and an
-  OpenAI stage-0 frontend remain. There is no mesh protocol or Skippy ABI break
-  in the explicit consumer path.
+  OpenAI stage-0 frontend remain. Explicit host requests still use source
+  precision; quantization selection currently exists only in the engine config
+  and `mlx-stage` proof CLI. There is no mesh protocol or Skippy ABI break in
+  the explicit consumer path.
