@@ -165,9 +165,14 @@ excludes the report. The working-disk metric is a measured source-tensor plus
 artifact-payload high-water mark, not allocated filesystem blocks or lock/report
 overhead. The v1 builder fails closed unless `model_type` is exactly `llama`.
 
-This is still an explicit artifact output, not the host's evictable cache. The
-next cache step must map the recorded identity to a managed destination,
-validate shard hashes on hit, and avoid all tensor-range requests on reuse.
+The follow-on `derive-cached` path maps that recipe to a locked managed
+directory and validates the report schema, recipe, aggregate artifact bytes,
+output-content digest, and every shard hash before accepting a hit. On the same
+pinned layer-14 slice, a cold call made 9 tensor-payload requests and the warm
+call made 0, returned the identical recipe/content/shard hashes, and used
+17,809,408 B max RSS. The warm path still reads lightweight config/index/header
+metadata to reconstruct the strong key. This is the reusable library/CLI seam;
+host lifecycle and eviction integration remain.
 
 ## Representative measurements
 
@@ -398,9 +403,9 @@ because it does not alter the derived packed weights.
 
 ## Next proof
 
-1. Use the derivation recipe hash as a managed host cache key; validate the
-   output-content digest and shard hashes on hit, then prove a warm load makes
-   no range requests.
+1. Wire the proven derived-stage cache into host prepare/load and cache eviction,
+   then decide whether a local request-to-recipe locator should remove even the
+   warm metadata probes.
 2. Quantize one real Nemotron-H BF16 matrix reproducibly, then implement one
    complete split-expert bank without accumulating every dense expert. Prove a
    small family member before attempting Ultra-scale ranges.

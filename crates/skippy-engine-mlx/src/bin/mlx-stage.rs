@@ -13,8 +13,9 @@ mod real {
     use clap::{Parser, Subcommand, ValueEnum};
     use model_hf::safetensors_stage::{SafetensorsStageMaterializer, SafetensorsStageRequest};
     use skippy_engine_mlx::{
-        MlxComputeDtype, MlxDerivedStageConfig, MlxStageEngine, MlxStageEngineConfig,
-        MlxWeightQuantization, derive_quantized_stage,
+        MlxComputeDtype, MlxDerivedStageCacheConfig, MlxDerivedStageConfig, MlxStageEngine,
+        MlxStageEngineConfig, MlxWeightQuantization, derive_quantized_stage,
+        derive_quantized_stage_cached,
     };
     use skippy_protocol::binary::{
         StageStateHeader, StageWireMessage, WireActivationDType, WireMessageKind, WireReplyKind,
@@ -69,6 +70,28 @@ mod real {
             include_prefixes: Vec<String>,
             #[arg(long)]
             output: PathBuf,
+            #[arg(long, value_enum, default_value_t = WeightQuantization::Affine4)]
+            weight_quantization: WeightQuantization,
+            /// Soft output shard target; one packed tensor may exceed it.
+            #[arg(long, default_value_t = 256)]
+            shard_size_mib: usize,
+        },
+        /// Reuse or build an identity-bound quantized stage cache entry.
+        DeriveCached {
+            #[arg(long)]
+            repo: String,
+            /// Immutable 40-character Hugging Face commit SHA.
+            #[arg(long)]
+            revision: String,
+            #[arg(long)]
+            layer_start: u32,
+            #[arg(long)]
+            layer_end: u32,
+            #[arg(long = "include-prefix")]
+            include_prefixes: Vec<String>,
+            /// Defaults to the mesh-llm cache directory.
+            #[arg(long)]
+            cache_root: Option<PathBuf>,
             #[arg(long, value_enum, default_value_t = WeightQuantization::Affine4)]
             weight_quantization: WeightQuantization,
             /// Soft output shard target; one packed tensor may exceed it.
@@ -194,6 +217,27 @@ mod real {
                 weight_quantization.into(),
                 shard_size_mib,
             ),
+            Command::DeriveCached {
+                repo,
+                revision,
+                layer_start,
+                layer_end,
+                include_prefixes,
+                cache_root,
+                weight_quantization,
+                shard_size_mib,
+            } => derive_cached(
+                SafetensorsStageRequest {
+                    repo,
+                    revision,
+                    layer_start,
+                    layer_end,
+                    include_prefixes,
+                },
+                cache_root,
+                weight_quantization.into(),
+                shard_size_mib,
+            ),
             Command::Prove {
                 connect,
                 tokens,
@@ -228,6 +272,31 @@ mod real {
             },
         )?;
         println!("{}", serde_json::to_string_pretty(&report)?);
+        Ok(())
+    }
+
+    fn derive_cached(
+        source: SafetensorsStageRequest,
+        cache_root: Option<PathBuf>,
+        quantization: MlxWeightQuantization,
+        shard_size_mib: usize,
+    ) -> Result<()> {
+        let shard_size_bytes = shard_size_mib
+            .checked_mul(1024 * 1024)
+            .context("derived shard size overflow")?;
+        let cache_root = cache_root
+            .unwrap_or_else(|| model_hf::store::mesh_llm_cache_dir().join("mlx-derived-stages"));
+        let materializer = SafetensorsStageMaterializer::from_environment()?;
+        let result = derive_quantized_stage_cached(
+            &materializer,
+            &MlxDerivedStageCacheConfig {
+                source,
+                cache_root,
+                quantization,
+                shard_size_bytes,
+            },
+        )?;
+        println!("{}", serde_json::to_string_pretty(&result)?);
         Ok(())
     }
 

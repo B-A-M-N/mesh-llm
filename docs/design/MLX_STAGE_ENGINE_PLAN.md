@@ -97,8 +97,15 @@ macOS peak footprint was about 241 MB. The two derived stages reproduced the
 established affine-4 tokens exactly. The v1 builder deliberately requires
 `model_type=llama` and rejects pre-quantized sources, rank-3 weights, and
 incompatible matrix dimensions. This closes the dense-Llama artifact-builder
-proof, not reusable host cache hits, Nemotron expert packing, or Inkling's
-transformed rank-3 path.
+proof, not Nemotron expert packing or Inkling's transformed rank-3 path.
+
+**Update — the derived-stage cache seam is proven.** `mlx-stage derive-cached`
+uses the derivation recipe as a destination identity, serializes competing
+builders with an advisory lock, and validates the output-content plus per-shard
+hashes on hits. A cold pinned layer-14 run made 9 tensor payload requests; the
+warm run made 0, skipped quantization, and used about 17.8 MB max RSS. The warm
+path still fetches lightweight config/index/header metadata to reconstruct the
+strong recipe. Host prepare/load integration and eviction ownership remain.
 
 The pinned safemlx revision also already includes whole-model Inkling text,
 vision, and audio execution. Earlier notes that called for porting Inkling were

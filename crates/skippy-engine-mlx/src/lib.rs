@@ -20,7 +20,9 @@ mod stage;
 pub use backend::MlxBackend;
 #[cfg(all(feature = "mlx", target_os = "macos"))]
 pub use derived::{
-    MlxDerivedStageConfig, MlxDerivedStageReport, MlxDerivedStageShard, derive_quantized_stage,
+    MlxDerivedStageCacheConfig, MlxDerivedStageCacheResult, MlxDerivedStageConfig,
+    MlxDerivedStageReport, MlxDerivedStageShard, derive_quantized_stage,
+    derive_quantized_stage_cached,
 };
 #[cfg(all(feature = "mlx", target_os = "macos"))]
 pub use engine::{ChatTurn, GenerateRequest, MlxEngine, MlxEngineConfig};

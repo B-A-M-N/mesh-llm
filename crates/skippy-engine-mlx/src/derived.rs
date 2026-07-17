@@ -20,17 +20,23 @@ use safemlx::{
 };
 use safemlx_lm::quantization::{WeightQuantization, quantize_tensor};
 use safetensors::tensor::{Dtype as SafeDtype, SafeTensors, View, serialize_to_file};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::stage::MlxWeightQuantization;
 
-const DERIVED_STAGE_SCHEMA_VERSION: u32 = 1;
+mod cache;
+
+pub use cache::{
+    MlxDerivedStageCacheConfig, MlxDerivedStageCacheResult, derive_quantized_stage_cached,
+};
+
+pub(super) const DERIVED_STAGE_SCHEMA_VERSION: u32 = 1;
 const DERIVED_STAGE_IMPLEMENTATION: &str = "mesh-mlx-range-derived-v1";
 const SAFEMLX_REVISION: &str = "4e53c5ecd7cbd91c0dfd0992a3c731ca2c36e9c7";
 const PLAN_FILE: &str = "stage-plan.json";
-const REPORT_FILE: &str = "derived-stage.json";
+pub(super) const REPORT_FILE: &str = "derived-stage.json";
 static DERIVED_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// Configuration for producing one MLX-quantized partial stage.
@@ -44,7 +50,7 @@ pub struct MlxDerivedStageConfig {
 }
 
 /// One finalized SafeTensors shard in a derived stage artifact.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct MlxDerivedStageShard {
     pub file: String,
     pub file_bytes: u64,
@@ -52,12 +58,12 @@ pub struct MlxDerivedStageShard {
 }
 
 /// Evidence and identity for a bounded quantized stage derivation.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct MlxDerivedStageReport {
     pub schema_version: u32,
     /// Identity of the source checkpoint, stage plan, quantization, implementation, and sharding.
     pub derivation_recipe_sha256: String,
-    /// Tamper-evident digest of every published artifact file except this report.
+    /// Corruption-detecting digest of every published artifact file except this report.
     pub output_content_sha256: String,
     pub checkpoint_sha256: String,
     pub plan_sha256: String,
@@ -235,7 +241,7 @@ pub fn derive_quantized_stage(
         .map(|path| derived_shard(path))
         .collect::<Result<Vec<_>>>()?;
     let output_content_sha256 = output_content_sha256(temporary.path())?;
-    let artifact_file_bytes = directory_file_bytes(temporary.path())?;
+    let artifact_file_bytes = artifact_file_bytes(temporary.path())?;
     state.working_disk_peak_bytes = state.working_disk_peak_bytes.max(artifact_file_bytes);
     let report = MlxDerivedStageReport {
         schema_version: DERIVED_STAGE_SCHEMA_VERSION,
@@ -536,6 +542,20 @@ fn ensure_dense_source_config(source: &[u8]) -> Result<()> {
     Ok(())
 }
 
+pub(super) fn prepare_derivation_recipe(
+    materializer: &SafetensorsStageMaterializer,
+    source: SafetensorsStageRequest,
+    quantization: MlxWeightQuantization,
+    shard_size_bytes: usize,
+) -> Result<String> {
+    let visit = materializer.prepare_tensor_visit(source)?;
+    ensure_dense_source_config(visit.config())?;
+    let quantization = serde_json::to_value(quantization.safemlx()?)?;
+    let plan_bytes = serde_json::to_vec(visit.plan())?;
+    let plan_sha256 = sha256_bytes(&plan_bytes);
+    derived_identity(visit.plan(), &plan_sha256, &quantization, shard_size_bytes)
+}
+
 fn derived_identity(
     plan: &model_hf::safetensors_stage::SafetensorsStagePlan,
     plan_sha256: &str,
@@ -569,7 +589,7 @@ fn derived_shard(path: &Path) -> Result<MlxDerivedStageShard> {
     })
 }
 
-fn output_content_sha256(path: &Path) -> Result<String> {
+pub(super) fn output_content_sha256(path: &Path) -> Result<String> {
     let mut files = Vec::new();
     for entry in fs::read_dir(path)? {
         let entry = entry?;
@@ -614,6 +634,20 @@ fn directory_file_bytes(path: &Path) -> Result<u64> {
     })
 }
 
+pub(super) fn artifact_file_bytes(path: &Path) -> Result<u64> {
+    fs::read_dir(path)?.try_fold(0_u64, |total, entry| {
+        let entry = entry?;
+        let bytes = if entry.file_type()?.is_file() && entry.file_name() != REPORT_FILE {
+            entry.metadata()?.len()
+        } else {
+            0
+        };
+        total
+            .checked_add(bytes)
+            .context("derived artifact byte count overflow")
+    })
+}
+
 fn write_json(path: PathBuf, value: &impl Serialize) -> Result<()> {
     let mut bytes = serde_json::to_vec_pretty(value)?;
     bytes.push(b'\n');
@@ -625,7 +659,7 @@ fn sha256_bytes(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
-fn sha256_file(path: &Path) -> Result<String> {
+pub(super) fn sha256_file(path: &Path) -> Result<String> {
     let mut reader = BufReader::new(File::open(path)?);
     let mut hasher = Sha256::new();
     let mut buffer = vec![0_u8; 1024 * 1024];
@@ -745,7 +779,7 @@ fn remove_abandoned_outputs(parent: &Path, destination_name: &str) -> Result<()>
     Ok(())
 }
 
-fn open_locked(path: &Path, nonblocking: bool) -> Result<Option<File>> {
+pub(super) fn open_locked(path: &Path, nonblocking: bool) -> Result<Option<File>> {
     use std::fs::OpenOptions;
     use std::os::fd::AsRawFd;
 

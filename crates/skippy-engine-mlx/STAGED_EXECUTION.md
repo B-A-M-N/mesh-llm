@@ -109,10 +109,20 @@ every output shard hash. Repeating the one-layer derivation produced a
 byte-identical weight shard; the whole directories intentionally differ because
 reports include local paths and runtime memory evidence. The shard-size option
 is a soft bundle target, so one packed tensor may exceed it. This is a bounded
-`model_type=llama` artifact builder, not yet the host's reusable cache and not
-evidence that frontier expert-bank transforms fit the same bound. Artifact byte
-counts and the measured source-plus-output working-disk high-water mark exclude
-the report, lock files, and filesystem allocation overhead.
+`model_type=llama` artifact builder, not evidence that frontier expert-bank
+transforms fit the same bound. Artifact byte counts and the measured
+source-plus-output working-disk high-water mark exclude the report, lock files,
+and filesystem allocation overhead.
+
+`mlx-stage derive-cached` then proved the reusable cache seam. It maps the
+strong recipe identity to a locked managed directory and validates schema,
+recipe, aggregate artifact bytes, output-content digest, and every shard hash
+before accepting a hit. On the same pinned layer-14 slice, the cold call made 9
+tensor-payload range requests; the warm call returned the identical recipe and
+content hashes with `cache_hit=true`, made 0 tensor-payload range requests, and
+used 17,809,408 B max RSS. It still re-plans lightweight config/index/header
+metadata to reconstruct the strong recipe key. Host lifecycle/eviction wiring
+is not yet connected to this library/CLI cache.
 
 The two partial files are the exact-range artifacts described in
 `../../spikes/mlx-safetensors-stages/FINDINGS.md`. Tied input/output embeddings
@@ -145,6 +155,11 @@ just mlx-stage derive \
   --output /tmp/mlx-derived-smol-stage1 \
   --weight-quantization affine4 --shard-size-mib 16
 ```
+
+To use the identity-bound cache instead of an explicit output path, replace
+`derive` with `derive-cached`, omit `--output`, and optionally pass
+`--cache-root`. Repeating the command reports `cache_hit=true` and
+`source_range_request_count=0`.
 
 The derived directories are already quantized; do not pass
 `--weight-quantization` when serving them.
