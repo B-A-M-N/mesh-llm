@@ -4540,6 +4540,7 @@ dependencies = [
  "chrono",
  "dirs",
  "hf-hub",
+ "json5",
  "libc",
  "model-artifact",
  "model-ref",

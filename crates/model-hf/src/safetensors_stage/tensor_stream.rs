@@ -333,6 +333,33 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "reads pinned Nemotron-H config, index, and one shard header"]
+    fn plans_real_nemotron_h_moe_layer_without_tensor_payloads() {
+        let cache = tempfile::tempdir().unwrap();
+        let materializer =
+            SafetensorsStageMaterializer::new(cache.path().join("cache"), None, None).unwrap();
+        let visit = materializer
+            .prepare_tensor_visit(SafetensorsStageRequest {
+                repo: "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-Base-BF16".to_string(),
+                revision: "97ab8012882a655dc38df4fee47422aca9caca07".to_string(),
+                layer_start: 1,
+                layer_end: 2,
+                include_prefixes: Vec::new(),
+            })
+            .unwrap();
+        let plan = visit.plan();
+
+        assert_eq!(plan.selected_tensor_count, 261);
+        assert_eq!(plan.selected_tensor_bytes, 2_594_936_576);
+        assert_eq!(plan.largest_selected_tensor_bytes, 19_955_712);
+        assert_eq!(plan.source_shard_count, 1);
+        assert_eq!(plan.source_shard_bytes, 4_991_210_024);
+        assert_eq!(plan.range_request_count, 2);
+        assert!(plan.source_shard_bytes_avoided > 2_396_000_000);
+        assert_eq!(visit.checkpoint_sha256().len(), 64);
+    }
+
+    #[test]
     #[ignore = "downloads one layer from a pinned Hugging Face SafeTensors checkpoint"]
     fn visits_real_smollm2_layer_without_retaining_source_shard() {
         let cache = tempfile::tempdir().unwrap();

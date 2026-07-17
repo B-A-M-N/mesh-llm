@@ -165,6 +165,24 @@ are intentionally duplicated across the stages; that is why the sum of the two
 files is larger than the full checkpoint even though neither process downloads
 the full checkpoint.
 
+The production `model-hf` planner now also understands the `nemotron_h`
+architecture used by Nemotron 3 Nano, including its `backbone.layers.*` layout
+and first/final boundary tensors. Against pinned
+`nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-Base-BF16` layer `1`, it selected
+2,594,936,576 bytes in 261 tensors from one 4,991,210,024-byte shard; the
+largest individual tensor was 19,955,712 bytes. This is metadata/range-planning
+evidence only. The derived builder and stage engine remain fail-closed for
+Nemotron-H until split ReLU2 experts and recurrent state are implemented.
+
+Reproduce the metadata-only proof (it downloads the pinned config, index, and
+one SafeTensors header, but no tensor payloads):
+
+```bash
+cargo test -p model-hf --lib \
+  plans_real_nemotron_h_moe_layer_without_tensor_payloads -- \
+  --ignored --nocapture
+```
+
 ## Reproduce
 
 Build once:
@@ -239,6 +257,9 @@ just mlx-stage prove --connect 127.0.0.1:19090 --wire-dtype f16
   experts need per-layer expert-bank assembly before quantization; Inkling needs
   its transformed rank-3 grouped-expert loader. Neither is silently treated as
   Llama.
+- The pinned safemlx Nemotron-H implementation matches the 52-layer Nano
+  schema, not Nemotron 3 Ultra's 108-layer latent-MoE schema. Ultra range plans
+  are storage-locality evidence, not executable-family support.
 - Greedy sampling only; sampling metadata is preserved in the contract and
   rejected explicitly when enabled.
 - No KV page import/export, cache trim/checkpoint, MTP, speculative verify,

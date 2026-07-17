@@ -2,9 +2,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{Context, Result, anyhow, ensure};
 use model_artifact::safetensors::{
-    IndexMetadata, LlamaConfig, SafetensorsIndex, TensorHeader, parse_header, parse_index,
-    parse_llama_config,
+    IndexMetadata, SafetensorsIndex, TensorHeader, parse_header, parse_index,
 };
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 use super::{
@@ -17,6 +17,57 @@ use super::{
 
 pub(crate) const MAX_INDEX_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_HEADER_BYTES: u64 = 256 * 1024 * 1024;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StageModelFamily {
+    Llama,
+    NemotronH,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawStageModelConfig {
+    model_type: String,
+    num_hidden_layers: u32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct StageModelLayout {
+    family: StageModelFamily,
+    num_hidden_layers: u32,
+}
+
+impl StageModelLayout {
+    fn layer_index(self, name: &str) -> Option<u32> {
+        self.layer_prefixes()
+            .iter()
+            .find_map(|prefix| name.strip_prefix(prefix)?.split_once('.')?.0.parse().ok())
+    }
+
+    fn layer_prefixes(self) -> &'static [&'static str] {
+        match self.family {
+            StageModelFamily::Llama => &["model.layers."],
+            StageModelFamily::NemotronH => &["backbone.layers.", "model.backbone.layers."],
+        }
+    }
+
+    fn embedding_prefix(self) -> &'static str {
+        match self.family {
+            StageModelFamily::Llama => "model.embed_tokens.",
+            StageModelFamily::NemotronH => "backbone.embeddings.",
+        }
+    }
+
+    fn final_norm_prefix(self) -> &'static str {
+        match self.family {
+            StageModelFamily::Llama => "model.norm.",
+            StageModelFamily::NemotronH => "backbone.norm_f.",
+        }
+    }
+
+    fn readout_prefix(self) -> &'static str {
+        "lm_head."
+    }
+}
 
 #[derive(Clone, Debug)]
 struct RemoteHeader {
@@ -44,7 +95,7 @@ pub(crate) fn prepare(
     let config = remote
         .small_file(config_url, MAX_INDEX_BYTES)
         .context("download SafeTensors model config")?;
-    let model_config = parse_llama_config(&config.bytes)?;
+    let model_config = parse_stage_model_layout(&config.bytes)?;
     validate_layer_range(request, &model_config)?;
     let config_sha256 = sha256_hex(&config.bytes);
     let mut selection_request = request.clone();
@@ -52,8 +103,8 @@ pub(crate) fn prepare(
 
     let mut layout = load_checkpoint_layout(remote, request)?;
     let checkpoint_sha256 = checkpoint_sha256(request, &config_sha256, &layout.layout_sha256)?;
-    validate_layer_coverage(&layout.index, request)?;
-    let selected = select_tensors(&layout.index.weight_map, &selection_request);
+    validate_layer_coverage(&layout.index, request, model_config)?;
+    let selected = select_tensors(&layout.index.weight_map, &selection_request, model_config);
     ensure!(
         !selected.is_empty(),
         "no tensors matched layers {}..{} or requested prefixes",
@@ -122,7 +173,38 @@ pub(crate) fn prepare(
     })
 }
 
-fn validate_layer_range(request: &SafetensorsStageRequest, config: &LlamaConfig) -> Result<()> {
+fn parse_stage_model_layout(bytes: &[u8]) -> Result<StageModelLayout> {
+    let config: RawStageModelConfig = match serde_json::from_slice(bytes) {
+        Ok(config) => config,
+        Err(strict_error) => {
+            let text =
+                std::str::from_utf8(bytes).context("SafeTensors model config is not UTF-8")?;
+            json5::from_str(text).with_context(|| {
+                format!("parse SafeTensors model config as strict JSON ({strict_error}) or JSON5")
+            })?
+        }
+    };
+    ensure!(
+        config.num_hidden_layers > 0,
+        "SafeTensors model num_hidden_layers must be non-zero"
+    );
+    let family = match config.model_type.as_str() {
+        "llama" => StageModelFamily::Llama,
+        "nemotron_h" => StageModelFamily::NemotronH,
+        model_type => anyhow::bail!(
+            "MLX partial SafeTensors currently supports model_type=llama or nemotron_h, got {model_type:?}"
+        ),
+    };
+    Ok(StageModelLayout {
+        family,
+        num_hidden_layers: config.num_hidden_layers,
+    })
+}
+
+fn validate_layer_range(
+    request: &SafetensorsStageRequest,
+    config: &StageModelLayout,
+) -> Result<()> {
     ensure!(
         request.layer_end <= config.num_hidden_layers,
         "stage layer end {} exceeds model layer count {}",
@@ -132,15 +214,22 @@ fn validate_layer_range(request: &SafetensorsStageRequest, config: &LlamaConfig)
     Ok(())
 }
 
-fn add_required_prefixes(request: &mut SafetensorsStageRequest, config: &LlamaConfig) {
-    if request.layer_start == 0 || request.layer_end == config.num_hidden_layers {
+fn add_required_prefixes(request: &mut SafetensorsStageRequest, config: &StageModelLayout) {
+    if request.layer_start == 0
+        || (config.family == StageModelFamily::Llama
+            && request.layer_end == config.num_hidden_layers)
+    {
         request
             .include_prefixes
-            .push("model.embed_tokens.".to_string());
+            .push(config.embedding_prefix().to_string());
     }
     if request.layer_end == config.num_hidden_layers {
-        request.include_prefixes.push("model.norm.".to_string());
-        request.include_prefixes.push("lm_head.".to_string());
+        request
+            .include_prefixes
+            .push(config.final_norm_prefix().to_string());
+        request
+            .include_prefixes
+            .push(config.readout_prefix().to_string());
     }
     request.include_prefixes.sort();
     request.include_prefixes.dedup();
@@ -149,13 +238,14 @@ fn add_required_prefixes(request: &mut SafetensorsStageRequest, config: &LlamaCo
 fn validate_layer_coverage(
     index: &SafetensorsIndex,
     request: &SafetensorsStageRequest,
+    config: StageModelLayout,
 ) -> Result<()> {
     for layer in request.layer_start..request.layer_end {
         ensure!(
             index
                 .weight_map
                 .keys()
-                .any(|name| layer_index(name) == Some(layer)),
+                .any(|name| config.layer_index(name) == Some(layer)),
             "SafeTensors checkpoint has no tensors for requested layer {layer}"
         );
     }
@@ -165,23 +255,33 @@ fn validate_layer_coverage(
 fn validate_required_tensors(
     selected: &BTreeSet<&str>,
     request: &SafetensorsStageRequest,
-    config: &LlamaConfig,
+    config: &StageModelLayout,
 ) -> Result<()> {
     let has_prefix = |prefix: &str| selected.iter().any(|name| name.starts_with(prefix));
     if request.layer_start == 0 {
         ensure!(
-            has_prefix("model.embed_tokens."),
-            "first MLX stage requires model.embed_tokens tensors"
+            has_prefix(config.embedding_prefix()),
+            "first MLX stage requires {} tensors",
+            config.embedding_prefix()
         );
     }
     if request.layer_end == config.num_hidden_layers {
         ensure!(
-            has_prefix("model.norm."),
-            "final MLX stage requires model.norm tensors"
+            has_prefix(config.final_norm_prefix()),
+            "final MLX stage requires {} tensors",
+            config.final_norm_prefix()
         );
+        let has_readout = has_prefix(config.readout_prefix())
+            || (config.family == StageModelFamily::Llama && has_prefix(config.embedding_prefix()));
         ensure!(
-            has_prefix("lm_head.") || has_prefix("model.embed_tokens."),
-            "final MLX stage requires lm_head or tied embedding tensors"
+            has_readout,
+            "final MLX stage requires {} tensors{}",
+            config.readout_prefix(),
+            if config.family == StageModelFamily::Llama {
+                " or tied embeddings"
+            } else {
+                ""
+            }
         );
     }
     Ok(())
@@ -299,11 +399,13 @@ fn ensure_matching_etag(left: &str, right: &str, file: &str) -> Result<()> {
 fn select_tensors<'a>(
     weight_map: &'a BTreeMap<String, String>,
     request: &SafetensorsStageRequest,
+    config: StageModelLayout,
 ) -> BTreeSet<&'a str> {
     weight_map
         .keys()
         .filter(|name| {
-            layer_index(name)
+            config
+                .layer_index(name)
                 .is_some_and(|layer| layer >= request.layer_start && layer < request.layer_end)
                 || request
                     .include_prefixes
@@ -312,14 +414,6 @@ fn select_tensors<'a>(
         })
         .map(String::as_str)
         .collect()
-}
-
-fn layer_index(name: &str) -> Option<u32> {
-    name.strip_prefix("model.layers.")?
-        .split_once('.')?
-        .0
-        .parse()
-        .ok()
 }
 
 fn plan_shard(
@@ -502,10 +596,50 @@ mod tests {
     use super::*;
 
     #[test]
-    fn recognizes_only_llama_layer_paths() {
-        assert_eq!(layer_index("model.layers.42.mlp.up_proj.weight"), Some(42));
-        assert_eq!(layer_index("transformer.h.7.attn.weight"), None);
-        assert_eq!(layer_index("model.embed_tokens.weight"), None);
+    fn recognizes_family_specific_layer_paths() {
+        let llama = parse_stage_model_layout(
+            br#"{"model_type":"llama","hidden_size":64,"num_hidden_layers":48}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            llama.layer_index("model.layers.42.mlp.up_proj.weight"),
+            Some(42)
+        );
+        assert_eq!(llama.layer_index("backbone.layers.7.mixer.weight"), None);
+        assert_eq!(llama.layer_index("model.embed_tokens.weight"), None);
+
+        let nemotron = parse_stage_model_layout(
+            br#"{"model_type":"nemotron_h","hidden_size":64,"num_hidden_layers":52}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            nemotron.layer_index("backbone.layers.7.mixer.up_proj.weight"),
+            Some(7)
+        );
+        assert_eq!(
+            nemotron.layer_index("model.backbone.layers.8.mixer.weight"),
+            Some(8)
+        );
+        assert_eq!(
+            nemotron.layer_index("model.layers.42.mlp.up_proj.weight"),
+            None
+        );
+    }
+
+    #[test]
+    fn parses_hugging_face_nonfinite_config_values_without_using_them() {
+        let layout = parse_stage_model_layout(
+            br#"{
+                "model_type":"nemotron_h",
+                "hidden_size":2688,
+                "num_hidden_layers":52,
+                "time_step_limit":[0.0, Infinity]
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(layout.family, StageModelFamily::NemotronH);
+        assert_eq!(layout.num_hidden_layers, 52);
     }
 
     #[test]
@@ -551,11 +685,9 @@ mod tests {
             layer_end: 2,
             include_prefixes: Vec::new(),
         };
-        let config = LlamaConfig {
-            model_type: "llama".to_string(),
-            hidden_size: 2,
+        let config = StageModelLayout {
+            family: StageModelFamily::Llama,
             num_hidden_layers: 2,
-            tie_word_embeddings: true,
         };
 
         add_required_prefixes(&mut request, &config);
@@ -567,6 +699,38 @@ mod tests {
                 "model.embed_tokens.".to_string(),
                 "model.norm.".to_string(),
             ]
+        );
+    }
+
+    #[test]
+    fn assigns_nemotron_embeddings_and_readout_to_their_own_boundaries() {
+        let config = StageModelLayout {
+            family: StageModelFamily::NemotronH,
+            num_hidden_layers: 2,
+        };
+        let mut first = SafetensorsStageRequest {
+            repo: "org/model".to_string(),
+            revision: "a".repeat(40),
+            layer_start: 0,
+            layer_end: 1,
+            include_prefixes: Vec::new(),
+        };
+        add_required_prefixes(&mut first, &config);
+        assert_eq!(
+            first.include_prefixes,
+            vec!["backbone.embeddings.".to_string()]
+        );
+
+        let mut final_stage = SafetensorsStageRequest {
+            layer_start: 1,
+            layer_end: 2,
+            ..first
+        };
+        final_stage.include_prefixes.clear();
+        add_required_prefixes(&mut final_stage, &config);
+        assert_eq!(
+            final_stage.include_prefixes,
+            vec!["backbone.norm_f.".to_string(), "lm_head.".to_string()]
         );
     }
 }

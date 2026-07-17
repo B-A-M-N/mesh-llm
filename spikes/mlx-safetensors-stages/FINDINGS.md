@@ -215,6 +215,15 @@ Every repository is pinned to the immutable revision shown below.
 | GLM-5.2 BF16 | `b4734de4facf877f85769a911abafc5283eab3d9` | 36..40 | 1.37 TiB | 73.54 GiB | 79.90 GiB | 6.36 GiB | 192 MiB |
 | DeepSeek V4 Pro FP8 | `b5968e9190ef611bbf34a7229255be88a0e937c1` | 28..32 | 805.32 GiB | 51.73 GiB | 51.73 GiB | 0 | 112 MiB |
 
+The production `model-hf` planner now reproduces a tractable `nemotron_h`
+architecture case from Nemotron 3 Nano rather than relying only on this spike.
+At immutable revision
+`97ab8012882a655dc38df4fee47422aca9caca07`, layer `1` of NVIDIA's 30B-A3B Base
+BF16 checkpoint selects 261 tensors / 2,594,936,576 bytes from a single
+4,991,210,024-byte shard, with a 19,955,712-byte largest tensor and two
+coalesced payload ranges. The config contains bare `Infinity`, so production
+metadata parsing uses strict JSON first and a JSON5 fallback.
+
 The format mechanism is stable and documented by the
 [SafeTensors format](https://github.com/huggingface/safetensors#format): the
 header records each tensor's dtype, shape, and byte offsets. Hugging Face's
@@ -387,10 +396,10 @@ SafeTensors acquisition is general, but MLX execution remains family-specific.
 The measured candidates suggest this order:
 
 1. **Qwen/Llama**: finish the partial loader and two-stage correctness proof.
-2. **Nemotron 3 Ultra**: best next frontier proof because `safemlx-lm` already
-   has a Nemotron-H implementation with public layer/cache structures and an
-   affine rank-3 expert runtime. Its public SafeTensors loader still needs the
-   matching on-load packing path and Mamba/recurrent stage-boundary certification.
+2. **Nemotron-H Nano 30B-A3B**: best next frontier proof because
+   `safemlx-lm` has matching public layer/cache structures and an affine rank-3
+   expert runtime. Its public SafeTensors path still needs bounded quantized
+   ReLU2 expert-bank assembly and Mamba/recurrent boundary certification.
 3. **Inkling text backbone**: safemlx already has whole-model text/multimodal
    execution; expose a partial-stage surface and use Transformers as the parity
    oracle rather than porting the family again.
@@ -405,6 +414,11 @@ published checkpoint is already about 554 GiB, and DeepSeek V4 Pro is already
 FP8. Preserve a compatible calibrated source encoding when the local backend
 supports it; use BF16-to-local-quant only when it is the cleanest compatible
 source path.
+
+Nemotron 3 Ultra is a distinct follow-up, not a larger drop-in Nano checkpoint.
+Its public config describes 108 layers through `layers_block_type`, 512 experts,
+and `moe_latent_size=2048`; it lacks the Nano fields consumed by the pinned
+safemlx implementation. The Ultra row above proves range locality only.
 
 ## Recommended artifact identity
 
@@ -430,9 +444,9 @@ because it does not alter the derived packed weights.
 1. Add capacity/eviction ownership to the host derived-stage cache, then decide
    whether a local request-to-recipe locator should remove even the warm
    metadata probes.
-2. Quantize one real Nemotron-H BF16 matrix reproducibly, then implement one
-   complete split-expert bank without accumulating every dense expert. Prove a
-   small family member before attempting Ultra-scale ranges.
+2. Quantize one real Nemotron-H Nano BF16 matrix reproducibly, then implement
+   one complete split-expert bank without accumulating every dense expert. Keep
+   Ultra gated behind its separate latent-MoE family implementation.
 3. Measure the MLX eval/readback/codec boundary fence independently at frontier
    residual widths and prefill sizes.
 4. Expose the existing safemlx Inkling text decoder as one stage, prove

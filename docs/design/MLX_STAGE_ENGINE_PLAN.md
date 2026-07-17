@@ -86,6 +86,22 @@ bytes; the temporary directory was empty at completion. A prepared visit makes
 the verified config and checkpoint identity available before tensor callbacks,
 and macOS/Unix advisory locks safely scavenge crash-abandoned visits.
 
+**Update — production range planning now covers the `nemotron_h` architecture
+used by Nemotron 3 Nano.** The planner recognizes its `backbone.layers.*`,
+embedding, final-norm, and readout paths and falls back to JSON5 for Hugging
+Face configs containing bare non-finite values.
+For pinned NVIDIA 30B-A3B Base BF16 layer `1`, it selected 261 tensors totaling
+2,594,936,576 bytes from a 4,991,210,024-byte shard; the largest tensor was
+19,955,712 bytes. No tensor payload was fetched by this proof. This removes the
+acquisition blocker for the next bounded expert-pack experiment.
+
+Nemotron 3 Ultra is not that next executable target. Its current public config
+uses a 108-layer `layers_block_type` latent-MoE design with 512 experts and
+`moe_latent_size=2048`, while the pinned safemlx `nemotron_h` implementation is
+the 52-layer Nano schema driven by `num_hidden_layers` and
+`hybrid_override_pattern`. Ultra range measurements remain valid storage
+evidence, but execution needs separate model-family work.
+
 **Update — direct exact-range to bounded affine stage artifacts is proven for
 Llama.** `mlx-stage derive` now consumes that prepared visit, quantizes/evaluates
 one rank-2 matrix at a time, serializes packed results into bounded SafeTensors
@@ -864,10 +880,11 @@ Spikes 1 and 2 are more decisive than any standalone token/s benchmark.
    the dense llama adapter and MLX two-process binary-wire proof are complete.
 3. Run **Spike 2 (boundary fence)** at frontier residual widths and keep it as a
    go/no-go gate.
-4. Use Nemotron-H as the first frontier-family follow-up: wire its existing
-   public layer/cache structures and affine expert runtime to public-checkpoint
-   on-load packing. Then expose safemlx's existing Inkling implementation as a
-   staged text decoder and use Transformers as the parity oracle.
+4. Use Nemotron-H **Nano** as the first frontier-family follow-up: wire its
+   existing public layer/cache structures and affine expert runtime to
+   public-checkpoint on-load packing. Do not treat Ultra as the same runtime
+   family. Then expose safemlx's existing Inkling implementation as a staged
+   text decoder and use Transformers as the parity oracle.
 
 ---
 
