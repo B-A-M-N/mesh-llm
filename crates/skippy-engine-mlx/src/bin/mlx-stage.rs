@@ -15,7 +15,7 @@ mod real {
     use skippy_engine_mlx::{
         MlxComputeDtype, MlxDerivationControl, MlxDerivedStageCacheConfig, MlxDerivedStageConfig,
         MlxStageEngine, MlxStageEngineConfig, MlxWeightQuantization, derive_quantized_stage,
-        derive_quantized_stage_cached, mlx_derived_stage_cache_root,
+        derive_quantized_stage_cached, mlx_derived_stage_cache_root, validate_nemotron_h_moe_stage,
     };
     use skippy_protocol::binary::{
         StageStateHeader, StageWireMessage, WireActivationDType, WireMessageKind, WireReplyKind,
@@ -72,7 +72,7 @@ mod real {
             output: PathBuf,
             #[arg(long, value_enum, default_value_t = WeightQuantization::Affine4)]
             weight_quantization: WeightQuantization,
-            /// Soft output shard target; one packed tensor may exceed it.
+            /// Soft output shard target; one converted tensor bundle may exceed it.
             #[arg(long, default_value_t = 256)]
             shard_size_mib: usize,
         },
@@ -94,9 +94,16 @@ mod real {
             cache_root: Option<PathBuf>,
             #[arg(long, value_enum, default_value_t = WeightQuantization::Affine4)]
             weight_quantization: WeightQuantization,
-            /// Soft output shard target; one packed tensor may exceed it.
+            /// Soft output shard target; one converted tensor bundle may exceed it.
             #[arg(long, default_value_t = 256)]
             shard_size_mib: usize,
+        },
+        /// Strict-load and execute one derived Nemotron-H MoE layer.
+        ValidateNemotronH {
+            #[arg(long)]
+            model: PathBuf,
+            #[arg(long)]
+            layer: usize,
         },
         /// Drive a stage chain and assert its greedy token sequence.
         Prove {
@@ -238,6 +245,11 @@ mod real {
                 weight_quantization.into(),
                 shard_size_mib,
             ),
+            Command::ValidateNemotronH { model, layer } => {
+                let report = validate_nemotron_h_moe_stage(model, layer)?;
+                println!("{}", serde_json::to_string_pretty(&report)?);
+                Ok(())
+            }
             Command::Prove {
                 connect,
                 tokens,

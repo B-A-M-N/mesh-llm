@@ -171,8 +171,9 @@ and first/final boundary tensors. Against pinned
 `nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-Base-BF16` layer `1`, it selected
 2,594,936,576 bytes in 261 tensors from one 4,991,210,024-byte shard; the
 largest individual tensor was 19,955,712 bytes. This is metadata/range-planning
-evidence only. The derived builder and stage engine remain fail-closed for
-Nemotron-H until split ReLU2 experts and recurrent state are implemented.
+evidence only for the general family layout. The derived builder now supports
+exactly one Nemotron-H Nano MoE layer at a time; the serving stage engine
+remains fail-closed until hybrid recurrent/attention boundaries are implemented.
 
 Reproduce the metadata-only proof (it downloads the pinned config, index, and
 one SafeTensors header, but no tensor payloads):
@@ -181,6 +182,30 @@ one SafeTensors header, but no tensor payloads):
 cargo test -p model-hf --lib \
   plans_real_nemotron_h_moe_layer_without_tensor_payloads -- \
   --ignored --nocapture
+```
+
+The bounded affine4 implementation has also been exercised against that exact
+pinned layer. It streamed 2,594,936,576 BF16 bytes through 261 individual range
+requests, quantized 258 matrices while retaining three dense tensors, and wrote
+730,324,736 tensor bytes. Maximum process RSS was 822,165,504 bytes and the
+largest ephemeral source tensor file was 19,955,848 bytes. The resulting
+artifact strict-loaded into safemlx's real layer-1 `TransformerBlock` and
+produced a finite `[1, 1, 2688]` output for a deterministic nonzero input.
+Here, bounded memory means bounded by the final packed layer: the six routed
+bank buffers total 718,405,632 bytes. It does not mean derivation stays at the
+one-expert (~20 MB source tensor) footprint. The forward is an executable smoke
+test, not a dense-versus-quantized numerical parity result.
+
+```bash
+just mlx-stage-build
+just mlx-stage derive \
+  --repo nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-Base-BF16 \
+  --revision 97ab8012882a655dc38df4fee47422aca9caca07 \
+  --layer-start 1 --layer-end 2 \
+  --output /tmp/nemotron-nano-layer1-affine4 \
+  --weight-quantization affine4
+just mlx-stage validate-nemotron-h \
+  --model /tmp/nemotron-nano-layer1-affine4 --layer 1
 ```
 
 ## Reproduce
@@ -260,6 +285,9 @@ just mlx-stage prove --connect 127.0.0.1:19090 --wire-dtype f16
 - The pinned safemlx Nemotron-H implementation matches the 52-layer Nano
   schema, not Nemotron 3 Ultra's 108-layer latent-MoE schema. Ultra range plans
   are storage-locality evidence, not executable-family support.
+- Bounded Nemotron-H derivation currently accepts exactly one `E`/MoE layer.
+  It does not yet expose a hybrid multi-layer stage or recurrent state on the
+  wire.
 - Greedy sampling only; sampling metadata is preserved in the contract and
   rejected explicitly when enabled.
 - No KV page import/export, cache trim/checkpoint, MTP, speculative verify,

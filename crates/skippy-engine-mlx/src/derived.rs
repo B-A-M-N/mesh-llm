@@ -28,13 +28,17 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::stage::MlxWeightQuantization;
+use nemotron_h::NemotronHDerivation;
 
 mod cache;
+mod expert_bank;
+mod nemotron_h;
 
 pub use cache::{
     MlxDerivedStageCacheConfig, MlxDerivedStageCacheResult, derive_quantized_stage_cached,
     load_prepared_quantized_stage, mlx_derived_stage_cache_root,
 };
+pub use nemotron_h::{MlxNemotronHValidationReport, validate_nemotron_h_moe_stage};
 
 pub(super) const DERIVED_STAGE_SCHEMA_VERSION: u32 = 1;
 const DERIVED_STAGE_IMPLEMENTATION: &str = "mesh-mlx-range-derived-v1";
@@ -152,9 +156,17 @@ impl PendingShard {
         }
     }
 
-    fn insert(&mut self, name: String, tensor: OwnedTensor) {
-        self.bytes = self.bytes.saturating_add(tensor.data.len());
+    fn insert(&mut self, name: String, tensor: OwnedTensor) -> Result<()> {
+        ensure!(
+            !self.tensors.contains_key(&name),
+            "derived tensor name {name:?} was produced more than once"
+        );
+        self.bytes = self
+            .bytes
+            .checked_add(tensor.data.len())
+            .context("pending derived shard byte count overflow")?;
         self.tensors.insert(name, tensor);
+        Ok(())
     }
 }
 
@@ -191,6 +203,45 @@ struct BuildState {
     output_tensor_bytes: u64,
     written_output_file_bytes: u64,
     working_disk_peak_bytes: u64,
+}
+
+enum TensorDerivation {
+    Llama,
+    NemotronH(NemotronHDerivation),
+}
+
+impl TensorDerivation {
+    fn new(
+        config: &Value,
+        layer_start: u32,
+        layer_end: u32,
+        quantization: WeightQuantization,
+    ) -> Result<Self> {
+        match config.get("model_type").and_then(Value::as_str) {
+            Some("llama") => Ok(Self::Llama),
+            Some("nemotron_h") => {
+                ensure!(
+                    matches!(quantization, WeightQuantization::Affine(_)),
+                    "bounded Nemotron-H expert banks currently require affine quantization"
+                );
+                Ok(Self::NemotronH(NemotronHDerivation::new(
+                    config,
+                    layer_start,
+                    layer_end,
+                )?))
+            }
+            model_type => anyhow::bail!(
+                "derived MLX stages support model_type=llama or nemotron_h, got {model_type:?}"
+            ),
+        }
+    }
+
+    fn finish(self) -> Result<Vec<(String, OwnedTensor)>> {
+        match self {
+            Self::Llama => Ok(Vec::new()),
+            Self::NemotronH(derivation) => derivation.finish(),
+        }
+    }
 }
 
 impl BuildState {
@@ -236,9 +287,15 @@ pub fn derive_quantized_stage(
         .control
         .verify_checkpoint(visit.checkpoint_sha256())?;
     let plan = visit.plan().clone();
-    let source_config = visit.config().to_vec();
-    ensure_dense_source_config(&source_config)?;
+    let source_config = parse_source_config(visit.config())?;
+    ensure_unquantized_source_config(&source_config)?;
     let quantization = config.quantization.safemlx()?;
+    let mut tensor_derivation = TensorDerivation::new(
+        &source_config,
+        plan.layer_start,
+        plan.layer_end,
+        quantization,
+    )?;
     let quantization_value = serde_json::to_value(quantization)?;
     let plan_bytes = serde_json::to_vec(&plan)?;
     let plan_sha256 = sha256_bytes(&plan_bytes);
@@ -271,6 +328,7 @@ pub fn derive_quantized_stage(
                 quantization,
                 &weights_stream,
                 &quantization_stream,
+                &mut tensor_derivation,
                 &mut state,
             )?;
             config.control.ensure_active()?;
@@ -285,19 +343,39 @@ pub fn derive_quantized_stage(
         },
     )?;
     config.control.ensure_active()?;
+    let final_arrays = tensor_derivation.finish()?;
+    if !final_arrays.is_empty() {
+        append_arrays(
+            final_arrays,
+            config.shard_size_bytes,
+            temporary.path(),
+            0,
+            &mut state,
+        )?;
+    }
+    config.control.ensure_active()?;
     if !state.pending.tensors.is_empty() {
         flush_shard(temporary.path(), &mut state)?;
     }
+    config.control.ensure_active()?;
     ensure!(
         !state.temporary_shards.is_empty(),
         "derived stage contains no tensors"
     );
     let finalized = finalize_shards(temporary.path(), &state)?;
+    config.control.ensure_active()?;
     let shards = finalized
         .iter()
-        .map(|path| derived_shard(path))
+        .map(|path| {
+            config.control.ensure_active()?;
+            let shard = derived_shard(path)?;
+            config.control.ensure_active()?;
+            Ok(shard)
+        })
         .collect::<Result<Vec<_>>>()?;
+    config.control.ensure_active()?;
     let output_content_sha256 = output_content_sha256(temporary.path())?;
+    config.control.ensure_active()?;
     let artifact_file_bytes = artifact_file_bytes(temporary.path())?;
     state.working_disk_peak_bytes = state.working_disk_peak_bytes.max(artifact_file_bytes);
     let report = MlxDerivedStageReport {
@@ -340,6 +418,7 @@ fn convert_tensor(
     quantization: WeightQuantization,
     weights_stream: &Stream,
     quantization_stream: &Stream,
+    derivation: &mut TensorDerivation,
     state: &mut BuildState,
 ) -> Result<Vec<(String, OwnedTensor)>> {
     let file = File::open(&tensor.path)?;
@@ -353,14 +432,31 @@ fn convert_tensor(
         tensor.name
     );
     let dense = Array::try_from(tensors.tensor(&tensor.name)?)?.copy(weights_stream)?;
-    let arrays = if should_quantize_source_weight(&tensor.name, &dense, quantization)? {
+    if let TensorDerivation::NemotronH(nemotron) = derivation
+        && nemotron.consume_expert(&tensor.name, &dense, quantization, quantization_stream)?
+    {
         state.quantized_tensor_count += 1;
-        quantize_tensor(&dense, quantization, quantization_stream)?
-            .into_named_arrays(&tensor.name)?
-    } else {
-        state.copied_tensor_count += 1;
-        vec![(tensor.name.clone(), dense)]
+        weights_stream.synchronize()?;
+        quantization_stream.synchronize()?;
+        return Ok(Vec::new());
+    }
+    let output_name = match derivation {
+        TensorDerivation::Llama => tensor.name.clone(),
+        TensorDerivation::NemotronH(nemotron) => nemotron.rewrite_name(&tensor.name)?,
     };
+    let keep_dense = matches!(
+        derivation,
+        TensorDerivation::NemotronH(_) if NemotronHDerivation::keep_dense(&output_name)
+    );
+    let arrays =
+        if !keep_dense && should_quantize_source_weight(&output_name, &dense, quantization)? {
+            state.quantized_tensor_count += 1;
+            quantize_tensor(&dense, quantization, quantization_stream)?
+                .into_named_arrays(&output_name)?
+        } else {
+            state.copied_tensor_count += 1;
+            vec![(output_name, dense)]
+        };
     eval(arrays.iter().map(|(_, array)| array))?;
     weights_stream.synchronize()?;
     quantization_stream.synchronize()?;
@@ -387,7 +483,7 @@ fn should_quantize_source_weight(
     }
     ensure!(
         tensor.ndim() == 2,
-        "derived stage v1 only supports dense rank-2 Llama weights; {name} has rank {}",
+        "derived stage only supports dense rank-2 matrix weights; {name} has rank {}",
         tensor.ndim()
     );
     ensure!(
@@ -504,7 +600,7 @@ fn append_arrays(
             .output_tensor_bytes
             .checked_add(u64::try_from(tensor.data.len())?)
             .context("derived output tensor byte count overflow")?;
-        state.pending.insert(name, tensor);
+        state.pending.insert(name, tensor)?;
     }
     Ok(())
 }
@@ -573,8 +669,8 @@ fn finalize_shards(output_dir: &Path, state: &BuildState) -> Result<Vec<PathBuf>
     Ok(outputs)
 }
 
-fn write_quantized_config(path: PathBuf, source: &[u8], quantization: &Value) -> Result<()> {
-    let mut config: Value = serde_json::from_slice(source).context("parse source config.json")?;
+fn write_quantized_config(path: PathBuf, source: &Value, quantization: &Value) -> Result<()> {
+    let mut config = source.clone();
     let object = config
         .as_object_mut()
         .context("source config.json must contain an object")?;
@@ -583,14 +679,16 @@ fn write_quantized_config(path: PathBuf, source: &[u8], quantization: &Value) ->
     write_json(path, &config)
 }
 
-fn ensure_dense_source_config(source: &[u8]) -> Result<()> {
-    let config: Value = serde_json::from_slice(source).context("parse source config.json")?;
+fn ensure_unquantized_source_config(config: &Value) -> Result<()> {
     let object = config
         .as_object()
         .context("source config.json must contain an object")?;
     ensure!(
-        object.get("model_type").and_then(Value::as_str) == Some("llama"),
-        "derived stage v1 only supports model_type=llama"
+        matches!(
+            object.get("model_type").and_then(Value::as_str),
+            Some("llama" | "nemotron_h")
+        ),
+        "derived MLX stages support model_type=llama or nemotron_h"
     );
     for key in ["quantization", "quantization_config", "compression_config"] {
         ensure!(
@@ -599,6 +697,70 @@ fn ensure_dense_source_config(source: &[u8]) -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn parse_source_config(source: &[u8]) -> Result<Value> {
+    match serde_json::from_slice(source) {
+        Ok(config) => Ok(config),
+        Err(strict_error) => {
+            let normalized = normalize_nonfinite_json_tokens(source)?;
+            serde_json::from_slice(&normalized).with_context(|| {
+                format!(
+                    "parse source config.json after normalizing non-finite values; strict JSON error: {strict_error}"
+                )
+            })
+        }
+    }
+}
+
+fn normalize_nonfinite_json_tokens(source: &[u8]) -> Result<Vec<u8>> {
+    let source = std::str::from_utf8(source).context("source config.json is not UTF-8")?;
+    let bytes = source.as_bytes();
+    let mut output = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    let mut in_string = false;
+    let mut escaped = false;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if in_string {
+            output.push(byte);
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_string = false;
+            }
+            index += 1;
+            continue;
+        }
+        if byte == b'"' {
+            in_string = true;
+            output.push(byte);
+            index += 1;
+            continue;
+        }
+        let replacement = ["-Infinity", "+Infinity", "Infinity", "NaN"]
+            .into_iter()
+            .find(|token| source[index..].starts_with(token));
+        if let Some(token) = replacement {
+            let end = index + token.len();
+            let leading_boundary = index == 0
+                || bytes[index - 1].is_ascii_whitespace()
+                || matches!(bytes[index - 1], b':' | b',' | b'[');
+            let trailing_boundary = bytes.get(end).is_none_or(|next| {
+                next.is_ascii_whitespace() || matches!(next, b',' | b']' | b'}')
+            });
+            if leading_boundary && trailing_boundary {
+                output.extend_from_slice(b"null");
+                index = end;
+                continue;
+            }
+        }
+        output.push(byte);
+        index += 1;
+    }
+    Ok(output)
 }
 
 pub(super) fn prepare_derivation_recipe(
@@ -612,8 +774,16 @@ pub(super) fn prepare_derivation_recipe(
     let visit = materializer.prepare_tensor_visit(source)?;
     control.ensure_active()?;
     control.verify_checkpoint(visit.checkpoint_sha256())?;
-    ensure_dense_source_config(visit.config())?;
-    let quantization = serde_json::to_value(quantization.safemlx()?)?;
+    let source_config = parse_source_config(visit.config())?;
+    ensure_unquantized_source_config(&source_config)?;
+    let quantization = quantization.safemlx()?;
+    TensorDerivation::new(
+        &source_config,
+        visit.plan().layer_start,
+        visit.plan().layer_end,
+        quantization,
+    )?;
+    let quantization = serde_json::to_value(quantization)?;
     let plan_bytes = serde_json::to_vec(visit.plan())?;
     let plan_sha256 = sha256_bytes(&plan_bytes);
     derived_identity(visit.plan(), &plan_sha256, &quantization, shard_size_bytes)
@@ -901,7 +1071,8 @@ mod tests {
         ))
         .unwrap();
 
-        write_quantized_config(path.clone(), br#"{"model_type":"llama"}"#, &quantization).unwrap();
+        write_quantized_config(path.clone(), &json!({"model_type": "llama"}), &quantization)
+            .unwrap();
 
         let config: Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
         assert_eq!(config["model_type"], "llama");
@@ -911,14 +1082,33 @@ mod tests {
 
     #[test]
     fn rejects_prequantized_source_metadata_and_ineligible_weights() {
-        let error = ensure_dense_source_config(
-            br#"{"model_type":"llama","quantization_config":{"quant_method":"fp8"}}"#,
-        )
+        let error = ensure_unquantized_source_config(&json!({
+            "model_type": "llama",
+            "quantization_config": {"quant_method": "fp8"}
+        }))
         .unwrap_err();
         assert!(error.to_string().contains("implicit dequantization"));
 
-        let error = ensure_dense_source_config(br#"{"model_type":"nemotron_h"}"#).unwrap_err();
-        assert!(error.to_string().contains("model_type=llama"));
+        let error =
+            ensure_unquantized_source_config(&json!({"model_type": "unknown"})).unwrap_err();
+        assert!(error.to_string().contains("llama or nemotron_h"));
+
+        let error = TensorDerivation::new(
+            &json!({
+                "model_type": "nemotron_h",
+                "hidden_size": 64,
+                "num_hidden_layers": 1,
+                "hybrid_override_pattern": "E",
+                "n_routed_experts": 2,
+                "moe_intermediate_size": 32
+            }),
+            0,
+            1,
+            WeightQuantization::MxFp4,
+        )
+        .err()
+        .expect("Nemotron-H MXFP4 should fail before tensor payloads");
+        assert!(error.to_string().contains("require affine"));
 
         let quantization: WeightQuantization = AffineQuantization::new(64, 4).unwrap().into();
         let packed = Array::from_slice(&vec![0_u32; 128], &[2, 64]);
@@ -948,8 +1138,43 @@ mod tests {
             )
             .unwrap_err()
             .to_string()
-            .contains("rank-2 Llama")
+            .contains("rank-2 matrix")
         );
+    }
+
+    #[test]
+    fn normalizes_nonfinite_config_values_but_not_strings() {
+        let config = parse_source_config(
+            br#"{
+                "model_type":"nemotron_h",
+                "label":"Infinity and NaN",
+                "limits":[Infinity,-Infinity,+Infinity,NaN]
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(config["label"], "Infinity and NaN");
+        assert_eq!(config["limits"], json!([null, null, null, null]));
+        assert!(parse_source_config(br#"{"bad":123Infinity}"#).is_err());
+    }
+
+    #[test]
+    fn pending_shard_rejects_canonical_name_collisions() {
+        let tensor = || OwnedTensor {
+            dtype: SafeDtype::F32,
+            shape: vec![1],
+            data: 1_f32.to_le_bytes().to_vec(),
+        };
+        let mut pending = PendingShard::new();
+
+        pending
+            .insert("model.weight".to_string(), tensor())
+            .unwrap();
+        let error = pending
+            .insert("model.weight".to_string(), tensor())
+            .unwrap_err();
+
+        assert!(error.to_string().contains("more than once"));
     }
 
     #[test]

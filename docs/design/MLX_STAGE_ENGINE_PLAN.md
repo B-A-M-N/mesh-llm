@@ -95,6 +95,26 @@ For pinned NVIDIA 30B-A3B Base BF16 layer `1`, it selected 261 tensors totaling
 19,955,712 bytes. No tensor payload was fetched by this proof. This removes the
 acquisition blocker for the next bounded expert-pack experiment.
 
+**Update — one real Nano MoE layer now derives and executes.** The production
+builder recognizes split ReLU2 experts, quantizes one expert matrix at a time,
+and writes each result into preallocated rank-3 affine banks. A two-expert test
+proves this incremental layout is byte-identical to quantizing a stacked bank.
+For pinned layer `1`, 2,594,936,576 source bytes became 730,324,736 affine4
+tensor bytes (258 source matrices quantized, three tensors dense) in 199.70
+seconds. Maximum RSS was 822,165,504 bytes; the only source payload retained at
+any instant was one tensor, at most 19,955,848 bytes. A validation command then
+strict-loaded safemlx's actual layer-1 `TransformerBlock` and executed a finite
+nonzero `[1, 1, 2688] -> [1, 1, 2688]` forward pass with 811,696,812 bytes of
+reported MLX peak memory. General hybrid-stage execution is still gated on
+recurrent/attention state and boundary work.
+
+The derivation memory bound is the final packed routed bank, not one expert:
+six preallocated payload buffers total 718,405,632 bytes. Moving those buffers
+to a disk-backed random-write spool is the next step if preparation RSS must
+stay near the largest individual source tensor. The finite forward plus strict
+parameter coverage proves artifact assembly and executability; quantization
+quality still needs a dense/reference parity oracle.
+
 Nemotron 3 Ultra is not that next executable target. Its current public config
 uses a 108-layer `layers_block_type` latent-MoE design with 512 experts and
 `moe_latent_size=2048`, while the pinned safemlx `nemotron_h` implementation is
@@ -880,11 +900,11 @@ Spikes 1 and 2 are more decisive than any standalone token/s benchmark.
    the dense llama adapter and MLX two-process binary-wire proof are complete.
 3. Run **Spike 2 (boundary fence)** at frontier residual widths and keep it as a
    go/no-go gate.
-4. Use Nemotron-H **Nano** as the first frontier-family follow-up: wire its
-   existing public layer/cache structures and affine expert runtime to
-   public-checkpoint on-load packing. Do not treat Ultra as the same runtime
-   family. Then expose safemlx's existing Inkling implementation as a staged
-   text decoder and use Transformers as the parity oracle.
+4. Extend the proven single-layer Nemotron-H **Nano** affine expert path into a
+   hybrid staged runtime with explicit recurrent/attention boundary state. Do
+   not treat Ultra as the same runtime family. Then expose safemlx's existing
+   Inkling implementation as a staged text decoder and use Transformers as the
+   parity oracle.
 
 ---
 

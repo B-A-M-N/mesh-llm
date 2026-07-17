@@ -224,6 +224,21 @@ BF16 checkpoint selects 261 tensors / 2,594,936,576 bytes from a single
 coalesced payload ranges. The config contains bare `Infinity`, so production
 metadata parsing uses strict JSON first and a JSON5 fallback.
 
+The next production proof now exists too. The exact layer ranges were consumed
+one tensor at a time and converted into an affine4/g64 artifact without ever
+constructing the dense 128-expert bank. The run quantized 258 matrices, copied
+three dense tensors, and reduced 2,594,936,576 source bytes to 730,324,736
+tensor bytes in 199.70 seconds. Maximum RSS was 822,165,504 bytes; the largest
+ephemeral source tensor file was 19,955,848 bytes. The six routed bank tensors
+use underscore companions required by safemlx, while shared expert matrices use
+normal dotted affine companions. The artifact strict-loaded into the actual
+Nano layer-1 block and produced finite `[1, 1, 2688]` output.
+
+This is bounded by the final packed layer rather than one-expert RAM: the six
+routed buffers total 718,405,632 bytes, consistent with the measured RSS. A
+disk-backed spool would lower derivation memory further. Strict loading and a
+finite forward prove executable assembly, not dense-versus-affine accuracy.
+
 The format mechanism is stable and documented by the
 [SafeTensors format](https://github.com/huggingface/safetensors#format): the
 header records each tensor's dtype, shape, and byte offsets. Hugging Face's
@@ -444,9 +459,9 @@ because it does not alter the derived packed weights.
 1. Add capacity/eviction ownership to the host derived-stage cache, then decide
    whether a local request-to-recipe locator should remove even the warm
    metadata probes.
-2. Quantize one real Nemotron-H Nano BF16 matrix reproducibly, then implement
-   one complete split-expert bank without accumulating every dense expert. Keep
-   Ultra gated behind its separate latent-MoE family implementation.
+2. Extend the proven single-layer Nemotron-H Nano artifact into a hybrid stage
+   while making recurrent/attention state explicit on the wire. Keep Ultra
+   gated behind its separate latent-MoE family implementation.
 3. Measure the MLX eval/readback/codec boundary fence independently at frontier
    residual widths and prefill sizes.
 4. Expose the existing safemlx Inkling text decoder as one stage, prove

@@ -21,8 +21,9 @@ pub use backend::MlxBackend;
 #[cfg(all(feature = "mlx", target_os = "macos"))]
 pub use derived::{
     MlxDerivationControl, MlxDerivedStageCacheConfig, MlxDerivedStageCacheResult,
-    MlxDerivedStageConfig, MlxDerivedStageReport, MlxDerivedStageShard, derive_quantized_stage,
-    derive_quantized_stage_cached, load_prepared_quantized_stage, mlx_derived_stage_cache_root,
+    MlxDerivedStageConfig, MlxDerivedStageReport, MlxDerivedStageShard,
+    MlxNemotronHValidationReport, derive_quantized_stage, derive_quantized_stage_cached,
+    load_prepared_quantized_stage, mlx_derived_stage_cache_root, validate_nemotron_h_moe_stage,
 };
 #[cfg(all(feature = "mlx", target_os = "macos"))]
 pub use engine::{ChatTurn, GenerateRequest, MlxEngine, MlxEngineConfig};
