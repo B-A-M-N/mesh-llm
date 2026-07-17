@@ -37,9 +37,10 @@ does not prove partial downloads: a whole-model server needs all model weights.
 The integrated loader now quantizes eligible, unquantized dense source tensors
 to affine 4-bit as they load. Inkling, Nemotron-H, and checkpoints already
 declaring a quantized representation retain their native representation. The
-automatic policy also retries the native representation when a family-specific
-strict loader rejects the optional transform. Explicit affine modes remain
-fail-closed. The earlier solo-serving measurements showed that this
+automatic policy also retries the native representation for quantization
+incompatibility or the known benign tied-Qwen `lm_head.weight` rejection. Other
+strict-loader failures remain fail-closed, as do explicit affine modes. The
+earlier solo-serving measurements showed that this
 load-time representation has the same steady-state generation speed as loading
 an equivalent pre-quantized artifact; see `../../spikes/mlx-solo/FINDINGS.md`.
 

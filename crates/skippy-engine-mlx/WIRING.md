@@ -57,8 +57,9 @@ the GGUF path. The automatic weight policy is intentionally conservative:
 - Inkling and Nemotron-H load their native representation because their routed
   rank-3 experts do not support that transform;
 - checkpoints already declaring quantization/compression load natively;
-- auto retries native loading when a family-specific strict/quantization check
-  rejects the optional transform;
+- auto retries native loading for quantization incompatibility or the known
+  benign tied-Qwen `lm_head.weight` strict-loader rejection; every other strict
+  validation failure remains fail-closed;
 - explicit `mlx-serve` users may choose auto, none, affine4, affine8, or mxfp4.
 
 The model is exposed through the shared `openai-frontend` router. The HTTP

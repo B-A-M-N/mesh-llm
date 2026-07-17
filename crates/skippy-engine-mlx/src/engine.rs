@@ -39,8 +39,8 @@ pub struct MlxEngineConfig {
     /// Quantize eligible dense checkpoint tensors as they are loaded. Already
     /// quantized checkpoints with matching metadata load directly.
     pub weight_quantization: Option<MlxWeightQuantization>,
-    /// Auto policy may retry native loading when a model-specific strict or
-    /// quantization check rejects the optional transform.
+    /// Auto policy may retry native loading for a quantization incompatibility
+    /// or a narrowly recognized benign strict-loader rejection.
     pub allow_native_quantization_fallback: bool,
 }
 
@@ -212,7 +212,7 @@ fn load_engine(config: &MlxEngineConfig) -> Result<LoadedEngine> {
         Err(error)
             if config.allow_native_quantization_fallback
                 && config.weight_quantization.is_some()
-                && optional_quantization_incompatible(&error) =>
+                && optional_quantization_incompatible(&config.model_dir, &error) =>
         {
             used_native_fallback = true;
             tracing::warn!(
@@ -258,12 +258,32 @@ fn load_engine(config: &MlxEngineConfig) -> Result<LoadedEngine> {
     })
 }
 
-fn optional_quantization_incompatible(error: &safemlx_lm::error::Error) -> bool {
-    matches!(
-        error,
-        safemlx_lm::error::Error::Quantization(_)
-            | safemlx_lm::error::Error::StrictLoadValidation { .. }
-    )
+fn optional_quantization_incompatible(model_dir: &Path, error: &safemlx_lm::error::Error) -> bool {
+    match error {
+        safemlx_lm::error::Error::Quantization(_) => true,
+        safemlx_lm::error::Error::StrictLoadValidation { missing, unused } => {
+            known_tied_qwen_lm_head_failure(model_dir, missing, unused)
+        }
+        _ => false,
+    }
+}
+
+fn known_tied_qwen_lm_head_failure(
+    model_dir: &Path,
+    missing: &[String],
+    unused: &[String],
+) -> bool {
+    if !missing.is_empty() || unused != ["lm_head.weight"] {
+        return false;
+    }
+    let Ok(bytes) = fs::read(model_dir.join("config.json")) else {
+        return false;
+    };
+    let Ok(config) = serde_json::from_slice::<Value>(&bytes) else {
+        return false;
+    };
+    config.get("model_type").and_then(Value::as_str) == Some("qwen3")
+        && config.get("tie_word_embeddings").and_then(Value::as_bool) == Some(true)
 }
 
 fn run_worker(
@@ -458,18 +478,66 @@ mod tests {
     }
 
     #[test]
-    fn automatic_quantization_retries_only_compatibility_failures() {
+    fn automatic_quantization_retries_quantization_failures() {
         assert!(optional_quantization_incompatible(
+            Path::new("unused"),
             &safemlx_lm::error::Error::Quantization("unsupported".to_string())
         ));
-        assert!(optional_quantization_incompatible(
-            &safemlx_lm::error::Error::StrictLoadValidation {
-                missing: Vec::new(),
-                unused: vec!["lm_head.weight".to_string()],
-            }
-        ));
         assert!(!optional_quantization_incompatible(
+            Path::new("unused"),
             &safemlx_lm::error::Error::UnsupportedArchitecture("unsupported".to_string())
         ));
+    }
+
+    #[test]
+    fn automatic_quantization_retries_only_known_tied_qwen_strict_failure() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(
+            temp.path().join("config.json"),
+            br#"{"model_type":"qwen3","tie_word_embeddings":true}"#,
+        )
+        .unwrap();
+        let error = safemlx_lm::error::Error::StrictLoadValidation {
+            missing: Vec::new(),
+            unused: vec!["lm_head.weight".to_string()],
+        };
+        assert!(optional_quantization_incompatible(temp.path(), &error));
+
+        let missing_core = safemlx_lm::error::Error::StrictLoadValidation {
+            missing: vec!["model.layers.0.self_attn.q_proj.weight".to_string()],
+            unused: vec!["lm_head.weight".to_string()],
+        };
+        assert!(!optional_quantization_incompatible(
+            temp.path(),
+            &missing_core
+        ));
+        let unexpected_unused = safemlx_lm::error::Error::StrictLoadValidation {
+            missing: Vec::new(),
+            unused: vec![
+                "lm_head.weight".to_string(),
+                "unexpected.weight".to_string(),
+            ],
+        };
+        assert!(!optional_quantization_incompatible(
+            temp.path(),
+            &unexpected_unused
+        ));
+        let shape_mismatch = safemlx_lm::error::Error::StrictLoadValidation {
+            missing: vec!["model.layers.0.mlp.down_proj.weight".to_string()],
+            unused: vec![
+                "model.layers.0.mlp.down_proj.weight -> model.layers.0.mlp.down_proj.weight: expected [1024, 3072], got [1024, 2048]".to_string(),
+            ],
+        };
+        assert!(!optional_quantization_incompatible(
+            temp.path(),
+            &shape_mismatch
+        ));
+
+        fs::write(
+            temp.path().join("config.json"),
+            br#"{"model_type":"llama","tie_word_embeddings":true}"#,
+        )
+        .unwrap();
+        assert!(!optional_quantization_incompatible(temp.path(), &error));
     }
 }
