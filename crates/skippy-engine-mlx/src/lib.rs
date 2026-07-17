@@ -10,6 +10,8 @@
 #[cfg(all(feature = "mlx", target_os = "macos"))]
 mod backend;
 #[cfg(all(feature = "mlx", target_os = "macos"))]
+mod boundary_bench;
+#[cfg(all(feature = "mlx", target_os = "macos"))]
 mod derived;
 #[cfg(all(feature = "mlx", target_os = "macos"))]
 mod engine;
@@ -18,6 +20,8 @@ mod stage;
 
 #[cfg(all(feature = "mlx", target_os = "macos"))]
 pub use backend::MlxBackend;
+#[cfg(all(feature = "mlx", target_os = "macos"))]
+pub use boundary_bench::{MlxBoundaryBenchConfig, MlxBoundaryBenchReport, benchmark_mlx_boundary};
 #[cfg(all(feature = "mlx", target_os = "macos"))]
 pub use derived::{
     MlxDerivationControl, MlxDerivedStageCacheConfig, MlxDerivedStageCacheResult,

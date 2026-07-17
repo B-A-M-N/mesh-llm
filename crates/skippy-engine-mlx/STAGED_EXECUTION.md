@@ -249,6 +249,60 @@ layer, including a 32-token prefill. It does not prove a second real model
 stage, decode, Nemotron recurrent state, host/QUIC orchestration, or end-to-end
 token logits.
 
+## Boundary-fence benchmark
+
+`mlx-stage bench-boundary` is the first instrumented pass over the independent
+boundary cost. It creates one evaluated F32 MLX array, applies a synthetic lazy
+F32 add, and times four release-mode phases separately:
+
+1. completion of the synthetic add through MLX eval/synchronize, with graph
+   construction outside the timer;
+2. the evaluated host view plus allocation/copy into the F32 byte buffer;
+3. the production Skippy F32 or F16 activation-payload encoder; and
+4. post-receive activation-payload reconstruction into F32.
+
+The host-copy phase includes the MLX evaluated-view call. The decode phase does
+not include message framing, socket reads, TCP, QUIC, or receive-buffer
+allocation. This is not a model-layer benchmark.
+
+All samples are collected before the telemetry exporter starts, then their
+original timestamps are emitted as bounded OTLP spans to an explicitly
+configured metrics-server. The benchmark fails on codec drift, non-finite
+values, telemetry loss, or a canonical span-count mismatch; it finalizes the
+run and saves metrics-server's canonical `report.json`. The report's
+`eval_and_host_copy_total` and `codec_total` percentiles are calculated from
+paired per-iteration sums, not by adding independent phase percentiles.
+
+F32 encoding and decoding are straight byte copies. F16 includes numeric
+conversion in both directions, so paired F32/F16 results come from separate
+per-dtype runs and are not a within-run equivalence comparison. MLX memory
+counters do not include the Rust host buffers.
+
+No prompt, activation values, local paths, collector endpoints, hardware IDs,
+or model contents enter telemetry. The required HTTP and OTLP endpoints are
+transport targets and are not copied into spans or run config. The operator run
+label is validated to a bounded URL-safe character set; a local output report
+may contain its explicitly requested report path.
+
+Reproduce one matrix cell with metrics-server running in another terminal:
+
+```bash
+just metrics-server \
+  db=/tmp/mlx-boundary.sqlite \
+  http_addr=127.0.0.1:18081 \
+  otlp_addr=127.0.0.1:14317
+
+just mlx-stage-build
+just mlx-stage bench-boundary \
+  --width 16384 --tokens 512 --wire-dtype f16 \
+  --warmup-iterations 3 --measured-iterations 20 \
+  --metrics-http http://127.0.0.1:18081 \
+  --metrics-otlp-grpc http://127.0.0.1:14317 \
+  --metrics-run-id mlx-boundary-w16384-t512-f16-v2 \
+  --metrics-report /tmp/mlx-boundary-metrics.json \
+  --output /tmp/mlx-boundary-local.json
+```
+
 ## Reproduce
 
 Build once:

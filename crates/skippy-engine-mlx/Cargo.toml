@@ -42,11 +42,13 @@ mlx = [
     "dep:libc",
     "dep:memmap2",
     "dep:model-hf",
+    "dep:reqwest",
     "dep:safetensors",
     "dep:safemlx",
     "dep:safemlx-lm",
     "dep:serde",
     "dep:sha2",
+    "dep:skippy-metrics",
     "dep:tokenizers",
     # SafeMLX and static llama.cpp both export GGUF C symbols such as
     # `gguf_get_key`; keep the native llama runtime in a separate link unit.
@@ -59,6 +61,7 @@ mlx = [
 openai-frontend = { path = "../openai-frontend" }
 model-hf = { path = "../model-hf", optional = true }
 skippy-engine = { path = "../skippy-engine" }
+skippy-metrics = { path = "../skippy-metrics", optional = true }
 skippy-protocol = { path = "../skippy-protocol" }
 skippy-server = { path = "../skippy-server" }
 async-trait = "0.1"
@@ -71,6 +74,7 @@ futures-core = "0.3"
 half = { version = "2", features = ["bytemuck"], optional = true }
 libc = { version = "0.2", optional = true }
 memmap2 = { version = "0.9", optional = true }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"], optional = true }
 serde_json = "1"
 serde = { version = "1", features = ["derive"], optional = true }
 sha2 = { version = "0.10", optional = true }

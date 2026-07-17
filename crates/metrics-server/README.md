@@ -26,6 +26,20 @@ activation byte counts, credit counters, and lifecycle/queue counters.
 Experimental feature runs should emit enough run, request, session, topology,
 stage, and model identifiers for report export and post-run debugging.
 
+The opt-in MLX boundary benchmark emits four shared span names:
+
+- `stage.mlx_boundary_eval_fence`
+- `stage.mlx_boundary_host_copy`
+- `stage.mlx_boundary_encode`
+- `stage.mlx_boundary_decode`
+
+Its run config and spans contain bounded benchmark shape, dtype, byte-count,
+schema/revision, and duration data only. The activation-byte metric is attached
+only to the encode span. The benchmark requires explicit HTTP and OTLP
+collector arguments; those transport targets are not copied into the run
+config or span attributes. It does not export activation values, prompts,
+paths, endpoint URLs, hardware identifiers, or model contents.
+
 ## Commands
 
 ```bash

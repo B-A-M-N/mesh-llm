@@ -140,6 +140,19 @@ one real frontier layer. The adjacent final stage and its three-layer topology
 are synthetic harness devices. It is not evidence for two real Nemotron
 stages, decode, recurrent state, host/QUIC placement, or full-model logits.
 
+**Update — a metrics-backed frontier-width boundary-fence runner is ready.**
+The release `mlx-stage bench-boundary` command separately times synthetic MLX
+add completion/eval, host readback and buffer copy, production F32 or F16
+activation encode, and post-receive reconstruction. It calculates real paired
+per-iteration boundary and encode-plus-decode distributions, gates codec
+correctness, and does not start telemetry export until timed work is complete.
+It requires explicit metrics-server HTTP and OTLP endpoints, emits bounded
+nonblocking spans, fails on loss or canonical count mismatch, finalizes the
+run, and writes the canonical metrics-server report. This is an independent
+synthetic fence and codec measurement, not model compute, message framing,
+TCP, QUIC, or a complete network gate. The reproduction command and evidence
+contract are in `crates/skippy-engine-mlx/STAGED_EXECUTION.md`.
+
 The derivation memory bound is the final packed routed bank, not one expert:
 six preallocated payload buffers total 718,405,632 bytes. Moving those buffers
 to a disk-backed random-write spool is the next step if preparation RSS must
@@ -930,8 +943,10 @@ Spikes 1 and 2 are more decisive than any standalone token/s benchmark.
    metadata probes.
 2. Teach topology planning and capability advertisement to select MLX stages;
    explicit host Prepare/Load and the engine-neutral server lane are proven.
-3. Run **Spike 2 (boundary fence)** at frontier residual widths and keep it as a
-   go/no-go gate.
+3. Extend the initial metrics-backed synthetic **Spike 2 (boundary fence)**
+   matrix to real model outputs and TCP/QUIC links. Preserve the separate
+   eval/synchronize, host copy, codec, and network phase evidence; do not assume
+   F16 wins when CPU conversion can exceed the bytes saved on a fast link.
 4. Extend the proven single-layer Nemotron-H **Nano** `StageEngine` adapter into
    a hybrid staged runtime with explicit recurrent/attention boundary state. Do
    not treat Ultra as the same runtime family. Then expose safemlx's existing
