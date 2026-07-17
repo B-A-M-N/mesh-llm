@@ -10,8 +10,8 @@ use sha2::{Digest, Sha256};
 use super::{
     http::RemoteSource,
     types::{
-        ByteRange, PreparedStage, SafetensorsShardPlan, SafetensorsSourceShard,
-        SafetensorsStagePlan, SafetensorsStageRequest, SelectedTensor,
+        ByteRange, PreparedStage, SafetensorsCheckpointDescriptor, SafetensorsShardPlan,
+        SafetensorsSourceShard, SafetensorsStagePlan, SafetensorsStageRequest, SelectedTensor,
     },
 };
 
@@ -28,12 +28,175 @@ enum StageModelFamily {
 struct RawStageModelConfig {
     model_type: String,
     num_hidden_layers: u32,
+    hidden_size: u32,
+    #[serde(default)]
+    max_position_embeddings: u32,
+    #[serde(default)]
+    num_attention_heads: u32,
+    #[serde(default)]
+    num_key_value_heads: u32,
+    #[serde(default)]
+    head_dim: u32,
 }
 
 #[derive(Clone, Copy, Debug)]
 struct StageModelLayout {
     family: StageModelFamily,
     num_hidden_layers: u32,
+}
+
+pub(crate) fn describe(
+    remote: &RemoteSource,
+    repo: &str,
+    revision: &str,
+) -> Result<SafetensorsCheckpointDescriptor> {
+    let probe = SafetensorsStageRequest {
+        repo: repo.to_string(),
+        revision: revision.to_string(),
+        layer_start: 0,
+        layer_end: 1,
+        include_prefixes: Vec::new(),
+    }
+    .normalized()?;
+    let config_url = remote.url(repo, revision, "config.json")?;
+    let config_file = remote
+        .small_file(config_url, MAX_INDEX_BYTES)
+        .context("download SafeTensors model config")?;
+    let config = parse_raw_stage_model_config(&config_file.bytes)?;
+    ensure!(
+        config.model_type == "llama",
+        "automatic distributed MLX planning currently supports model_type=llama, got {:?}",
+        config.model_type
+    );
+    validate_planning_config(&config)?;
+
+    let full = prepare(
+        remote,
+        &SafetensorsStageRequest {
+            layer_end: config.num_hidden_layers,
+            ..probe
+        },
+    )?;
+    let dense_tensor_bytes = full
+        .plan
+        .total_model_tensor_bytes
+        .context("SafeTensors checkpoint does not declare total tensor bytes")?;
+    let stage_layout = StageModelLayout {
+        family: StageModelFamily::Llama,
+        num_hidden_layers: config.num_hidden_layers,
+    };
+    let estimated_affine4_weight_bytes =
+        checked_sum(full.tensors.iter().map(estimated_affine4_tensor_bytes))?;
+    let estimated_affine4_layer_bytes = estimated_affine4_layer_bytes(stage_layout, &full.tensors)?;
+    let kv_heads = if config.num_key_value_heads > 0 {
+        config.num_key_value_heads
+    } else {
+        config.num_attention_heads
+    };
+    let head_dim = if config.head_dim > 0 {
+        config.head_dim
+    } else {
+        config.hidden_size / config.num_attention_heads
+    };
+    let kv_bytes_per_token_bf16 = u64::from(config.num_hidden_layers)
+        .checked_mul(u64::from(kv_heads))
+        .and_then(|bytes| bytes.checked_mul(u64::from(head_dim)))
+        .and_then(|bytes| bytes.checked_mul(2))
+        .and_then(|bytes| bytes.checked_mul(2))
+        .context("SafeTensors KV byte estimate overflow")?;
+
+    Ok(SafetensorsCheckpointDescriptor {
+        checkpoint_sha256: full.checkpoint_sha256,
+        repo: repo.to_string(),
+        revision: revision.to_string(),
+        model_type: config.model_type,
+        layer_count: config.num_hidden_layers,
+        hidden_size: config.hidden_size,
+        native_context_length: if config.max_position_embeddings == 0 {
+            2_048
+        } else {
+            config.max_position_embeddings
+        },
+        dense_tensor_bytes,
+        estimated_affine4_weight_bytes,
+        estimated_affine4_layer_bytes,
+        kv_bytes_per_token_bf16,
+    })
+}
+
+fn estimated_affine4_layer_bytes(
+    layout: StageModelLayout,
+    tensors: &[SelectedTensor],
+) -> Result<Vec<u64>> {
+    let mut layer_bytes = vec![0_u64; layout.num_hidden_layers as usize];
+    let final_layer = layer_bytes
+        .len()
+        .checked_sub(1)
+        .context("SafeTensors model has no layers")?;
+    for tensor in tensors {
+        let bytes = estimated_affine4_tensor_bytes(tensor);
+        if let Some(layer) = layout.layer_index(&tensor.name) {
+            add_estimated_bytes(&mut layer_bytes[layer as usize], bytes)?;
+        } else if tensor.name.starts_with(layout.embedding_prefix()) {
+            add_estimated_bytes(&mut layer_bytes[0], bytes)?;
+            if layout.family == StageModelFamily::Llama && final_layer != 0 {
+                // The current Llama final-stage selection reloads embeddings
+                // for tied readout compatibility, even when lm_head is also
+                // present. Charge the planner for what the stage really loads.
+                add_estimated_bytes(&mut layer_bytes[final_layer], bytes)?;
+            }
+        } else {
+            // Final norm/readout and any unclassified boundary tensors are
+            // selected only by the final stage.
+            add_estimated_bytes(&mut layer_bytes[final_layer], bytes)?;
+        }
+    }
+    Ok(layer_bytes)
+}
+
+fn estimated_affine4_tensor_bytes(tensor: &SelectedTensor) -> u64 {
+    let shape = &tensor.header.shape;
+    let is_dense_float_weight = tensor.name.ends_with(".weight")
+        && shape.len() == 2
+        && shape[1].is_multiple_of(64)
+        && matches!(tensor.header.dtype.as_str(), "F16" | "BF16" | "F32");
+    if !is_dense_float_weight {
+        return tensor.source_range.len();
+    }
+    let elements = shape.iter().copied().fold(1_u64, u64::saturating_mul);
+    // Packed 4-bit values plus a deliberately conservative allowance for
+    // group-64 scales, biases, alignment, and SafeTensors metadata.
+    elements.saturating_mul(3).div_ceil(4)
+}
+
+fn add_estimated_bytes(total: &mut u64, bytes: u64) -> Result<()> {
+    *total = total
+        .checked_add(bytes)
+        .context("SafeTensors affine-4 layer byte estimate overflow")?;
+    Ok(())
+}
+
+fn validate_planning_config(config: &RawStageModelConfig) -> Result<()> {
+    ensure!(
+        config.hidden_size > 0,
+        "SafeTensors hidden_size must be positive"
+    );
+    ensure!(
+        config.num_hidden_layers > 0,
+        "SafeTensors num_hidden_layers must be positive"
+    );
+    ensure!(
+        config.num_attention_heads > 0,
+        "SafeTensors num_attention_heads must be positive"
+    );
+    ensure!(
+        config
+            .hidden_size
+            .is_multiple_of(config.num_attention_heads)
+            || config.head_dim > 0,
+        "SafeTensors hidden_size is not divisible by num_attention_heads and head_dim is absent"
+    );
+    Ok(())
 }
 
 impl StageModelLayout {
@@ -174,16 +337,7 @@ pub(crate) fn prepare(
 }
 
 fn parse_stage_model_layout(bytes: &[u8]) -> Result<StageModelLayout> {
-    let config: RawStageModelConfig = match serde_json::from_slice(bytes) {
-        Ok(config) => config,
-        Err(strict_error) => {
-            let text =
-                std::str::from_utf8(bytes).context("SafeTensors model config is not UTF-8")?;
-            json5::from_str(text).with_context(|| {
-                format!("parse SafeTensors model config as strict JSON ({strict_error}) or JSON5")
-            })?
-        }
-    };
+    let config = parse_raw_stage_model_config(bytes)?;
     ensure!(
         config.num_hidden_layers > 0,
         "SafeTensors model num_hidden_layers must be non-zero"
@@ -199,6 +353,20 @@ fn parse_stage_model_layout(bytes: &[u8]) -> Result<StageModelLayout> {
         family,
         num_hidden_layers: config.num_hidden_layers,
     })
+}
+
+fn parse_raw_stage_model_config(bytes: &[u8]) -> Result<RawStageModelConfig> {
+    let config: RawStageModelConfig = match serde_json::from_slice(bytes) {
+        Ok(config) => config,
+        Err(strict_error) => {
+            let text =
+                std::str::from_utf8(bytes).context("SafeTensors model config is not UTF-8")?;
+            json5::from_str(text).with_context(|| {
+                format!("parse SafeTensors model config as strict JSON ({strict_error}) or JSON5")
+            })?
+        }
+    };
+    Ok(config)
 }
 
 fn validate_layer_range(
@@ -595,6 +763,22 @@ fn checked_sum(values: impl IntoIterator<Item = u64>) -> Result<u64> {
 mod tests {
     use super::*;
 
+    fn planning_tensor(name: &str, shape: Vec<u64>, source_bytes: u64) -> SelectedTensor {
+        SelectedTensor {
+            name: name.to_string(),
+            source_file: "model.safetensors".to_string(),
+            source_range: ByteRange {
+                start: 0,
+                end_exclusive: source_bytes,
+            },
+            header: TensorHeader {
+                dtype: "BF16".to_string(),
+                shape,
+                data_offsets: [0, source_bytes],
+            },
+        }
+    }
+
     #[test]
     fn recognizes_family_specific_layer_paths() {
         let llama = parse_stage_model_layout(
@@ -674,6 +858,26 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn affine4_layer_estimates_charge_boundary_tensors_to_loading_stages() {
+        let layout = StageModelLayout {
+            family: StageModelFamily::Llama,
+            num_hidden_layers: 2,
+        };
+        let tensors = vec![
+            planning_tensor("model.embed_tokens.weight", vec![128, 64], 16_384),
+            planning_tensor("model.layers.0.mlp.weight", vec![64, 64], 8_192),
+            planning_tensor("model.layers.1.mlp.weight", vec![64, 64], 8_192),
+            planning_tensor("model.norm.weight", vec![64], 128),
+            planning_tensor("lm_head.weight", vec![128, 64], 16_384),
+        ];
+
+        let estimates = estimated_affine4_layer_bytes(layout, &tensors).unwrap();
+
+        assert_eq!(estimates, vec![9_216, 15_488]);
+        assert!(estimates[1] > estimates[0]);
     }
 
     #[test]

@@ -15,7 +15,13 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use skippy_engine_mlx::{MlxBackend, MlxEngine, MlxEngineConfig};
+use skippy_engine_mlx::{
+    MlxBackend, MlxDistributedEngine, MlxDistributedEngineConfig, MlxEngine, MlxEngineConfig,
+    automatic_weight_quantization,
+};
+use skippy_protocol::binary::WireActivationDType;
+
+const DEFAULT_MAX_GENERATION_TOKENS: usize = 512;
 
 /// A loaded MLX model plus the OpenAI backend that serves it.
 pub(crate) struct MlxModelHandle {
@@ -26,11 +32,13 @@ impl MlxModelHandle {
     /// Loads a safetensors model directory on the MLX (Metal) engine. Blocking:
     /// call from `spawn_blocking`.
     pub(crate) fn load(model_dir: PathBuf, model_id: String, context_length: u32) -> Result<Self> {
+        let weight_quantization = automatic_weight_quantization(&model_dir)?;
         let config = MlxEngineConfig {
             model_dir,
             model_id,
-            default_max_tokens: context_length.max(1) as usize,
+            default_max_tokens: (context_length.max(1) as usize).min(DEFAULT_MAX_GENERATION_TOKENS),
             max_tokens_cap: context_length.max(1) as usize,
+            weight_quantization,
         };
         let engine = MlxEngine::spawn(config)?;
         Ok(Self {
@@ -38,33 +46,57 @@ impl MlxModelHandle {
         })
     }
 
+    /// Loads tokenizer/chat-template sidecars and drives a mesh-managed MLX
+    /// stage chain rooted at `stage_addr`. No model weights are loaded here.
+    pub(crate) fn load_distributed(
+        model_dir: PathBuf,
+        model_id: String,
+        context_length: u32,
+        stage_addr: SocketAddr,
+        wire_dtype: WireActivationDType,
+    ) -> Result<Self> {
+        let engine = MlxDistributedEngine::spawn(MlxDistributedEngineConfig {
+            model_dir,
+            model_id,
+            stage_addr,
+            wire_dtype,
+            default_max_tokens: (context_length.max(1) as usize).min(DEFAULT_MAX_GENERATION_TOKENS),
+            max_tokens_cap: context_length.max(1) as usize,
+            context_tokens: context_length.max(1) as usize,
+        })?;
+        Ok(Self {
+            backend: Arc::new(MlxBackend::new_distributed(engine)),
+        })
+    }
+
     /// Starts an `openai-frontend` HTTP server for this model on `port`.
-    pub(crate) fn start_http(&self, port: u16) -> MlxHttpHandle {
+    pub(crate) async fn start_http(
+        &self,
+        port: u16,
+        death_tx: tokio::sync::oneshot::Sender<()>,
+    ) -> Result<MlxHttpHandle> {
         let addr: SocketAddr = ([127, 0, 0, 1], port).into();
         let app = openai_frontend::router::router_for(self.backend.clone());
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let listener = tokio::net::TcpListener::bind(addr)
+            .await
+            .with_context(|| format!("bind MLX OpenAI frontend at {addr}"))?;
 
         let server = tokio::spawn(async move {
-            let listener = match tokio::net::TcpListener::bind(addr).await {
-                Ok(listener) => listener,
-                Err(error) => {
-                    tracing::error!(%addr, %error, "MLX openai frontend failed to bind");
-                    return;
-                }
-            };
             let serve = axum::serve(listener, app).with_graceful_shutdown(async move {
                 let _ = shutdown_rx.await;
             });
             if let Err(error) = serve.await {
                 tracing::error!(%error, "MLX openai frontend server error");
             }
+            let _ = death_tx.send(());
         });
 
-        MlxHttpHandle {
+        Ok(MlxHttpHandle {
             port,
             shutdown_tx: Some(shutdown_tx),
             server: Some(server),
-        }
+        })
     }
 }
 

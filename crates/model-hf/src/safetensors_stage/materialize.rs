@@ -16,7 +16,8 @@ use super::{
     layout,
     locking::CacheKeyLock,
     types::{
-        MANIFEST_SCHEMA_VERSION, PreparedStage, SafetensorsSourceShard, SafetensorsStageArtifact,
+        MANIFEST_SCHEMA_VERSION, PreparedSafetensorsCheckpoint, PreparedStage,
+        SafetensorsCheckpointDescriptor, SafetensorsSourceShard, SafetensorsStageArtifact,
         SafetensorsStageManifest, SafetensorsStagePlan, SafetensorsStageRequest, SelectedTensor,
     },
 };
@@ -25,8 +26,18 @@ const MODEL_FILE: &str = "model.safetensors";
 const CONFIG_FILE: &str = "config.json";
 const PLAN_FILE: &str = "stage-plan.json";
 const MANIFEST_FILE: &str = "stage-manifest.json";
+pub const CHECKPOINT_DESCRIPTOR_FILE: &str = "checkpoint-descriptor.json";
 const MAX_LOCAL_HEADER_BYTES: u64 = 256 * 1024 * 1024;
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+pub fn read_checkpoint_descriptor(path: &Path) -> Result<SafetensorsCheckpointDescriptor> {
+    read_json(&path.join(CHECKPOINT_DESCRIPTOR_FILE)).with_context(|| {
+        format!(
+            "read prepared SafeTensors checkpoint descriptor from {}",
+            path.display()
+        )
+    })
+}
 
 pub struct SafetensorsStageMaterializer {
     pub(crate) remote: RemoteSource,
@@ -53,6 +64,139 @@ impl SafetensorsStageMaterializer {
     pub fn plan(&self, request: SafetensorsStageRequest) -> Result<SafetensorsStagePlan> {
         let request = request.normalized()?;
         Ok(layout::prepare(&self.remote, &request)?.plan)
+    }
+
+    /// Fetches config/index/header metadata only. Tensor payload ranges are
+    /// planned but not downloaded.
+    pub fn describe_checkpoint(
+        &self,
+        repo: &str,
+        revision: &str,
+    ) -> Result<SafetensorsCheckpointDescriptor> {
+        layout::describe(&self.remote, repo, revision)
+    }
+
+    /// Caches only the tokenizer/config/chat-template files needed by the
+    /// distributed stage-0 frontend. No model tensor payload is downloaded.
+    pub fn prepare_checkpoint(
+        &self,
+        repo: &str,
+        revision: &str,
+    ) -> Result<PreparedSafetensorsCheckpoint> {
+        let descriptor = self.describe_checkpoint(repo, revision)?;
+        let cache_key = format!(
+            "checkpoint-{:x}",
+            Sha256::digest(format!("{repo}@{revision}").as_bytes())
+        );
+        let sidecar_root = self.cache_root.join("checkpoint-sidecars");
+        fs::create_dir_all(&sidecar_root).with_context(|| {
+            format!(
+                "create SafeTensors checkpoint sidecar cache {}",
+                sidecar_root.display()
+            )
+        })?;
+        let _cache_lock = CacheKeyLock::acquire(&self.cache_root, &cache_key)?;
+        let destination = sidecar_root.join(&cache_key);
+        if checkpoint_sidecars_match(&destination, &descriptor) {
+            return Ok(PreparedSafetensorsCheckpoint {
+                path: destination,
+                descriptor,
+            });
+        }
+        remove_stale_partials(&sidecar_root, &cache_key)?;
+        let temporary = temporary_path(&sidecar_root, &cache_key);
+        fs::create_dir(&temporary).with_context(|| {
+            format!(
+                "create temporary checkpoint sidecar cache {}",
+                temporary.display()
+            )
+        })?;
+        let write_result = self.write_checkpoint_sidecars(repo, revision, &temporary, &descriptor);
+        if let Err(error) = write_result {
+            let _ = fs::remove_dir_all(&temporary);
+            return Err(error);
+        }
+        let quarantine = destination
+            .exists()
+            .then(|| temporary_path(&sidecar_root, &format!("{cache_key}.stale")));
+        if let Some(quarantine) = quarantine.as_ref() {
+            fs::rename(&destination, quarantine).with_context(|| {
+                format!(
+                    "quarantine incomplete checkpoint sidecar cache {}",
+                    destination.display()
+                )
+            })?;
+        }
+        if let Err(error) = fs::rename(&temporary, &destination) {
+            if let Some(quarantine) = quarantine.as_ref() {
+                let _ = fs::rename(quarantine, &destination);
+            }
+            return Err(error).context("publish checkpoint sidecar cache");
+        }
+        if let Some(quarantine) = quarantine {
+            let _ = fs::remove_dir_all(quarantine);
+        }
+        sync_directory(&sidecar_root)?;
+        Ok(PreparedSafetensorsCheckpoint {
+            path: destination,
+            descriptor,
+        })
+    }
+
+    fn write_checkpoint_sidecars(
+        &self,
+        repo: &str,
+        revision: &str,
+        destination: &Path,
+        descriptor: &SafetensorsCheckpointDescriptor,
+    ) -> Result<()> {
+        self.cache_required_sidecar(repo, revision, "config.json", destination)?;
+        self.cache_required_sidecar(repo, revision, "tokenizer.json", destination)?;
+        for file in [
+            "tokenizer_config.json",
+            "chat_template.jinja",
+            "chat_template.json",
+            "generation_config.json",
+            "special_tokens_map.json",
+        ] {
+            self.cache_optional_sidecar(repo, revision, file, destination)?;
+        }
+        write_json(destination.join(CHECKPOINT_DESCRIPTOR_FILE), descriptor)?;
+        sync_directory(destination)
+    }
+
+    fn cache_required_sidecar(
+        &self,
+        repo: &str,
+        revision: &str,
+        file: &str,
+        destination: &Path,
+    ) -> Result<()> {
+        let remote = self
+            .remote
+            .small_file(
+                self.remote.url(repo, revision, file)?,
+                MAX_LOCAL_HEADER_BYTES,
+            )
+            .with_context(|| format!("download required checkpoint sidecar {file}"))?;
+        write_synced(destination.join(file), &remote.bytes)
+    }
+
+    fn cache_optional_sidecar(
+        &self,
+        repo: &str,
+        revision: &str,
+        file: &str,
+        destination: &Path,
+    ) -> Result<()> {
+        let Some(remote) = self.remote.optional_small_file(
+            self.remote.url(repo, revision, file)?,
+            MAX_LOCAL_HEADER_BYTES,
+        )?
+        else {
+            return Ok(());
+        };
+        write_synced(destination.join(file), &remote.bytes)
     }
 
     pub fn materialize(
@@ -289,13 +433,26 @@ impl SafetensorsStageMaterializer {
     }
 
     fn temporary_path(&self, cache_key: &str) -> PathBuf {
-        let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        self.cache_root.join(format!(
-            ".{cache_key}.{}.{}.partial",
-            std::process::id(),
-            sequence
-        ))
+        temporary_path(&self.cache_root, cache_key)
     }
+}
+
+fn checkpoint_sidecars_match(
+    destination: &Path,
+    expected: &SafetensorsCheckpointDescriptor,
+) -> bool {
+    destination.join(CONFIG_FILE).is_file()
+        && destination.join("tokenizer.json").is_file()
+        && read_checkpoint_descriptor(destination).is_ok_and(|actual| actual == *expected)
+}
+
+fn temporary_path(cache_root: &Path, cache_key: &str) -> PathBuf {
+    let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    cache_root.join(format!(
+        ".{cache_key}.{}.{}.partial",
+        std::process::id(),
+        sequence
+    ))
 }
 
 struct MaterializationSpan {

@@ -50,6 +50,21 @@ cache/session operations, additional staged families, and bounded
 range-to-derived-cache quantization remain. See
 `crates/skippy-engine-mlx/STAGED_EXECUTION.md`.
 
+**Update — whole-model and explicit mesh serving are now integrated.** The
+ordinary `mesh-llm serve --model` path can select MLX for a complete Hugging
+Face SafeTensors model, automatically quantize eligible unquantized dense
+weights to affine-4 at load time while preserving frontier/pre-quantized
+representations, and serve streaming or non-streaming OpenAI chat. The explicit `--split`
+path avoids the coordinator's full checkpoint download, advertises an additive
+MLX stage capability, derives per-host range-only affine artifacts, and drives
+the resulting chain from the same OpenAI surface. A real two-host 29/1-layer
+SmolLM2 run completed with roughly 70 MB and 17 MB stage artifacts while the
+remote never stored the roughly 269 MB source checkpoint. Planning now uses
+header-derived per-layer estimates so large embedding/readout tensors are not
+hidden by an equal-layer average. Automatic split selection and partial
+executors beyond dense Llama remain open. See
+`crates/skippy-engine-mlx/SERVE_INTEGRATION_STATUS.md`.
+
 **Update — host `StagePrepare` / `StageLoad` now consumes range-only MLX
 stages.** An immutable `hf-model://org/repo@<commit>` request is validated
 before network work, checked against a topology-wide checkpoint identity,

@@ -46,6 +46,7 @@ mlx = [
     "dep:safetensors",
     "dep:safemlx",
     "dep:safemlx-lm",
+    "dep:safemlx-lm-utils",
     "dep:serde",
     "dep:sha2",
     "dep:skippy-metrics",
@@ -92,6 +93,9 @@ safemlx = { git = "https://github.com/jbg/safemlx", rev = "4e53c5e", default-fea
     "safetensors",
 ], optional = true }
 safemlx-lm = { git = "https://github.com/jbg/safemlx", rev = "4e53c5e", optional = true }
+safemlx-lm-utils = { git = "https://github.com/jbg/safemlx", rev = "4e53c5e", default-features = false, features = [
+    "onig",
+], optional = true }
 # Standalone tokenizer for incremental (streaming) detokenization without
 # borrowing the model. `onig` matches safemlx-lm so the build dedupes.
 tokenizers = { version = "0.23", default-features = false, features = [

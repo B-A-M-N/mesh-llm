@@ -73,6 +73,33 @@ pub struct SafetensorsStagePlan {
     pub shards: Vec<SafetensorsShardPlan>,
 }
 
+/// Metadata-only description used to plan a distributed MLX topology without
+/// downloading checkpoint tensor payloads.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SafetensorsCheckpointDescriptor {
+    pub checkpoint_sha256: String,
+    pub repo: String,
+    pub revision: String,
+    pub model_type: String,
+    pub layer_count: u32,
+    pub hidden_size: u32,
+    pub native_context_length: u32,
+    pub dense_tensor_bytes: u64,
+    pub estimated_affine4_weight_bytes: u64,
+    /// Conservative affine-4 runtime bytes attributed to each transformer
+    /// layer. Boundary tensors are charged to the stages that load them.
+    #[serde(default)]
+    pub estimated_affine4_layer_bytes: Vec<u64>,
+    /// K + V cache bytes per token across all layers at BF16 precision.
+    pub kv_bytes_per_token_bf16: u64,
+}
+
+#[derive(Clone, Debug)]
+pub struct PreparedSafetensorsCheckpoint {
+    pub path: PathBuf,
+    pub descriptor: SafetensorsCheckpointDescriptor,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SafetensorsShardPlan {
     pub file: String,

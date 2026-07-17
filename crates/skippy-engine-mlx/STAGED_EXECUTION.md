@@ -6,8 +6,8 @@ Dense Llama-family MLX stages now run as separate OS processes from partial
 SafeTensors artifacts and communicate over Skippy's existing binary stage wire.
 The first proof uses `HuggingFaceTB/SmolLM2-135M-Instruct` split at layer 15.
 
-This is a production-shaped bridge with an explicit host control path, not yet
-the default automatic mesh launch path:
+This is now integrated with the explicit `mesh-llm serve --split` launch path,
+while automatic split selection remains future work:
 
 - `skippy-engine` owns the engine-neutral `StageEngine` contract and residual
   buffer descriptors.
@@ -25,10 +25,20 @@ the default automatic mesh launch path:
   `hf-model://org/repo@<commit>` reference now derive or reuse a validated
   quantized stage and start the same engine through the normal host
   stage-control loop.
+- The mesh advertises an additive `backend-mlx` capability, plans exact
+  SafeTensors ranges through its ordinary topology, and exposes the chain via
+  the normal OpenAI frontend.
 
 No process in the proof has access to the complete checkpoint. The tokenizer
 and config files are small shared metadata; tensor data comes only from that
 process's `model.safetensors`.
+
+The same branch also includes a complementary single-node proof. Ordinary
+`mesh-llm serve --model HuggingFaceTB/SmolLM2-135M-Instruct` resolves the full
+SafeTensors checkpoint, automatically quantizes eligible unquantized dense
+tensors to affine-4 during MLX load while preserving frontier/pre-quantized
+representations, and serves normal and streaming OpenAI chat. See
+`SERVE_INTEGRATION_STATUS.md` for the integrated status and limitations.
 
 ## Verified result
 

@@ -14,6 +14,8 @@ mod boundary_bench;
 #[cfg(all(feature = "mlx", target_os = "macos"))]
 mod derived;
 #[cfg(all(feature = "mlx", target_os = "macos"))]
+mod distributed;
+#[cfg(all(feature = "mlx", target_os = "macos"))]
 mod engine;
 #[cfg(all(feature = "mlx", target_os = "macos"))]
 mod stage;
@@ -34,7 +36,11 @@ pub use derived::{
     load_prepared_quantized_stage, mlx_derived_stage_cache_root, validate_nemotron_h_moe_stage,
 };
 #[cfg(all(feature = "mlx", target_os = "macos"))]
-pub use engine::{ChatTurn, GenerateRequest, MlxEngine, MlxEngineConfig};
+pub use distributed::{MlxDistributedEngine, MlxDistributedEngineConfig};
+#[cfg(all(feature = "mlx", target_os = "macos"))]
+pub use engine::{
+    ChatTurn, GenerateRequest, MlxEngine, MlxEngineConfig, automatic_weight_quantization,
+};
 #[cfg(all(feature = "mlx", target_os = "macos"))]
 pub use stage::{
     MlxComputeDtype, MlxNemotronHStageValidationReport, MlxNemotronHWireValidationReport,

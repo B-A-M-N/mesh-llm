@@ -11,6 +11,8 @@
 //! This also naturally serializes GPU access (one generation at a time), which
 //! matches how goose drives safemlx today.
 
+use std::fs;
+use std::path::Path;
 use std::path::PathBuf;
 use std::thread;
 use std::time::Instant;
@@ -21,9 +23,11 @@ use tokio::sync::mpsc;
 
 use safemlx::transforms::async_eval;
 use safemlx::{Device, DeviceType, Stream};
-use safemlx_lm::models::LoadedModel;
 use safemlx_lm::models::input::{InputPart, ModelInput};
+use safemlx_lm::models::{LoadedModel, ModelLoadOptions};
 use safemlx_lm::sampler::DefaultSampler;
+
+use crate::stage::MlxWeightQuantization;
 
 /// How the worker should load and run a model.
 #[derive(Clone, Debug)]
@@ -32,6 +36,54 @@ pub struct MlxEngineConfig {
     pub model_id: String,
     pub default_max_tokens: usize,
     pub max_tokens_cap: usize,
+    /// Quantize eligible dense checkpoint tensors as they are loaded. Already
+    /// quantized checkpoints with matching metadata load directly.
+    pub weight_quantization: Option<MlxWeightQuantization>,
+}
+
+/// Selects load-time affine-4 only for dense, unquantized model families that
+/// the pinned safemlx runtime can quantize safely. Frontier grouped-expert
+/// families and checkpoints already declaring a representation load natively.
+pub fn automatic_weight_quantization(model_dir: &Path) -> Result<Option<MlxWeightQuantization>> {
+    if model_dir.is_file() {
+        return Ok(None);
+    }
+    let config: Value = serde_json::from_slice(
+        &fs::read(model_dir.join("config.json"))
+            .map_err(|error| anyhow!("read MLX config.json: {error}"))?,
+    )
+    .map_err(|error| anyhow!("parse MLX config.json: {error}"))?;
+    Ok(automatic_weight_quantization_for_config(&config))
+}
+
+fn automatic_weight_quantization_for_config(config: &Value) -> Option<MlxWeightQuantization> {
+    let model_type = config.get("model_type").and_then(Value::as_str);
+    let text_config = config.get("text_config");
+    let text_model_type = text_config
+        .and_then(|value| value.get("model_type"))
+        .and_then(Value::as_str);
+    let is_grouped_expert = |model_type: Option<&str>| {
+        matches!(
+            model_type,
+            Some("inkling_mm_model" | "nemotron_h" | "nemotron_h_moe")
+        )
+    };
+    let unsupported_grouped_experts =
+        is_grouped_expert(model_type) || is_grouped_expert(text_model_type);
+    let declares_representation = declares_weight_representation(config)
+        || text_config.is_some_and(declares_weight_representation);
+    (!unsupported_grouped_experts && !declares_representation).then_some(
+        MlxWeightQuantization::Affine {
+            group_size: 64,
+            bits: 4,
+        },
+    )
+}
+
+fn declares_weight_representation(config: &Value) -> bool {
+    ["quantization", "quantization_config", "compression_config"]
+        .iter()
+        .any(|key| config.get(*key).is_some_and(|value| !value.is_null()))
 }
 
 /// One chat turn, in `Send` form (no MLX types).
@@ -138,17 +190,30 @@ fn load_engine(config: &MlxEngineConfig) -> Result<LoadedEngine> {
     let weights_stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
 
     let started = Instant::now();
-    let model = LoadedModel::load(&config.model_dir, &stream, &weights_stream)
-        .map_err(|e| anyhow!("load {}: {e}", config.model_dir.display()))?;
+    let options = config
+        .weight_quantization
+        .map(MlxWeightQuantization::safemlx)
+        .transpose()?
+        .map_or_else(
+            ModelLoadOptions::default,
+            ModelLoadOptions::with_quantization,
+        );
+    let model =
+        LoadedModel::load_with_options(&config.model_dir, options, &stream, &weights_stream)
+            .map_err(|e| anyhow!("load {}: {e}", config.model_dir.display()))?;
     stream.synchronize().map_err(|e| anyhow!("sync: {e}"))?;
 
     let tokenizer = tokenizers::Tokenizer::from_file(config.model_dir.join("tokenizer.json"))
         .map_err(|e| anyhow!("tokenizer.json: {e}"))?;
     let eos = model.eos_token_ids().to_vec();
+    let quantization_label = config
+        .weight_quantization
+        .map_or_else(|| "checkpoint".to_string(), MlxWeightQuantization::label);
 
     tracing::info!(
         model = %config.model_id,
         kind = model.model_type(),
+        weight_quantization = %quantization_label,
         load_secs = started.elapsed().as_secs_f64(),
         "MLX model loaded"
     );
@@ -178,7 +243,7 @@ fn run_worker(
 
     while let Some(job) = job_rx.blocking_recv() {
         let reply = job.reply.clone();
-        if let Err(e) = generate_one(&mut engine, job) {
+        if let Err(e) = generate_one(&config, &mut engine, job) {
             let _ = reply.send(TokenMsg::Error(e.to_string()));
         }
     }
@@ -209,7 +274,7 @@ fn build_prompt(model: &mut LoadedModel, req: &GenerateRequest) -> Result<(Strin
     }
 }
 
-fn generate_one(engine: &mut LoadedEngine, job: Job) -> Result<()> {
+fn generate_one(config: &MlxEngineConfig, engine: &mut LoadedEngine, job: Job) -> Result<()> {
     let LoadedEngine {
         model,
         stream,
@@ -223,6 +288,13 @@ fn generate_one(engine: &mut LoadedEngine, job: Job) -> Result<()> {
         .encode_to_array(&prompt, add_special, stream)
         .map_err(|e| anyhow!("encode: {e}"))?;
     let prompt_tokens = tokens.shape()[1] as u32;
+    let available_tokens = config.max_tokens_cap.saturating_sub(prompt_tokens as usize);
+    anyhow::ensure!(
+        available_tokens > 0,
+        "MLX prompt uses {prompt_tokens} tokens, exceeding the {}-token context",
+        config.max_tokens_cap
+    );
+    let max_tokens = job.req.max_tokens.min(available_tokens);
 
     let mut cache = model.new_cache();
     let parts = [InputPart::text_token_ids(&tokens)];
@@ -236,12 +308,13 @@ fn generate_one(engine: &mut LoadedEngine, job: Job) -> Result<()> {
         DefaultSampler,
     );
 
-    let mut ids: Vec<u32> = Vec::with_capacity(job.req.max_tokens);
+    let mut ids: Vec<u32> = Vec::with_capacity(max_tokens);
+    let mut decoder = tokenizer.decode_stream(true);
     let mut emitted = String::new();
     let mut finish = FinishReason::Length;
 
     let mut current = generator.next().transpose().map_err(|e| anyhow!("{e}"))?;
-    for index in 0..job.req.max_tokens {
+    for index in 0..max_tokens {
         let Some(token) = current.take() else {
             finish = FinishReason::Stop;
             break;
@@ -249,7 +322,7 @@ fn generate_one(engine: &mut LoadedEngine, job: Job) -> Result<()> {
 
         // Start the next decode before reading this token back (mlx-lm's
         // one-token async pipeline overlaps compute with host readback).
-        let next = if index + 1 < job.req.max_tokens {
+        let next = if index + 1 < max_tokens {
             let next = generator.next();
             if let Some(Ok(next_token)) = next.as_ref() {
                 async_eval([next_token]).map_err(|e| anyhow!("async_eval: {e}"))?;
@@ -266,21 +339,14 @@ fn generate_one(engine: &mut LoadedEngine, job: Job) -> Result<()> {
         }
         ids.push(token_id);
 
-        // Incremental detokenization: decode the whole id sequence and emit only
-        // the newly appended suffix. Robust for byte-level BPE where one char can
-        // span multiple tokens.
-        let full = tokenizer
-            .decode(&ids, true)
-            .map_err(|e| anyhow!("decode: {e}"))?;
-        if let Some(delta) = full.strip_prefix(emitted.as_str()) {
-            if !delta.is_empty() {
-                if reply.send(TokenMsg::Delta(delta.to_string())).is_err() {
-                    return Ok(()); // client hung up
-                }
-                emitted = full;
+        if let Some(delta) = decoder
+            .step(token_id)
+            .map_err(|error| anyhow!("decode: {error}"))?
+        {
+            emitted.push_str(&delta);
+            if reply.send(TokenMsg::Delta(delta)).is_err() {
+                return Ok(()); // client hung up
             }
-        } else {
-            emitted = full; // rare re-render; resync silently
         }
 
         if reply.is_closed() {
@@ -289,10 +355,64 @@ fn generate_one(engine: &mut LoadedEngine, job: Job) -> Result<()> {
         current = next.transpose().map_err(|e| anyhow!("{e}"))?;
     }
 
+    let decoded = tokenizer
+        .decode(&ids, true)
+        .map_err(|error| anyhow!("finalize decode: {error}"))?;
+    if let Some(suffix) = decoded.strip_prefix(&emitted)
+        && !suffix.is_empty()
+    {
+        let _ = reply.send(TokenMsg::Delta(suffix.to_string()));
+    }
+
     let _ = reply.send(TokenMsg::Done {
         finish_reason: finish,
         prompt_tokens,
         completion_tokens: ids.len() as u32,
     });
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn automatic_quantization_preserves_frontier_and_prequantized_models() {
+        assert_eq!(
+            automatic_weight_quantization_for_config(&json!({"model_type": "llama"})),
+            Some(MlxWeightQuantization::Affine {
+                group_size: 64,
+                bits: 4
+            })
+        );
+        assert_eq!(
+            automatic_weight_quantization_for_config(&json!({"model_type": "inkling_mm_model"})),
+            None
+        );
+        assert_eq!(
+            automatic_weight_quantization_for_config(&json!({"model_type": "nemotron_h"})),
+            None
+        );
+        assert_eq!(
+            automatic_weight_quantization_for_config(&json!({
+                "model_type": "multimodal_wrapper",
+                "text_config": {"model_type": "nemotron_h"}
+            })),
+            None
+        );
+        assert_eq!(
+            automatic_weight_quantization_for_config(&json!({
+                "model_type": "qwen3",
+                "quantization_config": {"bits": 8}
+            })),
+            None
+        );
+        assert_eq!(
+            automatic_weight_quantization_for_config(&json!({
+                "model_type": "qwen3_vl",
+                "text_config": {"compression_config": {"format": "mxfp4"}}
+            })),
+            None
+        );
+    }
 }

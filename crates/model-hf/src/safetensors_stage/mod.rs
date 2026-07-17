@@ -5,10 +5,13 @@ mod materialize;
 mod tensor_stream;
 mod types;
 
-pub use materialize::SafetensorsStageMaterializer;
+pub use materialize::{
+    CHECKPOINT_DESCRIPTOR_FILE, SafetensorsStageMaterializer, read_checkpoint_descriptor,
+};
 pub use tensor_stream::SafetensorsStageTensorVisit;
 pub use types::{
-    ByteRange, SafetensorsShardPlan, SafetensorsSourceShard, SafetensorsStageArtifact,
+    ByteRange, PreparedSafetensorsCheckpoint, SafetensorsCheckpointDescriptor,
+    SafetensorsShardPlan, SafetensorsSourceShard, SafetensorsStageArtifact,
     SafetensorsStageManifest, SafetensorsStagePlan, SafetensorsStageRequest,
     SafetensorsStageTensorFile, SafetensorsStageTensorVisitReport,
 };

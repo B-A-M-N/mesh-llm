@@ -1,113 +1,118 @@
-# MLX serve-integration — WIP status & blocker
+# MLX serve integration status
 
-This branch (`micn/mlx-serve-wiring`) stacks the **`mesh-llm serve` integration**
-on top of the standalone MLX engine crate from PR #1009 (`micn/mlx-redux`).
+## Draft status
 
-Goal: on a Mac, `mesh-llm serve --model <hf-safetensors>` routes to the MLX
-(Metal) engine and the model appears in `/v1/models` — with non-macOS / no-feature
-builds byte-for-byte unaffected.
+The `micn/mlx-redux` draft now has two connected serving proofs on Apple
+Silicon. Both use mesh-llm's ordinary model/runtime and OpenAI surfaces rather
+than a standalone demonstration server.
 
-**Status: functionally complete and verified locally, but blocked by one repo
-publish invariant. Needs a maintainer decision before it can merge.** Captured
-here so the work + reasoning aren't lost.
+1. Whole-model serving resolves a Hugging Face SafeTensors repository through
+   the normal `mesh-llm serve --model ...` path, loads it with MLX, applies
+   automatic affine 4-bit/group-64 quantization while loading eligible dense
+   weights, and
+   serves `/v1/models` plus streaming and non-streaming chat completions.
+2. Explicit `--split` serving resolves only metadata at the coordinator,
+   advertises an additive MLX stage capability, plans the ordinary stage
+   topology, and makes each stage fetch and derive only its assigned tensor
+   ranges. The coordinator's OpenAI frontend drives the stage chain over the
+   existing Skippy binary activation transport.
 
-## What works (verified on Apple Silicon this session)
+This is a substantial draft checkpoint, not production support for arbitrary
+SafeTensors models.
 
-- `skippy-engine-mlx` is now a real workspace member (removed its private
-  `[workspace]`; added to root `members`, both CI crate-list scripts, and it
-  stays out of `default-members`).
-- `mlx` feature added to `mesh-llm-host-runtime` and `mesh-llm`, wired as a
-  **macOS-target-gated optional dep** (`[target.'cfg(target_os = "macos")'.dependencies]`).
-- `crates/mesh-llm-host-runtime/src/inference/mlx.rs`: `MlxModelHandle` +
-  `MlxHttpHandle` serving over the real `openai-frontend::router_for` + axum, with
-  graceful shutdown.
-- `LocalRuntimeBackendHandle::Mlx` variant + all match arms (cfg-gated).
-- `start_runtime_mlx_model` + `is_safetensors_model_path` routing: safetensors
-  models branch to MLX *before* the GGUF planning path.
-- **Build gate PASSED:** `cargo build -p mesh-llm --features mlx` → exit 0.
-- **Don't-break-default PASSED:** no-feature `cargo check`/clippy clean;
-  `cargo tree` confirms safemlx is absent unless `--features mlx`.
-- fmt clean; clippy clean both with and without `--features mlx`
-  (boxed the `Skippy` enum variant to satisfy `large_enum_variant`).
-- `xtask repo-consistency ci-crate-lists` PASSES.
+## Verified whole-model proof
 
-## Key finding: the two-native-stack link collision (RESOLVED)
-
-Linking MLX statically alongside the patched llama.cpp fails with:
-
-```
-ld64.lld: error: duplicate symbol: gguf_get_key
-  >>> defined in .../gguflib-src/gguflib.c              (MLX's vendored GGUF parser)
-  >>> defined in libskippy_ffi...(gguf.cpp.o)           (patched llama.cpp)
-```
-
-MLX statically links antirez's `gguflib` (via `MLX_BUILD_GGUF=ON`, and
-`safemlx-sys` link-directs `gguflib` unconditionally); the patched llama.cpp
-exports the same C symbols. Two independent GGUF parsers → duplicate symbol.
-
-**Fix:** the `mlx` feature now implies `dynamic-native-runtime`. That loads the
-llama.cpp runtime as a dylib (as release builds already do), so its GGUF symbols
-live in a separate link unit and don't collide with MLX's static `gguflib`.
-`cargo build -p mesh-llm --features mlx` alone links clean after this.
-
-## BLOCKER: publish invariant (needs a maintainer call)
-
-```
-cargo run -p xtask -- repo-consistency release-targets
-  error: mesh-llm-host-runtime: publishable crate depends on
-         non-publishable workspace crate `skippy-engine-mlx`
-```
-
-Root-cause chain:
-- `skippy-engine-mlx` git-pins `safemlx` / `safemlx-lm` to a public commit of
-  `github.com/jbg/safemlx` (crates.io's published safemlx produces gibberish for
-  dense models — verified; only the git commit serves correctly).
-- crates.io forbids git dependencies → the crate must be `publish = false`.
-- `mesh-llm-host-runtime` is a **published** SDK crate, and the repo invariant
-  (enforced by `xtask release-targets`, reflecting a real `cargo publish`
-  constraint) forbids a publishable crate from depending on a `publish = false`
-  one — even an optional, target-gated dep.
-
-This is **not solved elsewhere in the repo**: the other `publish = false` crates
-(`skippy-quantize`, `mesh-llm-commands`) are only consumed by the non-published
-binary crate `mesh-llm`, never by a published library crate.
-
-### Options
-
-- **A. `[patch.crates-io]` redirect + make the crate publishable.** Follows the
-  existing `hf-hub` precedent (a published-crate dep already redirected to a fork
-  via `[patch.crates-io]` in the root manifest). Add `skippy-engine-mlx` to
-  `scripts/publish-crates.sh`. Caveat that differs from hf-hub: safemlx's
-  *published* version is known-broken, so a hypothetically-published
-  `skippy-engine-mlx` with `mlx` on would reference broken upstream — acceptable
-  only because the feature is off by default and explicitly a stopgap until
-  safemlx cuts a working release.
-- **B. Hold the host-runtime wiring.** Ship the standalone crate (PR #1009) as
-  is; keep this branch as the ready-to-go integration until safemlx releases a
-  working crates.io version, then flip git-pin → version-pin and merge. Most
-  honest; doesn't deliver "serve just works" yet.
-- **C. Loosen the xtask invariant** to exempt optional/target deps. Not
-  recommended: it would allow a manifest that genuinely cannot `cargo publish`.
-
-**Recommendation: B for now** (this branch is the parked, working integration),
-moving to **A** if/when we want it live before safemlx releases. The real
-unlock is a working safemlx crates.io release, after which this is a trivial
-git-pin → version-pin swap and the invariant is satisfied automatically.
-
-## How to reproduce / verify
+`HuggingFaceTB/SmolLM2-135M-Instruct` was started through the shipped command
+shape:
 
 ```bash
-export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer   # Metal toolchain
-cargo build -p mesh-llm --features mlx          # exit 0 (links clean)
-cargo check -p mesh-llm-host-runtime            # no-feature: clean, no safemlx
-cargo run -p xtask -- repo-consistency ci-crate-lists     # PASS
-cargo run -p xtask -- repo-consistency release-targets    # FAILS (the blocker)
+mesh-llm serve --model HuggingFaceTB/SmolLM2-135M-Instruct
 ```
 
-## Remaining once unblocked
+The normal resolver downloaded the complete SafeTensors checkpoint, selected
+backend `mlx`, and served model listing, non-streaming chat, and SSE chat. This
+proves useful single-node MLX serving is part of the work. It intentionally
+does not prove partial downloads: a whole-model server needs all model weights.
 
-- End-to-end serve test: `mesh-llm serve --model <mlx-safetensors-repo>` →
-  confirm `/v1/models` + `/v1/chat/completions`.
-- Fold this status into `WIRING.md` (note the `dynamic-native-runtime`
-  requirement and the publish resolution chosen).
-- Rebase onto `main` and open/land the real PR.
+The integrated loader now quantizes eligible, unquantized dense source tensors
+to affine 4-bit as they load. Inkling, Nemotron-H, and checkpoints already
+declaring a quantized representation retain their native representation. The
+earlier solo-serving measurements showed that this
+load-time representation has the same steady-state generation speed as loading
+an equivalent pre-quantized artifact; see `../../spikes/mlx-solo/FINDINGS.md`.
+
+The 135M model is adequate as a serving and protocol oracle, but its weak agent
+output is not evidence of Goose-quality model behavior. Larger single-node
+models still need quality, memory-high-water, and agent-harness measurements.
+
+## Verified mesh split proof
+
+A two-host explicit split of the same 30-layer model completed through the
+normal OpenAI frontend:
+
+| Stage | Layers | Derived affine-4 artifact |
+| --- | ---: | ---: |
+| coordinator stage | `0..29` | about 70 MB |
+| remote final stage | `29..30` | about 17 MB |
+
+The remote host never stored the complete roughly 269 MB source checkpoint.
+It fetched metadata plus the tensor ranges selected for its layer and final
+boundary tensors. A non-streaming request traversed both real stages and
+returned coherent text; SSE also completed with `[DONE]`.
+
+The apparently uneven artifacts are expected: embeddings and readout tensors
+are much larger than a typical transformer block. The planner now derives
+conservative per-layer affine-4 estimates from SafeTensors headers and charges
+boundary tensors to every stage that loads them, rather than dividing total
+bytes evenly by layer count.
+
+## Safety and lifecycle behavior
+
+- Only immutable 40-character Hugging Face revisions identify split tensor
+  ranges.
+- Config, index, and shard headers are fetched before tensor payloads; exact
+  HTTP ranges are identity-checked with strong ETags.
+- Coordinator sidecars and derived stage artifacts are lock-protected and
+  atomically published.
+- Stage `Prepare` may derive a missing entry; `Load` validates and consumes an
+  already prepared entry.
+- Connections track every touched session. EOF, transport error, timeout, or
+  normal stop resets local state and propagates `Stop` through downstream
+  stages.
+- Stage and generation I/O have bounded timeouts.
+- MLX frontend bind succeeds before the model is advertised as ready.
+- The capability advertisement is additive and is emitted only by an
+  Apple-Silicon build containing the MLX feature. Older peers safely treat the
+  absent field as unsupported.
+
+## Current boundaries
+
+- Partial-download integration is currently entered by explicit `--split`;
+  automatic startup still follows the existing whole-model resolver.
+- Integrated partial generation supports dense `model_type=llama` stages.
+- Generation is serialized to one MLX lane and currently uses greedy sampling.
+- Automatic affine-4 is the current default for eligible dense checkpoints,
+  not yet a general hardware/quality policy surface.
+- Cache capacity and eviction are not yet owned by this integration.
+- Frontier families require their own stage semantics. Nemotron-H has
+  metadata/range planning and a one-layer execution proof, but not a complete
+  hybrid-model topology. Inkling has whole-model support in the pinned safemlx
+  runtime and compelling exact-range storage evidence, but no integrated
+  partial-stage executor yet.
+
+## Build and focused verification
+
+Use the MLX recipes because they provide the full Xcode Metal toolchain and
+copy the required `mlx.metallib` beside the executable:
+
+```bash
+just mlx-build
+just mlx-release-build
+```
+
+Focused library checks require the same developer directory:
+
+```bash
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
+  cargo test -p skippy-engine-mlx --features mlx --lib
+```

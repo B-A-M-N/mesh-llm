@@ -19,16 +19,51 @@ use openai_frontend::common::{FinishReason, Usage, completion_id};
 use openai_frontend::errors::OpenAiError;
 use openai_frontend::models::ModelObject;
 
+use crate::distributed::MlxDistributedEngine;
 use crate::engine::{ChatTurn, FinishReason as EngineFinish, GenerateRequest, MlxEngine, TokenMsg};
 
+enum BackendEngine {
+    Local(MlxEngine),
+    Distributed(MlxDistributedEngine),
+}
+
+impl BackendEngine {
+    fn model_id(&self) -> &str {
+        match self {
+            Self::Local(engine) => engine.model_id(),
+            Self::Distributed(engine) => engine.model_id(),
+        }
+    }
+
+    fn clamp_max_tokens(&self, requested: Option<usize>) -> usize {
+        match self {
+            Self::Local(engine) => engine.clamp_max_tokens(requested),
+            Self::Distributed(engine) => engine.clamp_max_tokens(requested),
+        }
+    }
+
+    fn submit(&self, request: GenerateRequest) -> tokio::sync::mpsc::UnboundedReceiver<TokenMsg> {
+        match self {
+            Self::Local(engine) => engine.submit(request),
+            Self::Distributed(engine) => engine.submit(request),
+        }
+    }
+}
+
 pub struct MlxBackend {
-    engine: Arc<MlxEngine>,
+    engine: Arc<BackendEngine>,
 }
 
 impl MlxBackend {
     pub fn new(engine: MlxEngine) -> Self {
         Self {
-            engine: Arc::new(engine),
+            engine: Arc::new(BackendEngine::Local(engine)),
+        }
+    }
+
+    pub fn new_distributed(engine: MlxDistributedEngine) -> Self {
+        Self {
+            engine: Arc::new(BackendEngine::Distributed(engine)),
         }
     }
 

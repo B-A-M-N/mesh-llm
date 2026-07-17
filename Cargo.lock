@@ -7784,6 +7784,7 @@ dependencies = [
  "reqwest 0.12.28",
  "safemlx",
  "safemlx-lm",
+ "safemlx-lm-utils",
  "safetensors",
  "serde",
  "serde_json",

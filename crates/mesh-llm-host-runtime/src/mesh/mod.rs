@@ -1603,6 +1603,7 @@ pub(crate) struct PeerAnnouncement {
     pub(crate) artifact_transfer_supported: bool,
     pub(crate) stage_protocol_generation_supported: bool,
     pub(crate) stage_status_list_supported: bool,
+    pub(crate) mlx_stage_supported: bool,
     pub(crate) advertised_model_throughput: Vec<crate::network::metrics::ModelThroughputHint>,
     pub(crate) latency_ms: Option<u32>,
     pub(crate) latency_source: Option<crate::proto::node::LatencySource>,
@@ -1701,6 +1702,7 @@ pub struct PeerInfo {
     pub artifact_transfer_supported: bool,
     pub stage_protocol_generation_supported: bool,
     pub stage_status_list_supported: bool,
+    pub mlx_stage_supported: bool,
     pub(crate) advertised_model_throughput: Vec<crate::network::metrics::ModelThroughputHint>,
     /// Most recent direct RTT sample for display purposes (refreshed periodically).
     pub display_rtt: Option<DirectLatencyObservation>,
@@ -1784,6 +1786,7 @@ impl PeerInfo {
             artifact_transfer_supported: ann.artifact_transfer_supported,
             stage_protocol_generation_supported: ann.stage_protocol_generation_supported,
             stage_status_list_supported: ann.stage_status_list_supported,
+            mlx_stage_supported: ann.mlx_stage_supported,
             advertised_model_throughput: ann.advertised_model_throughput.clone(),
             display_rtt: None,
             selected_path: None,
@@ -7848,6 +7851,7 @@ impl Node {
             skippy_protocol::STAGE_SUBPROTOCOL_FEATURE_STATUS_LIST => {
                 peer.stage_status_list_supported
             }
+            skippy_protocol::STAGE_SUBPROTOCOL_FEATURE_BACKEND_MLX => peer.mlx_stage_supported,
             _ => false,
         }
     }

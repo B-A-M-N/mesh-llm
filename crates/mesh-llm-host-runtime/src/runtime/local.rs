@@ -85,7 +85,6 @@ pub(super) enum LocalRuntimeBackendHandle {
         // as the HTTP server is serving it; not read directly.
         _model: crate::inference::mlx::MlxModelHandle,
         http: crate::inference::mlx::MlxHttpHandle,
-        _death_tx: tokio::sync::oneshot::Sender<()>,
     },
 }
 
@@ -598,6 +597,8 @@ pub(super) async fn start_runtime_local_model(
         return start_runtime_mlx_model(spec, model_name).await;
     }
 
+    crate::system::native_runtime::ensure_native_runtime_loaded()?;
+
     let package_ref = spec.model_path.to_string_lossy().to_string();
     let layer_package = if skippy::is_layer_package_ref(&package_ref) {
         let package_ref_for_identity = package_ref.clone();
@@ -721,6 +722,12 @@ fn scan_layer_package_metadata(
 }
 
 pub(super) fn runtime_model_planning_bytes(model_path: &Path) -> Result<u64> {
+    #[cfg(all(feature = "mlx", target_os = "macos"))]
+    if let Ok(descriptor) = model_hf::safetensors_stage::read_checkpoint_descriptor(model_path)
+        && descriptor.estimated_affine4_weight_bytes > 0
+    {
+        return Ok(descriptor.estimated_affine4_weight_bytes);
+    }
     let package_ref = model_path.to_string_lossy().to_string();
     if skippy::is_layer_package_ref(&package_ref) {
         return Ok(skippy::identity_from_layer_package(&package_ref)?.source_model_bytes);
@@ -759,8 +766,7 @@ pub(super) async fn start_runtime_split_model(
     let SplitRuntimeStartPreparation {
         package,
         participant_snapshot,
-        compact_meta,
-        kv_bytes_per_token,
+        planning_metadata,
         planned_topology,
     } = split_setup;
     let stages = planned_topology.stages;
@@ -815,7 +821,8 @@ pub(super) async fn start_runtime_split_model(
         SPLIT_INITIAL_SHUTDOWN_GENERATION,
         planned_participants,
         stages,
-    );
+    )
+    .with_control_managed_stage0(package.package_ref.starts_with("hf-model://"));
     let mut loaded = load_split_runtime_generation(SplitGenerationLoadSpec {
         node: spec.node,
         mesh_config: spec.mesh_config,
@@ -850,10 +857,10 @@ pub(super) async fn start_runtime_split_model(
         projector_path,
         ctx_size,
         topology_resources: SplitTopologyResourceInputs {
-            native_context_length: compact_meta.context_length,
-            kv_bytes_per_token,
+            native_context_length: planning_metadata.native_context_length,
+            kv_bytes_per_token: planning_metadata.kv_bytes_per_token,
             ctx_size_override: spec.ctx_size_override,
-            parallel_override: spec.parallel_override,
+            parallel_override: split_parallel_override(&package, spec.parallel_override),
         },
         cache_type_k_override: spec.cache_type_k_override.map(str::to_string),
         cache_type_v_override: spec.cache_type_v_override.map(str::to_string),
@@ -874,9 +881,14 @@ pub(super) async fn start_runtime_split_model(
 struct SplitRuntimeStartPreparation {
     package: skippy::SkippyPackageIdentity,
     participant_snapshot: SplitParticipantSnapshot,
-    compact_meta: models::gguf::GgufCompactMeta,
-    kv_bytes_per_token: u64,
+    planning_metadata: SplitRuntimePlanningMetadata,
     planned_topology: PlannedRuntimeSliceTopology,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SplitRuntimePlanningMetadata {
+    native_context_length: u32,
+    kv_bytes_per_token: u64,
 }
 
 async fn prepare_split_runtime_start(
@@ -895,13 +907,12 @@ async fn prepare_split_runtime_start(
         timeout,
     )
     .await?;
-    let compact_meta = split_runtime_compact_meta(&package).await?;
-    let kv_bytes_per_token = split_runtime_kv_bytes_per_token(
+    let planning_metadata = split_runtime_planning_metadata(
         &package,
-        &compact_meta,
         spec.cache_type_k_override,
         spec.cache_type_v_override,
-    )?;
+    )
+    .await?;
     let planned_topology = plan_runtime_slice_topology_with_resources(
         topology_id,
         model_ref,
@@ -909,18 +920,54 @@ async fn prepare_split_runtime_start(
         &participant_snapshot.participants,
         &participant_snapshot.excluded,
         SplitTopologyResourceInputs {
-            native_context_length: compact_meta.context_length,
-            kv_bytes_per_token,
+            native_context_length: planning_metadata.native_context_length,
+            kv_bytes_per_token: planning_metadata.kv_bytes_per_token,
             ctx_size_override: spec.ctx_size_override,
-            parallel_override: spec.parallel_override,
+            parallel_override: split_parallel_override(&package, spec.parallel_override),
         },
     )?;
     Ok(SplitRuntimeStartPreparation {
         package,
         participant_snapshot,
-        compact_meta,
-        kv_bytes_per_token,
+        planning_metadata,
         planned_topology,
+    })
+}
+
+fn split_parallel_override(
+    package: &skippy::SkippyPackageIdentity,
+    requested: Option<usize>,
+) -> Option<usize> {
+    if package.package_ref.starts_with("hf-model://") {
+        Some(1)
+    } else {
+        requested
+    }
+}
+
+async fn split_runtime_planning_metadata(
+    package: &skippy::SkippyPackageIdentity,
+    cache_type_k_override: Option<&str>,
+    cache_type_v_override: Option<&str>,
+) -> Result<SplitRuntimePlanningMetadata> {
+    #[cfg(all(feature = "mlx", target_os = "macos"))]
+    if is_mlx_split_package(package) {
+        let descriptor = describe_mlx_split_package(package).await?;
+        return Ok(SplitRuntimePlanningMetadata {
+            native_context_length: descriptor.native_context_length,
+            kv_bytes_per_token: descriptor.kv_bytes_per_token_bf16,
+        });
+    }
+
+    let compact_meta = split_runtime_compact_meta(package).await?;
+    Ok(SplitRuntimePlanningMetadata {
+        native_context_length: compact_meta.context_length,
+        kv_bytes_per_token: split_runtime_kv_bytes_per_token(
+            package,
+            &compact_meta,
+            cache_type_k_override,
+            cache_type_v_override,
+        )?,
     })
 }
 
@@ -979,6 +1026,10 @@ async fn resolve_split_runtime_package(
     model_path: &Path,
     model_ref: &str,
 ) -> Result<skippy::SkippyPackageIdentity> {
+    #[cfg(all(feature = "mlx", target_os = "macos"))]
+    if is_safetensors_model_path(model_path) {
+        return resolve_mlx_split_package(model_path).await;
+    }
     let model_path_str = model_path.to_string_lossy().to_string();
     if skippy::is_layer_package_ref(&model_path_str) {
         Ok(tokio::task::spawn_blocking(move || {
@@ -991,6 +1042,119 @@ async fn resolve_split_runtime_package(
             model_ref, model_path,
         )?)
     }
+}
+
+#[cfg(all(feature = "mlx", target_os = "macos"))]
+fn is_mlx_split_package(package: &skippy::SkippyPackageIdentity) -> bool {
+    package.package_ref.starts_with("hf-model://")
+}
+
+#[cfg(all(feature = "mlx", target_os = "macos"))]
+async fn resolve_mlx_split_package(model_path: &Path) -> Result<skippy::SkippyPackageIdentity> {
+    let prepared_descriptor =
+        model_hf::safetensors_stage::read_checkpoint_descriptor(model_path).ok();
+    let (package_ref, descriptor) = if let Some(descriptor) = prepared_descriptor {
+        anyhow::ensure!(
+            is_immutable_huggingface_revision(&descriptor.revision),
+            "distributed MLX checkpoint descriptor revision must be an immutable 40-character commit SHA"
+        );
+        (
+            format!("hf-model://{}@{}", descriptor.repo, descriptor.revision),
+            descriptor,
+        )
+    } else {
+        let identity = mlx_huggingface_identity(model_path).with_context(|| {
+            format!(
+                "distributed MLX requires a SafeTensors model in the Hugging Face cache with an immutable revision: {}",
+                model_path.display()
+            )
+        })?;
+        let package_ref = format!("hf-model://{}@{}", identity.repo_id, identity.revision);
+        let descriptor = describe_mlx_checkpoint(&identity.repo_id, &identity.revision).await?;
+        (package_ref, descriptor)
+    };
+    Ok(skippy::SkippyPackageIdentity {
+        package_ref,
+        manifest_sha256: descriptor.checkpoint_sha256.clone(),
+        source_model_path: mlx_model_dir(model_path),
+        source_model_sha256: descriptor.checkpoint_sha256,
+        source_model_bytes: descriptor.dense_tensor_bytes,
+        source_files: Vec::new(),
+        layer_weight_bytes: descriptor.estimated_affine4_layer_bytes,
+        layer_count: descriptor.layer_count,
+        activation_width: descriptor.hidden_size,
+        tensor_count: 0,
+        generation: None,
+    })
+}
+
+#[cfg(all(feature = "mlx", target_os = "macos"))]
+fn is_immutable_huggingface_revision(revision: &str) -> bool {
+    revision.len() == 40 && revision.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+#[cfg(all(feature = "mlx", target_os = "macos"))]
+fn mlx_huggingface_identity(
+    model_path: &Path,
+) -> Option<model_hf::store::local::HuggingFaceModelIdentity> {
+    if model_path.is_file() {
+        return models::huggingface_identity_for_path(model_path);
+    }
+    [
+        "model.safetensors.index.json",
+        "model.safetensors",
+        "model-00001-of-00001.safetensors",
+    ]
+    .into_iter()
+    .map(|name| model_path.join(name))
+    .find_map(|path| models::huggingface_identity_for_path(&path))
+    .or_else(|| {
+        std::fs::read_dir(model_path)
+            .ok()?
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.ends_with(".safetensors"))
+            })
+            .find_map(|path| models::huggingface_identity_for_path(&path))
+    })
+}
+
+#[cfg(all(feature = "mlx", target_os = "macos"))]
+async fn describe_mlx_split_package(
+    package: &skippy::SkippyPackageIdentity,
+) -> Result<model_hf::safetensors_stage::SafetensorsCheckpointDescriptor> {
+    if let Ok(descriptor) =
+        model_hf::safetensors_stage::read_checkpoint_descriptor(&package.source_model_path)
+    {
+        return Ok(descriptor);
+    }
+    let source = package
+        .package_ref
+        .strip_prefix("hf-model://")
+        .context("MLX split package is missing hf-model:// prefix")?;
+    let parsed = model_ref::parse_model_ref(source).context("parse MLX split package ref")?;
+    let revision = parsed
+        .revision
+        .context("MLX split package requires immutable revision")?;
+    describe_mlx_checkpoint(&parsed.repo, &revision).await
+}
+
+#[cfg(all(feature = "mlx", target_os = "macos"))]
+async fn describe_mlx_checkpoint(
+    repo: &str,
+    revision: &str,
+) -> Result<model_hf::safetensors_stage::SafetensorsCheckpointDescriptor> {
+    let repo = repo.to_string();
+    let revision = revision.to_string();
+    tokio::task::spawn_blocking(move || {
+        model_hf::safetensors_stage::SafetensorsStageMaterializer::from_environment()?
+            .describe_checkpoint(&repo, &revision)
+    })
+    .await
+    .context("join MLX checkpoint descriptor task")?
 }
 
 fn split_kv_cache_quant(
@@ -1108,6 +1272,7 @@ fn package_ref_has_independent_prepare_source(package_ref: &str) -> bool {
     // HF layer packages can be resolved by the selected worker during prepare;
     // peer artifact transfer is only an optional cache warm path.
     skippy_runtime::package::is_hf_package_ref(package_ref)
+        || package_ref.starts_with("hf-model://")
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1128,6 +1293,7 @@ pub(super) enum SplitParticipantExclusionReason {
     MissingVram,
     MissingModelInterest,
     StageProtocolGeneration,
+    MlxBackendUnavailable,
     MissingStagePath,
     StagePathRelayOnly,
     StagePathTooSlow,
@@ -1145,6 +1311,7 @@ impl SplitParticipantExclusionReason {
             Self::MissingVram => "missing_vram",
             Self::MissingModelInterest => "missing_model_interest",
             Self::StageProtocolGeneration => "stage_protocol_generation",
+            Self::MlxBackendUnavailable => "mlx_backend_unavailable",
             Self::MissingStagePath => "missing_stage_path",
             Self::StagePathRelayOnly => "stage_path_relay_only",
             Self::StagePathTooSlow => "stage_path_too_slow",
@@ -1167,6 +1334,9 @@ impl SplitParticipantExclusionReason {
             }
             Self::StageProtocolGeneration => {
                 "Upgrade this peer so it advertises current stage protocol support."
+            }
+            Self::MlxBackendUnavailable => {
+                "Use an Apple Silicon peer running an MLX-enabled mesh-llm build."
             }
             Self::MissingStagePath => {
                 "Wait for direct peer latency to be measured or fix direct QUIC connectivity."
@@ -1225,11 +1395,18 @@ struct SplitGenerationLoadSpec<'a> {
 
 struct SplitGenerationLoadSettings<'a> {
     stage0: &'a RuntimeSliceStagePlan,
+    backend: SplitRuntimeBackend,
     runtime_options: skippy_server::EmbeddedRuntimeOptions,
     embedded_openai: skippy::ResolvedEmbeddedOpenAiArgs,
     load_mode: LoadMode,
     activation_width: i32,
     activation_wire_dtype: skippy::StageWireDType,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SplitRuntimeBackend {
+    Skippy,
+    Mlx,
 }
 
 async fn load_split_runtime_generation(
@@ -1306,6 +1483,16 @@ async fn load_split_runtime_generation_inner(
         &stage0_return_endpoint,
     ))
     .await?;
+    if settings.backend == SplitRuntimeBackend::Mlx {
+        return Box::pin(load_mlx_split_runtime_generation(
+            spec,
+            &settings,
+            cleanup_on_error,
+            &mut ready_by_stage,
+            downstream,
+        ))
+        .await;
+    }
     let downstream_endpoint = if downstream.node_id == Some(spec.node.id()) {
         downstream.endpoint
     } else {
@@ -1430,6 +1617,141 @@ async fn load_split_runtime_generation_inner(
     })
 }
 
+#[cfg(all(feature = "mlx", target_os = "macos"))]
+async fn load_mlx_split_runtime_generation(
+    spec: &SplitGenerationLoadSpec<'_>,
+    settings: &SplitGenerationLoadSettings<'_>,
+    cleanup_on_error: &mut bool,
+    ready_by_stage: &mut HashMap<String, skippy::StageStatusSnapshot>,
+    downstream: skippy::StagePeerDescriptor,
+) -> Result<SplitRuntimeGenerationHandle> {
+    *cleanup_on_error = true;
+    let load = split_runtime_stage_load_request(
+        spec,
+        settings,
+        settings.stage0,
+        Some(downstream),
+        "127.0.0.1:0",
+    );
+    prepare_split_stage(spec.node, settings.stage0.node_id, load.clone()).await?;
+    wait_for_split_stage_source(
+        spec.node,
+        settings.stage0.node_id,
+        &load,
+        Duration::from_secs(30 * 60),
+    )
+    .await
+    .context("prepare local MLX stage 0")?;
+    let response = spec
+        .node
+        .send_local_stage_control(skippy::StageControlRequest::Load(load))
+        .await
+        .context("load local MLX stage 0")?;
+    let skippy::StageControlResponse::Ready(ready) = response else {
+        anyhow::bail!("unexpected response while loading MLX stage 0");
+    };
+    anyhow::ensure!(
+        ready.accepted,
+        "MLX stage 0 rejected load: {}",
+        ready.error.unwrap_or_else(|| "unknown error".to_string())
+    );
+    let stage_addr = ready
+        .status
+        .bind_addr
+        .parse()
+        .with_context(|| format!("parse MLX stage 0 endpoint {}", ready.status.bind_addr))?;
+    ready_by_stage.insert(settings.stage0.stage_id.clone(), ready.status);
+
+    let model_dir = mlx_model_dir(spec.model_path);
+    let model_ref = spec.model_ref.to_string();
+    let context_length = spec.ctx_size;
+    let wire_dtype = skippy_wire_dtype(settings.activation_wire_dtype)?;
+    let _ = emit_event(OutputEvent::ModelLoading {
+        model: model_ref.clone(),
+        source: None,
+    });
+    let load_model_ref = model_ref.clone();
+    let mlx_model = tokio::task::spawn_blocking(move || {
+        crate::inference::mlx::MlxModelHandle::load_distributed(
+            model_dir,
+            load_model_ref,
+            context_length,
+            stage_addr,
+            wire_dtype,
+        )
+    })
+    .await
+    .context("join distributed MLX frontend load task")??;
+    let _ = emit_event(OutputEvent::ModelLoaded {
+        model: model_ref.clone(),
+        bytes: None,
+    });
+    let (death_tx, death_rx) = tokio::sync::oneshot::channel();
+    let http = mlx_model
+        .start_http(alloc_local_port().await?, death_tx)
+        .await?;
+    let capabilities = models::runtime_verified_model_capabilities(
+        spec.model_ref,
+        spec.model_path,
+        models::RuntimeMediaCapabilityEvidence {
+            vision_projector_loaded: false,
+        },
+    );
+    spec.node
+        .activate_stage_topology(split_stage_topology_instance(
+            &spec.generation.topology_id,
+            &spec.generation.run_id,
+            spec.model_ref,
+            spec.package,
+            &spec.generation.stages,
+            ready_by_stage,
+        ))
+        .await;
+
+    Ok(SplitRuntimeGenerationHandle {
+        loaded_name: model_ref,
+        handle: LocalRuntimeModelHandle {
+            port: http.port(),
+            backend: "mlx".to_string(),
+            context_length,
+            slots: 1,
+            capabilities,
+            inner: LocalRuntimeBackendHandle::Mlx {
+                _model: mlx_model,
+                http,
+            },
+        },
+        death_rx,
+        cleanup: Some(SplitGenerationCleanup {
+            generation: spec.generation.clone(),
+        }),
+        coordinator_rx: None,
+        coordinator_task: None,
+    })
+}
+
+#[cfg(not(all(feature = "mlx", target_os = "macos")))]
+async fn load_mlx_split_runtime_generation(
+    _spec: &SplitGenerationLoadSpec<'_>,
+    _settings: &SplitGenerationLoadSettings<'_>,
+    _cleanup_on_error: &mut bool,
+    _ready_by_stage: &mut HashMap<String, skippy::StageStatusSnapshot>,
+    _downstream: skippy::StagePeerDescriptor,
+) -> Result<SplitRuntimeGenerationHandle> {
+    anyhow::bail!("distributed MLX serving requires macOS and the mlx feature")
+}
+
+#[cfg(all(feature = "mlx", target_os = "macos"))]
+fn skippy_wire_dtype(
+    dtype: skippy::StageWireDType,
+) -> Result<skippy_protocol::binary::WireActivationDType> {
+    match dtype {
+        skippy::StageWireDType::F32 => Ok(skippy_protocol::binary::WireActivationDType::F32),
+        skippy::StageWireDType::F16 => Ok(skippy_protocol::binary::WireActivationDType::F16),
+        skippy::StageWireDType::Q8 => anyhow::bail!("MLX stages do not support Q8 activations"),
+    }
+}
+
 async fn load_downstream_split_runtime_stages(
     spec: &SplitGenerationLoadSpec<'_>,
     settings: &SplitGenerationLoadSettings<'_>,
@@ -1447,13 +1769,13 @@ async fn load_downstream_split_runtime_stages(
             downstream.clone(),
             stage0_return_endpoint,
         );
-        prepare_split_stage(spec.node, stage.node_id, load.clone()).await?;
-        wait_for_split_stage_source(
+        Box::pin(prepare_split_stage(spec.node, stage.node_id, load.clone())).await?;
+        Box::pin(wait_for_split_stage_source(
             spec.node,
             stage.node_id,
             &load,
             Duration::from_secs(30 * 60),
-        )
+        ))
         .await
         .with_context(|| {
             format!(
@@ -1512,6 +1834,7 @@ fn split_runtime_stage_load_request(
     stage0_return_endpoint: &str,
 ) -> skippy::StageLoadRequest {
     let resolved_config = &settings.runtime_options.config;
+    let mlx = settings.backend == SplitRuntimeBackend::Mlx;
     let upstream = if downstream.is_none() {
         split_runtime_stage_upstream(spec, stage0_return_endpoint)
     } else {
@@ -1521,7 +1844,7 @@ fn split_runtime_stage_load_request(
         topology_id: spec.generation.topology_id.clone(),
         run_id: spec.generation.run_id.clone(),
         model_id: spec.model_ref.to_string(),
-        backend: "skippy".to_string(),
+        backend: if mlx { "mlx" } else { "skippy" }.to_string(),
         package_ref: spec.package.package_ref.clone(),
         manifest_sha256: spec.package.manifest_sha256.clone(),
         stage_id: stage.stage_id.clone(),
@@ -1534,23 +1857,27 @@ fn split_runtime_stage_load_request(
             spec.model_path,
         )),
         source_model_bytes: Some(spec.package.source_model_bytes),
-        projector_path: spec.projector_path.clone(),
+        projector_path: (!mlx).then(|| spec.projector_path.clone()).flatten(),
         selected_device: None,
         bind_addr: "127.0.0.1:0".to_string(),
         activation_width: settings.activation_width,
         wire_dtype: settings.activation_wire_dtype,
         ctx_size: spec.ctx_size,
-        lane_count: spec.slots as u32,
-        n_batch: resolved_config.n_batch,
-        n_ubatch: resolved_config.n_ubatch,
+        lane_count: if mlx { 1 } else { spec.slots as u32 },
+        n_batch: (!mlx).then_some(resolved_config.n_batch).flatten(),
+        n_ubatch: (!mlx).then_some(resolved_config.n_ubatch).flatten(),
         n_gpu_layers: resolved_config.n_gpu_layers,
-        mmap: resolved_config.mmap,
-        mlock: resolved_config.mlock,
+        mmap: (!mlx).then_some(resolved_config.mmap).flatten(),
+        mlock: !mlx && resolved_config.mlock,
         weight_quantization: skippy::StageWeightQuantization::Auto,
         cache_type_k: resolved_config.cache_type_k.clone(),
         cache_type_v: resolved_config.cache_type_v.clone(),
-        flash_attn_type: resolved_config.flash_attn_type,
-        native_mtp_enabled: resolved_config.native_mtp_enabled,
+        flash_attn_type: if mlx {
+            FlashAttentionType::Auto
+        } else {
+            resolved_config.flash_attn_type
+        },
+        native_mtp_enabled: !mlx && resolved_config.native_mtp_enabled,
         shutdown_generation: spec.generation.generation,
         coordinator_term: spec.generation.coordinator_term,
         coordinator_id: Some(spec.node.id()),
@@ -1582,6 +1909,11 @@ fn split_generation_load_settings<'a>(
         .stages
         .first()
         .context("split topology did not produce stage 0")?;
+    let backend = if spec.package.package_ref.starts_with("hf-model://") {
+        SplitRuntimeBackend::Mlx
+    } else {
+        SplitRuntimeBackend::Skippy
+    };
     let load_mode = split_generation_load_mode(spec.package);
     let activation_width =
         skippy_stage_activation_width(spec.package.activation_width, spec.model_ref)?;
@@ -1631,16 +1963,23 @@ fn split_generation_load_settings<'a>(
     );
     Ok(SplitGenerationLoadSettings {
         stage0,
+        backend,
         runtime_options,
         embedded_openai,
         load_mode,
         activation_width,
-        activation_wire_dtype: resolved.skippy.activation_wire_dtype,
+        activation_wire_dtype: if backend == SplitRuntimeBackend::Mlx {
+            skippy::StageWireDType::F16
+        } else {
+            resolved.skippy.activation_wire_dtype
+        },
     })
 }
 
 fn split_generation_load_mode(package: &skippy::SkippyPackageIdentity) -> LoadMode {
-    if skippy::is_layer_package_ref(&package.package_ref) {
+    if package.package_ref.starts_with("hf-model://") {
+        LoadMode::ArtifactSlice
+    } else if skippy::is_layer_package_ref(&package.package_ref) {
         LoadMode::LayerPackage
     } else {
         LoadMode::RuntimeSlice
@@ -1885,6 +2224,7 @@ struct SplitTopologyGeneration {
     lease_until_unix_ms: u64,
     participants: Vec<SplitParticipant>,
     stages: Vec<RuntimeSliceStagePlan>,
+    control_managed_stage0: bool,
 }
 
 impl SplitTopologyGeneration {
@@ -1903,7 +2243,13 @@ impl SplitTopologyGeneration {
             lease_until_unix_ms: split_coordinator_lease_until_unix_ms(),
             participants,
             stages,
+            control_managed_stage0: false,
         }
+    }
+
+    fn with_control_managed_stage0(mut self, enabled: bool) -> Self {
+        self.control_managed_stage0 = enabled;
+        self
     }
 }
 
@@ -2386,16 +2732,19 @@ impl SplitTopologyCoordinator {
             split_stages_meet_minimum(&stages),
             "split runtime needs at least two stage participants"
         );
-        Ok(SplitTopologyGeneration::new(
-            topology_id,
-            run_id,
-            generation,
-            participants,
-            stages,
-        ))
+        Ok(
+            SplitTopologyGeneration::new(topology_id, run_id, generation, participants, stages)
+                .with_control_managed_stage0(self.active.control_managed_stage0),
+        )
     }
 
     fn local_model_fits(&self) -> bool {
+        if self.package.package_ref.starts_with("hf-model://") {
+            // Metadata-only MLX startup deliberately has no whole checkpoint
+            // for a local fallback. Keep serving withdrawn until a replacement
+            // split can be elected.
+            return false;
+        }
         let local_capacity = self
             .pinned_gpu
             .as_ref()
@@ -2750,7 +3099,8 @@ async fn stop_split_generation(
         )
         .await;
     }
-    for stage in generation.stages.iter().skip(1) {
+    let skip = usize::from(!generation.control_managed_stage0);
+    for stage in generation.stages.iter().skip(skip) {
         let stop = skippy::StageStopRequest {
             topology_id: generation.topology_id.clone(),
             run_id: generation.run_id.clone(),
@@ -2983,7 +3333,7 @@ fn split_participant_blocker(
     })
 }
 
-const fn split_participant_exclusion_reason_order() -> [SplitParticipantExclusionReason; 12] {
+const fn split_participant_exclusion_reason_order() -> [SplitParticipantExclusionReason; 13] {
     [
         SplitParticipantExclusionReason::StageControlUnreachable,
         SplitParticipantExclusionReason::PackageManifestMismatch,
@@ -2994,6 +3344,7 @@ const fn split_participant_exclusion_reason_order() -> [SplitParticipantExclusio
         SplitParticipantExclusionReason::StagePathRelayOnly,
         SplitParticipantExclusionReason::StagePathTooSlow,
         SplitParticipantExclusionReason::StageProtocolGeneration,
+        SplitParticipantExclusionReason::MlxBackendUnavailable,
         SplitParticipantExclusionReason::MissingVram,
         SplitParticipantExclusionReason::MissingModelInterest,
         SplitParticipantExclusionReason::Client,
@@ -3049,6 +3400,13 @@ async fn collect_split_participants(
             });
             continue;
         }
+        if let Some(reason) = split_peer_backend_exclusion_reason(&peer, package) {
+            excluded.push(SplitParticipantExclusion {
+                node_id: peer.id,
+                reason,
+            });
+            continue;
+        }
         if let Some(reason) =
             split_peer_stage_path_exclusion_reason(node.split_stage_path_snapshot(peer.id).await)
         {
@@ -3095,6 +3453,14 @@ async fn collect_split_participants(
         participants,
         excluded,
     }
+}
+
+fn split_peer_backend_exclusion_reason(
+    peer: &mesh::PeerInfo,
+    package: &skippy::SkippyPackageIdentity,
+) -> Option<SplitParticipantExclusionReason> {
+    (package.package_ref.starts_with("hf-model://") && !peer.mlx_stage_supported)
+        .then_some(SplitParticipantExclusionReason::MlxBackendUnavailable)
 }
 
 fn split_peer_preflight_exclusion_reason(
@@ -3195,7 +3561,9 @@ fn split_inventory_package_signal_result(
     if split_inventory_manifest_mismatch(inventory, package) {
         return Err(SplitParticipantExclusionReason::PackageManifestMismatch);
     }
-    if split_inventory_has_no_stage_surface(inventory) {
+    if split_inventory_has_no_stage_surface(inventory)
+        && !package_ref_has_independent_prepare_source(&package.package_ref)
+    {
         return Err(SplitParticipantExclusionReason::StageInventoryEmpty);
     }
     let signal = split_inventory_package_signal(inventory, package);
@@ -3487,7 +3855,7 @@ async fn wait_for_split_stage_source(
 ) -> Result<()> {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
-        let inventory = query_stage_inventory(node, stage_node_id, load)
+        let inventory = Box::pin(query_stage_inventory(node, stage_node_id, load))
             .await
             .with_context(|| stage_control_unreachable_message(&load.stage_id, stage_node_id))?;
         if split_stage_source_is_ready(&inventory, load) {
@@ -3669,7 +4037,10 @@ fn is_safetensors_model_path(path: &Path) -> bool {
     }
     if path.is_dir() {
         return path.join("model.safetensors").exists()
-            || path.join("model.safetensors.index.json").exists();
+            || path.join("model.safetensors.index.json").exists()
+            || path
+                .join(model_hf::safetensors_stage::CHECKPOINT_DESCRIPTOR_FILE)
+                .exists();
     }
     false
 }
@@ -3722,8 +4093,8 @@ async fn start_runtime_mlx_model(
         bytes: None,
     });
 
-    let http = mlx_model.start_http(port);
     let (death_tx, death_rx) = tokio::sync::oneshot::channel();
+    let http = mlx_model.start_http(port, death_tx).await?;
 
     Ok((
         model_name,
@@ -3736,7 +4107,6 @@ async fn start_runtime_mlx_model(
             inner: LocalRuntimeBackendHandle::Mlx {
                 _model: mlx_model,
                 http,
-                _death_tx: death_tx,
             },
         },
         death_rx,
@@ -4129,6 +4499,7 @@ mod tests {
             artifact_transfer_supported: false,
             stage_protocol_generation_supported,
             stage_status_list_supported: false,
+            mlx_stage_supported: false,
             advertised_model_throughput: vec![],
 
             display_rtt: None,
@@ -4873,6 +5244,33 @@ max_tokens = 222
     }
 
     #[test]
+    fn mlx_package_signal_allows_cold_independent_prepare() {
+        let mut package = package(10);
+        package.package_ref = format!("hf-model://org/model@{}", "a".repeat(40));
+        package.manifest_sha256 = "b".repeat(64);
+        let inventory = skippy::StageLayerInventory {
+            model_id: "model-a".to_string(),
+            package_ref: package.package_ref.clone(),
+            manifest_sha256: package.manifest_sha256.clone(),
+            layer_count: 0,
+            ready_ranges: Vec::new(),
+            available_ranges: Vec::new(),
+            missing_ranges: Vec::new(),
+            preparing_ranges: Vec::new(),
+            source_model_path: None,
+            source_model_bytes: None,
+            source_model_kind: skippy::SourceModelKind::Unknown,
+            weight_quantization: skippy::StageWeightQuantization::Auto,
+        };
+
+        let signal = split_inventory_package_signal_result(&inventory, &package, false)
+            .expect("immutable MLX source should be independently preparable");
+
+        assert_eq!(signal.cached_slice_bytes, 0);
+        assert_eq!(signal.missing_artifact_bytes, package.source_model_bytes);
+    }
+
+    #[test]
     fn split_participant_timeout_error_reports_blocker_summary() {
         let participants = vec![SplitParticipant::new(make_id(1), 2_000_000_000, None)];
         let excluded = vec![
@@ -4927,6 +5325,33 @@ max_tokens = 222
             ),
             None
         );
+    }
+
+    #[test]
+    fn mlx_split_requires_explicit_peer_backend_capability() {
+        let mut peer = split_test_peer(0x71, "SmolLM2", true);
+        let mut package = package(30);
+        package.package_ref = format!("hf-model://org/model@{}", "a".repeat(40));
+
+        assert_eq!(
+            split_peer_backend_exclusion_reason(&peer, &package),
+            Some(SplitParticipantExclusionReason::MlxBackendUnavailable)
+        );
+
+        peer.mlx_stage_supported = true;
+        assert_eq!(split_peer_backend_exclusion_reason(&peer, &package), None);
+    }
+
+    #[test]
+    fn mlx_split_uses_artifact_slice_and_one_lane() {
+        let mut package = package(30);
+        package.package_ref = format!("hf-model://org/model@{}", "a".repeat(40));
+
+        assert_eq!(
+            split_generation_load_mode(&package),
+            LoadMode::ArtifactSlice
+        );
+        assert_eq!(split_parallel_override(&package, Some(8)), Some(1));
     }
 
     #[test]
@@ -5734,7 +6159,7 @@ max_tokens = 222
         );
         let mesh_config = plugin::MeshConfig::default();
 
-        let error = match Box::pin(load_split_runtime_generation(SplitGenerationLoadSpec {
+        let load_future = load_split_runtime_generation(SplitGenerationLoadSpec {
             node: &node,
             mesh_config: &mesh_config,
             model_ref: "Qwen",
@@ -5755,9 +6180,8 @@ max_tokens = 222
             ),
             skippy_telemetry: skippy::SkippyTelemetryOptions::off(),
             survey_telemetry: survey::SurveyTelemetry::disabled(),
-        }))
-        .await
-        {
+        });
+        let error = match Box::pin(load_future).await {
             Ok(_) => panic!("candidate split generation load unexpectedly succeeded"),
             Err(error) => error,
         };

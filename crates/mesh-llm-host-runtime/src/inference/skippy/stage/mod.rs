@@ -367,6 +367,7 @@ impl StageControlState {
         if load.backend == "mlx" {
             return mlx::load_stage(self, key, load, bind_addr).await;
         }
+        crate::system::native_runtime::ensure_native_runtime_loaded()?;
         let mut effective_load = load;
         effective_load.bind_addr = bind_addr.to_string();
         super::configure_materialized_stage_cache();

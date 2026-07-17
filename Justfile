@@ -258,6 +258,16 @@ mlx-stage-build:
     cp target/release/safemlx-resources/mlx.metallib target/release/mlx.metallib
     cmp -s target/release/safemlx-resources/mlx.metallib target/release/mlx.metallib
 
+# Build the shipped mesh-llm binary with whole-model and distributed MLX serving.
+[macos]
+mlx-build:
+    DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer MESH_LLM_CARGO_FEATURES=mlx scripts/build-mac.sh
+
+# Release-mode MLX build; writes mesh-llm and its sibling mlx.metallib.
+[macos]
+mlx-release-build:
+    DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer MESH_LLM_BUILD_PROFILE=release MESH_LLM_CARGO_FEATURES=mlx scripts/build-mac.sh
+
 # Run `mlx-stage serve ...` or `mlx-stage prove ...` after `just mlx-stage-build`.
 mlx-stage *ARGS:
     target/release/mlx-stage {{ ARGS }}

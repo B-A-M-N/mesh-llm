@@ -11,8 +11,34 @@ mod real {
     use std::sync::Arc;
 
     use anyhow::{Context, Result};
-    use clap::Parser;
-    use skippy_engine_mlx::{MlxBackend, MlxEngine, MlxEngineConfig};
+    use clap::{Parser, ValueEnum};
+    use skippy_engine_mlx::{MlxBackend, MlxEngine, MlxEngineConfig, MlxWeightQuantization};
+
+    #[derive(Clone, Copy, Debug, ValueEnum)]
+    enum WeightQuantization {
+        Auto,
+        None,
+        Affine4,
+        Affine8,
+        MxFp4,
+    }
+
+    impl WeightQuantization {
+        fn engine(self) -> Option<MlxWeightQuantization> {
+            match self {
+                Self::Auto | Self::None => None,
+                Self::Affine4 => Some(MlxWeightQuantization::Affine {
+                    group_size: 64,
+                    bits: 4,
+                }),
+                Self::Affine8 => Some(MlxWeightQuantization::Affine {
+                    group_size: 64,
+                    bits: 8,
+                }),
+                Self::MxFp4 => Some(MlxWeightQuantization::MxFp4),
+            }
+        }
+    }
 
     #[derive(Parser, Debug)]
     #[command(about = "Serve an MLX safetensors model over the mesh-llm OpenAI frontend")]
@@ -30,6 +56,10 @@ mod real {
 
         #[arg(long, default_value_t = 4096)]
         max_tokens_cap: usize,
+
+        /// Weight representation for dense checkpoints.
+        #[arg(long, value_enum, default_value = "auto")]
+        weight_quantization: WeightQuantization,
 
         #[arg(long, default_value = "127.0.0.1:11434")]
         bind: String,
@@ -51,11 +81,18 @@ mod real {
                 .unwrap_or_else(|| "mlx-model".to_string())
         });
 
+        let weight_quantization = match cli.weight_quantization {
+            WeightQuantization::Auto => {
+                skippy_engine_mlx::automatic_weight_quantization(&cli.model)?
+            }
+            explicit => explicit.engine(),
+        };
         let config = MlxEngineConfig {
             model_dir: cli.model.clone(),
             model_id: model_id.clone(),
             default_max_tokens: cli.default_max_tokens,
             max_tokens_cap: cli.max_tokens_cap,
+            weight_quantization,
         };
 
         tracing::info!("loading MLX model from {} ...", cli.model.display());

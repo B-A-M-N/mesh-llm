@@ -7,6 +7,7 @@
 //! second wire protocol. Advanced operations stay capability-gated.
 
 use std::{
+    collections::HashSet,
     io::{self, Write},
     net::{Shutdown, SocketAddr, TcpListener, TcpStream},
     sync::{
@@ -16,6 +17,8 @@ use std::{
     thread,
     time::Duration,
 };
+
+const ENGINE_STAGE_IO_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
 use anyhow::{Context, Result, bail, ensure};
 use skippy_engine::{
@@ -170,6 +173,8 @@ fn handle_connection(
     mut upstream: TcpStream,
     downstream_control: Arc<Mutex<Option<TcpStream>>>,
 ) -> Result<()> {
+    upstream.set_read_timeout(Some(ENGINE_STAGE_IO_TIMEOUT))?;
+    upstream.set_write_timeout(Some(ENGINE_STAGE_IO_TIMEOUT))?;
     let mut downstream = options
         .downstream_addr
         .map(connect_downstream)
@@ -183,9 +188,41 @@ fn handle_connection(
     upstream.flush().ok();
     let activation_width =
         i32::try_from(engine.info().activation_width).context("activation width exceeds i32")?;
+    let mut active_sessions = HashSet::new();
+    let result = handle_connection_messages(
+        engine.as_ref(),
+        &options,
+        &mut upstream,
+        downstream.as_mut(),
+        activation_width,
+        &mut active_sessions,
+    );
+    let cleanup = cleanup_connection_sessions(
+        engine.as_ref(),
+        downstream.as_mut(),
+        options.wire_dtype,
+        &active_sessions,
+    );
+    match (result, cleanup) {
+        (Err(error), Err(cleanup_error)) => {
+            eprintln!("engine stage session cleanup also failed: {cleanup_error:#}");
+            Err(error)
+        }
+        (Err(error), _) => Err(error),
+        (Ok(()), cleanup) => cleanup,
+    }
+}
 
+fn handle_connection_messages(
+    engine: &dyn StageEngine,
+    options: &EngineStageServerOptions,
+    upstream: &mut TcpStream,
+    mut downstream: Option<&mut TcpStream>,
+    activation_width: i32,
+    active_sessions: &mut HashSet<u64>,
+) -> Result<()> {
     loop {
-        let message = match read_stage_message(&mut upstream, activation_width) {
+        let message = match read_stage_message(&mut *upstream, activation_width) {
             Ok(message) => message,
             Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
             Err(error) => return Err(error).context("read engine stage message"),
@@ -193,33 +230,67 @@ fn handle_connection(
         if message.kind == WireMessageKind::Stop {
             engine.reset_session(message.session_id)?;
             let downstream_reply =
-                forward_control(downstream.as_mut(), &message, options.wire_dtype)?;
-            send_ack(&mut upstream, downstream_reply)?;
+                forward_control(downstream.as_deref_mut(), &message, options.wire_dtype)?;
+            send_ack(upstream, downstream_reply)?;
+            active_sessions.remove(&message.session_id);
             continue;
         }
         if message.kind.is_session_control() {
-            execute_session_control(engine.as_ref(), &message)?;
+            active_sessions.insert(message.session_id);
+            execute_session_control(engine, &message)?;
             let downstream_reply =
-                forward_control(downstream.as_mut(), &message, options.wire_dtype)?;
-            send_ack(&mut upstream, downstream_reply)?;
+                forward_control(downstream.as_deref_mut(), &message, options.wire_dtype)?;
+            send_ack(upstream, downstream_reply)?;
             continue;
         }
 
+        active_sessions.insert(message.session_id);
         let request = execution_request(&message, activation_width)?;
         let output = engine.execute(request)?;
-        match downstream.as_mut() {
+        match downstream.as_deref_mut() {
             Some(downstream) => {
-                let forwarded =
-                    forwarded_message(engine.as_ref(), &message, output, options.wire_dtype)?;
+                let forwarded = forwarded_message(engine, &message, output, options.wire_dtype)?;
                 write_stage_message(&mut *downstream, &forwarded, options.wire_dtype)
                     .context("forward engine stage message")?;
                 downstream.flush().ok();
                 let reply = recv_reply(&mut *downstream).context("receive downstream reply")?;
-                send_reply(&mut upstream, reply)?;
+                send_reply(upstream, reply)?;
             }
-            None => send_final_reply(&mut upstream, &message, output)?,
+            None => send_final_reply(upstream, &message, output)?,
         }
     }
+}
+
+fn cleanup_connection_sessions(
+    engine: &dyn StageEngine,
+    mut downstream: Option<&mut TcpStream>,
+    wire_dtype: WireActivationDType,
+    active_sessions: &HashSet<u64>,
+) -> Result<()> {
+    let mut first_error = None;
+    for session_id in active_sessions {
+        if let Err(error) = engine.reset_session(*session_id)
+            && first_error.is_none()
+        {
+            first_error = Some(error.context(format!("reset abandoned session {session_id}")));
+        }
+        let stop = StageWireMessage::stop_with_identity(wire_dtype, *session_id, *session_id);
+        let downstream_result = forward_control(downstream.as_deref_mut(), &stop, wire_dtype)
+            .and_then(|reply| {
+                ensure!(
+                    reply.is_none_or(|reply| reply.kind == WireReplyKind::Ack),
+                    "abandoned session stop expected downstream ACK"
+                );
+                Ok(())
+            });
+        if let Err(error) = downstream_result
+            && first_error.is_none()
+        {
+            first_error =
+                Some(error.context(format!("propagate abandoned session {session_id} stop")));
+        }
+    }
+    first_error.map_or(Ok(()), Err)
 }
 
 fn connect_downstream(addr: SocketAddr) -> Result<TcpStream> {
@@ -230,8 +301,8 @@ fn connect_downstream(addr: SocketAddr) -> Result<TcpStream> {
     stream.set_read_timeout(Some(CONNECT_TIMEOUT))?;
     stream.set_write_timeout(Some(CONNECT_TIMEOUT))?;
     recv_ready(&mut stream).context("downstream engine stage did not become ready")?;
-    stream.set_read_timeout(None)?;
-    stream.set_write_timeout(None)?;
+    stream.set_read_timeout(Some(ENGINE_STAGE_IO_TIMEOUT))?;
+    stream.set_write_timeout(Some(ENGINE_STAGE_IO_TIMEOUT))?;
     Ok(stream)
 }
 
@@ -413,6 +484,43 @@ mod tests {
     use super::*;
     use skippy_protocol::binary::StageStateHeader;
 
+    struct RecordingEngine {
+        info: skippy_engine::StageEngineInfo,
+        resets: Mutex<Vec<u64>>,
+    }
+
+    impl RecordingEngine {
+        fn new() -> Self {
+            Self {
+                info: skippy_engine::StageEngineInfo {
+                    engine: "test".to_string(),
+                    model_id: "test/model".to_string(),
+                    stage_index: 0,
+                    layer_start: 0,
+                    layer_end: 1,
+                    total_layers: 1,
+                    activation_width: 4,
+                },
+                resets: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl StageEngine for RecordingEngine {
+        fn info(&self) -> &skippy_engine::StageEngineInfo {
+            &self.info
+        }
+
+        fn execute(&self, _request: StageExecutionRequest) -> Result<StageExecutionOutput> {
+            Ok(StageExecutionOutput::default())
+        }
+
+        fn reset_session(&self, session_id: u64) -> Result<()> {
+            self.resets.lock().unwrap().push(session_id);
+            Ok(())
+        }
+    }
+
     fn decode_message(tokens: Vec<i32>, current_token: i32) -> StageWireMessage {
         let kind = WireMessageKind::DecodeEmbd;
         let mut state = StageStateHeader::new(kind, WireActivationDType::F16);
@@ -438,5 +546,17 @@ mod tests {
         let request = execution_request(&decode_message(vec![1, 2, 3], 7), 4).unwrap();
         assert_eq!(request.token_ids, vec![7]);
         assert_eq!(request.kind, StageExecutionKind::Decode);
+    }
+
+    #[test]
+    fn connection_cleanup_resets_every_abandoned_session() {
+        let engine = RecordingEngine::new();
+        let sessions = HashSet::from([7, 9]);
+
+        cleanup_connection_sessions(&engine, None, WireActivationDType::F16, &sessions).unwrap();
+
+        let mut resets = engine.resets.lock().unwrap().clone();
+        resets.sort_unstable();
+        assert_eq!(resets, vec![7, 9]);
     }
 }
