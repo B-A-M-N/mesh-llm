@@ -390,6 +390,56 @@ async fn prepare_stage_records_background_source_availability() {
     panic!("prepare did not become available, last state: {last_state:?}");
 }
 
+#[cfg(not(all(feature = "mlx", target_os = "macos")))]
+#[tokio::test]
+async fn prepare_mlx_fails_closed_without_downloading_on_unsupported_build() {
+    let file = tempfile::NamedTempFile::new().unwrap();
+    let mut load = load_request();
+    load.backend = "mlx".to_string();
+    load.load_mode = LoadMode::ArtifactSlice;
+    load.package_ref = format!("hf-model://org/model@{}", "a".repeat(40));
+    load.model_path = Some(file.path().to_string_lossy().into_owned());
+    load.downstream = None;
+    let mut state = StageControlState::default();
+
+    let accepted = state
+        .prepare(StagePrepareRequest {
+            load: load.clone(),
+            coordinator_id: None,
+        })
+        .await
+        .unwrap();
+    assert!(accepted.accepted);
+
+    for _ in 0..20 {
+        let inventory = state
+            .inventory(StageInventoryRequest {
+                model_id: load.model_id.clone(),
+                package_ref: load.package_ref.clone(),
+                manifest_sha256: load.manifest_sha256.clone(),
+            })
+            .await;
+        if let Some(status) = inventory
+            .preparing_ranges
+            .iter()
+            .find(|status| status.stage_id == load.stage_id)
+            && status.state == StagePreparationState::Failed
+        {
+            assert!(
+                status
+                    .error
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("unsupported stage backend 'mlx'")
+            );
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    panic!("unsupported MLX prepare did not fail closed");
+}
+
 #[tokio::test]
 async fn prepare_layer_package_stays_downloading_while_peer_prefetch_is_pending() {
     let mut load = load_request();

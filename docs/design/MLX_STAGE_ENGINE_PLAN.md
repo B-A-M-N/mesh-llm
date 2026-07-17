@@ -1,6 +1,6 @@
 # MLX as a Skippy Stage Engine — Deep Dive and Plan
 
-## Status: exploratory design proposal
+## Status: implemented prototype and remaining research plan
 
 This document evaluates using Apple **MLX** (via the Rust `safemlx` / `safemlx-lm`
 crates) as an alternative inference engine behind Skippy's staged execution
@@ -46,6 +46,19 @@ F16 residuals. Their post-proof RSS was about 189 MiB each. This closes the
 dense execution and process-boundary proof. Host topology selection, advanced
 cache/session operations, additional families, and bounded-memory quantization
 remain. See `crates/skippy-engine-mlx/STAGED_EXECUTION.md`.
+
+**Update — host `StagePrepare` / `StageLoad` now consumes range-only MLX
+stages.** An immutable `hf-model://org/repo@<commit>` request is validated
+before network work, materialized on a blocking worker, checked against a
+topology-wide checkpoint identity, strict-loaded into `MlxStageEngine`, and
+served through the existing Skippy binary wire. A clean-cache SmolLM2 proof ran
+both 15-layer ranges through `spawn_stage_control_loop`, reproduced the same
+eight reference tokens, and stopped both stages. Each node-side range plan read
+about 162.86 MB of a 269.06 MB source shard and avoided about 106.2 MB. Startup
+now fails closed on bind/topology/downstream errors, and Stop closes and joins
+active connections. Automatic MLX topology production, capability
+advertisement, remote two-node proof, and bounded-memory load-time quantization
+remain; this checkpoint proves the host consumer path, not automatic placement.
 
 ---
 

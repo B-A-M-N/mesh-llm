@@ -188,6 +188,17 @@ struct PrepareSourceResult {
 }
 
 async fn prepare_stage_source(load: &StageLoadRequest) -> Result<PrepareSourceResult> {
+    if load.backend == "mlx" {
+        #[cfg(all(feature = "mlx", target_os = "macos"))]
+        {
+            let artifact = super::mlx::prepare_stage(load).await?;
+            return Ok(PrepareSourceResult {
+                bytes_total: Some(artifact.manifest.output_file_bytes),
+            });
+        }
+        #[cfg(not(all(feature = "mlx", target_os = "macos")))]
+        anyhow::bail!("unsupported stage backend 'mlx' on this build");
+    }
     if load.load_mode == LoadMode::LayerPackage || is_layer_package_ref(&load.package_ref) {
         let load = load.clone();
         let package = tokio::task::spawn_blocking(move || resolve_stage_load_package(&load))

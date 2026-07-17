@@ -3549,18 +3549,12 @@ fn split_stage_source_is_ready(
     if ready_running_stage {
         return true;
     }
-    if load.load_mode != LoadMode::LayerPackage && !skippy::is_layer_package_ref(&load.package_ref)
-    {
-        return inventory
-            .available_ranges
-            .iter()
-            .any(|range| split_layer_range_covers(range, load));
-    }
-    inventory.preparing_ranges.iter().any(|status| {
+    let prepared_stage_source = inventory.preparing_ranges.iter().any(|status| {
         status.topology_id == load.topology_id
             && status.run_id == load.run_id
             && status.stage_id == load.stage_id
             && status.model_id == load.model_id
+            && status.backend == load.backend
             && status.package_ref == load.package_ref
             && status.manifest_sha256 == load.manifest_sha256
             && status.layer_start <= load.layer_start
@@ -3569,7 +3563,18 @@ fn split_stage_source_is_ready(
                 status.state,
                 skippy::StagePreparationState::Available | skippy::StagePreparationState::Ready
             )
-    })
+    });
+    if prepared_stage_source {
+        return true;
+    }
+    if load.load_mode != LoadMode::LayerPackage && !skippy::is_layer_package_ref(&load.package_ref)
+    {
+        return inventory
+            .available_ranges
+            .iter()
+            .any(|range| split_layer_range_covers(range, load));
+    }
+    false
 }
 
 fn split_layer_range_covers(range: &skippy::LayerRange, load: &skippy::StageLoadRequest) -> bool {
@@ -5032,6 +5037,37 @@ max_tokens = 222
             ),
             source_model_bytes: Some(4_900_000_000),
             source_model_kind: skippy::SourceModelKind::LayerPackage,
+        };
+
+        assert!(!split_stage_source_is_ready(&inventory, &load));
+
+        inventory
+            .preparing_ranges
+            .push(test_preparation_status_from_load(&load));
+
+        assert!(split_stage_source_is_ready(&inventory, &load));
+    }
+
+    #[test]
+    fn mlx_artifact_slice_accepts_exact_prepare_availability() {
+        let mut load = stage_load_request(LoadMode::ArtifactSlice);
+        load.backend = "mlx".to_string();
+        load.package_ref = format!(
+            "hf-model://HuggingFaceTB/SmolLM2-135M-Instruct@{}",
+            "a".repeat(40)
+        );
+        let mut inventory = skippy::StageLayerInventory {
+            model_id: load.model_id.clone(),
+            package_ref: load.package_ref.clone(),
+            manifest_sha256: load.manifest_sha256.clone(),
+            layer_count: 0,
+            ready_ranges: Vec::new(),
+            available_ranges: Vec::new(),
+            missing_ranges: Vec::new(),
+            preparing_ranges: Vec::new(),
+            source_model_path: None,
+            source_model_bytes: None,
+            source_model_kind: skippy::SourceModelKind::Unknown,
         };
 
         assert!(!split_stage_source_is_ready(&inventory, &load));

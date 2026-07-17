@@ -50,6 +50,7 @@ pub struct MlxStageEngineConfig {
     pub layer_start: u32,
     pub layer_end: u32,
     pub compute_dtype: MlxComputeDtype,
+    pub ctx_size: Option<u32>,
 }
 
 enum WorkerJob {
@@ -81,6 +82,10 @@ impl MlxStageEngine {
             Ok(Err(error)) => Err(anyhow!("MLX stage load failed: {error}")),
             Err(_) => Err(anyhow!("MLX stage worker exited before readiness")),
         }
+    }
+
+    pub fn stage_info(&self) -> &StageEngineInfo {
+        &self.info
     }
 
     fn request<T>(
@@ -116,6 +121,7 @@ struct LoadedStage {
     model: llama::Model,
     stream: Stream,
     compute_dtype: Dtype,
+    ctx_size: Option<usize>,
     info: StageEngineInfo,
     sessions: BTreeMap<u64, Vec<Option<ConcatKeyValueCache>>>,
 }
@@ -190,6 +196,7 @@ fn load_stage(config: MlxStageEngineConfig) -> Result<LoadedStage> {
         model,
         stream,
         compute_dtype: config.compute_dtype.mlx(),
+        ctx_size: config.ctx_size.map(usize::try_from).transpose()?,
         info,
         sessions: BTreeMap::new(),
     })
@@ -263,6 +270,7 @@ impl LoadedStage {
         }
         ensure!(!request.token_ids.is_empty(), "stage request has no tokens");
         let token_count = request.token_ids.len();
+        self.ensure_context_capacity(request.session_id, token_count)?;
         if let Some(input) = request.input.as_ref() {
             ensure!(
                 input.token_count == token_count,
@@ -305,6 +313,27 @@ impl LoadedStage {
             activation: Some(array_activation(&hidden, &self.stream)?),
             predicted_tokens: Vec::new(),
         })
+    }
+
+    fn ensure_context_capacity(&self, session_id: u64, token_count: usize) -> Result<()> {
+        let Some(ctx_size) = self.ctx_size else {
+            return Ok(());
+        };
+        let offset = self
+            .sessions
+            .get(&session_id)
+            .and_then(|caches| caches.first())
+            .and_then(Option::as_ref)
+            .map(KeyValueCache::offset)
+            .map(usize::try_from)
+            .transpose()?
+            .unwrap_or_default();
+        ensure!(
+            offset.saturating_add(token_count) <= ctx_size,
+            "MLX stage context limit {ctx_size} exceeded by {} tokens",
+            offset.saturating_add(token_count)
+        );
+        Ok(())
     }
 
     fn input_hidden(&mut self, request: &StageExecutionRequest) -> Result<Array> {

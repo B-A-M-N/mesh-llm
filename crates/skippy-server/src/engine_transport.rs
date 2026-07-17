@@ -8,9 +8,9 @@
 
 use std::{
     io::{self, Write},
-    net::{SocketAddr, TcpListener, TcpStream},
+    net::{Shutdown, SocketAddr, TcpListener, TcpStream},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
     thread,
@@ -47,11 +47,26 @@ pub fn serve_stage_engine_until(
     options: EngineStageServerOptions,
     shutdown: Arc<AtomicBool>,
 ) -> Result<()> {
+    let listener = prepare_stage_engine_listener(engine.as_ref(), &options)?;
+    serve_prepared_stage_engine_until(engine, options, listener, shutdown)
+}
+
+pub(crate) fn prepare_stage_engine_listener(
+    engine: &dyn StageEngine,
+    options: &EngineStageServerOptions,
+) -> Result<TcpListener> {
     engine.info().validate()?;
-    validate_topology(engine.as_ref(), &options)?;
+    validate_topology(engine, options)?;
     let listener = TcpListener::bind(options.bind_addr)
         .with_context(|| format!("bind engine stage at {}", options.bind_addr))?;
     listener.set_nonblocking(true)?;
+    if let Some(downstream_addr) = options.downstream_addr {
+        drop(
+            connect_downstream(downstream_addr).with_context(|| {
+                format!("preflight downstream engine stage at {downstream_addr}")
+            })?,
+        );
+    }
     eprintln!(
         "skippy engine stage listening: engine={} model={} binary={} layers={}..{} width={} dtype={:?}",
         engine.info().engine,
@@ -62,27 +77,83 @@ pub fn serve_stage_engine_until(
         engine.info().activation_width,
         options.wire_dtype,
     );
+    Ok(listener)
+}
 
-    while !shutdown.load(Ordering::SeqCst) {
-        let (upstream, peer_addr) = match listener.accept() {
-            Ok(connection) => connection,
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                thread::sleep(Duration::from_millis(25));
-                continue;
-            }
-            Err(error) => return Err(error).context("accept engine stage connection"),
-        };
-        upstream.set_nonblocking(false)?;
-        upstream.set_nodelay(true).ok();
-        let engine = engine.clone();
-        let options = options.clone();
-        thread::spawn(move || {
-            if let Err(error) = handle_connection(engine, options, upstream) {
-                eprintln!("engine stage connection from {peer_addr} failed: {error:#}");
-            }
-        });
+pub(crate) fn serve_prepared_stage_engine_until(
+    engine: Arc<dyn StageEngine>,
+    options: EngineStageServerOptions,
+    listener: TcpListener,
+    shutdown: Arc<AtomicBool>,
+) -> Result<()> {
+    let mut connections = Vec::new();
+    let result = (|| {
+        while !shutdown.load(Ordering::SeqCst) {
+            reap_finished_connections(&mut connections);
+            let (upstream, peer_addr) = match listener.accept() {
+                Ok(connection) => connection,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(25));
+                    continue;
+                }
+                Err(error) => return Err(error).context("accept engine stage connection"),
+            };
+            upstream.set_nonblocking(false)?;
+            upstream.set_nodelay(true).ok();
+            let control = upstream.try_clone()?;
+            let downstream_control = Arc::new(Mutex::new(None));
+            let engine = engine.clone();
+            let options = options.clone();
+            let connection_downstream = Arc::clone(&downstream_control);
+            let connection = thread::spawn(move || {
+                if let Err(error) =
+                    handle_connection(engine, options, upstream, connection_downstream)
+                {
+                    eprintln!("engine stage connection from {peer_addr} failed: {error:#}");
+                }
+            });
+            connections.push(ActiveConnection {
+                control,
+                downstream_control,
+                thread: connection,
+            });
+        }
+        Ok(())
+    })();
+    stop_active_connections(connections);
+    result
+}
+
+struct ActiveConnection {
+    control: TcpStream,
+    downstream_control: Arc<Mutex<Option<TcpStream>>>,
+    thread: thread::JoinHandle<()>,
+}
+
+fn reap_finished_connections(connections: &mut Vec<ActiveConnection>) {
+    let mut index = 0;
+    while index < connections.len() {
+        if connections[index].thread.is_finished() {
+            let connection = connections.swap_remove(index);
+            let _ = connection.thread.join();
+        } else {
+            index += 1;
+        }
     }
-    Ok(())
+}
+
+fn stop_active_connections(connections: Vec<ActiveConnection>) {
+    for connection in &connections {
+        let _ = connection.control.shutdown(Shutdown::Both);
+        if let Ok(downstream) = connection.downstream_control.lock()
+            && let Some(downstream) = downstream.as_ref()
+        {
+            let _ = downstream.shutdown(Shutdown::Both);
+        }
+    }
+    for connection in connections {
+        let _ = connection.thread.join();
+    }
 }
 
 fn validate_topology(engine: &dyn StageEngine, options: &EngineStageServerOptions) -> Result<()> {
@@ -97,13 +168,19 @@ fn handle_connection(
     engine: Arc<dyn StageEngine>,
     options: EngineStageServerOptions,
     mut upstream: TcpStream,
+    downstream_control: Arc<Mutex<Option<TcpStream>>>,
 ) -> Result<()> {
-    send_ready(&mut upstream).context("send engine stage ready")?;
-    upstream.flush().ok();
     let mut downstream = options
         .downstream_addr
         .map(connect_downstream)
         .transpose()?;
+    if let Some(stream) = downstream.as_ref() {
+        *downstream_control
+            .lock()
+            .expect("downstream control lock poisoned") = Some(stream.try_clone()?);
+    }
+    send_ready(&mut upstream).context("send engine stage ready")?;
+    upstream.flush().ok();
     let activation_width =
         i32::try_from(engine.info().activation_width).context("activation width exceeds i32")?;
 
@@ -146,10 +223,15 @@ fn handle_connection(
 }
 
 fn connect_downstream(addr: SocketAddr) -> Result<TcpStream> {
-    let mut stream = TcpStream::connect(addr)
+    const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+    let mut stream = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT)
         .with_context(|| format!("connect downstream engine stage at {addr}"))?;
     stream.set_nodelay(true).ok();
+    stream.set_read_timeout(Some(CONNECT_TIMEOUT))?;
+    stream.set_write_timeout(Some(CONNECT_TIMEOUT))?;
     recv_ready(&mut stream).context("downstream engine stage did not become ready")?;
+    stream.set_read_timeout(None)?;
+    stream.set_write_timeout(None)?;
     Ok(stream)
 }
 

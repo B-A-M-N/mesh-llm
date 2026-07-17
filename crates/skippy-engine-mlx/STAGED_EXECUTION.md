@@ -6,7 +6,8 @@ Dense Llama-family MLX stages now run as separate OS processes from partial
 SafeTensors artifacts and communicate over Skippy's existing binary stage wire.
 The first proof uses `HuggingFaceTB/SmolLM2-135M-Instruct` split at layer 15.
 
-This is a production-shaped bridge, not yet the default mesh launch path:
+This is a production-shaped bridge with an explicit host control path, not yet
+the default automatic mesh launch path:
 
 - `skippy-engine` owns the engine-neutral `StageEngine` contract and residual
   buffer descriptors.
@@ -19,6 +20,9 @@ This is a production-shaped bridge, not yet the default mesh launch path:
   per-session KV caches on a dedicated MLX worker thread, and executes only its
   configured layer range.
 - `mlx-stage` starts a stage process or drives a chain as a proof client.
+- `StagePrepare` / `StageLoad` with `backend=mlx` and an immutable
+  `hf-model://org/repo@<commit>` reference now materialize and start the same
+  engine through the normal host stage-control loop.
 
 No process in the proof has access to the complete checkpoint. The tokenizer
 and config files are small shared metadata; tensor data comes only from that
@@ -43,6 +47,22 @@ That exactly matches the whole-model and in-process split reference for the
 same prompt across prompt prefill and seven subsequent decode calls. Each stage
 kept an independent per-layer KV cache, and `Stop` cleared the session in both
 processes.
+
+The host-managed proof also passed from a clean MLX stage cache. Both ranges
+shared checkpoint identity
+`303b5a31e5226edb03a48f6f77464736a91a404b1500f385ec43d0951ce81e87`,
+but retained distinct stage cache keys:
+
+| Layers | Planned HTTP payload | Complete source shard | Avoided | Requests |
+| --- | ---: | ---: | ---: | ---: |
+| `0..15` | 162,857,381 bytes | 269,060,552 bytes | 106,204,032 bytes | 3 |
+| `15..30` | 162,858,533 bytes | 269,060,552 bytes | 106,202,880 bytes | 4 |
+
+The test submitted Prepare, polled inventory, submitted Load, checked the
+materialized status identity/path, generated the same eight reference tokens,
+and submitted Stop through `spawn_stage_control_loop`. The runtime status does
+not mislabel the derived slice as the full source model or claim a cache pin
+that does not exist.
 
 The two partial files are the exact-range artifacts described in
 `../../spikes/mlx-safetensors-stages/FINDINGS.md`. Tied input/output embeddings
@@ -96,6 +116,8 @@ just mlx-stage prove --connect 127.0.0.1:19090 --wire-dtype f16
 - `engine_transport` is the reduced compatibility lane. The mature llama.cpp
   binary server remains unchanged and still owns telemetry, exact-prefix cache,
   batching, and OpenAI orchestration.
-- Mesh topology planning does not yet launch `MlxStageEngine`; the next product
-  step is selecting this engine from stage config and advertising it as an
-  additive capability. There is no mesh protocol or Skippy ABI break here.
+- Mesh topology planning does not yet produce MLX stage assignments. The host
+  can consume explicit `backend=mlx` Prepare/Load requests, but automatic
+  placement, capability advertisement, coordinator model planning, and an
+  OpenAI stage-0 frontend remain. There is no mesh protocol or Skippy ABI break
+  in the explicit consumer path.

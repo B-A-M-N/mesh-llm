@@ -113,6 +113,7 @@ mod real {
                     layer_start,
                     layer_end,
                     compute_dtype: compute_dtype.into(),
+                    ctx_size: None,
                 },
                 EngineStageServerOptions {
                     bind_addr: bind,
