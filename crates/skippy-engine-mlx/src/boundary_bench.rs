@@ -2,7 +2,10 @@
 
 mod tcp;
 
-pub use tcp::{MlxTcpBoundaryBenchConfig, MlxTcpBoundaryBenchReport, benchmark_mlx_tcp_boundary};
+pub use tcp::{
+    MlxTcpBoundaryBenchConfig, MlxTcpBoundaryBenchReport, MlxTcpBoundarySinkConfig,
+    benchmark_mlx_tcp_boundary, serve_mlx_tcp_boundary_sink,
+};
 
 use std::{
     collections::BTreeMap,

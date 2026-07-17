@@ -15,8 +15,9 @@ mod real {
     use skippy_engine_mlx::{
         MlxBoundaryBenchConfig, MlxComputeDtype, MlxDerivationControl, MlxDerivedStageCacheConfig,
         MlxDerivedStageConfig, MlxStageEngine, MlxStageEngineConfig, MlxTcpBoundaryBenchConfig,
-        MlxWeightQuantization, benchmark_mlx_boundary, benchmark_mlx_tcp_boundary,
-        derive_quantized_stage, derive_quantized_stage_cached, mlx_derived_stage_cache_root,
+        MlxTcpBoundarySinkConfig, MlxWeightQuantization, benchmark_mlx_boundary,
+        benchmark_mlx_tcp_boundary, derive_quantized_stage, derive_quantized_stage_cached,
+        mlx_derived_stage_cache_root, serve_mlx_tcp_boundary_sink,
         validate_nemotron_h_binary_wire_tokens, validate_nemotron_h_moe_stage,
         validate_nemotron_h_stage_engine,
     };
@@ -149,7 +150,7 @@ mod real {
             #[arg(long)]
             output: Option<PathBuf>,
         },
-        /// Measure one activation through production Skippy loopback TCP.
+        /// Measure one activation through local or remote production Skippy TCP.
         BenchTcpBoundary {
             #[arg(long)]
             width: usize,
@@ -169,8 +170,22 @@ mod real {
             metrics_run_id: Option<String>,
             #[arg(long)]
             metrics_report: PathBuf,
+            /// Connect to a separately running validating sink instead of loopback.
+            #[arg(long)]
+            connect: Option<SocketAddr>,
             #[arg(long)]
             output: Option<PathBuf>,
+        },
+        /// Run a trusted-network-only validating sink for the TCP boundary benchmark.
+        ServeTcpBoundarySink {
+            #[arg(long)]
+            bind: SocketAddr,
+            #[arg(long)]
+            width: usize,
+            #[arg(long)]
+            tokens: usize,
+            #[arg(long, value_enum)]
+            wire_dtype: WireDtype,
         },
         /// Drive a stage chain and assert its greedy token sequence.
         Prove {
@@ -387,6 +402,7 @@ mod real {
                 metrics_otlp_grpc,
                 metrics_run_id,
                 metrics_report,
+                connect,
                 output,
             } => {
                 let metrics_run_id = match metrics_run_id {
@@ -403,6 +419,7 @@ mod real {
                     metrics_otlp_grpc,
                     metrics_run_id,
                     metrics_report_path: metrics_report,
+                    connect_addr: connect,
                 })?;
                 let json = serde_json::to_vec_pretty(&report)?;
                 if let Some(output) = output {
@@ -417,6 +434,17 @@ mod real {
                 println!("{}", String::from_utf8(json)?);
                 Ok(())
             }
+            Command::ServeTcpBoundarySink {
+                bind,
+                width,
+                tokens,
+                wire_dtype,
+            } => serve_mlx_tcp_boundary_sink(&MlxTcpBoundarySinkConfig {
+                bind_addr: bind,
+                width,
+                token_count: tokens,
+                wire_dtype: wire_dtype.into(),
+            }),
             Command::Prove {
                 connect,
                 tokens,

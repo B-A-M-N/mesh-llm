@@ -23,7 +23,8 @@ pub use backend::MlxBackend;
 #[cfg(all(feature = "mlx", target_os = "macos"))]
 pub use boundary_bench::{
     MlxBoundaryBenchConfig, MlxBoundaryBenchReport, MlxTcpBoundaryBenchConfig,
-    MlxTcpBoundaryBenchReport, benchmark_mlx_boundary, benchmark_mlx_tcp_boundary,
+    MlxTcpBoundaryBenchReport, MlxTcpBoundarySinkConfig, benchmark_mlx_boundary,
+    benchmark_mlx_tcp_boundary, serve_mlx_tcp_boundary_sink,
 };
 #[cfg(all(feature = "mlx", target_os = "macos"))]
 pub use derived::{

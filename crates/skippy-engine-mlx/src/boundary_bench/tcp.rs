@@ -16,6 +16,7 @@ use std::{
 use anyhow::{Context, Result, anyhow, ensure};
 use serde::Serialize;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use skippy_engine::{
     StageEngine, StageEngineInfo, StageExecutionKind, StageExecutionOutput, StageExecutionRequest,
 };
@@ -30,7 +31,7 @@ use skippy_protocol::{
     },
 };
 use skippy_server::{
-    engine_transport::{EngineStageServerOptions, serve_stage_engine_until},
+    engine_transport::{EngineStageServerOptions, serve_stage_engine, serve_stage_engine_until},
     telemetry::{Telemetry, TelemetryLevel, TelemetryStats, lifecycle_attrs},
 };
 
@@ -40,8 +41,12 @@ use super::{
     wait_for_telemetry, wire_dtype_label,
 };
 
-const BENCHMARK_SCHEMA: &str = "mlx-tcp-boundary-v1";
+const BENCHMARK_SCHEMA: &str = "mlx-tcp-boundary-v2";
 const PREDICTED_SENTINEL: i32 = 424_243;
+const CONNECT_DEADLINE: Duration = Duration::from_secs(10);
+const CONNECT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(1);
+const READY_TIMEOUT: Duration = Duration::from_secs(5);
+const ROUNDTRIP_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// One explicit, reproducible production-TCP boundary benchmark run.
 #[derive(Clone, Debug)]
@@ -55,6 +60,16 @@ pub struct MlxTcpBoundaryBenchConfig {
     pub metrics_otlp_grpc: String,
     pub metrics_run_id: String,
     pub metrics_report_path: PathBuf,
+    pub connect_addr: Option<SocketAddr>,
+}
+
+/// Foreground production sink for a separate-process or remote benchmark.
+#[derive(Clone, Debug)]
+pub struct MlxTcpBoundarySinkConfig {
+    pub bind_addr: SocketAddr,
+    pub width: usize,
+    pub token_count: usize,
+    pub wire_dtype: WireActivationDType,
 }
 
 /// Sender encode through production server decode and predicted reply.
@@ -67,12 +82,14 @@ pub struct MlxTcpBoundaryBenchReport {
     pub width: usize,
     pub token_count: usize,
     pub wire_dtype: String,
+    pub transport: &'static str,
     pub warmup_iterations: usize,
     pub measured_iterations: usize,
     pub f32_boundary_bytes: usize,
     pub wire_activation_payload_bytes: usize,
     pub tcp_roundtrip: MlxBoundaryDurationSummary,
-    pub warmup_roundtrip_max_abs_diff: f32,
+    pub warmup_validation_ack_received: bool,
+    pub warmup_sink_acknowledged_max_abs_diff: f32,
     pub telemetry: TelemetryStats,
     pub canonical_span_count: u64,
 }
@@ -88,34 +105,82 @@ pub fn benchmark_mlx_tcp_boundary(
         .map_err(|_| anyhow!("MLX TCP boundary benchmark thread panicked"))?
 }
 
+/// Runs the validating final-stage sink in the foreground until interrupted.
+pub fn serve_mlx_tcp_boundary_sink(config: &MlxTcpBoundarySinkConfig) -> Result<()> {
+    validate_protocol_shape(config.width, config.token_count, config.wire_dtype)?;
+    let source = source_bytes(config.width, config.token_count)?;
+    let engine = Arc::new(TcpBoundarySink::new(
+        config.width,
+        config.token_count,
+        config.wire_dtype,
+        source,
+    )?);
+    serve_stage_engine(
+        engine,
+        EngineStageServerOptions {
+            bind_addr: config.bind_addr,
+            downstream_addr: None,
+            wire_dtype: config.wire_dtype,
+        },
+    )
+}
+
 fn benchmark_mlx_tcp_boundary_inner(
     config: &MlxTcpBoundaryBenchConfig,
 ) -> Result<MlxTcpBoundaryBenchReport> {
     validate_config(config)?;
-    let source = source_bytes(config)?;
-    let engine = Arc::new(TcpBoundarySink::new(config, Arc::clone(&source))?);
-    let (server, mut client) = TcpStageServer::spawn_ready(
-        engine.clone(),
-        EngineStageServerOptions {
-            bind_addr: "127.0.0.1:0".parse()?,
-            downstream_addr: None,
-            wire_dtype: config.wire_dtype,
-        },
-    )?;
-
-    for iteration in 0..config.warmup_iterations {
-        run_roundtrip(config, &source, &mut client, u64::try_from(iteration)?)?;
-    }
-    let warmup_roundtrip_max_abs_diff = engine
-        .validation_diff()?
-        .context("TCP boundary warmup did not reach the sink engine")?;
-
-    let samples = measure_roundtrips(config, &source, &mut client)?;
-    drop(client);
-    server.stop()?;
+    let source = source_bytes(config.width, config.token_count)?;
+    let (server, engine, mut client) = match config.connect_addr {
+        Some(connect_addr) => (None, None, connect_ready(connect_addr)?),
+        None => {
+            let engine = Arc::new(TcpBoundarySink::new(
+                config.width,
+                config.token_count,
+                config.wire_dtype,
+                Arc::clone(&source),
+            )?);
+            let (server, client) = TcpStageServer::spawn_ready(
+                engine.clone(),
+                EngineStageServerOptions {
+                    bind_addr: "127.0.0.1:0".parse()?,
+                    downstream_addr: None,
+                    wire_dtype: config.wire_dtype,
+                },
+            )?;
+            (Some(server), Some(engine), client)
+        }
+    };
 
     create_metrics_run(config)?;
     let mut metrics_run = MetricsRunGuard::new(config);
+    let session_id = benchmark_session_id(&config.metrics_run_id);
+    let mut warmup_roundtrip_max_abs_diff = 0.0_f32;
+    for iteration in 0..config.warmup_iterations {
+        let diff = run_roundtrip(
+            config,
+            &source,
+            &mut client,
+            session_id,
+            u64::try_from(iteration)?,
+        )?;
+        warmup_roundtrip_max_abs_diff = warmup_roundtrip_max_abs_diff.max(diff);
+    }
+    if let Some(engine) = engine.as_ref() {
+        let local_diff = engine
+            .validation_diff(session_id)?
+            .context("TCP boundary warmup acknowledgement has no matching local sink validation")?;
+        ensure!(
+            local_diff.to_bits() == warmup_roundtrip_max_abs_diff.to_bits(),
+            "TCP boundary warmup acknowledgement differs from local sink validation"
+        );
+    }
+
+    let samples = measure_roundtrips(config, &source, &mut client, session_id)?;
+    drop(client);
+    if let Some(server) = server {
+        server.stop()?;
+    }
+
     let telemetry_runtime = TcpTelemetryRuntime::new(config)?;
     let attrs = benchmark_attrs(config)?;
     for sample in &samples {
@@ -149,6 +214,7 @@ fn benchmark_mlx_tcp_boundary_inner(
         width: config.width,
         token_count: config.token_count,
         wire_dtype: wire_dtype_label(config.wire_dtype)?.to_string(),
+        transport: transport_label(config),
         warmup_iterations: config.warmup_iterations,
         measured_iterations: config.measured_iterations,
         f32_boundary_bytes: activation_bytes(config, size_of::<f32>())?,
@@ -161,18 +227,15 @@ fn benchmark_mlx_tcp_boundary_inner(
             },
         )?,
         tcp_roundtrip: summarize(samples.iter().map(|sample| sample.elapsed))?,
-        warmup_roundtrip_max_abs_diff,
+        warmup_validation_ack_received: true,
+        warmup_sink_acknowledged_max_abs_diff: warmup_roundtrip_max_abs_diff,
         telemetry,
         canonical_span_count,
     })
 }
 
 fn validate_config(config: &MlxTcpBoundaryBenchConfig) -> Result<()> {
-    ensure!(config.width > 0, "TCP boundary width must be non-zero");
-    ensure!(
-        config.token_count > 0,
-        "TCP boundary token count must be non-zero"
-    );
+    validate_protocol_shape(config.width, config.token_count, config.wire_dtype)?;
     ensure!(
         config.warmup_iterations > 0,
         "TCP boundary benchmark needs a correctness warmup"
@@ -190,20 +253,31 @@ fn validate_config(config: &MlxTcpBoundaryBenchConfig) -> Result<()> {
         "metrics-server OTLP endpoint is required"
     );
     validate_metrics_run_id(&config.metrics_run_id)?;
-    wire_dtype_label(config.wire_dtype)?;
-    let token_count = i32::try_from(config.token_count).context("token count exceeds i32")?;
-    let width = i32::try_from(config.width).context("activation width exceeds i32")?;
-    u32::try_from(config.width).context("activation width exceeds u32")?;
+    Ok(())
+}
+
+fn validate_protocol_shape(
+    width: usize,
+    token_count: usize,
+    wire_dtype: WireActivationDType,
+) -> Result<()> {
+    ensure!(width > 0, "TCP boundary width must be non-zero");
+    ensure!(token_count > 0, "TCP boundary token count must be non-zero");
+    wire_dtype_label(wire_dtype)?;
+    let token_count_i32 = i32::try_from(token_count).context("token count exceeds i32")?;
+    let width_i32 = i32::try_from(width).context("activation width exceeds i32")?;
+    u32::try_from(width).context("activation width exceeds u32")?;
     ensure!(
-        config.token_count <= MAX_STAGE_SIDEBAND_VALUES,
+        token_count <= MAX_STAGE_SIDEBAND_VALUES,
         "token sideband count exceeds protocol maximum"
     );
-    let wire_bytes = activation_wire_bytes(config.wire_dtype, token_count, width)?;
+    let wire_bytes = activation_wire_bytes(wire_dtype, token_count_i32, width_i32)?;
     ensure!(
         wire_bytes <= MAX_STAGE_ACTIVATION_BYTES,
         "wire activation exceeds protocol maximum"
     );
-    let decoded_bytes = activation_wire_bytes(WireActivationDType::F32, token_count, width)?;
+    let decoded_bytes =
+        activation_wire_bytes(WireActivationDType::F32, token_count_i32, width_i32)?;
     ensure!(
         decoded_bytes <= MAX_STAGE_DECODED_ACTIVATION_BYTES,
         "decoded activation exceeds protocol maximum"
@@ -211,10 +285,9 @@ fn validate_config(config: &MlxTcpBoundaryBenchConfig) -> Result<()> {
     Ok(())
 }
 
-fn source_bytes(config: &MlxTcpBoundaryBenchConfig) -> Result<Arc<Vec<u8>>> {
-    let elements = config
-        .width
-        .checked_mul(config.token_count)
+fn source_bytes(width: usize, token_count: usize) -> Result<Arc<Vec<u8>>> {
+    let elements = width
+        .checked_mul(token_count)
         .context("TCP boundary element count overflow")?;
     Ok(Arc::new(
         (0..elements)
@@ -230,11 +303,13 @@ fn measure_roundtrips(
     config: &MlxTcpBoundaryBenchConfig,
     source: &[u8],
     client: &mut TcpStream,
+    session_id: u64,
 ) -> Result<Vec<PhaseTiming>> {
     (0..config.measured_iterations)
         .map(|iteration| {
             let request_id = u64::try_from(config.warmup_iterations + iteration)?;
-            let ((), timing) = time_phase(|| run_roundtrip(config, source, client, request_id))?;
+            let (_, timing) =
+                time_phase(|| run_roundtrip(config, source, client, session_id, request_id))?;
             Ok(timing)
         })
         .collect()
@@ -244,8 +319,9 @@ fn run_roundtrip(
     config: &MlxTcpBoundaryBenchConfig,
     source: &[u8],
     client: &mut TcpStream,
+    session_id: u64,
     request_id: u64,
-) -> Result<()> {
+) -> Result<f32> {
     let token_count = i32::try_from(config.token_count)?;
     let width = i32::try_from(config.width)?;
     let kind = WireMessageKind::PrefillFinalEmbd;
@@ -258,7 +334,7 @@ fn run_roundtrip(
         token_count,
         state,
         request_id,
-        session_id: 1,
+        session_id,
         sampling: None,
         chat_sampling_metadata: None,
         tokens: vec![0; config.token_count],
@@ -273,10 +349,14 @@ fn run_roundtrip(
     ensure!(
         reply.kind == WireReplyKind::PredictedToken
             && reply.predicted == PREDICTED_SENTINEL
-            && reply.predicted_tokens == [PREDICTED_SENTINEL],
-        "TCP boundary sink returned the wrong prediction"
+            && reply.predicted_tokens.len() == 2
+            && reply.predicted_tokens[0] == PREDICTED_SENTINEL,
+        "TCP boundary sink returned no validation acknowledgement"
     );
-    Ok(())
+    let diff = validation_diff_from_ack(reply.predicted_tokens[1]);
+    validate_roundtrip(config.wire_dtype, diff)
+        .context("TCP boundary sink acknowledged an invalid activation")?;
+    Ok(diff)
 }
 
 struct TcpBoundarySink {
@@ -284,12 +364,16 @@ struct TcpBoundarySink {
     token_count: usize,
     wire_dtype: WireActivationDType,
     source: Arc<Vec<u8>>,
-    validated: AtomicBool,
-    validation_diff: Mutex<Option<f32>>,
+    validation: Mutex<Option<(u64, f32)>>,
 }
 
 impl TcpBoundarySink {
-    fn new(config: &MlxTcpBoundaryBenchConfig, source: Arc<Vec<u8>>) -> Result<Self> {
+    fn new(
+        width: usize,
+        token_count: usize,
+        wire_dtype: WireActivationDType,
+        source: Arc<Vec<u8>>,
+    ) -> Result<Self> {
         let info = StageEngineInfo {
             engine: "mlx-tcp-boundary-sink".to_string(),
             model_id: "synthetic/mlx-tcp-boundary".to_string(),
@@ -297,24 +381,39 @@ impl TcpBoundarySink {
             layer_start: 1,
             layer_end: 2,
             total_layers: 2,
-            activation_width: u32::try_from(config.width)?,
+            activation_width: u32::try_from(width)?,
         };
         info.validate()?;
         Ok(Self {
             info,
-            token_count: config.token_count,
-            wire_dtype: config.wire_dtype,
+            token_count,
+            wire_dtype,
             source,
-            validated: AtomicBool::new(false),
-            validation_diff: Mutex::new(None),
+            validation: Mutex::new(None),
         })
     }
 
-    fn validation_diff(&self) -> Result<Option<f32>> {
-        Ok(*self
-            .validation_diff
+    fn validation_diff(&self, session_id: u64) -> Result<Option<f32>> {
+        Ok(self
+            .validation
             .lock()
-            .map_err(|_| anyhow!("TCP boundary validation lock poisoned"))?)
+            .map_err(|_| anyhow!("TCP boundary validation lock poisoned"))?
+            .filter(|(validated_session, _)| *validated_session == session_id)
+            .map(|(_, diff)| diff))
+    }
+
+    fn validate_session(&self, session_id: u64, activation: &[u8]) -> Result<f32> {
+        if let Some(diff) = self.validation_diff(session_id)? {
+            return Ok(diff);
+        }
+        let diff = max_abs_diff(&self.source, activation)?;
+        validate_roundtrip(self.wire_dtype, diff)?;
+        *self
+            .validation
+            .lock()
+            .map_err(|_| anyhow!("TCP boundary validation lock poisoned"))? =
+            Some((session_id, diff));
+        Ok(diff)
     }
 }
 
@@ -336,21 +435,24 @@ impl StageEngine for TcpBoundarySink {
                 && activation.width == self.info.activation_width as usize,
             "TCP boundary sink received the wrong activation shape"
         );
-        if !self.validated.swap(true, Ordering::SeqCst) {
-            let diff = max_abs_diff(&self.source, &activation.f32_le_bytes)?;
-            validate_roundtrip(self.wire_dtype, diff)?;
-            *self
-                .validation_diff
-                .lock()
-                .map_err(|_| anyhow!("TCP boundary validation lock poisoned"))? = Some(diff);
-        }
+        let diff = self.validate_session(request.session_id, &activation.f32_le_bytes)?;
         Ok(StageExecutionOutput {
             activation: None,
-            predicted_tokens: vec![PREDICTED_SENTINEL],
+            predicted_tokens: vec![PREDICTED_SENTINEL, validation_diff_ack(diff)],
         })
     }
 
-    fn reset_session(&self, _session_id: u64) -> Result<()> {
+    fn reset_session(&self, session_id: u64) -> Result<()> {
+        let mut validation = self
+            .validation
+            .lock()
+            .map_err(|_| anyhow!("TCP boundary validation lock poisoned"))?;
+        if validation
+            .as_ref()
+            .is_some_and(|(validated_session, _)| *validated_session == session_id)
+        {
+            *validation = None;
+        }
         Ok(())
     }
 }
@@ -425,16 +527,22 @@ fn reserve_loopback_addr() -> Result<SocketAddr> {
 }
 
 fn connect_ready(addr: SocketAddr) -> Result<TcpStream> {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + CONNECT_DEADLINE;
     loop {
-        let error = match TcpStream::connect(addr) {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        ensure!(
+            !remaining.is_zero(),
+            "connect TCP boundary stage at {addr} timed out"
+        );
+        let error = match TcpStream::connect_timeout(&addr, remaining.min(CONNECT_ATTEMPT_TIMEOUT))
+        {
             Ok(mut stream) => {
                 stream.set_nodelay(true).ok();
-                stream.set_read_timeout(Some(Duration::from_millis(250)))?;
-                stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+                stream.set_read_timeout(Some(remaining.min(READY_TIMEOUT)))?;
+                stream.set_write_timeout(Some(ROUNDTRIP_TIMEOUT))?;
                 match recv_ready(&mut stream) {
                     Ok(()) => {
-                        stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+                        stream.set_read_timeout(Some(ROUNDTRIP_TIMEOUT))?;
                         return Ok(stream);
                     }
                     Err(error) => anyhow!(error).context("receive TCP boundary ready handshake"),
@@ -447,6 +555,22 @@ fn connect_ready(addr: SocketAddr) -> Result<TcpStream> {
         }
         thread::sleep(Duration::from_millis(25));
     }
+}
+
+fn benchmark_session_id(metrics_run_id: &str) -> u64 {
+    let digest = Sha256::digest(metrics_run_id.as_bytes());
+    let bytes: [u8; size_of::<u64>()] = digest[..size_of::<u64>()]
+        .try_into()
+        .expect("SHA-256 prefix has the requested length");
+    u64::from_le_bytes(bytes)
+}
+
+fn validation_diff_ack(diff: f32) -> i32 {
+    i32::from_le_bytes(diff.to_bits().to_le_bytes())
+}
+
+fn validation_diff_from_ack(ack: i32) -> f32 {
+    f32::from_bits(u32::from_le_bytes(ack.to_le_bytes()))
 }
 
 struct TcpTelemetryRuntime {
@@ -534,6 +658,7 @@ fn metrics_run_body(config: &MlxTcpBoundaryBenchConfig) -> Result<Value> {
         "width": config.width,
         "token_count": config.token_count,
         "wire_dtype": wire_dtype_label(config.wire_dtype)?,
+        "transport": transport_label(config),
         "warmup_iterations": config.warmup_iterations,
         "measured_iterations": config.measured_iterations,
         "stages": [{
@@ -623,6 +748,14 @@ fn activation_bytes(config: &MlxTcpBoundaryBenchConfig, element_bytes: usize) ->
         .context("TCP boundary byte count overflow")
 }
 
+fn transport_label(config: &MlxTcpBoundaryBenchConfig) -> &'static str {
+    if config.connect_addr.is_some() {
+        "external_tcp"
+    } else {
+        "loopback"
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -638,12 +771,14 @@ mod tests {
             metrics_otlp_grpc: "https://otlp.invalid/private".to_string(),
             metrics_run_id: "tcp-test-run".to_string(),
             metrics_report_path: PathBuf::from("/private/report.json"),
+            connect_addr: None,
         }
     }
 
     #[test]
     fn telemetry_contains_no_transport_targets_or_local_paths() {
-        let config = config();
+        let mut config = config();
+        config.connect_addr = Some("203.0.113.10:1234".parse().unwrap());
         let exported = json!({
             "stage_config": telemetry_stage_config(&config).unwrap(),
             "span_attributes": benchmark_attrs(&config).unwrap(),
@@ -653,12 +788,13 @@ mod tests {
         assert!(!serialized.contains("collector.invalid"));
         assert!(!serialized.contains("otlp.invalid"));
         assert!(!serialized.contains("/private/"));
+        assert!(!serialized.contains("203.0.113.10"));
     }
 
     #[test]
     fn source_values_are_finite_and_in_the_codec_gate_range() {
         let config = config();
-        let source = source_bytes(&config).unwrap();
+        let source = source_bytes(config.width, config.token_count).unwrap();
         assert_eq!(source.len(), 4096 * 32 * size_of::<f32>());
         assert!(
             source
@@ -677,8 +813,16 @@ mod tests {
             config.width = 8;
             config.token_count = 2;
             config.wire_dtype = wire_dtype;
-            let source = source_bytes(&config).unwrap();
-            let engine = Arc::new(TcpBoundarySink::new(&config, Arc::clone(&source)).unwrap());
+            let source = source_bytes(config.width, config.token_count).unwrap();
+            let engine = Arc::new(
+                TcpBoundarySink::new(
+                    config.width,
+                    config.token_count,
+                    config.wire_dtype,
+                    Arc::clone(&source),
+                )
+                .unwrap(),
+            );
             let (server, mut client) = TcpStageServer::spawn_ready(
                 engine.clone(),
                 EngineStageServerOptions {
@@ -689,11 +833,46 @@ mod tests {
             )
             .unwrap();
 
-            run_roundtrip(&config, &source, &mut client, 1).unwrap();
-            assert!(engine.validation_diff().unwrap().unwrap() <= expected_diff);
+            let session_id = benchmark_session_id(&config.metrics_run_id);
+            let acknowledged_diff =
+                run_roundtrip(&config, &source, &mut client, session_id, 1).unwrap();
+            assert!(acknowledged_diff <= expected_diff);
+            assert_eq!(
+                engine.validation_diff(session_id).unwrap(),
+                Some(acknowledged_diff)
+            );
             drop(client);
             server.stop().unwrap();
         }
+    }
+
+    #[test]
+    fn sink_validates_each_session_and_failed_validation_does_not_poison_it() {
+        let config = config();
+        let source = source_bytes(config.width, config.token_count).unwrap();
+        let engine = TcpBoundarySink::new(
+            config.width,
+            config.token_count,
+            config.wire_dtype,
+            Arc::clone(&source),
+        )
+        .unwrap();
+        assert!(engine.validate_session(11, &source).unwrap() <= 0.001);
+
+        let mut invalid = source.as_ref().clone();
+        invalid[..size_of::<f32>()].copy_from_slice(&10.0_f32.to_le_bytes());
+        assert!(engine.validate_session(12, &invalid).is_err());
+        assert_eq!(engine.validation_diff(12).unwrap(), None);
+
+        assert!(engine.validate_session(12, &source).unwrap() <= 0.001);
+        assert!(engine.validation_diff(12).unwrap().is_some());
+    }
+
+    #[test]
+    fn validation_ack_and_session_identity_round_trip() {
+        let diff = 0.000_452_160_84_f32;
+        assert_eq!(validation_diff_from_ack(validation_diff_ack(diff)), diff);
+        assert_ne!(benchmark_session_id("run-a"), benchmark_session_id("run-b"));
     }
 
     #[test]

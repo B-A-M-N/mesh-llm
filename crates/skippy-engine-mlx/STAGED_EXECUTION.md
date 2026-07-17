@@ -398,6 +398,52 @@ just mlx-stage bench-tcp-boundary \
   --output /tmp/mlx-tcp-boundary-local.json
 ```
 
+### Separate-process and two-host TCP fence
+
+TCP v2 can move the validating sink into a separate process or host while
+retaining the same production `engine_transport` framing and reconstruction
+path. The sink is intentionally a benchmark tool: it is unauthenticated,
+unencrypted TCP and must be bound only on a trusted private network or behind a
+firewall. Its `width`, `tokens`, and `wire-dtype` must exactly match the sender.
+
+Start the sink in the foreground on the receiving host:
+
+```bash
+just mlx-stage serve-tcp-boundary-sink \
+  --bind 0.0.0.0:19090 \
+  --width 16384 --tokens 512 --wire-dtype f16
+```
+
+Then add `--connect <sink-private-address>:19090` to
+`bench-tcp-boundary` on the sending host and use a fresh metrics run ID. The
+runner allows 10 seconds for connect/READY and 30 seconds for each write and
+reply. It uses one warmed persistent connection per invocation; the foreground
+sink can accept later invocations without a restart. Run only one benchmark
+client at a time per sink: its deliberately bounded validation cache retains
+the most recent session, so concurrent clients can force revalidation into a
+measured sample.
+
+Each run derives a distinct wire session from its metrics run ID. The sink
+validates the first activation for that session and returns the observed
+maximum absolute error as an explicit acknowledgement. It records the session
+only after the exact-F32 / bounded-F16 gate succeeds, so a failed attempt cannot
+poison a retry. The sender requires and independently gates that acknowledgement
+before recording samples. Reports use the neutral `external_tcp` label because
+an address supplied with `--connect` may still be localhost; the address itself
+is excluded from the local/canonical telemetry payload.
+
+The current READY handshake does not carry sink build identity. For controlled
+two-host evidence, copy the exact same release `mlx-stage` artifact to the sink
+host and compare its SHA-256 on both hosts. Record that out-of-band checksum
+alongside the client `code_revision`; do not infer sink provenance from the
+client revision alone.
+
+The acknowledgement is a claim made by the sink, not cryptographic remote
+attestation. `warmup_validation_ack_received` means the expected structured
+reply arrived, and `warmup_sink_acknowledged_max_abs_diff` is the value reported
+by that sink. The identical-artifact checksum procedure above is therefore part
+of the controlled evidence, not an optional provenance detail.
+
 ## Reproduce
 
 Build once:

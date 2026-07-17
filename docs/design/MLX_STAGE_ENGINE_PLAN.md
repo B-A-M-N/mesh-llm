@@ -179,6 +179,17 @@ F32 16K p50 and broad p95 make this evidence a framing/host-copy validation,
 not a link-throughput estimate. A controlled remote TCP/QUIC sweep is still
 required before automatic wire-dtype selection.
 
+**Update — the two-host TCP runner is now fail-closed.** TCP boundary schema v2
+can connect to a separately running production `engine_transport` sink. A
+unique per-run wire session forces a fresh first-activation validation even
+when the foreground sink is reused, and the sink returns the measured
+exact-F32 / bounded-F16 error as an acknowledgement required by the sender.
+Connect/READY and round-trip IO are bounded. Canonical telemetry records only
+the neutral `external_tcp` mode, never the target address. The benchmark sink
+is plaintext and unauthenticated, so it is restricted to trusted private
+networks. Until sink revision is added to READY, controlled evidence must copy
+and independently hash the identical release artifact on both hosts.
+
 The derivation memory bound is the final packed routed bank, not one expert:
 six preallocated payload buffers total 718,405,632 bytes. Moving those buffers
 to a disk-backed random-write spool is the next step if preparation RSS must
