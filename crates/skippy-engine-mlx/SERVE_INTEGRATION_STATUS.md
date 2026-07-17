@@ -94,6 +94,8 @@ bytes evenly by layer count.
 - Automatic affine-4 is the current default for eligible dense checkpoints,
   not yet a general hardware/quality policy surface.
 - Cache capacity and eviction are not yet owned by this integration.
+- The publishable crate uses registry requirements while the workspace root
+  patches them to the certified public safemlx revision.
 - Frontier families require their own stage semantics. Nemotron-H has
   metadata/range planning and a one-layer execution proof, but not a complete
   hybrid-model topology. Inkling has whole-model support in the pinned safemlx

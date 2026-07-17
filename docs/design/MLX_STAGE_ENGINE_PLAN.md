@@ -992,18 +992,19 @@ Spikes 1 and 2 are more decisive than any standalone token/s benchmark.
   them out of early phases.
 - **Two artifact pipelines** add storage + certification cost; mitigate with a
   single canonical BF16 source and reproducible derivation.
-- **safemlx supply chain — pin to a git rev, not a crates.io version (confirmed
-  this session).** The published crates collide version strings with the fork
+- **safemlx supply chain — certify a git revision behind registry requirements
+  (confirmed this session).** The published crates collide version strings with the fork
   HEAD: crates.io `safemlx-lm 0.4.1` is a *different, older* codebase than the
   fork's `0.4.1` (851 vs 2221 lines in `qwen3.rs`), because the fork develops on
   a fixed version without bumping. A fork-free build against published crates
   **compiled and ran but produced gibberish for Qwen3 source precision and
   crashed on a pre-quantized repo** (`rms_norm` size mismatch) — the working
   dense-Qwen3/Llama + JIT-quant code exists only in unpublished fork HEAD. So
-  MLX-for-Skippy must **pin a specific git commit** of `jbg/safemlx` (and carry
-  the small loader fixes until upstreamed), or coordinate a real published
-  release. This makes "track upstream + pin + possibly patch" a **standing cost**,
-  not a one-off.
+  The published `skippy-engine-mlx` manifest therefore uses normal registry
+  requirements while this workspace patches them to a **specific public git
+  commit** of `jbg/safemlx`. A future safemlx release can remove that root
+  patch. This makes "track upstream + certify + patch" a **standing cost**, not
+  a one-off.
 - **Hardware coverage is a moving target with two gates.** New backends must land
   in upstream `ml-explore/mlx` *then* be wired through safemlx (which authors no
   backends itself). ROCm is an active-but-unmerged upstream experiment (#2300);
