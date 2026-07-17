@@ -133,6 +133,36 @@ pub struct SafetensorsStageArtifact {
     pub cache_hit: bool,
 }
 
+/// One selected tensor materialized as an ephemeral, valid SafeTensors file.
+///
+/// The file exists only for the duration of the visitor callback that receives
+/// this value. Callers must consume it before returning from that callback.
+#[derive(Debug)]
+pub struct SafetensorsStageTensorFile {
+    pub name: String,
+    pub dtype: String,
+    pub shape: Vec<u64>,
+    pub source_file: String,
+    pub source_range: ByteRange,
+    pub path: PathBuf,
+    pub file_bytes: u64,
+}
+
+/// Summary of a sequential selected-tensor visit.
+#[derive(Clone, Debug)]
+pub struct SafetensorsStageTensorVisitReport {
+    /// The artifact-oriented range plan used to select and verify tensors.
+    /// Its `range_request_count` describes coalesced materialization spans;
+    /// `source_range_request_count` is the visitor's actual request count.
+    pub plan: SafetensorsStagePlan,
+    pub visited_tensor_count: usize,
+    pub visited_tensor_bytes: u64,
+    pub source_range_request_count: usize,
+    /// Largest ephemeral source file produced by `model-hf` during this visit.
+    /// This excludes consumer output files, filesystem overhead, and RSS.
+    pub temporary_file_peak_bytes: u64,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct SelectedTensor {
     pub name: String,

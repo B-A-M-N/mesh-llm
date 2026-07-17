@@ -29,10 +29,20 @@ shards, so exact tensor ranges are mandatory: whole-shard selection would turn
 a 109.84 GiB four-layer stage into a 942.99 GiB download.
 
 The small dense-model path is now proven through execution, including
-tensor-at-a-time affine-4 quantization into the live MLX model. The remaining
-artifact proof is direct range-to-quantized-cache materialization with measured
-peak RSS and disk use: the current path first retains the complete BF16 stage
-slice on disk, then quantizes its tensors one at a time during model load.
+tensor-at-a-time affine-4 quantization into the live MLX model. `model-hf` now
+also exposes a backend-neutral sequential visitor that downloads each selected
+range as an ephemeral, valid one-tensor SafeTensors file and deletes it before
+fetching the next tensor. The remaining artifact proof is consuming that seam
+to build bounded quantized-cache shards with measured peak RSS and disk use;
+the serving path still first retains the complete BF16 stage slice on disk.
+Its prepared session exposes the verified config, config hash, checkpoint
+identity, and range plan before payload callbacks. On macOS/Unix, advisory
+locks also scavenge crash-abandoned visits without removing concurrent ones.
+
+The pinned SmolLM2 layer-14 visitor proof fetched 9 tensors totaling 7,080,192
+bytes from a 269,060,552-byte source shard. Its largest temporary one-tensor
+file was 1,769,584 bytes, and the visitor cache directory was empty afterward.
+Those figures bound temporary disk use for this fixture, not process memory.
 
 ## Reproduce
 
@@ -357,10 +367,10 @@ because it does not alter the derived packed weights.
 
 ## Next proof
 
-1. Expose a sequential selected-range callback/temp-artifact seam from
-   `model-hf`, then replace BF16-stage-on-disk + live quantization with direct
-   range -> MLX affine -> bounded derived-cache shards. Prove peak RSS and disk
-   bounds using both OS physical footprint and MLX allocator counters.
+1. Consume the sequential selected-range visitor from `model-hf` to replace
+   BF16-stage-on-disk + live quantization with direct range -> MLX affine ->
+   bounded derived-cache shards. Prove peak RSS and disk bounds using both OS
+   physical footprint and MLX allocator counters.
 2. Measure the MLX eval/readback/codec boundary fence independently at frontier
    residual widths and prefill sizes.
 3. Introduce the engine-neutral stage interface and run the same proof through

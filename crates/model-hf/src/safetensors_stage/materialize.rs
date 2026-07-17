@@ -29,8 +29,8 @@ const MAX_LOCAL_HEADER_BYTES: u64 = 256 * 1024 * 1024;
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 pub struct SafetensorsStageMaterializer {
-    remote: RemoteSource,
-    cache_root: PathBuf,
+    pub(crate) remote: RemoteSource,
+    pub(crate) cache_root: PathBuf,
 }
 
 impl SafetensorsStageMaterializer {
@@ -338,7 +338,7 @@ fn materialization_spans(tensors: &[&SelectedTensor]) -> Vec<MaterializationSpan
     spans
 }
 
-fn ensure_source_identity(
+pub(super) fn ensure_source_identity(
     identity: &SafetensorsSourceShard,
     actual_etag: Option<&str>,
 ) -> Result<()> {
@@ -614,6 +614,78 @@ mod tests {
         assert!(!repaired.cache_hit);
         assert!(requests.lock().unwrap().len() > request_count);
         validate_local_safetensors(&repaired.path.join(MODEL_FILE)).unwrap();
+    }
+
+    #[test]
+    fn visits_selected_tensors_as_one_ephemeral_file_at_a_time() {
+        let checkpoint = Arc::new(test_checkpoint());
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let endpoint = start_checkpoint_server(checkpoint, Arc::clone(&requests));
+        let cache = tempfile::tempdir().unwrap();
+        let cache_root = cache.path().join("cache");
+        let materializer =
+            SafetensorsStageMaterializer::new(cache_root.clone(), Some(&endpoint), None).unwrap();
+        let mut visited = Vec::new();
+
+        let visit = materializer.prepare_tensor_visit(test_request()).unwrap();
+        assert_eq!(visit.checkpoint_sha256(), visit.plan().checkpoint_sha256);
+        assert_eq!(
+            format!("{:x}", Sha256::digest(visit.config())),
+            visit.config_sha256()
+        );
+        let metadata_request_count = requests.lock().unwrap().len();
+        let report = visit
+            .visit_tensor_files(|tensor| {
+                assert!(tensor.path.is_file());
+                assert_eq!(
+                    fs::read_dir(tensor.path.parent().unwrap())?.count(),
+                    1,
+                    "more than one ephemeral source tensor was retained"
+                );
+                validate_local_safetensors(&tensor.path)?;
+                let mut reader = BufReader::new(File::open(&tensor.path)?);
+                let mut header_len = [0_u8; 8];
+                reader.read_exact(&mut header_len)?;
+                let header_len = u64::from_le_bytes(header_len);
+                let mut header = vec![0_u8; usize::try_from(header_len)?];
+                reader.read_exact(&mut header)?;
+                let parsed = parse_header(&header, tensor.source_range.len())?;
+                assert_eq!(parsed.keys().collect::<Vec<_>>(), vec![&tensor.name]);
+                visited.push(tensor.name.clone());
+                Ok(())
+            })
+            .unwrap();
+
+        assert_eq!(visited.len(), report.plan.selected_tensor_count);
+        assert_eq!(report.visited_tensor_count, visited.len());
+        assert_eq!(report.source_range_request_count, visited.len());
+        assert_eq!(
+            report.visited_tensor_bytes,
+            report.plan.selected_tensor_bytes
+        );
+        assert!(report.temporary_file_peak_bytes > 0);
+        let payload_request_count = requests.lock().unwrap().len() - metadata_request_count;
+        assert_eq!(payload_request_count, report.source_range_request_count);
+        assert!(fs::read_dir(cache_root).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn removes_ephemeral_tensor_files_when_the_visitor_fails() {
+        let checkpoint = Arc::new(test_checkpoint());
+        let endpoint = start_checkpoint_server(checkpoint, Arc::new(Mutex::new(Vec::new())));
+        let cache = tempfile::tempdir().unwrap();
+        let cache_root = cache.path().join("cache");
+        let materializer =
+            SafetensorsStageMaterializer::new(cache_root.clone(), Some(&endpoint), None).unwrap();
+
+        let error = materializer
+            .prepare_tensor_visit(test_request())
+            .unwrap()
+            .visit_tensor_files(|_| anyhow::bail!("stop after first tensor"))
+            .unwrap_err();
+
+        assert!(error.to_string().contains("stop after first tensor"));
+        assert!(fs::read_dir(cache_root).unwrap().next().is_none());
     }
 
     #[test]

@@ -74,6 +74,18 @@ physical copies: TensorView conversion, stream copies, mmap pages, and MLX
 scratch all require explicit high-water measurement. The host does not select
 this profile yet, and the BF16 partial stage still exists on disk first.
 
+**Update — exact ranges can now be consumed sequentially without a BF16 stage
+artifact.** `model-hf` exposes each selected tensor as an ephemeral, valid
+one-tensor SafeTensors file, verifies the pinned source identity, and removes
+that file before downloading the next tensor. This is an engine-neutral source
+seam, not yet a quantized derived cache: the MLX consumer, bounded output
+shards, cache identity, and cold-load high-water measurements remain. On the
+pinned SmolLM2 layer-14 proof, it fetched 7,080,192 tensor bytes from a
+269,060,552-byte source shard while the largest temporary file was 1,769,584
+bytes; the temporary directory was empty at completion. A prepared visit makes
+the verified config and checkpoint identity available before tensor callbacks,
+and macOS/Unix advisory locks safely scavenge crash-abandoned visits.
+
 The pinned safemlx revision also already includes whole-model Inkling text,
 vision, and audio execution. Earlier notes that called for porting Inkling were
 stale. The remaining Inkling work is a partial-stage API plus wiring its
@@ -695,9 +707,10 @@ single-machine parity first, then two Macs over the real network.
 > `StageWireMessage` boundaries matched unsplit MLX with zero measured dense
 > logit delta; two real F16-wire processes also matched the whole-model
 > affine-4 token reference after tensor-wise on-load quantization. Explicit host
-> stage control now starts the source-precision path. Direct
-> range-to-quantized-cache materialization, profile-bearing topology requests,
-> and remote two-node execution remain.
+> stage control now starts the source-precision path. A sequential exact-range
+> tensor visitor now removes the need to create a BF16 stage artifact in the
+> next cache builder. Direct range-to-quantized-cache materialization,
+> profile-bearing topology requests, and remote two-node execution remain.
 
 **Phase 4 — KV/state codec + verify + trim/checkpoint.** Implement the
 engine-general cache codec (§5.2), `verify_tokens_frame` for speculative decode,
