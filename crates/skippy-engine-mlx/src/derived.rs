@@ -46,7 +46,7 @@ pub use nemotron_h::{MlxNemotronHValidationReport, validate_nemotron_h_moe_stage
 
 pub(super) const DERIVED_STAGE_SCHEMA_VERSION: u32 = 1;
 const DERIVED_STAGE_IMPLEMENTATION: &str = "mesh-mlx-range-derived-v1";
-const SAFEMLX_REVISION: &str = "4e53c5ecd7cbd91c0dfd0992a3c731ca2c36e9c7";
+const SAFEMLX_REVISION: &str = "c6b47418f3ea0e7b304464a80d8bc8f63f3bbc22";
 const PLAN_FILE: &str = "stage-plan.json";
 pub(super) const REPORT_FILE: &str = "derived-stage.json";
 static DERIVED_SEQUENCE: AtomicU64 = AtomicU64::new(0);

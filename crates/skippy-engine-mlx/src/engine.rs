@@ -478,6 +478,20 @@ mod tests {
     }
 
     #[test]
+    fn published_mlx_lm_quantization_without_mode_is_supported() {
+        let quantization = serde_json::from_value::<safemlx_lm::quantization::WeightQuantization>(
+            json!({"group_size": 64, "bits": 4}),
+        )
+        .unwrap();
+        assert_eq!(
+            quantization,
+            safemlx_lm::quantization::WeightQuantization::Affine(
+                safemlx_lm::quantization::AffineQuantization::new(64, 4).unwrap()
+            )
+        );
+    }
+
+    #[test]
     fn automatic_quantization_retries_quantization_failures() {
         assert!(optional_quantization_incompatible(
             Path::new("unused"),

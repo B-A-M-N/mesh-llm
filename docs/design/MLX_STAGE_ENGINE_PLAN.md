@@ -987,7 +987,9 @@ Spikes 1 and 2 are more decisive than any standalone token/s benchmark.
   Qwen3-0.6B alone: (1) the published crate hard-enables the `metal` feature, so
   a Metal-less/CI build needs a **workspace-level** `default-features = false`;
   (2) tied-embedding `lm_head.weight` fails the *quantized* strict loader
-  (dense load tolerates it). Both fixed in the fork; expect more per-family.
+  (dense load tolerates it). The pinned fork fixes the omitted-mode loader gap;
+  mesh handles the exact tied-head rejection with a narrow native-load fallback.
+  Expect more per-family.
 - **Recurrent/hybrid + MoE** splitting is materially harder than dense; scope
   them out of early phases.
 - **Two artifact pipelines** add storage + certification cost; mitigate with a
@@ -999,12 +1001,15 @@ Spikes 1 and 2 are more decisive than any standalone token/s benchmark.
   a fixed version without bumping. A fork-free build against published crates
   **compiled and ran but produced gibberish for Qwen3 source precision and
   crashed on a pre-quantized repo** (`rms_norm` size mismatch) — the working
-  dense-Qwen3/Llama + JIT-quant code exists only in unpublished fork HEAD. So
-  The published `skippy-engine-mlx` manifest therefore uses normal registry
-  requirements while this workspace patches them to a **specific public git
-  commit** of `jbg/safemlx`. A future safemlx release can remove that root
-  patch. This makes "track upstream + certify + patch" a **standing cost**, not
-  a one-off.
+  dense-Qwen3/Llama + JIT-quant code exists only in unpublished fork HEAD. The
+  `skippy-engine-mlx` manifest uses normal registry requirements while this
+  workspace patches them to a **specific public git commit** based on
+  `jbg/safemlx`. Root patches do not propagate to crates.io consumers, and the
+  registry release lacks APIs used by the engine, so standalone published MLX
+  consumers are not usable yet. The current compatibility fix is proposed
+  upstream in `jbg/safemlx#2`; compatible future safemlx releases can remove
+  the root patch and unblock that feature shape. This makes "track upstream +
+  certify + patch" a **standing cost**, not a one-off.
 - **Hardware coverage is a moving target with two gates.** New backends must land
   in upstream `ml-explore/mlx` *then* be wired through safemlx (which authors no
   backends itself). ROCm is an active-but-unmerged upstream experiment (#2300);

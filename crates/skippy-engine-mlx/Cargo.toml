@@ -5,7 +5,8 @@
 #
 # The published manifest uses crates.io versions. This repository patches them
 # to a proven public safemlx commit until an equivalent release is available.
-# See WIRING.md.
+# Root patches do not propagate, so standalone published consumers cannot use
+# the `mlx` feature until those safemlx APIs are released. See WIRING.md.
 [package]
 name = "skippy-engine-mlx"
 version.workspace = true
@@ -81,7 +82,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # MLX stack. The workspace root patches these versions to the proven public
-# commit; published consumers see ordinary registry dependencies.
+# commit. The registry versions do not yet provide all APIs used by this
+# feature, so this is currently a workspace/source-build integration.
 safemlx = { version = "0.1.3", default-features = false, features = [
     "accelerate",
     "metal",

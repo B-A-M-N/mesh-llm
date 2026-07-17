@@ -83,9 +83,9 @@ strum = { version = "0.28", features = ["derive"] }
 
 [patch.crates-io]
 hf-hub = { git = "https://github.com/Mesh-LLM/hf-hub", branch = "mesh-llm" }
-safemlx = { git = "https://github.com/jbg/safemlx", rev = "4e53c5e" }
-safemlx-lm = { git = "https://github.com/jbg/safemlx", rev = "4e53c5e" }
-safemlx-lm-utils = { git = "https://github.com/jbg/safemlx", rev = "4e53c5e" }
+safemlx = { git = "https://github.com/michaelneale/safemlx", rev = "c6b4741" }
+safemlx-lm = { git = "https://github.com/michaelneale/safemlx", rev = "c6b4741" }
+safemlx-lm-utils = { git = "https://github.com/michaelneale/safemlx", rev = "c6b4741" }
 
 [workspace.lints.clippy]
 cognitive_complexity = "warn"

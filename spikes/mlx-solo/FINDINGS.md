@@ -149,4 +149,5 @@ Still open:
   Skippy's F16/F32 binary activation codec; see
   `../mlx-safetensors-stages/FINDINGS.md`. Two `skippy-server` processes, the
   boundary-fence benchmark, and bounded-memory load-time quantization remain.
-- Upstreaming the two fixes to `jbg/safemlx` (or carrying a thin fork).
+- The omitted-mode compatibility fix is proposed in `jbg/safemlx#2`; the
+  tied-`lm_head.weight` quantized-loader fix still needs upstream resolution.

@@ -57,6 +57,24 @@ requested exact response. This proves the adaptive fallback preserves useful
 single-node serving rather than turning optional quantization into a startup
 requirement.
 
+The ordinary command also now accepts an unchanged published MLX-LM artifact:
+
+```bash
+mesh-llm serve --model mlx-community/Qwen3-0.6B-4bit --ctx-size 16384
+```
+
+The recorded run resolved Hugging Face revision
+`73e3e38d981303bc594367cd910ea6eb48349da8`; the unpinned command above follows
+the repository's current default revision.
+
+The repository's omitted `quantization.mode` is interpreted as MLX-LM's
+standard `affine` default by the pinned safemlx correction proposed upstream in
+`jbg/safemlx#2`. The integrated server loaded the cached 4-bit checkpoint in
+about 1.2 seconds, advertised it through `/v1/models`, returned `391` for
+`23 * 17`, completed SSE with `[DONE]`, and served Goose through the same
+OpenAI endpoint. A 4K-context Goose attempt was correctly rejected because its
+assembled request required about 11.2K tokens; the 16K run completed.
+
 ## Verified mesh split proof
 
 A two-host explicit split of the same 30-layer model completed through the
@@ -106,8 +124,10 @@ bytes evenly by layer count.
 - Automatic affine-4 is the current default for eligible dense checkpoints,
   not yet a general hardware/quality policy surface.
 - Cache capacity and eviction are not yet owned by this integration.
-- The publishable crate uses registry requirements while the workspace root
-  patches them to the certified public safemlx revision.
+- The workspace root must patch the registry requirements to the certified
+  public safemlx revision. Root patches do not propagate to crates.io
+  consumers, so standalone published `skippy-engine-mlx --features mlx` support
+  is not usable until compatible safemlx releases contain the required APIs.
 - Frontier families require their own stage semantics. Nemotron-H has
   metadata/range planning and a one-layer execution proof, but not a complete
   hybrid-model topology. Inkling has whole-model support in the pinned safemlx

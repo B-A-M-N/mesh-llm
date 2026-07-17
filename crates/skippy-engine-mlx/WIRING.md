@@ -15,10 +15,20 @@ The crate manifest uses ordinary crates.io requirements:
 - `safemlx-lm-utils = 0.1.4`
 
 The repository root patches those packages to public safemlx commit
-`4e53c5e`. That commit contains the loader/model behavior certified by this
-draft; the published releases do not yet contain every required correction.
-Using `[patch.crates-io]` keeps the workspace reproducibly pinned without
-putting illegal git dependencies in the published crate manifest.
+`c6b4741`, based on upstream `4e53c5e`. It adds MLX-LM-compatible handling for
+published checkpoints that omit `quantization.mode` and therefore imply
+`affine`; the correction is proposed upstream in `jbg/safemlx#2`. The published
+releases do not yet contain every required correction. Using
+`[patch.crates-io]` keeps the workspace reproducibly pinned without putting
+illegal git dependencies in the published crate manifest.
+
+This patch is required, not optional downstream polish: Cargo root patches do
+not propagate through published crates, and the current registry
+`safemlx-lm = 0.4.1` lacks APIs used by the MLX engine. Consequently the
+workspace and source-built `mesh-llm` MLX feature are usable, while standalone
+published `skippy-engine-mlx --features mlx` consumers must wait for compatible
+safemlx releases. Keeping the crate in the publish graph does not certify that
+feature shape yet.
 
 `skippy-engine-mlx` is therefore part of `scripts/publish-crates.sh` after its
 workspace dependencies and before `mesh-llm-host-runtime`. Both
