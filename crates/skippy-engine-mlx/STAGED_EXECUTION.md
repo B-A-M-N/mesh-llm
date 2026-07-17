@@ -625,13 +625,13 @@ LAN/QUIC evidence.
 - `engine_transport` is the reduced compatibility lane. The mature llama.cpp
   binary server remains unchanged and still owns telemetry, exact-prefix cache,
   batching, and OpenAI orchestration.
-- Mesh topology planning does not yet produce MLX stage assignments. The host
-  can consume explicit `backend=mlx` Prepare/Load requests, but automatic
-  placement, capability advertisement, coordinator model planning, and an
-  OpenAI stage-0 frontend remain. Explicit host requests now derive and reuse
-  quantized artifacts, but cache eviction and an optional local
-  request-to-recipe locator remain. The quantization field is an additive mesh
-  protocol change; old peers omit it and therefore mean `auto`, while unknown
+- Explicit `mesh-llm serve --split` now capability-gates MLX participants,
+  produces stage assignments, and drives them from an OpenAI stage-0 frontend.
+  Automatic split selection and additional family adapters remain. Explicit
+  host requests derive and reuse quantized artifacts, but cache eviction and
+  an optional local request-to-recipe locator remain. The quantization field
+  is an additive mesh protocol change; old peers omit it and therefore mean
+  `auto`, while unknown
   values fail closed on new peers. Automatic placement must capability-gate
   explicit non-default profiles before mixed-version deployment. No Skippy ABI
   changed.

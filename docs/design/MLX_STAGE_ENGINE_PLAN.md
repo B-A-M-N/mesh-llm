@@ -74,10 +74,10 @@ Skippy binary wire. `StageLoad` requires that prepared entry and cannot derive
 or download tensor payloads on a miss. A clean-cache SmolLM2 proof ran both
 15-layer ranges through
 `spawn_stage_control_loop`, reproduced the affine-4 eight-token reference, and
-stopped both stages without retaining dense stage artifacts. Automatic MLX
-topology production, capability advertisement, remote two-node proof, and
-cache eviction remain; this checkpoint proves the host consumer path, not
-automatic placement.
+stopped both stages without retaining dense stage artifacts. At that
+checkpoint, topology production, capability advertisement, remote two-node
+proof, and cache eviction remained; the newer integrated update above
+supersedes the first three items. Cache eviction still remains.
 
 **Update — partial MLX stages now JIT-quantize one tensor at a time.** The
 pinned safemlx strict loader already contains the required bounded lazy-graph
@@ -275,8 +275,9 @@ unknown values fail closed. Apple Metal currently maps `auto` to affine
 host lifecycle fetched 162,825,984 and 162,827,136 source tensor bytes and wrote
 45,859,713 and 45,861,308-byte derived artifacts. It passed in 120.74 seconds;
 the immediate validated-cache run passed in 8.87 seconds with 258,162,688 B max
-RSS. `MESH_MLX_DERIVED_CACHE_DIR` overrides the host cache root. Eviction,
-automatic topology selection, and the remote two-node proof remain.
+RSS. `MESH_MLX_DERIVED_CACHE_DIR` overrides the host cache root. This was the
+pre-integration checkpoint; eviction remains, while the newer update above
+records explicit topology selection and the mesh-managed two-node proof.
 
 Prepare is the only lifecycle operation allowed to build a missing entry;
 Load validates and consumes the prepared artifact or fails closed.
@@ -1018,8 +1019,8 @@ Spikes 1 and 2 are more decisive than any standalone token/s benchmark.
 1. Add capacity and eviction ownership to the host derived-stage cache, and
    decide whether a local request-to-recipe locator should eliminate warm-path
    metadata probes.
-2. Teach topology planning and capability advertisement to select MLX stages;
-   explicit host Prepare/Load and the engine-neutral server lane are proven.
+2. Extend the explicit, capability-gated dense-Llama topology into automatic
+   split selection and additional certified model-family stage adapters.
 3. Extend the initial metrics-backed synthetic **Spike 2 (boundary fence)**
    matrix to real model outputs and TCP/QUIC links. Preserve the separate
    eval/synchronize, host copy, codec, and network phase evidence; do not assume
