@@ -83,12 +83,33 @@ def projector_path(args: argparse.Namespace) -> Path:
     return require_gguf_magic(target)
 
 
+def run_report(command: list[str], report_out: str) -> None:
+    print("+", " ".join(command), flush=True)
+    completed = subprocess.run(command, text=True, capture_output=True)
+    if completed.stderr:
+        print(completed.stderr, end="", flush=True)
+    if completed.stdout:
+        print(completed.stdout, end="", flush=True)
+    if completed.returncode != 0:
+        raise subprocess.CalledProcessError(completed.returncode, command)
+    report = Path(report_out)
+    report.parent.mkdir(parents=True, exist_ok=True)
+    report.write_text(completed.stdout, encoding="utf-8")
+    print(f"certification report: {report}", flush=True)
+
+
 def certify(args: argparse.Namespace, mesh_root: Path) -> None:
     binary = mesh_root / "target" / "release" / "skippy-quantize"
     run("just", "skippy-quantize-standalone-release-build", "cpu", cwd=mesh_root)
+    projector = projector_path(args)
+    if args.projector_only:
+        run_report(
+            [str(binary), "validate-projector", "--projector", str(projector), "--json"],
+            args.report_out,
+        )
+        return
     target_parts = [require_gguf_magic(path) for path in model_parts(args)]
     mtp_draft = require_gguf_magic(Path(args.mtp_draft))
-    projector = projector_path(args)
     command = [str(binary), "validate-mtp-attach"]
     for part in target_parts:
         command.extend(("--model", str(part)))
@@ -107,18 +128,7 @@ def certify(args: argparse.Namespace, mesh_root: Path) -> None:
     )
     if args.mtp_layer_count is not None:
         command.extend(("--mtp-layer-count", str(args.mtp_layer_count)))
-    print("+", " ".join(command), flush=True)
-    completed = subprocess.run(command, text=True, capture_output=True)
-    if completed.stderr:
-        print(completed.stderr, end="", flush=True)
-    if completed.stdout:
-        print(completed.stdout, end="", flush=True)
-    if completed.returncode != 0:
-        raise subprocess.CalledProcessError(completed.returncode, command)
-    report = Path(args.report_out)
-    report.parent.mkdir(parents=True, exist_ok=True)
-    report.write_text(completed.stdout, encoding="utf-8")
-    print(f"certification report: {report}", flush=True)
+    run_report(command, args.report_out)
 
 
 def parse_args() -> argparse.Namespace:
@@ -130,6 +140,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--projector", required=True)
     parser.add_argument("--projector-url")
     parser.add_argument("--projector-local-path", default="/tmp/mmproj.gguf")
+    parser.add_argument("--projector-only", action="store_true")
     parser.add_argument("--layer-count", type=int, required=True)
     parser.add_argument("--mtp-layer-count", type=int)
     parser.add_argument("--ctx-size", type=int, default=64)
