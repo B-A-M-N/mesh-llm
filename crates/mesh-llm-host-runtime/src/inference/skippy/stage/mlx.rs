@@ -1,10 +1,15 @@
-use std::{net::SocketAddr, sync::Arc};
+use std::{
+    net::SocketAddr,
+    sync::{Arc, atomic::AtomicBool},
+};
 
 use anyhow::{Context, Result, bail, ensure};
-use model_hf::safetensors_stage::{
-    SafetensorsStageArtifact, SafetensorsStageMaterializer, SafetensorsStageRequest,
+use model_hf::safetensors_stage::{SafetensorsStageMaterializer, SafetensorsStageRequest};
+use skippy_engine_mlx::{
+    MlxComputeDtype, MlxDerivationControl, MlxDerivedStageCacheConfig, MlxDerivedStageCacheResult,
+    MlxStageEngine, MlxStageEngineConfig, MlxWeightQuantization, derive_quantized_stage_cached,
+    load_prepared_quantized_stage, mlx_derived_stage_cache_root,
 };
-use skippy_engine_mlx::{MlxComputeDtype, MlxStageEngine, MlxStageEngineConfig};
 use skippy_protocol::LoadMode;
 use skippy_protocol::binary::WireActivationDType;
 use skippy_server::{
@@ -12,16 +17,17 @@ use skippy_server::{
 };
 
 use super::{
-    RunningStage, StageControlState, StageLoadRequest, StageReadyResponse, StageStatusFilter,
-    StageWireDType, stage_load_failure_context,
+    MlxStageArtifact, RunningStage, StageControlState, StageLoadRequest, StageReadyResponse,
+    StageStatusFilter, StageWeightQuantization, StageWireDType, stage_load_failure_context,
 };
 
 const HF_MODEL_PREFIX: &str = "hf-model://";
+const DERIVED_SHARD_SIZE_BYTES: usize = 256 * 1024 * 1024;
 
 pub(super) struct MlxStageLaunch {
     pub(super) load: StageLoadRequest,
     pub(super) server: EmbeddedServerHandle,
-    pub(super) artifact: SafetensorsStageArtifact,
+    pub(super) artifact: MlxDerivedStageCacheResult,
 }
 
 pub(super) async fn load_stage(
@@ -42,13 +48,16 @@ pub(super) async fn load_stage(
         return Err(error.context(context));
     }
     let effective_load = launch.load;
+    let artifact = MlxStageArtifact {
+        path: launch.artifact.output_dir,
+    };
     state.stages.insert(
         key,
         RunningStage {
             load: effective_load.clone(),
             server: launch.server,
             materialized: None,
-            mlx_artifact: Some(launch.artifact),
+            mlx_artifact: Some(artifact),
             package: None,
             _materialized_pin: None,
         },
@@ -107,11 +116,14 @@ async fn wait_for_engine_stage_ready(
     }
 }
 
-pub(super) async fn prepare_stage(load: &StageLoadRequest) -> Result<SafetensorsStageArtifact> {
+pub(super) async fn prepare_stage(
+    load: &StageLoadRequest,
+    cancelled: Arc<AtomicBool>,
+) -> Result<MlxDerivedStageCacheResult> {
     let load = load.clone();
-    tokio::task::spawn_blocking(move || materialize_stage_blocking(&load))
+    tokio::task::spawn_blocking(move || derive_stage_blocking(&load, Some(cancelled)))
         .await
-        .context("join MLX SafeTensors stage preparation")?
+        .context("join MLX derived stage preparation")?
 }
 
 pub(super) async fn launch_stage(
@@ -120,9 +132,9 @@ pub(super) async fn launch_stage(
 ) -> Result<MlxStageLaunch> {
     let blocking_load = load.clone();
     let (artifact, engine) = tokio::task::spawn_blocking(move || {
-        let artifact = materialize_stage_blocking(&blocking_load)?;
+        let artifact = resolve_stage_blocking(&blocking_load, None, false)?;
         let engine = Arc::new(MlxStageEngine::spawn(MlxStageEngineConfig {
-            model_dir: artifact.path.clone(),
+            model_dir: artifact.output_dir.clone(),
             model_id: blocking_load.model_id.clone(),
             stage_index: blocking_load.stage_index,
             layer_start: blocking_load.layer_start,
@@ -143,7 +155,7 @@ pub(super) async fn launch_stage(
     .context("join MLX stage load task")??;
 
     load.bind_addr = bind_addr.to_string();
-    load.model_path = Some(artifact.path.to_string_lossy().into_owned());
+    load.model_path = Some(artifact.output_dir.to_string_lossy().into_owned());
     let server = skippy_server::start_stage_engine(
         engine,
         EngineStageServerOptions {
@@ -159,16 +171,62 @@ pub(super) async fn launch_stage(
     })
 }
 
-fn materialize_stage_blocking(load: &StageLoadRequest) -> Result<SafetensorsStageArtifact> {
+fn derive_stage_blocking(
+    load: &StageLoadRequest,
+    cancelled: Option<Arc<AtomicBool>>,
+) -> Result<MlxDerivedStageCacheResult> {
+    resolve_stage_blocking(load, cancelled, true)
+}
+
+fn resolve_stage_blocking(
+    load: &StageLoadRequest,
+    cancelled: Option<Arc<AtomicBool>>,
+    build_on_miss: bool,
+) -> Result<MlxDerivedStageCacheResult> {
     let request = request_from_load(load)?;
-    let artifact = SafetensorsStageMaterializer::from_environment()?.materialize(request)?;
+    let materializer = SafetensorsStageMaterializer::from_environment()?;
+    let config = MlxDerivedStageCacheConfig {
+        source: request,
+        cache_root: mlx_derived_stage_cache_root(),
+        quantization: mlx_weight_quantization(load.weight_quantization),
+        control: MlxDerivationControl::new(Some(load.manifest_sha256.clone()), cancelled),
+        shard_size_bytes: DERIVED_SHARD_SIZE_BYTES,
+    };
+    let artifact = if build_on_miss {
+        derive_quantized_stage_cached(&materializer, &config)?
+    } else {
+        load_prepared_quantized_stage(&materializer, &config)?
+    };
     ensure!(
-        artifact.manifest.checkpoint_sha256 == load.manifest_sha256,
+        artifact.report.checkpoint_sha256 == load.manifest_sha256,
         "MLX checkpoint identity {} does not match stage claim {}",
-        artifact.manifest.checkpoint_sha256,
+        artifact.report.checkpoint_sha256,
         load.manifest_sha256
     );
+    tracing::info!(
+        cache_hit = artifact.cache_hit,
+        source_range_request_count = artifact.source_range_request_count,
+        derivation_recipe_sha256 = %artifact.report.derivation_recipe_sha256,
+        stage_id = %load.stage_id,
+        "MLX derived stage cache resolved"
+    );
     Ok(artifact)
+}
+
+fn mlx_weight_quantization(quantization: StageWeightQuantization) -> MlxWeightQuantization {
+    match quantization {
+        StageWeightQuantization::Auto | StageWeightQuantization::Affine4 => {
+            MlxWeightQuantization::Affine {
+                group_size: 64,
+                bits: 4,
+            }
+        }
+        StageWeightQuantization::Affine8 => MlxWeightQuantization::Affine {
+            group_size: 64,
+            bits: 8,
+        },
+        StageWeightQuantization::MxFp4 => MlxWeightQuantization::MxFp4,
+    }
 }
 
 fn request_from_load(load: &StageLoadRequest) -> Result<SafetensorsStageRequest> {
@@ -270,6 +328,7 @@ fn wire_dtype(dtype: StageWireDType) -> Result<WireActivationDType> {
 mod tests {
     use std::{io::Write, net::TcpStream, time::Duration};
 
+    use skippy_engine_mlx::MlxDerivedStageReport;
     use skippy_protocol::FlashAttentionType;
     use skippy_protocol::binary::{
         StageStateHeader, StageWireMessage, WireMessageKind, WireReplyKind, recv_ready, recv_reply,
@@ -286,7 +345,7 @@ mod tests {
     const SMOL_REPO: &str = "HuggingFaceTB/SmolLM2-135M-Instruct";
     const SMOL_REVISION: &str = "12fd25f77366fa6b3b4b768ec3050bf629380bac";
     const SMOL_PROMPT: &[i32] = &[1, 1531, 314, 260, 3575, 28];
-    const SMOL_EXPECTED: &[i32] = &[284, 260, 2240, 314, 1343, 327, 624, 8685];
+    const SMOL_EXPECTED: &[i32] = &[260, 2240, 314, 253, 1379, 282, 25801, 28];
 
     #[test]
     fn parses_commit_addressed_mlx_stage_ref() {
@@ -331,9 +390,31 @@ mod tests {
         assert!(request_from_load(&load).is_err());
     }
 
+    #[test]
+    fn maps_explicit_and_hardware_auto_weight_quantization() {
+        assert_eq!(
+            mlx_weight_quantization(StageWeightQuantization::Auto),
+            MlxWeightQuantization::Affine {
+                group_size: 64,
+                bits: 4
+            }
+        );
+        assert_eq!(
+            mlx_weight_quantization(StageWeightQuantization::Affine8),
+            MlxWeightQuantization::Affine {
+                group_size: 64,
+                bits: 8
+            }
+        );
+        assert_eq!(
+            mlx_weight_quantization(StageWeightQuantization::MxFp4),
+            MlxWeightQuantization::MxFp4
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[ignore = "downloads about 310 MiB and requires Apple Silicon Metal"]
-    async fn real_control_plane_materializes_and_runs_two_range_only_stages() -> Result<()> {
+    async fn real_control_plane_derives_and_runs_two_quantized_range_stages() -> Result<()> {
         let plan = tokio::task::spawn_blocking(|| {
             SafetensorsStageMaterializer::from_environment()?.plan(SafetensorsStageRequest {
                 repo: SMOL_REPO.to_string(),
@@ -404,6 +485,7 @@ mod tests {
                         model_id: load.model_id.clone(),
                         package_ref: load.package_ref.clone(),
                         manifest_sha256: load.manifest_sha256.clone(),
+                        weight_quantization: load.weight_quantization,
                     }),
                 )
                 .await?;
@@ -462,9 +544,20 @@ mod tests {
         let plan: model_hf::safetensors_stage::SafetensorsStagePlan = serde_json::from_slice(
             &std::fs::read(std::path::Path::new(artifact_path).join("stage-plan.json"))?,
         )?;
+        let report: MlxDerivedStageReport = serde_json::from_slice(&std::fs::read(
+            std::path::Path::new(artifact_path).join("derived-stage.json"),
+        )?)?;
         ensure!(
             plan.planned_download_bytes < plan.source_shard_bytes,
             "running MLX stage planned a complete source shard download"
+        );
+        ensure!(
+            report.checkpoint_sha256 == load.manifest_sha256,
+            "running MLX stage changed source checkpoint identity"
+        );
+        ensure!(
+            report.quantization_label == "affine-4bit-g64",
+            "running MLX stage did not use the requested quantization"
         );
         Ok(())
     }
@@ -636,6 +729,7 @@ mod tests {
             n_gpu_layers: 0,
             mmap: None,
             mlock: false,
+            weight_quantization: StageWeightQuantization::Affine4,
             cache_type_k: "f16".to_string(),
             cache_type_v: "f16".to_string(),
             flash_attn_type: FlashAttentionType::Auto,

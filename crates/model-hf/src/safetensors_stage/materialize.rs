@@ -689,6 +689,30 @@ mod tests {
     }
 
     #[test]
+    fn cancelled_tensor_visit_stops_before_the_first_payload_request() {
+        let checkpoint = Arc::new(test_checkpoint());
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let endpoint = start_checkpoint_server(checkpoint, Arc::clone(&requests));
+        let cache = tempfile::tempdir().unwrap();
+        let cache_root = cache.path().join("cache");
+        let materializer =
+            SafetensorsStageMaterializer::new(cache_root.clone(), Some(&endpoint), None).unwrap();
+
+        let visit = materializer.prepare_tensor_visit(test_request()).unwrap();
+        let metadata_request_count = requests.lock().unwrap().len();
+        let error = visit
+            .visit_tensor_files_cancellable(|| true, |_| Ok(()))
+            .unwrap_err();
+
+        assert!(error.to_string().contains("tensor visit cancelled"));
+        assert_eq!(requests.lock().unwrap().len(), metadata_request_count);
+        assert!(
+            !cache_root.exists() || fs::read_dir(cache_root).unwrap().next().is_none(),
+            "cancelled visit retained an ephemeral tensor directory"
+        );
+    }
+
+    #[test]
     fn serializes_concurrent_materialization_of_the_same_cache_key() {
         let checkpoint = Arc::new(test_checkpoint());
         let requests = Arc::new(Mutex::new(Vec::new()));

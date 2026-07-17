@@ -733,6 +733,7 @@ mod tests {
                     model_id: "qwen".to_string(),
                     package_ref: "hf://repo/model".to_string(),
                     manifest_sha256: "a5".repeat(32),
+                    weight_quantization: 0,
                 },
             )),
             ..frame.clone()

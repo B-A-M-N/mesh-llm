@@ -40,9 +40,13 @@ struct RunningStage {
     load: StageLoadRequest,
     server: EmbeddedServerHandle,
     materialized: Option<super::materialization::MaterializedStageArtifact>,
-    mlx_artifact: Option<model_hf::safetensors_stage::SafetensorsStageArtifact>,
+    mlx_artifact: Option<MlxStageArtifact>,
     package: Option<super::materialization::ResolvedStagePackage>,
     _materialized_pin: Option<super::materialization::MaterializedStagePin>,
+}
+
+struct MlxStageArtifact {
+    path: std::path::PathBuf,
 }
 
 #[derive(Default)]
@@ -152,6 +156,7 @@ impl StageControlState {
                 status.model_id == request.model_id
                     && status.package_ref == request.package_ref
                     && status.manifest_sha256 == request.manifest_sha256
+                    && status.weight_quantization == request.weight_quantization
             })
             .cloned()
             .collect::<Vec<_>>();
@@ -175,6 +180,7 @@ impl StageControlState {
                 stage.load.model_id == request.model_id
                     && stage.load.package_ref == request.package_ref
                     && stage.load.manifest_sha256 == request.manifest_sha256
+                    && stage.load.weight_quantization == request.weight_quantization
             })
             .map(|stage| LayerRange {
                 layer_start: stage.load.layer_start,
@@ -206,6 +212,7 @@ impl StageControlState {
                 .as_ref()
                 .map(|source| source.kind)
                 .unwrap_or(SourceModelKind::Unknown),
+            weight_quantization: request.weight_quantization,
         }
     }
 

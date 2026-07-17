@@ -2699,6 +2699,7 @@ pub struct StageRuntimeStatus {
     pub n_batch: Option<u32>,
     pub n_ubatch: Option<u32>,
     pub flash_attn_type: skippy_protocol::FlashAttentionType,
+    pub weight_quantization: crate::inference::skippy::StageWeightQuantization,
     pub error: Option<String>,
     pub shutdown_generation: u64,
 }

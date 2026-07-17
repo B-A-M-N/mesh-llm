@@ -52,17 +52,17 @@ range-to-derived-cache quantization remain. See
 
 **Update — host `StagePrepare` / `StageLoad` now consumes range-only MLX
 stages.** An immutable `hf-model://org/repo@<commit>` request is validated
-before network work, materialized on a blocking worker, checked against a
-topology-wide checkpoint identity, strict-loaded into `MlxStageEngine`, and
-served through the existing Skippy binary wire. A clean-cache SmolLM2 proof ran
-both 15-layer ranges through `spawn_stage_control_loop`, reproduced the same
-eight reference tokens, and stopped both stages. Each node-side range plan read
-about 162.86 MB of a 269.06 MB source shard and avoided about 106.2 MB. Startup
-now fails closed on bind/topology/downstream errors, and Stop closes and joins
-active connections. Automatic MLX topology production, capability
-advertisement, remote two-node proof, host quantization selection, and bounded
-range-to-derived-cache materialization remain; this checkpoint proves the host
-consumer path, not automatic placement.
+before network work, checked against a topology-wide checkpoint identity,
+derived into or reused from the recipe-keyed quantized cache on a blocking
+worker, strict-loaded into `MlxStageEngine`, and served through the existing
+Skippy binary wire. `StageLoad` requires that prepared entry and cannot derive
+or download tensor payloads on a miss. A clean-cache SmolLM2 proof ran both
+15-layer ranges through
+`spawn_stage_control_loop`, reproduced the affine-4 eight-token reference, and
+stopped both stages without retaining dense stage artifacts. Automatic MLX
+topology production, capability advertisement, remote two-node proof, and
+cache eviction remain; this checkpoint proves the host consumer path, not
+automatic placement.
 
 **Update — partial MLX stages now JIT-quantize one tensor at a time.** The
 pinned safemlx strict loader already contains the required bounded lazy-graph
@@ -71,8 +71,8 @@ repeat. A whole-model affine-4 reference and two independently quantized
 SmolLM2 stages generated the same eight tokens over F16 residuals. Post-proof
 RSS was about 85.3 and 85.9 MiB per stage. This bounds the lazy graph, not
 physical copies: TensorView conversion, stream copies, mmap pages, and MLX
-scratch all require explicit high-water measurement. The host does not select
-this profile yet, and the BF16 partial stage still exists on disk first.
+scratch all require explicit high-water measurement. The newer direct-derived
+host path below removes the intermediate BF16 stage.
 
 **Update — exact ranges can now be consumed sequentially without a BF16 stage
 artifact.** `model-hf` exposes each selected tensor as an ephemeral, valid
@@ -105,7 +105,32 @@ builders with an advisory lock, and validates the output-content plus per-shard
 hashes on hits. A cold pinned layer-14 run made 9 tensor payload requests; the
 warm run made 0, skipped quantization, and used about 17.8 MB max RSS. The warm
 path still fetches lightweight config/index/header metadata to reconstruct the
-strong recipe. Host prepare/load integration and eviction ownership remain.
+strong recipe.
+
+**Update — the host now owns the direct-derived load path and carries the
+quantization choice.** The additive stage-load field supports `auto`, affine
+4-bit, affine 8-bit, and MXFP4. Missing values from older peers map to `auto`;
+unknown values fail closed. Apple Metal currently maps `auto` to affine
+4-bit/group-64, and the resolved recipe remains identity-bound. A cold two-half
+host lifecycle fetched 162,825,984 and 162,827,136 source tensor bytes and wrote
+45,859,713 and 45,861,308-byte derived artifacts. It passed in 120.74 seconds;
+the immediate validated-cache run passed in 8.87 seconds with 258,162,688 B max
+RSS. `MESH_MLX_DERIVED_CACHE_DIR` overrides the host cache root. Eviction,
+automatic topology selection, and the remote two-node proof remain.
+
+Prepare is the only lifecycle operation allowed to build a missing entry;
+Load validates and consumes the prepared artifact or fails closed.
+
+The host additionally verifies the topology checkpoint claim from metadata
+before any tensor payload is fetched. Prepare cancellation reaches recipe-lock
+waits and the range visitor, with checks between payload requests and around
+each quantization callback. In-flight HTTP or MLX work is cooperative rather
+than preemptive. Inventory responses echo the requested profile, and
+preparation plus running status carry it, preventing (for example) an affine-4
+preparation from satisfying an affine-8 load. Old peers omit these additive
+fields and therefore mean `auto`; automatic non-default placement must require
+a peer that advertises the new semantics. Cache-hit validation streams each
+shard once while checking both its shard hash and the aggregate content digest.
 
 The pinned safemlx revision also already includes whole-model Inkling text,
 vision, and audio execution. Earlier notes that called for porting Inkling were
@@ -728,10 +753,11 @@ single-machine parity first, then two Macs over the real network.
 > `StageWireMessage` boundaries matched unsplit MLX with zero measured dense
 > logit delta; two real F16-wire processes also matched the whole-model
 > affine-4 token reference after tensor-wise on-load quantization. Explicit host
-> stage control now starts the source-precision path. A sequential exact-range
-> tensor visitor now removes the need to create a BF16 stage artifact in the
-> next cache builder. Direct range-to-quantized-cache materialization,
-> profile-bearing topology requests, and remote two-node execution remain.
+> stage control now derives or reuses a quantized artifact directly from exact
+> tensor ranges. The additive load request carries the quantization profile,
+> and clean plus warm-cache host lifecycles reproduce the affine-4 reference.
+> Automatic profile-bearing MLX topology production, cache eviction, and remote
+> two-node execution remain.
 
 **Phase 4 — KV/state codec + verify + trim/checkpoint.** Implement the
 engine-general cache codec (§5.2), `verify_tokens_frame` for speculative decode,
@@ -751,13 +777,13 @@ Apple-Silicon nodes. llama.cpp remains the cross-platform default.
 
 ## 8. Spike gates (go/no-go before Phase 3)
 
-1. **Partial-loading proof (DENSE GO, QUANT PARTIAL):** remote exact-range
+1. **Partial-loading proof (DENSE + LLAMA QUANT GO, FRONTIER PARTIAL):** remote exact-range
    selection is proven, including on 1.9 TB Inkling BF16. SmolLM2 partial files
-   were materialized and loaded without a complete checkpoint. Still required:
-   The live-model loader now quantizes/evaluates one tensor at a time and split
-   output matches a whole quantized reference. Still required: measure cold-load
-   high-water RSS and stream HTTP ranges directly into a derived quantized cache
-   without retaining the whole BF16 stage slice on disk.
+   were materialized and loaded without a complete checkpoint. The live-model
+   loader quantizes/evaluates one tensor at a time, and the host now streams
+   exact ranges into a derived quantized cache without retaining the BF16 stage
+   slice. Still required: bounded expert-bank/slab transforms and high-water
+   evidence for Inkling and Nemotron-family frontier tensors.
 2. **Boundary latency breakdown (GO/NO-GO):** measure layer compute, cast,
    contiguous, **eval fence**, host readback, serialize, and receive-reconstruct
    **independently**, at hidden widths 4096/8192/16384 and token counts

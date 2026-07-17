@@ -13,9 +13,9 @@ mod real {
     use clap::{Parser, Subcommand, ValueEnum};
     use model_hf::safetensors_stage::{SafetensorsStageMaterializer, SafetensorsStageRequest};
     use skippy_engine_mlx::{
-        MlxComputeDtype, MlxDerivedStageCacheConfig, MlxDerivedStageConfig, MlxStageEngine,
-        MlxStageEngineConfig, MlxWeightQuantization, derive_quantized_stage,
-        derive_quantized_stage_cached,
+        MlxComputeDtype, MlxDerivationControl, MlxDerivedStageCacheConfig, MlxDerivedStageConfig,
+        MlxStageEngine, MlxStageEngineConfig, MlxWeightQuantization, derive_quantized_stage,
+        derive_quantized_stage_cached, mlx_derived_stage_cache_root,
     };
     use skippy_protocol::binary::{
         StageStateHeader, StageWireMessage, WireActivationDType, WireMessageKind, WireReplyKind,
@@ -268,6 +268,7 @@ mod real {
                 source,
                 output_dir,
                 quantization,
+                control: MlxDerivationControl::default(),
                 shard_size_bytes,
             },
         )?;
@@ -284,8 +285,7 @@ mod real {
         let shard_size_bytes = shard_size_mib
             .checked_mul(1024 * 1024)
             .context("derived shard size overflow")?;
-        let cache_root = cache_root
-            .unwrap_or_else(|| model_hf::store::mesh_llm_cache_dir().join("mlx-derived-stages"));
+        let cache_root = cache_root.unwrap_or_else(mlx_derived_stage_cache_root);
         let materializer = SafetensorsStageMaterializer::from_environment()?;
         let result = derive_quantized_stage_cached(
             &materializer,
@@ -293,6 +293,7 @@ mod real {
                 source,
                 cache_root,
                 quantization,
+                control: MlxDerivationControl::default(),
                 shard_size_bytes,
             },
         )?;

@@ -1546,6 +1546,7 @@ fn split_runtime_stage_load_request(
         n_gpu_layers: resolved_config.n_gpu_layers,
         mmap: resolved_config.mmap,
         mlock: resolved_config.mlock,
+        weight_quantization: skippy::StageWeightQuantization::Auto,
         cache_type_k: resolved_config.cache_type_k.clone(),
         cache_type_v: resolved_config.cache_type_v.clone(),
         flash_attn_type: resolved_config.flash_attn_type,
@@ -3172,6 +3173,7 @@ async fn split_peer_package_signal(
         model_id: model_ref.to_string(),
         package_ref: package.package_ref.clone(),
         manifest_sha256: package.manifest_sha256.clone(),
+        weight_quantization: skippy::StageWeightQuantization::Auto,
     };
     let result = node
         .send_stage_control(peer_id, skippy::StageControlRequest::Inventory(request))
@@ -3542,6 +3544,9 @@ fn split_stage_source_is_ready(
     inventory: &skippy::StageLayerInventory,
     load: &skippy::StageLoadRequest,
 ) -> bool {
+    if inventory.weight_quantization != load.weight_quantization {
+        return false;
+    }
     let ready_running_stage = inventory
         .ready_ranges
         .iter()
@@ -3557,6 +3562,7 @@ fn split_stage_source_is_ready(
             && status.backend == load.backend
             && status.package_ref == load.package_ref
             && status.manifest_sha256 == load.manifest_sha256
+            && status.weight_quantization == load.weight_quantization
             && status.layer_start <= load.layer_start
             && status.layer_end >= load.layer_end
             && matches!(
@@ -3590,6 +3596,7 @@ async fn query_stage_inventory(
         model_id: load.model_id.clone(),
         package_ref: load.package_ref.clone(),
         manifest_sha256: load.manifest_sha256.clone(),
+        weight_quantization: load.weight_quantization,
     };
     let response = if stage_node_id == node.id() {
         node.send_local_stage_control(skippy::StageControlRequest::Inventory(request))
@@ -4058,6 +4065,7 @@ mod tests {
             n_gpu_layers: -1,
             mmap: None,
             mlock: false,
+            weight_quantization: skippy::StageWeightQuantization::Auto,
             cache_type_k: "f16".to_string(),
             cache_type_v: "f16".to_string(),
             flash_attn_type: FlashAttentionType::Auto,
@@ -4295,6 +4303,7 @@ mod tests {
             n_batch: None,
             n_ubatch: None,
             flash_attn_type: FlashAttentionType::Auto,
+            weight_quantization: skippy::StageWeightQuantization::Auto,
             error: None,
             shutdown_generation: generation.generation,
         }
@@ -4621,6 +4630,7 @@ max_tokens = 222
             n_batch: load.n_batch,
             n_ubatch: load.n_ubatch,
             flash_attn_type: load.flash_attn_type,
+            weight_quantization: load.weight_quantization,
             error: None,
             shutdown_generation: load.shutdown_generation,
             coordinator_term: load.coordinator_term,
@@ -4657,6 +4667,7 @@ max_tokens = 222
             n_batch: None,
             n_ubatch: None,
             flash_attn_type: FlashAttentionType::Auto,
+            weight_quantization: skippy::StageWeightQuantization::Auto,
             error: None,
             shutdown_generation: stop.shutdown_generation,
             coordinator_term: stop.coordinator_term,
@@ -4679,6 +4690,7 @@ max_tokens = 222
             stage_index: load.stage_index,
             layer_start: load.layer_start,
             layer_end: load.layer_end,
+            weight_quantization: load.weight_quantization,
             state: skippy::StagePreparationState::Available,
             bytes_done: load.source_model_bytes,
             bytes_total: load.source_model_bytes,
@@ -4709,6 +4721,7 @@ max_tokens = 222
             source_model_path: Some("/models/qwen.gguf".to_string()),
             source_model_bytes: Some(40_000_000),
             source_model_kind: skippy::SourceModelKind::LayerPackage,
+            weight_quantization: request.weight_quantization,
         }
     }
 
@@ -4825,6 +4838,7 @@ max_tokens = 222
             source_model_path: None,
             source_model_bytes: None,
             source_model_kind: skippy::SourceModelKind::LayerPackage,
+            weight_quantization: skippy::StageWeightQuantization::Auto,
         };
 
         let signal = split_inventory_package_signal(&inventory, &package);
@@ -5037,6 +5051,7 @@ max_tokens = 222
             ),
             source_model_bytes: Some(4_900_000_000),
             source_model_kind: skippy::SourceModelKind::LayerPackage,
+            weight_quantization: load.weight_quantization,
         };
 
         assert!(!split_stage_source_is_ready(&inventory, &load));
@@ -5052,6 +5067,7 @@ max_tokens = 222
     fn mlx_artifact_slice_accepts_exact_prepare_availability() {
         let mut load = stage_load_request(LoadMode::ArtifactSlice);
         load.backend = "mlx".to_string();
+        load.weight_quantization = skippy::StageWeightQuantization::Affine8;
         load.package_ref = format!(
             "hf-model://HuggingFaceTB/SmolLM2-135M-Instruct@{}",
             "a".repeat(40)
@@ -5068,10 +5084,20 @@ max_tokens = 222
             source_model_path: None,
             source_model_bytes: None,
             source_model_kind: skippy::SourceModelKind::Unknown,
+            weight_quantization: skippy::StageWeightQuantization::Auto,
         };
 
         assert!(!split_stage_source_is_ready(&inventory, &load));
 
+        inventory.weight_quantization = load.weight_quantization;
+
+        let mut wrong_profile = test_preparation_status_from_load(&load);
+        wrong_profile.weight_quantization = skippy::StageWeightQuantization::Affine4;
+        inventory.preparing_ranges.push(wrong_profile);
+
+        assert!(!split_stage_source_is_ready(&inventory, &load));
+
+        inventory.preparing_ranges.clear();
         inventory
             .preparing_ranges
             .push(test_preparation_status_from_load(&load));
@@ -5097,6 +5123,7 @@ max_tokens = 222
             source_model_path: Some("/models/qwen.gguf".to_string()),
             source_model_bytes: Some(4_900_000_000),
             source_model_kind: skippy::SourceModelKind::PlainGguf,
+            weight_quantization: load.weight_quantization,
         };
 
         assert!(split_stage_source_is_ready(&inventory, &load));
@@ -5121,6 +5148,7 @@ max_tokens = 222
             source_model_path: None,
             source_model_bytes: None,
             source_model_kind: skippy::SourceModelKind::Unknown,
+            weight_quantization: skippy::StageWeightQuantization::Auto,
         };
 
         let signal = split_inventory_package_signal(&inventory, &package);
@@ -5154,6 +5182,7 @@ max_tokens = 222
             source_model_path: None,
             source_model_bytes: None,
             source_model_kind: skippy::SourceModelKind::Unknown,
+            weight_quantization: skippy::StageWeightQuantization::Auto,
         };
 
         assert_eq!(
@@ -5184,6 +5213,7 @@ max_tokens = 222
             source_model_path: Some("/cache/layer-package".to_string()),
             source_model_bytes: Some(1_000),
             source_model_kind: skippy::SourceModelKind::LayerPackage,
+            weight_quantization: skippy::StageWeightQuantization::Auto,
         };
         inventory.manifest_sha256 = "other-manifest".to_string();
 
@@ -5218,6 +5248,7 @@ max_tokens = 222
             source_model_path: Some("/cache/layer-package".to_string()),
             source_model_bytes: Some(1_000),
             source_model_kind: skippy::SourceModelKind::LayerPackage,
+            weight_quantization: skippy::StageWeightQuantization::Auto,
         };
 
         assert_eq!(

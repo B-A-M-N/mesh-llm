@@ -40,6 +40,7 @@ fn load_request() -> StageLoadRequest {
         n_gpu_layers: -1,
         mmap: Some(false),
         mlock: true,
+        weight_quantization: StageWeightQuantization::Auto,
         cache_type_k: "f16".to_string(),
         cache_type_v: "q8_0".to_string(),
         flash_attn_type: FlashAttentionType::Enabled,
@@ -370,6 +371,7 @@ async fn prepare_stage_records_background_source_availability() {
                 model_id: load.model_id.clone(),
                 package_ref: load.package_ref.clone(),
                 manifest_sha256: load.manifest_sha256.clone(),
+                weight_quantization: load.weight_quantization,
             })
             .await;
         if let Some(status) = inventory
@@ -417,6 +419,7 @@ async fn prepare_mlx_fails_closed_without_downloading_on_unsupported_build() {
                 model_id: load.model_id.clone(),
                 package_ref: load.package_ref.clone(),
                 manifest_sha256: load.manifest_sha256.clone(),
+                weight_quantization: load.weight_quantization,
             })
             .await;
         if let Some(status) = inventory
@@ -471,6 +474,7 @@ async fn prepare_layer_package_stays_downloading_while_peer_prefetch_is_pending(
             model_id: load.model_id.clone(),
             package_ref: load.package_ref.clone(),
             manifest_sha256: load.manifest_sha256.clone(),
+            weight_quantization: load.weight_quantization,
         })
         .await;
     let status = inventory
@@ -513,6 +517,7 @@ async fn prepare_layer_package_fails_only_after_peer_prefetch_and_local_resoluti
                 model_id: load.model_id.clone(),
                 package_ref: load.package_ref.clone(),
                 manifest_sha256: load.manifest_sha256.clone(),
+                weight_quantization: load.weight_quantization,
             })
             .await;
         if let Some(status) = inventory
@@ -579,6 +584,7 @@ async fn cancel_prepare_persists_cancelled_status_and_blocks_late_prefetch_resul
             model_id: load.model_id.clone(),
             package_ref: load.package_ref.clone(),
             manifest_sha256: load.manifest_sha256.clone(),
+            weight_quantization: load.weight_quantization,
         })
         .await;
     let status = inventory
@@ -649,6 +655,7 @@ async fn prepare_preserves_equal_or_newer_cancelled_status() {
             model_id: load.model_id.clone(),
             package_ref: load.package_ref.clone(),
             manifest_sha256: load.manifest_sha256.clone(),
+            weight_quantization: load.weight_quantization,
         })
         .await;
     let stored = inventory
@@ -700,6 +707,7 @@ async fn status_update_upserts_preparation_status_and_rejects_stale_generation()
             model_id: load.model_id.clone(),
             package_ref: load.package_ref.clone(),
             manifest_sha256: load.manifest_sha256.clone(),
+            weight_quantization: load.weight_quantization,
         })
         .await;
     let status = inventory
@@ -724,6 +732,7 @@ async fn status_update_upserts_preparation_status_and_rejects_stale_generation()
             model_id: load.model_id.clone(),
             package_ref: load.package_ref.clone(),
             manifest_sha256: load.manifest_sha256.clone(),
+            weight_quantization: load.weight_quantization,
         })
         .await;
     let status = inventory
@@ -749,6 +758,7 @@ async fn inventory_retains_failed_prepare_status() {
             model_id: load.model_id.clone(),
             package_ref: load.package_ref.clone(),
             manifest_sha256: load.manifest_sha256.clone(),
+            weight_quantization: load.weight_quantization,
         })
         .await;
 
@@ -761,12 +771,43 @@ async fn inventory_retains_failed_prepare_status() {
     assert_eq!(status.error.as_deref(), Some("source unavailable"));
 }
 
+#[tokio::test]
+async fn inventory_does_not_report_a_different_weight_profile_as_prepared() {
+    let mut load = load_request();
+    load.backend = "mlx".to_string();
+    load.weight_quantization = StageWeightQuantization::Affine4;
+    let key = stage_key(&load.topology_id, &load.run_id, &load.stage_id);
+    let state = StageControlState::default();
+    state.preparations.lock().await.insert(
+        key,
+        preparation_status_from_load(&load, StagePreparationState::Available, None),
+    );
+
+    let mut request = StageInventoryRequest {
+        model_id: load.model_id.clone(),
+        package_ref: load.package_ref.clone(),
+        manifest_sha256: load.manifest_sha256.clone(),
+        weight_quantization: StageWeightQuantization::Affine8,
+    };
+    assert!(
+        state
+            .inventory(request.clone())
+            .await
+            .preparing_ranges
+            .is_empty()
+    );
+
+    request.weight_quantization = StageWeightQuantization::Affine4;
+    assert_eq!(state.inventory(request).await.preparing_ranges.len(), 1);
+}
+
 #[test]
 fn inventory_source_candidates_prefer_explicit_gguf_ref() {
     let request = StageInventoryRequest {
         model_id: "catalog-model".to_string(),
         package_ref: "gguf:///tmp/source-model.gguf".to_string(),
         manifest_sha256: "sha256".to_string(),
+        weight_quantization: StageWeightQuantization::Auto,
     };
 
     let candidates = inventory_source_candidates(&request);

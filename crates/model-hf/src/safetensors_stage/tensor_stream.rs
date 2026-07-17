@@ -69,10 +69,29 @@ impl SafetensorsStageTensorVisit<'_> {
     /// that reads the file before returning from the callback. This lets a
     /// backend quantize or transform exact HTTP ranges sequentially without
     /// retaining the complete BF16 stage artifact on disk.
-    pub fn visit_tensor_files<F>(self, mut visitor: F) -> Result<SafetensorsStageTensorVisitReport>
+    pub fn visit_tensor_files<F>(self, visitor: F) -> Result<SafetensorsStageTensorVisitReport>
     where
         F: FnMut(&SafetensorsStageTensorFile) -> Result<()>,
     {
+        self.visit_tensor_files_cancellable(|| false, visitor)
+    }
+
+    /// Visits selected tensors while cooperatively checking for cancellation.
+    ///
+    /// Cancellation is checked before each payload request and immediately
+    /// before and after the visitor. An in-flight HTTP response or visitor call
+    /// is allowed to finish; its ephemeral file is removed when this method
+    /// returns.
+    pub fn visit_tensor_files_cancellable<F, C>(
+        self,
+        mut is_cancelled: C,
+        mut visitor: F,
+    ) -> Result<SafetensorsStageTensorVisitReport>
+    where
+        F: FnMut(&SafetensorsStageTensorFile) -> Result<()>,
+        C: FnMut() -> bool,
+    {
+        ensure!(!is_cancelled(), "SafeTensors tensor visit cancelled");
         let directory = EphemeralTensorDirectory::create(&self.materializer.cache_root)?;
         let source_shards = self
             .prepared
@@ -89,6 +108,7 @@ impl SafetensorsStageTensorVisit<'_> {
         let mut visited_tensor_bytes = 0_u64;
         let mut temporary_file_peak_bytes = 0_u64;
         for (index, tensor) in tensors.iter().enumerate() {
+            ensure!(!is_cancelled(), "SafeTensors tensor visit cancelled");
             let source = source_shards
                 .get(tensor.source_file.as_str())
                 .with_context(|| format!("missing source identity for {}", tensor.source_file))?;
@@ -99,7 +119,9 @@ impl SafetensorsStageTensorVisit<'_> {
                 self.materializer
                     .write_tensor_file(&path, &self.prepared.plan, tensor, source)?;
             temporary_file_peak_bytes = temporary_file_peak_bytes.max(file_bytes);
+            ensure!(!is_cancelled(), "SafeTensors tensor visit cancelled");
             visitor(&tensor_file(tensor, path.clone(), file_bytes))?;
+            ensure!(!is_cancelled(), "SafeTensors tensor visit cancelled");
             fs::remove_file(&path)
                 .with_context(|| format!("remove ephemeral tensor file {}", path.display()))?;
             visited_tensor_bytes = visited_tensor_bytes

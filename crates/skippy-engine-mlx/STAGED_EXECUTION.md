@@ -22,8 +22,9 @@ the default automatic mesh launch path:
   configured layer range.
 - `mlx-stage` starts a stage process or drives a chain as a proof client.
 - `StagePrepare` / `StageLoad` with `backend=mlx` and an immutable
-  `hf-model://org/repo@<commit>` reference now materialize and start the same
-  engine through the normal host stage-control loop.
+  `hf-model://org/repo@<commit>` reference now derive or reuse a validated
+  quantized stage and start the same engine through the normal host
+  stage-control loop.
 
 No process in the proof has access to the complete checkpoint. The tokenizer
 and config files are small shared metadata; tensor data comes only from that
@@ -121,8 +122,42 @@ before accepting a hit. On the same pinned layer-14 slice, the cold call made 9
 tensor-payload range requests; the warm call returned the identical recipe and
 content hashes with `cache_hit=true`, made 0 tensor-payload range requests, and
 used 17,809,408 B max RSS. It still re-plans lightweight config/index/header
-metadata to reconstruct the strong recipe key. Host lifecycle/eviction wiring
-is not yet connected to this library/CLI cache.
+metadata to reconstruct the strong recipe key.
+
+The host control path now consumes this cache directly. `StagePrepare` maps the
+load request to a derivation recipe and builds or validates it on a blocking
+worker; `StageLoad` validates the same entry and loads MLX from the derived
+directory. It fails on a cache miss instead of downloading or quantizing tensor
+payloads during Load. The load request carries an additive quantization profile:
+`auto`, affine 4-bit, affine 8-bit, or MXFP4. An absent profile from an older
+peer means `auto`; an unknown value fails closed. On the current Apple Metal
+backend, `auto` selects affine 4-bit with group size 64. The chosen profile is
+part of the recipe identity and is carried through inventory, preparation, and
+running status. Inventory responses echo the requested profile, so one profile
+cannot satisfy readiness for another, including across mixed-version peers.
+
+The host's claimed checkpoint identity is verified from the lightweight
+metadata plan before the first tensor payload request. Prepare cancellation is
+also threaded into cache-lock waits and the sequential visitor. It is checked
+before every payload request and before and after each quantization callback;
+an HTTP transfer or MLX operation already in flight finishes cooperatively
+before its temporary file is removed.
+
+A clean host-control run built both halves without retaining a dense stage:
+
+| Layers | Exact source tensor bytes | Derived artifact | Payload requests |
+| --- | ---: | ---: | ---: |
+| `0..15` | 162,825,984 B | 45,859,713 B | 136 |
+| `15..30` | 162,827,136 B | 45,861,308 B | 137 |
+
+It completed Prepare, Load, Start, generation, and Stop in 120.74 seconds and
+produced the established affine-4 token reference. An immediate identical run
+hit both validated entries, performed the same lifecycle in 8.87 seconds, and
+used 258,162,688 B max RSS. `MESH_MLX_DERIVED_CACHE_DIR` can isolate or relocate
+the host cache for testing and operations. Cache capacity and eviction still
+need an owner; warm lookup also still probes lightweight upstream metadata to
+reconstruct the strong recipe, then streams each cached shard once to verify
+both its shard hash and the aggregate content digest.
 
 The two partial files are the exact-range artifacts described in
 `../../spikes/mlx-safetensors-stages/FINDINGS.md`. Tied input/output embeddings
@@ -214,8 +249,10 @@ just mlx-stage prove --connect 127.0.0.1:19090 --wire-dtype f16
 - Mesh topology planning does not yet produce MLX stage assignments. The host
   can consume explicit `backend=mlx` Prepare/Load requests, but automatic
   placement, capability advertisement, coordinator model planning, and an
-  OpenAI stage-0 frontend remain. Explicit host requests still use source
-  precision; quantization selection currently exists only in the engine config
-  and `mlx-stage` proof/derive CLI. The explicit derived artifact is not yet an
-  automatic cache hit path. There is no mesh protocol or Skippy ABI break in
-  the explicit consumer path.
+  OpenAI stage-0 frontend remain. Explicit host requests now derive and reuse
+  quantized artifacts, but cache eviction and an optional local
+  request-to-recipe locator remain. The quantization field is an additive mesh
+  protocol change; old peers omit it and therefore mean `auto`, while unknown
+  values fail closed on new peers. Automatic placement must capability-gate
+  explicit non-default profiles before mixed-version deployment. No Skippy ABI
+  changed.

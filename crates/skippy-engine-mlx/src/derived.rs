@@ -6,7 +6,10 @@ use std::{
     fs::{self, File},
     io::{BufReader, Read},
     path::{Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
 };
 
 use anyhow::{Context, Result, ensure};
@@ -30,6 +33,7 @@ mod cache;
 
 pub use cache::{
     MlxDerivedStageCacheConfig, MlxDerivedStageCacheResult, derive_quantized_stage_cached,
+    load_prepared_quantized_stage, mlx_derived_stage_cache_root,
 };
 
 pub(super) const DERIVED_STAGE_SCHEMA_VERSION: u32 = 1;
@@ -39,12 +43,53 @@ const PLAN_FILE: &str = "stage-plan.json";
 pub(super) const REPORT_FILE: &str = "derived-stage.json";
 static DERIVED_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+/// Expected source identity and cooperative cancellation for a derivation.
+#[derive(Clone, Debug, Default)]
+pub struct MlxDerivationControl {
+    expected_checkpoint_sha256: Option<String>,
+    cancelled: Option<Arc<AtomicBool>>,
+}
+
+impl MlxDerivationControl {
+    pub fn new(
+        expected_checkpoint_sha256: Option<String>,
+        cancelled: Option<Arc<AtomicBool>>,
+    ) -> Self {
+        Self {
+            expected_checkpoint_sha256,
+            cancelled,
+        }
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancelled
+            .as_ref()
+            .is_some_and(|cancelled| cancelled.load(Ordering::Acquire))
+    }
+
+    fn ensure_active(&self) -> Result<()> {
+        ensure!(!self.is_cancelled(), "MLX stage derivation cancelled");
+        Ok(())
+    }
+
+    fn verify_checkpoint(&self, actual: &str) -> Result<()> {
+        if let Some(expected) = &self.expected_checkpoint_sha256 {
+            ensure!(
+                actual == expected,
+                "MLX checkpoint identity {actual} does not match stage claim {expected}"
+            );
+        }
+        Ok(())
+    }
+}
+
 /// Configuration for producing one MLX-quantized partial stage.
 #[derive(Clone, Debug)]
 pub struct MlxDerivedStageConfig {
     pub source: SafetensorsStageRequest,
     pub output_dir: PathBuf,
     pub quantization: MlxWeightQuantization,
+    pub control: MlxDerivationControl,
     /// Soft output bundle target. A single packed tensor may exceed this size.
     pub shard_size_bytes: usize,
 }
@@ -174,6 +219,7 @@ pub fn derive_quantized_stage(
     materializer: &SafetensorsStageMaterializer,
     config: &MlxDerivedStageConfig,
 ) -> Result<MlxDerivedStageReport> {
+    config.control.ensure_active()?;
     ensure!(
         config.shard_size_bytes > 0,
         "derived shard size must be non-zero"
@@ -185,6 +231,10 @@ pub fn derive_quantized_stage(
         config.output_dir.display()
     );
     let visit = materializer.prepare_tensor_visit(config.source.clone())?;
+    config.control.ensure_active()?;
+    config
+        .control
+        .verify_checkpoint(visit.checkpoint_sha256())?;
     let plan = visit.plan().clone();
     let source_config = visit.config().to_vec();
     ensure_dense_source_config(&source_config)?;
@@ -211,23 +261,30 @@ pub fn derive_quantized_stage(
     let quantization_stream = Stream::new_with_device(&Device::new(DeviceType::Gpu, 0));
     let initial_output_file_bytes = directory_file_bytes(temporary.path())?;
     let mut state = BuildState::new(initial_output_file_bytes);
-    let visit_report = visit.visit_tensor_files(|tensor| {
-        state.observe_source_file(tensor.file_bytes);
-        let arrays = convert_tensor(
-            tensor,
-            quantization,
-            &weights_stream,
-            &quantization_stream,
-            &mut state,
-        )?;
-        append_arrays(
-            arrays,
-            config.shard_size_bytes,
-            temporary.path(),
-            tensor.file_bytes,
-            &mut state,
-        )
-    })?;
+    let visit_report = visit.visit_tensor_files_cancellable(
+        || config.control.is_cancelled(),
+        |tensor| {
+            config.control.ensure_active()?;
+            state.observe_source_file(tensor.file_bytes);
+            let arrays = convert_tensor(
+                tensor,
+                quantization,
+                &weights_stream,
+                &quantization_stream,
+                &mut state,
+            )?;
+            config.control.ensure_active()?;
+            append_arrays(
+                arrays,
+                config.shard_size_bytes,
+                temporary.path(),
+                tensor.file_bytes,
+                &mut state,
+            )?;
+            config.control.ensure_active()
+        },
+    )?;
+    config.control.ensure_active()?;
     if !state.pending.tensors.is_empty() {
         flush_shard(temporary.path(), &mut state)?;
     }
@@ -271,7 +328,9 @@ pub fn derive_quantized_stage(
         mlx_peak_memory_bytes: peak_memory()?,
         shards,
     };
+    config.control.ensure_active()?;
     write_json(temporary.path().join(REPORT_FILE), &report)?;
+    config.control.ensure_active()?;
     temporary.publish(&config.output_dir)?;
     Ok(report)
 }
@@ -547,8 +606,12 @@ pub(super) fn prepare_derivation_recipe(
     source: SafetensorsStageRequest,
     quantization: MlxWeightQuantization,
     shard_size_bytes: usize,
+    control: &MlxDerivationControl,
 ) -> Result<String> {
+    control.ensure_active()?;
     let visit = materializer.prepare_tensor_visit(source)?;
+    control.ensure_active()?;
+    control.verify_checkpoint(visit.checkpoint_sha256())?;
     ensure_dense_source_config(visit.config())?;
     let quantization = serde_json::to_value(quantization.safemlx()?)?;
     let plan_bytes = serde_json::to_vec(visit.plan())?;
@@ -812,6 +875,22 @@ mod tests {
     use safemlx_lm::quantization::AffineQuantization;
 
     use super::*;
+
+    #[test]
+    fn derivation_control_rejects_cancellation_and_wrong_checkpoint() {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let control = MlxDerivationControl::new(
+            Some("expected-checkpoint".to_string()),
+            Some(Arc::clone(&cancelled)),
+        );
+
+        assert!(control.ensure_active().is_ok());
+        assert!(control.verify_checkpoint("expected-checkpoint").is_ok());
+        assert!(control.verify_checkpoint("other-checkpoint").is_err());
+
+        cancelled.store(true, Ordering::Release);
+        assert!(control.ensure_active().is_err());
+    }
 
     #[test]
     fn quantized_config_preserves_source_and_adds_both_metadata_keys() {

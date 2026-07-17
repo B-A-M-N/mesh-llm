@@ -2400,6 +2400,7 @@ async fn seed_runtime_data_api_state(state: &MeshApi) {
             n_batch: Some(2048),
             n_ubatch: Some(512),
             flash_attn_type: skippy_protocol::FlashAttentionType::Enabled,
+            weight_quantization: crate::inference::skippy::StageWeightQuantization::Auto,
             error: None,
             shutdown_generation: 7,
             coordinator_term: 11,

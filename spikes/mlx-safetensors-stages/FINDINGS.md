@@ -28,16 +28,15 @@ close to exact. For Inkling, tensors are heavily interleaved across source
 shards, so exact tensor ranges are mandatory: whole-shard selection would turn
 a 109.84 GiB four-layer stage into a 942.99 GiB download.
 
-The small dense-model path is now proven through execution, including
-tensor-at-a-time affine-4 quantization into the live MLX model. `model-hf` now
-also exposes a backend-neutral sequential visitor that downloads each selected
-range as an ephemeral, valid one-tensor SafeTensors file and deletes it before
-fetching the next tensor. The remaining artifact proof is consuming that seam
-to build bounded quantized-cache shards with measured peak RSS and disk use;
-the serving path still first retains the complete BF16 stage slice on disk.
-Its prepared session exposes the verified config, config hash, checkpoint
-identity, and range plan before payload callbacks. On macOS/Unix, advisory
-locks also scavenge crash-abandoned visits without removing concurrent ones.
+The small dense-model path is now proven through execution, including a host
+path that streams selected tensor ranges into bounded affine-4 cache shards,
+then loads the derived stage without retaining a complete BF16 stage slice.
+`model-hf` exposes the backend-neutral sequential visitor that downloads each
+selected range as an ephemeral, valid one-tensor SafeTensors file and deletes it
+before fetching the next tensor. Its prepared session exposes the verified
+config, config hash, checkpoint identity, and range plan before payload
+callbacks. On macOS/Unix, advisory locks also scavenge crash-abandoned visits
+without removing concurrent ones.
 
 The pinned SmolLM2 layer-14 visitor proof fetched 9 tensors totaling 7,080,192
 bytes from a 269,060,552-byte source shard. Its largest temporary one-tensor
@@ -171,8 +170,33 @@ output-content digest, and every shard hash before accepting a hit. On the same
 pinned layer-14 slice, a cold call made 9 tensor-payload requests and the warm
 call made 0, returned the identical recipe/content/shard hashes, and used
 17,809,408 B max RSS. The warm path still reads lightweight config/index/header
-metadata to reconstruct the strong key. This is the reusable library/CLI seam;
-host lifecycle and eviction integration remain.
+metadata to reconstruct the strong key.
+
+The host `StagePrepare` and `StageLoad` lifecycle now uses that cache. The
+stage-load wire carries an additive `auto`/affine-4/affine-8/MXFP4 profile;
+older peers that omit it select `auto`, while unknown values fail closed. On
+Apple Metal, `auto` currently resolves to affine-4/group-64. A clean two-half
+host test made 136 and 137 tensor-payload requests, fetched 162,825,984 and
+162,827,136 bytes, and produced 45,859,713 and 45,861,308-byte artifacts. The
+complete Prepare/Load/Start/generate/Stop lifecycle passed in 120.74 seconds
+with the established affine-4 tokens. An immediate validated-cache run passed
+in 8.87 seconds with 258,162,688 B max RSS. Cache eviction and an optional
+local request-to-recipe locator remain; the host cache root can be overridden
+with `MESH_MLX_DERIVED_CACHE_DIR`.
+
+Only Prepare may fetch tensor payloads and build a missing entry. Load performs
+metadata planning and full cache validation, then fails rather than deriving if
+the prepared entry is absent or corrupt.
+
+Checkpoint claims are compared with the metadata-derived identity before the
+first tensor payload request. Cancellation is cooperative through cache-lock
+waits and the sequential range/quantization loop; an already-running HTTP or
+MLX operation finishes before cleanup. Inventory responses echo the requested
+quantization profile, and preparation plus running status carry it, so readiness
+for one recipe cannot silently satisfy another. Cache-hit validation reads each
+shard once while checking its own hash and the aggregate content digest.
+Mixed-version automatic placement must still capability-gate explicit
+non-default profiles because an old receiver ignores new additive fields.
 
 ## Representative measurements
 
@@ -403,9 +427,9 @@ because it does not alter the derived packed weights.
 
 ## Next proof
 
-1. Wire the proven derived-stage cache into host prepare/load and cache eviction,
-   then decide whether a local request-to-recipe locator should remove even the
-   warm metadata probes.
+1. Add capacity/eviction ownership to the host derived-stage cache, then decide
+   whether a local request-to-recipe locator should remove even the warm
+   metadata probes.
 2. Quantize one real Nemotron-H BF16 matrix reproducibly, then implement one
    complete split-expert bank without accumulating every dense expert. Prove a
    small family member before attempting Ultra-scale ranges.
