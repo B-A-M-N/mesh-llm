@@ -856,6 +856,20 @@ name = "bytemuck"
 version = "1.25.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c8efb64bd706a16a1bdde310ae86b351e4d21550d98d056f22f8a7f7a2183fec"
+dependencies = [
+ "bytemuck_derive",
+]
+
+[[package]]
+name = "bytemuck_derive"
+version = "1.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f65693059b6b9c588b9f62fed1cedbf0a8b805631457ea162d68f0de186f3de5"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.118",
+]
 
 [[package]]
 name = "byteorder"
@@ -2555,6 +2569,7 @@ version = "2.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ea2d84b969582b4b1864a92dc5d27cd2b77b622a8d79306834f1be5ba20d84b"
 dependencies = [
+ "bytemuck",
  "cfg-if 1.0.4",
  "crunchy",
  "zerocopy",
@@ -7757,15 +7772,24 @@ dependencies = [
  "async-stream",
  "async-trait",
  "axum",
+ "bytemuck",
  "clap",
  "futures-core",
+ "half",
+ "libc",
+ "memmap2",
+ "model-hf",
  "openai-frontend",
  "safemlx",
  "safemlx-lm",
+ "safetensors",
+ "serde",
  "serde_json",
+ "sha2 0.10.9",
  "skippy-engine",
  "skippy-protocol",
  "skippy-server",
+ "tempfile",
  "tokenizers",
  "tokio",
  "tracing",

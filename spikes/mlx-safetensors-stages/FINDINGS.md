@@ -134,9 +134,40 @@ whole-model reference:
 The two separately quantized `0..15` and `15..30` processes reproduced all
 eight tokens over F16 stage residuals. Each process retained 349 MLX parameters;
 post-proof RSS was 87,392 KiB and 87,952 KiB. This is correctness and steady-RSS
-evidence, not a peak-memory claim. The next memory gate must sample the cold
-load high-water mark and remove the requirement to keep the complete BF16 stage
-slice on disk.
+evidence, not a peak-memory claim.
+
+## Direct range-to-quantized artifact proof
+
+`mlx-stage derive` now removes the complete BF16 stage slice from the workflow.
+It consumes one verified range file at a time, quantizes eligible rank-2 Llama
+weights, evaluates and synchronizes MLX work, copies the packed arrays into a
+bounded host-side shard, and returns before `model-hf` deletes the dense source
+file. Output uses pure-Rust SafeTensors serialization to coexist with the
+Skippy/llama.cpp native link.
+
+For the two 15-layer SmolLM2 halves at affine-4/group-64 and 16 MiB output
+shards:
+
+| Layers | Dense source payload | Derived artifact | Largest source temp | MLX peak active | Max RSS | macOS peak footprint |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `0..15` | 162,825,984 B | 45,887,848 B | 56,623,208 B | 72,548,352 B | 140,853,248 B | 240,157,440 B |
+| `15..30` | 162,827,136 B | 45,889,726 B | 56,623,208 B | 72,548,352 B | 140,722,176 B | 241,550,080 B |
+
+Each artifact contained three shards and an index. Both loaded directly as
+pre-quantized partial stages and reproduced the same eight-token affine-4
+reference over F16 residuals. Repeating a one-layer derivation produced a
+byte-identical weight shard. The report separates its input recipe hash from an
+output-content digest and per-shard hashes; runtime memory evidence is
+deliberately not part of either. Whole directories are not byte-identical
+because reports include the local path and measurements. Shard size is a soft
+bundle target and a single packed tensor may exceed it. The artifact byte count
+excludes the report. The working-disk metric is a measured source-tensor plus
+artifact-payload high-water mark, not allocated filesystem blocks or lock/report
+overhead. The v1 builder fails closed unless `model_type` is exactly `llama`.
+
+This is still an explicit artifact output, not the host's evictable cache. The
+next cache step must map the recorded identity to a managed destination,
+validate shard hashes on hit, and avoid all tensor-range requests on reuse.
 
 ## Representative measurements
 
@@ -367,16 +398,13 @@ because it does not alter the derived packed weights.
 
 ## Next proof
 
-1. Consume the sequential selected-range visitor from `model-hf` to replace
-   BF16-stage-on-disk + live quantization with direct range -> MLX affine ->
-   bounded derived-cache shards. Prove peak RSS and disk bounds using both OS
-   physical footprint and MLX allocator counters.
-2. Measure the MLX eval/readback/codec boundary fence independently at frontier
+1. Use the derivation recipe hash as a managed host cache key; validate the
+   output-content digest and shard hashes on hit, then prove a warm load makes
+   no range requests.
+2. Quantize one real Nemotron-H BF16 matrix reproducibly, then implement one
+   complete split-expert bank without accumulating every dense expert. Prove a
+   small family member before attempting Ultra-scale ranges.
+3. Measure the MLX eval/readback/codec boundary fence independently at frontier
    residual widths and prefill sizes.
-3. Introduce the engine-neutral stage interface and run the same proof through
-   two real `skippy-server` processes.
-4. First quantize one real Nemotron-H BF16 matrix reproducibly, then implement
-   one complete split-expert bank without accumulating every dense expert.
-   Prove a small family member before attempting Ultra-scale ranges.
-5. Expose the existing safemlx Inkling text decoder as one stage, prove
+4. Expose the existing safemlx Inkling text decoder as one stage, prove
    Transformers parity, then add stage ranges and network execution.

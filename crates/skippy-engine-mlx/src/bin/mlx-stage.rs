@@ -11,8 +11,10 @@ mod real {
 
     use anyhow::{Context, Result, ensure};
     use clap::{Parser, Subcommand, ValueEnum};
+    use model_hf::safetensors_stage::{SafetensorsStageMaterializer, SafetensorsStageRequest};
     use skippy_engine_mlx::{
-        MlxComputeDtype, MlxStageEngine, MlxStageEngineConfig, MlxWeightQuantization,
+        MlxComputeDtype, MlxDerivedStageConfig, MlxStageEngine, MlxStageEngineConfig,
+        MlxWeightQuantization, derive_quantized_stage,
     };
     use skippy_protocol::binary::{
         StageStateHeader, StageWireMessage, WireActivationDType, WireMessageKind, WireReplyKind,
@@ -51,6 +53,27 @@ mod real {
             compute_dtype: ComputeDtype,
             #[arg(long, value_enum)]
             weight_quantization: Option<WeightQuantization>,
+        },
+        /// Download exact stage tensors and write bounded MLX-quantized shards.
+        Derive {
+            #[arg(long)]
+            repo: String,
+            /// Immutable 40-character Hugging Face commit SHA.
+            #[arg(long)]
+            revision: String,
+            #[arg(long)]
+            layer_start: u32,
+            #[arg(long)]
+            layer_end: u32,
+            #[arg(long = "include-prefix")]
+            include_prefixes: Vec<String>,
+            #[arg(long)]
+            output: PathBuf,
+            #[arg(long, value_enum, default_value_t = WeightQuantization::Affine4)]
+            weight_quantization: WeightQuantization,
+            /// Soft output shard target; one packed tensor may exceed it.
+            #[arg(long, default_value_t = 256)]
+            shard_size_mib: usize,
         },
         /// Drive a stage chain and assert its greedy token sequence.
         Prove {
@@ -150,6 +173,27 @@ mod real {
                     wire_dtype: wire_dtype.into(),
                 },
             ),
+            Command::Derive {
+                repo,
+                revision,
+                layer_start,
+                layer_end,
+                include_prefixes,
+                output,
+                weight_quantization,
+                shard_size_mib,
+            } => derive(
+                SafetensorsStageRequest {
+                    repo,
+                    revision,
+                    layer_start,
+                    layer_end,
+                    include_prefixes,
+                },
+                output,
+                weight_quantization.into(),
+                shard_size_mib,
+            ),
             Command::Prove {
                 connect,
                 tokens,
@@ -162,6 +206,29 @@ mod real {
     fn serve(config: MlxStageEngineConfig, options: EngineStageServerOptions) -> Result<()> {
         let engine = Arc::new(MlxStageEngine::spawn(config)?);
         serve_stage_engine(engine, options)
+    }
+
+    fn derive(
+        source: SafetensorsStageRequest,
+        output_dir: PathBuf,
+        quantization: MlxWeightQuantization,
+        shard_size_mib: usize,
+    ) -> Result<()> {
+        let shard_size_bytes = shard_size_mib
+            .checked_mul(1024 * 1024)
+            .context("derived shard size overflow")?;
+        let materializer = SafetensorsStageMaterializer::from_environment()?;
+        let report = derive_quantized_stage(
+            &materializer,
+            &MlxDerivedStageConfig {
+                source,
+                output_dir,
+                quantization,
+                shard_size_bytes,
+            },
+        )?;
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        Ok(())
     }
 
     fn prove(

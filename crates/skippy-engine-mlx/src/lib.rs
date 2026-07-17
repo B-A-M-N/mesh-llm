@@ -10,12 +10,18 @@
 #[cfg(all(feature = "mlx", target_os = "macos"))]
 mod backend;
 #[cfg(all(feature = "mlx", target_os = "macos"))]
+mod derived;
+#[cfg(all(feature = "mlx", target_os = "macos"))]
 mod engine;
 #[cfg(all(feature = "mlx", target_os = "macos"))]
 mod stage;
 
 #[cfg(all(feature = "mlx", target_os = "macos"))]
 pub use backend::MlxBackend;
+#[cfg(all(feature = "mlx", target_os = "macos"))]
+pub use derived::{
+    MlxDerivedStageConfig, MlxDerivedStageReport, MlxDerivedStageShard, derive_quantized_stage,
+};
 #[cfg(all(feature = "mlx", target_os = "macos"))]
 pub use engine::{ChatTurn, GenerateRequest, MlxEngine, MlxEngineConfig};
 #[cfg(all(feature = "mlx", target_os = "macos"))]

@@ -1,11 +1,6 @@
 //! Partial-layer MLX implementation of the engine-neutral Skippy stage contract.
 
-use std::{
-    collections::BTreeMap,
-    path::{Path, PathBuf},
-    sync::mpsc,
-    thread,
-};
+use std::{collections::BTreeMap, path::PathBuf, sync::mpsc, thread};
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use safemlx::module::{Module, ModuleParameters, ModuleParametersExt};
@@ -19,8 +14,8 @@ use safemlx_lm::{
     },
     quantization::{AffineQuantization, WeightQuantization},
     weights::{
-        StrictLoadConfig, StrictLoadReport, load_safetensors_quantized_strict,
-        load_safetensors_strict,
+        StrictLoadConfig, StrictLoadReport, load_safetensors_dir_quantized_strict,
+        load_safetensors_dir_strict,
     },
 };
 use skippy_engine::{
@@ -53,7 +48,7 @@ pub enum MlxWeightQuantization {
 }
 
 impl MlxWeightQuantization {
-    fn safemlx(self) -> Result<WeightQuantization> {
+    pub(crate) fn safemlx(self) -> Result<WeightQuantization> {
         match self {
             Self::Affine { group_size, bits } => {
                 Ok(AffineQuantization::new(group_size, bits)?.into())
@@ -62,7 +57,7 @@ impl MlxWeightQuantization {
         }
     }
 
-    fn label(self) -> String {
+    pub(crate) fn label(self) -> String {
         match self {
             Self::Affine { group_size, bits } => format!("affine-{bits}bit-g{group_size}"),
             Self::MxFp4 => "mxfp4".to_string(),
@@ -203,6 +198,18 @@ fn load_stage(config: MlxStageEngineConfig) -> Result<LoadedStage> {
         .weight_quantization
         .map(MlxWeightQuantization::safemlx)
         .transpose()?;
+    let weight_quantization_label = config.weight_quantization.map_or_else(
+        || {
+            model_args
+                .quantization
+                .or(model_args.quantization_config)
+                .map_or_else(
+                    || "none".to_string(),
+                    |value| format!("checkpoint-{value:?}"),
+                )
+        },
+        MlxWeightQuantization::label,
+    );
     if let Some(quantization) = quantization {
         ensure!(
             model_args.quantization.is_none() && model_args.quantization_config.is_none(),
@@ -214,18 +221,18 @@ fn load_stage(config: MlxStageEngineConfig) -> Result<LoadedStage> {
     let load_config = partial_stage_load_config(&info);
     let mut load_report = StrictLoadReport::default();
     match quantization {
-        Some(quantization) => load_safetensors_quantized_strict(
+        Some(quantization) => load_safetensors_dir_quantized_strict(
             &mut model,
-            weight_file(&config.model_dir),
+            &config.model_dir,
             &weights_stream,
             &stream,
             quantization,
             &load_config,
             &mut load_report,
         )?,
-        None => load_safetensors_strict(
+        None => load_safetensors_dir_strict(
             &mut model,
-            weight_file(&config.model_dir),
+            &config.model_dir,
             &weights_stream,
             &load_config,
             &mut load_report,
@@ -242,9 +249,7 @@ fn load_stage(config: MlxStageEngineConfig) -> Result<LoadedStage> {
         info.layer_start,
         info.layer_end,
         model.parameters().flatten().len(),
-        config
-            .weight_quantization
-            .map_or_else(|| "none".to_string(), MlxWeightQuantization::label),
+        weight_quantization_label,
     );
     Ok(LoadedStage {
         model,
@@ -272,10 +277,6 @@ fn partial_stage_load_config(info: &StageEngineInfo) -> StrictLoadConfig {
             .allow_missing_contains("lm_head.");
     }
     config
-}
-
-fn weight_file(model_dir: &Path) -> PathBuf {
-    model_dir.join("model.safetensors")
 }
 
 fn retain_local_layers(model: &mut llama::Model, start: u32, end: u32) -> Result<()> {

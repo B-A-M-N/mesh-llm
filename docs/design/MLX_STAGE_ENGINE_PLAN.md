@@ -32,10 +32,10 @@ Inkling BF16, four layers contain 109.84 GiB of tensors scattered across 942.99
 GiB of shard files; exact ranges avoid 833.15 GiB. A SmolLM2-135M proof then
 materialized two partial files (layers 0..15 and 15..30), loaded each directly
 into MLX, and matched unsplit logits exactly for prefill plus eight decode steps
-through Skippy's real F16 and F32 binary activation codec. The remaining
-artifact gate is direct range-to-derived-cache quantization for frontier-sized
-source tensors; tensor-at-a-time quantization into a live partial model is now
-proven on SmolLM2.
+through Skippy's real F16 and F32 binary activation codec. Direct range-to-
+quantized artifacts is now also proven for dense Llama below. The remaining
+frontier artifact gate is bounded family-specific expert transformation and a
+managed cache rather than the basic SafeTensors range mechanism.
 See `spikes/mlx-safetensors-stages/FINDINGS.md`.
 
 **Update — the first engine-neutral, multi-process stage chain is now proven.**
@@ -77,14 +77,28 @@ this profile yet, and the BF16 partial stage still exists on disk first.
 **Update — exact ranges can now be consumed sequentially without a BF16 stage
 artifact.** `model-hf` exposes each selected tensor as an ephemeral, valid
 one-tensor SafeTensors file, verifies the pinned source identity, and removes
-that file before downloading the next tensor. This is an engine-neutral source
-seam, not yet a quantized derived cache: the MLX consumer, bounded output
-shards, cache identity, and cold-load high-water measurements remain. On the
-pinned SmolLM2 layer-14 proof, it fetched 7,080,192 tensor bytes from a
+that file before downloading the next tensor. This engine-neutral source seam
+is consumed by the Llama builder below; managed cache hits and frontier-family
+transforms remain. On the pinned SmolLM2 layer-14 proof, it fetched 7,080,192
+tensor bytes from a
 269,060,552-byte source shard while the largest temporary file was 1,769,584
 bytes; the temporary directory was empty at completion. A prepared visit makes
 the verified config and checkpoint identity available before tensor callbacks,
 and macOS/Unix advisory locks safely scavenge crash-abandoned visits.
+
+**Update — direct exact-range to bounded affine stage artifacts is proven for
+Llama.** `mlx-stage derive` now consumes that prepared visit, quantizes/evaluates
+one rank-2 matrix at a time, serializes packed results into bounded SafeTensors
+shards, and records the checkpoint/plan/quantizer identity and output hashes.
+Two direct-derived SmolLM2 halves were about 45.89 MB each in three shards,
+versus about 162.83 MB of dense ranges fetched per half. Largest source temp was
+56.62 MB, MLX peak-active memory was 72.55 MB, max RSS was about 140.8 MB, and
+macOS peak footprint was about 241 MB. The two derived stages reproduced the
+established affine-4 tokens exactly. The v1 builder deliberately requires
+`model_type=llama` and rejects pre-quantized sources, rank-3 weights, and
+incompatible matrix dimensions. This closes the dense-Llama artifact-builder
+proof, not reusable host cache hits, Nemotron expert packing, or Inkling's
+transformed rank-3 path.
 
 The pinned safemlx revision also already includes whole-model Inkling text,
 vision, and audio execution. Earlier notes that called for porting Inkling were

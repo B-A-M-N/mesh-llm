@@ -16,7 +16,8 @@ the default automatic mesh launch path:
 - `skippy-server::llama_engine` proves the existing llama `RuntimeState` can
   implement the same dense contract, including F16/BF16/F32 residual conversion
   and checkpoint/restore/trim delegation, without changing the native ABI.
-- `MlxStageEngine` loads one materialized partial SafeTensors file, owns
+- `MlxStageEngine` loads one materialized partial SafeTensors file or sharded
+  directory, owns
   per-session KV caches on a dedicated MLX worker thread, and executes only its
   configured layer range.
 - `mlx-stage` starts a stage process or drives a chain as a proof client.
@@ -79,8 +80,39 @@ independently loaded 15-layer stages generated the same quantized-model tokens:
 The two-stage processes retained 349 MLX parameters each and had post-proof RSS
 of 87,392 KiB and 87,952 KiB, versus roughly 189 MiB each at source precision.
 This proves deterministic per-stage quantization and quantized stage execution;
-it does not yet prove peak RSS, direct range-to-quantized-cache disk bounds, or
-host/topology selection of the quantization profile.
+it does not by itself prove peak RSS or remove the dense partial artifact.
+
+The next proof removed that dense partial artifact. `mlx-stage derive` consumes
+the sequential exact-range session from `model-hf`, quantizes and synchronizes
+one matrix at a time, copies packed results into a bounded host-side output
+shard, and deletes each dense source tensor before fetching the next. Pure-Rust
+SafeTensors I/O avoids linking MLX's bundled GGUF symbols into the existing
+Skippy/llama.cpp binary.
+
+With 16 MiB output shards, the two SmolLM2 halves produced:
+
+| Layers | Dense ranges fetched | Quantized artifact | Shards | Largest source temp | MLX peak active | Process max RSS | macOS peak footprint |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `0..15` | 162,825,984 B | 45,887,848 B | 3 | 56,623,208 B | 72,548,352 B | 140,853,248 B | 240,157,440 B |
+| `15..30` | 162,827,136 B | 45,889,726 B | 3 | 56,623,208 B | 72,548,352 B | 140,722,176 B | 241,550,080 B |
+
+Both derived directories loaded without a quantization request because their
+config records the affine-4/group-64 encoding. They again produced exactly:
+
+```text
+[260, 2240, 314, 253, 1379, 282, 25801, 28]
+```
+
+No complete dense stage or source shard was written. The report separates the
+checkpoint/plan/quantizer recipe hash from an output-content digest and records
+every output shard hash. Repeating the one-layer derivation produced a
+byte-identical weight shard; the whole directories intentionally differ because
+reports include local paths and runtime memory evidence. The shard-size option
+is a soft bundle target, so one packed tensor may exceed it. This is a bounded
+`model_type=llama` artifact builder, not yet the host's reusable cache and not
+evidence that frontier expert-bank transforms fit the same bound. Artifact byte
+counts and the measured source-plus-output working-disk high-water mark exclude
+the report, lock files, and filesystem allocation overhead.
 
 The two partial files are the exact-range artifacts described in
 `../../spikes/mlx-safetensors-stages/FINDINGS.md`. Tied input/output embeddings
@@ -95,6 +127,27 @@ Build once:
 ```bash
 just mlx-stage-build
 ```
+
+Derive both quantized stage directories directly from immutable source ranges:
+
+```bash
+just mlx-stage derive \
+  --repo HuggingFaceTB/SmolLM2-135M-Instruct \
+  --revision 12fd25f77366fa6b3b4b768ec3050bf629380bac \
+  --layer-start 0 --layer-end 15 \
+  --output /tmp/mlx-derived-smol-stage0 \
+  --weight-quantization affine4 --shard-size-mib 16
+
+just mlx-stage derive \
+  --repo HuggingFaceTB/SmolLM2-135M-Instruct \
+  --revision 12fd25f77366fa6b3b4b768ec3050bf629380bac \
+  --layer-start 15 --layer-end 30 \
+  --output /tmp/mlx-derived-smol-stage1 \
+  --weight-quantization affine4 --shard-size-mib 16
+```
+
+The derived directories are already quantized; do not pass
+`--weight-quantization` when serving them.
 
 Start the final stage:
 
@@ -132,6 +185,10 @@ just mlx-stage prove --connect 127.0.0.1:19090 --wire-dtype f16
 - Dense Llama-family checkpoints only in `MlxStageEngine`. The pinned safemlx
   revision has whole-model Inkling and Nemotron-H implementations, but neither
   is exposed through this partial-stage adapter yet.
+- The derived builder handles ordinary rank-2 Llama weights. Nemotron split
+  experts need per-layer expert-bank assembly before quantization; Inkling needs
+  its transformed rank-3 grouped-expert loader. Neither is silently treated as
+  Llama.
 - Greedy sampling only; sampling metadata is preserved in the contract and
   rejected explicitly when enabled.
 - No KV page import/export, cache trim/checkpoint, MTP, speculative verify,
@@ -144,5 +201,6 @@ just mlx-stage prove --connect 127.0.0.1:19090 --wire-dtype f16
   placement, capability advertisement, coordinator model planning, and an
   OpenAI stage-0 frontend remain. Explicit host requests still use source
   precision; quantization selection currently exists only in the engine config
-  and `mlx-stage` proof CLI. There is no mesh protocol or Skippy ABI break in
+  and `mlx-stage` proof/derive CLI. The explicit derived artifact is not yet an
+  automatic cache hit path. There is no mesh protocol or Skippy ABI break in
   the explicit consumer path.
