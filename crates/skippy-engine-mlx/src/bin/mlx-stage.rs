@@ -16,6 +16,7 @@ mod real {
         MlxComputeDtype, MlxDerivationControl, MlxDerivedStageCacheConfig, MlxDerivedStageConfig,
         MlxStageEngine, MlxStageEngineConfig, MlxWeightQuantization, derive_quantized_stage,
         derive_quantized_stage_cached, mlx_derived_stage_cache_root, validate_nemotron_h_moe_stage,
+        validate_nemotron_h_stage_engine,
     };
     use skippy_protocol::binary::{
         StageStateHeader, StageWireMessage, WireActivationDType, WireMessageKind, WireReplyKind,
@@ -100,6 +101,13 @@ mod real {
         },
         /// Strict-load and execute one derived Nemotron-H MoE layer.
         ValidateNemotronH {
+            #[arg(long)]
+            model: PathBuf,
+            #[arg(long)]
+            layer: usize,
+        },
+        /// Prove StageEngine output numerically matches direct execution.
+        ValidateNemotronHStage {
             #[arg(long)]
             model: PathBuf,
             #[arg(long)]
@@ -247,6 +255,11 @@ mod real {
             ),
             Command::ValidateNemotronH { model, layer } => {
                 let report = validate_nemotron_h_moe_stage(model, layer)?;
+                println!("{}", serde_json::to_string_pretty(&report)?);
+                Ok(())
+            }
+            Command::ValidateNemotronHStage { model, layer } => {
+                let report = validate_nemotron_h_stage_engine(model, layer)?;
                 println!("{}", serde_json::to_string_pretty(&report)?);
                 Ok(())
             }

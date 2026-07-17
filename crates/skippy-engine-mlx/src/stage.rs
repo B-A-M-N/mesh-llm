@@ -1,5 +1,7 @@
 //! Partial-layer MLX implementation of the engine-neutral Skippy stage contract.
 
+mod nemotron_h;
+
 use std::{collections::BTreeMap, path::PathBuf, sync::mpsc, thread};
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
@@ -22,6 +24,9 @@ use skippy_engine::{
     StageActivation, StageEngine, StageEngineInfo, StageExecutionKind, StageExecutionOutput,
     StageExecutionRequest,
 };
+
+use self::nemotron_h::NemotronHMoeStage;
+pub use self::nemotron_h::{MlxNemotronHStageValidationReport, validate_nemotron_h_stage_engine};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum MlxComputeDtype {
@@ -141,13 +146,43 @@ impl StageEngine for MlxStageEngine {
     }
 }
 
-struct LoadedStage {
+struct LlamaLoadedStage {
     model: llama::Model,
     stream: Stream,
     compute_dtype: Dtype,
     ctx_size: Option<usize>,
     info: StageEngineInfo,
     sessions: BTreeMap<u64, Vec<Option<ConcatKeyValueCache>>>,
+}
+
+enum LoadedStage {
+    Llama(Box<LlamaLoadedStage>),
+    NemotronH(Box<NemotronHMoeStage>),
+}
+
+impl LoadedStage {
+    fn info(&self) -> &StageEngineInfo {
+        match self {
+            Self::Llama(stage) => &stage.info,
+            Self::NemotronH(stage) => stage.info(),
+        }
+    }
+
+    fn execute(&mut self, request: StageExecutionRequest) -> Result<StageExecutionOutput> {
+        match self {
+            Self::Llama(stage) => stage.execute(request),
+            Self::NemotronH(stage) => stage.execute(request),
+        }
+    }
+
+    fn reset_session(&mut self, session_id: u64) {
+        match self {
+            Self::Llama(stage) => {
+                stage.sessions.remove(&session_id);
+            }
+            Self::NemotronH(stage) => stage.reset_session(session_id),
+        }
+    }
 }
 
 fn run_worker(
@@ -157,7 +192,7 @@ fn run_worker(
 ) {
     let mut stage = match load_stage(config) {
         Ok(stage) => {
-            let _ = ready_tx.send(Ok(stage.info.clone()));
+            let _ = ready_tx.send(Ok(stage.info().clone()));
             stage
         }
         Err(error) => {
@@ -171,7 +206,7 @@ fn run_worker(
                 let _ = reply.send(stage.execute(request).map_err(|error| format!("{error:#}")));
             }
             WorkerJob::Reset { session_id, reply } => {
-                stage.sessions.remove(&session_id);
+                stage.reset_session(session_id);
                 let _ = reply.send(Ok(()));
             }
         }
@@ -179,6 +214,28 @@ fn run_worker(
 }
 
 fn load_stage(config: MlxStageEngineConfig) -> Result<LoadedStage> {
+    if model_type(&config.model_dir)?.as_deref() == Some("nemotron_h") {
+        return Ok(LoadedStage::NemotronH(Box::new(NemotronHMoeStage::load(
+            config,
+        )?)));
+    }
+    Ok(LoadedStage::Llama(Box::new(load_llama_stage(config)?)))
+}
+
+fn model_type(model_dir: &std::path::Path) -> Result<Option<String>> {
+    let config_path = model_dir.join("config.json");
+    let config: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(&config_path)
+            .with_context(|| format!("read MLX stage config {}", config_path.display()))?,
+    )
+    .with_context(|| format!("parse MLX stage config {}", config_path.display()))?;
+    Ok(config
+        .get("model_type")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned))
+}
+
+fn load_llama_stage(config: MlxStageEngineConfig) -> Result<LlamaLoadedStage> {
     let stream = Stream::new_with_device(&Device::new(DeviceType::Gpu, 0));
     let weights_stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
     let mut model_args = llama::get_llama_model_args(&config.model_dir)?;
@@ -251,7 +308,7 @@ fn load_stage(config: MlxStageEngineConfig) -> Result<LoadedStage> {
         model.parameters().flatten().len(),
         weight_quantization_label,
     );
-    Ok(LoadedStage {
+    Ok(LlamaLoadedStage {
         model,
         stream,
         compute_dtype: config.compute_dtype.mlx(),
@@ -311,7 +368,7 @@ fn copy_stage_weights_to_compute_stream(
     Ok(())
 }
 
-impl LoadedStage {
+impl LlamaLoadedStage {
     fn execute(&mut self, request: StageExecutionRequest) -> Result<StageExecutionOutput> {
         if request.kind == StageExecutionKind::Verify {
             bail!("MLX dense stage verification is not implemented yet");
@@ -505,6 +562,20 @@ fn last_argmax(logits: &Array, stream: &Stream) -> Result<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn detects_nemotron_h_stage_family_from_config() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.json"),
+            br#"{"model_type":"nemotron_h"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            model_type(dir.path()).unwrap().as_deref(),
+            Some("nemotron_h")
+        );
+    }
 
     #[test]
     fn validates_requested_weight_quantization_before_model_load() {

@@ -95,7 +95,8 @@ For pinned NVIDIA 30B-A3B Base BF16 layer `1`, it selected 261 tensors totaling
 19,955,712 bytes. No tensor payload was fetched by this proof. This removes the
 acquisition blocker for the next bounded expert-pack experiment.
 
-**Update — one real Nano MoE layer now derives and executes.** The production
+**Update — one real Nano MoE layer now derives and executes through the shared
+stage contract.** The production
 builder recognizes split ReLU2 experts, quantizes one expert matrix at a time,
 and writes each result into preallocated rank-3 affine banks. A two-expert test
 proves this incremental layout is byte-identical to quantizing a stacked bank.
@@ -104,16 +105,28 @@ tensor bytes (258 source matrices quantized, three tensors dense) in 199.70
 seconds. Maximum RSS was 822,165,504 bytes; the only source payload retained at
 any instant was one tensor, at most 19,955,848 bytes. A validation command then
 strict-loaded safemlx's actual layer-1 `TransformerBlock` and executed a finite
-nonzero `[1, 1, 2688] -> [1, 1, 2688]` forward pass with 811,696,812 bytes of
-reported MLX peak memory. General hybrid-stage execution is still gated on
-recurrent/attention state and boundary work.
+nonzero `[1, 1, 2688] -> [1, 1, 2688]` forward pass. `MlxStageEngine` now
+auto-detects that artifact, strict-loads only the selected block, accepts the
+normal F32 residual activation, computes in BF16, and returns F32 residuals.
+Its result matched a direct block execution within `atol=1e-4`, `rtol=1e-4`;
+across repeated validation runs, worst observed max absolute and relative
+differences were `1.1920929e-7` and `1.8225228e-5` (the relative metric excludes
+reference magnitudes at or below `atol`). Two session IDs plus an independent
+reset/reuse comparison of session 1 all passed. Runtime MLX active/peak memory
+was 730,404,608 / 811,763,256 bytes.
+The comparison command loads a direct reference and then the stage, so its
+process RSS high-water is not representative of a single serving stage.
+General hybrid-stage execution is still gated on recurrent/attention state and
+boundary work.
 
 The derivation memory bound is the final packed routed bank, not one expert:
 six preallocated payload buffers total 718,405,632 bytes. Moving those buffers
 to a disk-backed random-write spool is the next step if preparation RSS must
 stay near the largest individual source tensor. The finite forward plus strict
 parameter coverage proves artifact assembly and executability; quantization
-quality still needs a dense/reference parity oracle.
+quality still needs a dense-BF16 or Transformers reference parity oracle; this
+new gate proves the stage wrapper agrees with direct execution of the same
+affine artifact.
 
 Nemotron 3 Ultra is not that next executable target. Its current public config
 uses a 108-layer `layers_block_type` latent-MoE design with 512 experts and
@@ -891,17 +904,15 @@ Spikes 1 and 2 are more decisive than any standalone token/s benchmark.
 
 ## 10. Immediate next steps
 
-1. Expose a sequential selected-range callback/temp-artifact seam, add direct
-   range-to-quantized-cache shards, and measure peak RSS/disk use with OS and
-   MLX counters. The live model loader's tensor-wise quantization and split
-   correctness are proven, but physical source copies remain unbounded evidence.
-2. Route normal `skippy-server` launch through the engine-neutral contract while
-   retaining capability-gated llama-only batching/cache/MTP/multimodal paths;
-   the dense llama adapter and MLX two-process binary-wire proof are complete.
+1. Add capacity and eviction ownership to the host derived-stage cache, and
+   decide whether a local request-to-recipe locator should eliminate warm-path
+   metadata probes.
+2. Teach topology planning and capability advertisement to select MLX stages;
+   explicit host Prepare/Load and the engine-neutral server lane are proven.
 3. Run **Spike 2 (boundary fence)** at frontier residual widths and keep it as a
    go/no-go gate.
-4. Extend the proven single-layer Nemotron-H **Nano** affine expert path into a
-   hybrid staged runtime with explicit recurrent/attention boundary state. Do
+4. Extend the proven single-layer Nemotron-H **Nano** `StageEngine` adapter into
+   a hybrid staged runtime with explicit recurrent/attention boundary state. Do
    not treat Ultra as the same runtime family. Then expose safemlx's existing
    Inkling implementation as a staged text decoder and use Transformers as the
    parity oracle.

@@ -16,10 +16,10 @@ the default automatic mesh launch path:
 - `skippy-server::llama_engine` proves the existing llama `RuntimeState` can
   implement the same dense contract, including F16/BF16/F32 residual conversion
   and checkpoint/restore/trim delegation, without changing the native ABI.
-- `MlxStageEngine` loads one materialized partial SafeTensors file or sharded
-  directory, owns
-  per-session KV caches on a dedicated MLX worker thread, and executes only its
-  configured layer range.
+- `MlxStageEngine` auto-detects the materialized SafeTensors family. Dense
+  Llama stages own per-session KV caches; the first frontier adapter executes
+  one internal, stateless Nemotron-H Nano MoE layer. MLX objects remain on a
+  dedicated worker thread.
 - `mlx-stage` starts a stage process or drives a chain as a proof client.
 - `StagePrepare` / `StageLoad` with `backend=mlx` and an immutable
   `hf-model://org/repo@<commit>` reference now derive or reuse a validated
@@ -171,9 +171,10 @@ and first/final boundary tensors. Against pinned
 `nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-Base-BF16` layer `1`, it selected
 2,594,936,576 bytes in 261 tensors from one 4,991,210,024-byte shard; the
 largest individual tensor was 19,955,712 bytes. This is metadata/range-planning
-evidence only for the general family layout. The derived builder now supports
-exactly one Nemotron-H Nano MoE layer at a time; the serving stage engine
-remains fail-closed until hybrid recurrent/attention boundaries are implemented.
+evidence only for the general family layout. The derived builder and stage
+engine now support exactly one internal Nemotron-H Nano MoE layer at a time.
+Mamba, attention, first/final boundaries, and multi-layer hybrid stages remain
+fail-closed until their state and boundary semantics are implemented.
 
 Reproduce the metadata-only proof (it downloads the pinned config, index, and
 one SafeTensors header, but no tensor payloads):
@@ -191,6 +192,14 @@ requests, quantized 258 matrices while retaining three dense tensors, and wrote
 largest ephemeral source tensor file was 19,955,848 bytes. The resulting
 artifact strict-loaded into safemlx's real layer-1 `TransformerBlock` and
 produced a finite `[1, 1, 2688]` output for a deterministic nonzero input.
+The same artifact then loaded through `MlxStageEngine`; execution through the
+shared F32 `StageActivation` contract matched direct block execution within
+`atol=1e-4`, `rtol=1e-4` (across repeated validation runs, worst observed max
+absolute difference `1.1920929e-7`, max relative difference `1.8225228e-5` for
+reference values above `atol`). It
+compared two session IDs, reset session 1, and independently compared its
+repeated output too. Separate sparse executions were not bit-identical, so the
+validator records both hashes and enforces the declared numerical tolerance.
 Here, bounded memory means bounded by the final packed layer: the six routed
 bank buffers total 718,405,632 bytes. It does not mean derivation stays at the
 one-expert (~20 MB source tensor) footprint. The forward is an executable smoke
@@ -205,6 +214,8 @@ just mlx-stage derive \
   --output /tmp/nemotron-nano-layer1-affine4 \
   --weight-quantization affine4
 just mlx-stage validate-nemotron-h \
+  --model /tmp/nemotron-nano-layer1-affine4 --layer 1
+just mlx-stage validate-nemotron-h-stage \
   --model /tmp/nemotron-nano-layer1-affine4 --layer 1
 ```
 
@@ -275,19 +286,19 @@ just mlx-stage prove --connect 127.0.0.1:19090 --wire-dtype f16
 
 ## Deliberate limitations of this checkpoint
 
-- Dense Llama-family checkpoints only in `MlxStageEngine`. The pinned safemlx
-  revision has whole-model Inkling and Nemotron-H implementations, but neither
-  is exposed through this partial-stage adapter yet.
-- The derived builder handles ordinary rank-2 Llama weights. Nemotron split
-  experts need per-layer expert-bank assembly before quantization; Inkling needs
-  its transformed rank-3 grouped-expert loader. Neither is silently treated as
-  Llama.
+- `MlxStageEngine` supports dense Llama ranges and exactly one internal,
+  stateless Nemotron-H Nano `E`/MoE layer. It rejects Nemotron Mamba, attention,
+  dense-MLP, first/final, and multi-layer ranges. Inkling is not exposed through
+  the partial-stage adapter.
+- The derived builder handles ordinary rank-2 Llama weights and one Nano split
+  expert bank. Inkling still needs its transformed rank-3 grouped-expert loader;
+  unsupported families are not silently treated as Llama.
 - The pinned safemlx Nemotron-H implementation matches the 52-layer Nano
   schema, not Nemotron 3 Ultra's 108-layer latent-MoE schema. Ultra range plans
   are storage-locality evidence, not executable-family support.
-- Bounded Nemotron-H derivation currently accepts exactly one `E`/MoE layer.
-  It does not yet expose a hybrid multi-layer stage or recurrent state on the
-  wire.
+- Bounded Nemotron-H derivation and execution currently accept exactly one
+  internal `E`/MoE layer. They do not expose a hybrid multi-layer stage or
+  recurrent state on the wire.
 - Greedy sampling only; sampling metadata is preserved in the contract and
   rejected explicitly when enabled.
 - No KV page import/export, cache trim/checkpoint, MTP, speculative verify,

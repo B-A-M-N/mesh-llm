@@ -17,6 +17,7 @@ use safemlx_lm::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use super::{OwnedTensor, expert_bank::AffineExpertBankAssembler};
 
@@ -82,6 +83,7 @@ pub struct MlxNemotronHValidationReport {
     pub input_shape: Vec<i32>,
     pub output_shape: Vec<i32>,
     pub output_is_finite: bool,
+    pub output_f32_sha256: String,
     pub mlx_active_memory_bytes: usize,
     pub mlx_cache_memory_bytes: usize,
     pub mlx_peak_memory_bytes: usize,
@@ -93,6 +95,13 @@ pub fn validate_nemotron_h_moe_stage(
     model_dir: impl AsRef<Path>,
     layer: usize,
 ) -> Result<MlxNemotronHValidationReport> {
+    Ok(validate_nemotron_h_moe_stage_output(model_dir, layer)?.0)
+}
+
+pub(crate) fn validate_nemotron_h_moe_stage_output(
+    model_dir: impl AsRef<Path>,
+    layer: usize,
+) -> Result<(MlxNemotronHValidationReport, Vec<f32>)> {
     let model_dir = model_dir.as_ref();
     let args = get_nemotron_h_model_args(model_dir)?;
     ensure!(
@@ -116,10 +125,9 @@ pub fn validate_nemotron_h_moe_stage(
     )?;
     load_report.finish(&block, &load_config)?;
 
-    let values = (0..args.hidden_size)
-        .map(|index| bf16::from_f32(((index % 31) as f32 - 15.0) / 32.0))
-        .collect::<Vec<_>>();
-    let input = Array::from_slice(&values, &[1, 1, args.hidden_size]);
+    let values = nemotron_h_validation_values(args.hidden_size);
+    let input = Array::from_slice(&values, &[1, 1, args.hidden_size])
+        .as_dtype(safemlx::Dtype::Bfloat16, &stream)?;
     let output = block.forward(
         BlockInput {
             x: &input,
@@ -128,25 +136,47 @@ pub fn validate_nemotron_h_moe_stage(
         },
         &stream,
     )?;
-    let finite = output.is_finite(&stream)?.all(None, &stream)?;
-    eval([&output, &finite])?;
+    let output_f32 = output.as_dtype(safemlx::Dtype::Float32, &stream)?;
+    let finite = output_f32.is_finite(&stream)?.all(None, &stream)?;
+    eval([&output_f32, &finite])?;
     stream.synchronize()?;
     let output_is_finite = finite.try_item::<bool>(&stream)?;
     ensure!(
         output_is_finite,
         "Nemotron-H layer output contains non-finite values"
     );
+    let evaluated_output = output_f32.evaluated()?;
+    let output_values = evaluated_output.as_slice::<f32>().to_vec();
+    let output_f32_sha256 = f32_sha256(&output_values);
 
-    Ok(MlxNemotronHValidationReport {
-        model_dir: model_dir.to_path_buf(),
-        layer,
-        input_shape: input.shape().to_vec(),
-        output_shape: output.shape().to_vec(),
-        output_is_finite,
-        mlx_active_memory_bytes: active_memory()?,
-        mlx_cache_memory_bytes: cache_memory()?,
-        mlx_peak_memory_bytes: peak_memory()?,
-    })
+    Ok((
+        MlxNemotronHValidationReport {
+            model_dir: model_dir.to_path_buf(),
+            layer,
+            input_shape: input.shape().to_vec(),
+            output_shape: output.shape().to_vec(),
+            output_is_finite,
+            output_f32_sha256,
+            mlx_active_memory_bytes: active_memory()?,
+            mlx_cache_memory_bytes: cache_memory()?,
+            mlx_peak_memory_bytes: peak_memory()?,
+        },
+        output_values,
+    ))
+}
+
+pub(crate) fn nemotron_h_validation_values(hidden_size: i32) -> Vec<f32> {
+    (0..hidden_size)
+        .map(|index| bf16::from_f32(((index % 31) as f32 - 15.0) / 32.0).to_f32())
+        .collect()
+}
+
+fn f32_sha256(values: &[f32]) -> String {
+    let mut hasher = Sha256::new();
+    for value in values {
+        hasher.update(value.to_le_bytes());
+    }
+    format!("{:x}", hasher.finalize())
 }
 
 impl NemotronHDerivation {

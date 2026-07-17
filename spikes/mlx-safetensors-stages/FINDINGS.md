@@ -232,12 +232,21 @@ tensor bytes in 199.70 seconds. Maximum RSS was 822,165,504 bytes; the largest
 ephemeral source tensor file was 19,955,848 bytes. The six routed bank tensors
 use underscore companions required by safemlx, while shared expert matrices use
 normal dotted affine companions. The artifact strict-loaded into the actual
-Nano layer-1 block and produced finite `[1, 1, 2688]` output.
+Nano layer-1 block and produced finite `[1, 1, 2688]` output. The shared
+`MlxStageEngine` adapter now also auto-detects and loads this one internal
+stateless MoE layer. Its F32 residual output matched direct execution of the
+same affine block within `atol=1e-4`, `rtol=1e-4` (max absolute
+`1.1920929e-7`, max relative `1.8225228e-5` above the `atol`
+reference-magnitude floor across repeated runs). Two session IDs and an
+independent reset/reuse comparison of session 1 all passed. The different output
+hashes show that sparse MLX executions are not bit-identical; the numerical gate
+is explicit rather than claiming exactness.
 
 This is bounded by the final packed layer rather than one-expert RAM: the six
 routed buffers total 718,405,632 bytes, consistent with the measured RSS. A
-disk-backed spool would lower derivation memory further. Strict loading and a
-finite forward prove executable assembly, not dense-versus-affine accuracy.
+disk-backed spool would lower derivation memory further. Strict loading, a
+finite forward, and stage-wrapper parity prove executable assembly and the mesh
+engine seam, not dense-versus-affine accuracy.
 
 The format mechanism is stable and documented by the
 [SafeTensors format](https://github.com/huggingface/safetensors#format): the
@@ -459,9 +468,9 @@ because it does not alter the derived packed weights.
 1. Add capacity/eviction ownership to the host derived-stage cache, then decide
    whether a local request-to-recipe locator should remove even the warm
    metadata probes.
-2. Extend the proven single-layer Nemotron-H Nano artifact into a hybrid stage
-   while making recurrent/attention state explicit on the wire. Keep Ultra
-   gated behind its separate latent-MoE family implementation.
+2. Extend the proven single-layer Nemotron-H Nano `StageEngine` adapter into a
+   hybrid stage while making recurrent/attention state explicit on the wire.
+   Keep Ultra gated behind its separate latent-MoE family implementation.
 3. Measure the MLX eval/readback/codec boundary fence independently at frontier
    residual widths and prefill sizes.
 4. Expose the existing safemlx Inkling text decoder as one stage, prove
