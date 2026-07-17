@@ -153,6 +153,16 @@ synthetic fence and codec measurement, not model compute, message framing,
 TCP, QUIC, or a complete network gate. The reproduction command and evidence
 contract are in `crates/skippy-engine-mlx/STAGED_EXECUTION.md`.
 
+**V2 result.** Commit `d381bbd3` produced 20 completed canonical runs / 1,600
+spans with no telemetry loss. For 512-token boundaries at widths 4K, 8K, and
+16K, F16 halved payloads while adding 4.77, 9.60, and 19.26 ms over F32 codec
+work. With conversion and transfer serialized, those three cells independently
+place the effective-payload break-even near 0.81 GiB/s (7.0 Gbit/s): use F16
+below that measured link rate and F32 above it, subject to a real TCP/QUIC test
+and any conversion/transfer overlap. The 16K cell measured 32 MiB / 0.927 ms
+for F32 versus 16 MiB / 20.187 ms for F16. This makes wire dtype a hardware and
+link policy choice, not a model-format constant.
+
 The derivation memory bound is the final packed routed bank, not one expert:
 six preallocated payload buffers total 718,405,632 bytes. Moving those buffers
 to a disk-backed random-write spool is the next step if preparation RSS must

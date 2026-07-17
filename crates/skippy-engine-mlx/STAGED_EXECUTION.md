@@ -284,6 +284,42 @@ transport targets and are not copied into spans or run config. The operator run
 label is validated to a bounded URL-safe character set; a local output report
 may contain its explicitly requested report path.
 
+### V2 evidence
+
+The commit `d381bbd3` matrix ran serially on an Apple M5 Max with 128 GB
+unified memory and macOS 26.5.2. Each release-mode process used three warmups
+and 20 measured iterations. Boundary p50 is the paired
+`eval_and_host_copy_total`; codec p50 is the paired `codec_total`.
+
+| Width | Tokens | F32 payload | F32 boundary | F32 codec | F16 payload | F16 boundary | F16 codec |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 2,688 | 32 | 0.328 MiB | 0.629 ms | 0.010 ms | 0.164 MiB | 0.236 ms | 0.259 ms |
+| 4,096 | 1 | 0.016 MiB | 0.244 ms | 0.001 ms | 0.008 MiB | 0.234 ms | 0.010 ms |
+| 4,096 | 32 | 0.500 MiB | 0.580 ms | 0.014 ms | 0.250 MiB | 0.570 ms | 0.306 ms |
+| 4,096 | 512 | 8 MiB | 0.832 ms | 0.217 ms | 4 MiB | 0.920 ms | 4.986 ms |
+| 8,192 | 1 | 0.031 MiB | 0.255 ms | 0.001 ms | 0.016 MiB | 0.640 ms | 0.020 ms |
+| 8,192 | 32 | 1 MiB | 0.631 ms | 0.031 ms | 0.500 MiB | 0.604 ms | 0.596 ms |
+| 8,192 | 512 | 16 MiB | 1.212 ms | 0.437 ms | 8 MiB | 1.340 ms | 10.036 ms |
+| 16,384 | 1 | 0.063 MiB | 0.613 ms | 0.003 ms | 0.031 MiB | 0.716 ms | 0.042 ms |
+| 16,384 | 32 | 2 MiB | 0.609 ms | 0.052 ms | 1 MiB | 0.680 ms | 1.211 ms |
+| 16,384 | 512 | 32 MiB | 1.572 ms | 0.927 ms | 16 MiB | 1.651 ms | 20.187 ms |
+
+Do not over-interpret the one-token or independent F32/F16 boundary timings:
+at that scale dispatch, allocator, and process-level noise are material. The
+large-prefill codec result is much more stable and nearly linear. At widths
+4K, 8K, and 16K, F16 saved 4, 8, and 16 MiB while adding 4.77, 9.60, and
+19.26 ms over the F32 codec. With serialized conversion and transfer, that is
+an approximately 0.81 GiB/s (7.0 Gbit/s) effective-payload break-even point:
+below it F16 should recover its conversion cost from bytes saved; above it F32
+should be faster. Actual selection must be measured per host/link because
+conversion can be optimized or overlapped and TCP/QUIC costs are absent here.
+
+All F32 round trips were exact. All F16 runs stayed finite with maximum absolute
+error `0.00045216084`, below the declared `0.001` synthetic-range gate. The 20
+canonical reports contain 20 completed runs and exactly 1,600 spans: 400 for
+each phase, zero drops, and zero export errors. Only the 400 encode spans carry
+`skippy.activation_bytes_sent`.
+
 Reproduce one matrix cell with metrics-server running in another terminal:
 
 ```bash
