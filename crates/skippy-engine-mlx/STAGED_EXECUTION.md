@@ -339,6 +339,41 @@ just mlx-stage bench-boundary \
   --output /tmp/mlx-boundary-local.json
 ```
 
+### Production loopback-TCP follow-on
+
+`mlx-stage bench-tcp-boundary` moves the same synthetic activation through the
+production engine-neutral Skippy TCP server. Its paired round-trip timer starts
+before F32/F16 activation encoding and ends after the predicted-token reply, so
+it includes sender encoding, binary framing/write, loopback TCP, server
+read/framing, F32 reconstruction, the synthetic final `StageEngine` adapter,
+and reply framing/read. It also includes construction and destruction of the
+message plus its token/position sidebands and the sink/reply assertions. The
+reported `wire_activation_payload_bytes` excludes the fixed frame, eight bytes
+per token of sidebands, and the reply. It excludes MLX/model compute, QUIC,
+remote links, and the outbound activation encoding of a non-final stage.
+
+Connection bind/connect/READY and teardown are outside the timer. Samples run
+sequentially over one warmed persistent connection with client and server as
+threads in the same process. This is steady-state loopback latency, not
+connection startup, multi-process behavior, concurrent throughput, or pipeline
+overlap.
+
+The first warmup validates the complete decoded tensor against the source using
+the same exact-F32 / bounded-F16 gate. Measured samples finish before telemetry
+starts. Each sample then becomes one
+`stage.mlx_boundary_tcp_roundtrip` span in a canonical metrics-server run.
+
+```bash
+just mlx-stage bench-tcp-boundary \
+  --width 16384 --tokens 512 --wire-dtype f16 \
+  --warmup-iterations 3 --measured-iterations 20 \
+  --metrics-http http://127.0.0.1:18081 \
+  --metrics-otlp-grpc http://127.0.0.1:14317 \
+  --metrics-run-id mlx-tcp-boundary-w16384-t512-f16-v1 \
+  --metrics-report /tmp/mlx-tcp-boundary-metrics.json \
+  --output /tmp/mlx-tcp-boundary-local.json
+```
+
 ## Reproduce
 
 Build once:

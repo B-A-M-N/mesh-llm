@@ -14,10 +14,11 @@ mod real {
     use model_hf::safetensors_stage::{SafetensorsStageMaterializer, SafetensorsStageRequest};
     use skippy_engine_mlx::{
         MlxBoundaryBenchConfig, MlxComputeDtype, MlxDerivationControl, MlxDerivedStageCacheConfig,
-        MlxDerivedStageConfig, MlxStageEngine, MlxStageEngineConfig, MlxWeightQuantization,
-        benchmark_mlx_boundary, derive_quantized_stage, derive_quantized_stage_cached,
-        mlx_derived_stage_cache_root, validate_nemotron_h_binary_wire_tokens,
-        validate_nemotron_h_moe_stage, validate_nemotron_h_stage_engine,
+        MlxDerivedStageConfig, MlxStageEngine, MlxStageEngineConfig, MlxTcpBoundaryBenchConfig,
+        MlxWeightQuantization, benchmark_mlx_boundary, benchmark_mlx_tcp_boundary,
+        derive_quantized_stage, derive_quantized_stage_cached, mlx_derived_stage_cache_root,
+        validate_nemotron_h_binary_wire_tokens, validate_nemotron_h_moe_stage,
+        validate_nemotron_h_stage_engine,
     };
     use skippy_protocol::binary::{
         StageStateHeader, StageWireMessage, WireActivationDType, WireMessageKind, WireReplyKind,
@@ -127,6 +128,29 @@ mod real {
         },
         /// Measure the MLX completion, host-copy, and activation-codec boundary.
         BenchBoundary {
+            #[arg(long)]
+            width: usize,
+            #[arg(long)]
+            tokens: usize,
+            #[arg(long, value_enum)]
+            wire_dtype: WireDtype,
+            #[arg(long, default_value_t = 3)]
+            warmup_iterations: usize,
+            #[arg(long, default_value_t = 20)]
+            measured_iterations: usize,
+            #[arg(long)]
+            metrics_http: String,
+            #[arg(long)]
+            metrics_otlp_grpc: String,
+            #[arg(long)]
+            metrics_run_id: Option<String>,
+            #[arg(long)]
+            metrics_report: PathBuf,
+            #[arg(long)]
+            output: Option<PathBuf>,
+        },
+        /// Measure one activation through production Skippy loopback TCP.
+        BenchTcpBoundary {
             #[arg(long)]
             width: usize,
             #[arg(long)]
@@ -330,6 +354,46 @@ mod real {
                     None => default_boundary_run_id()?,
                 };
                 let report = benchmark_mlx_boundary(&MlxBoundaryBenchConfig {
+                    width,
+                    token_count: tokens,
+                    wire_dtype: wire_dtype.into(),
+                    warmup_iterations,
+                    measured_iterations,
+                    metrics_http,
+                    metrics_otlp_grpc,
+                    metrics_run_id,
+                    metrics_report_path: metrics_report,
+                })?;
+                let json = serde_json::to_vec_pretty(&report)?;
+                if let Some(output) = output {
+                    if let Some(parent) = output
+                        .parent()
+                        .filter(|parent| !parent.as_os_str().is_empty())
+                    {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                    std::fs::write(output, &json)?;
+                }
+                println!("{}", String::from_utf8(json)?);
+                Ok(())
+            }
+            Command::BenchTcpBoundary {
+                width,
+                tokens,
+                wire_dtype,
+                warmup_iterations,
+                measured_iterations,
+                metrics_http,
+                metrics_otlp_grpc,
+                metrics_run_id,
+                metrics_report,
+                output,
+            } => {
+                let metrics_run_id = match metrics_run_id {
+                    Some(metrics_run_id) => metrics_run_id,
+                    None => default_boundary_run_id()?,
+                };
+                let report = benchmark_mlx_tcp_boundary(&MlxTcpBoundaryBenchConfig {
                     width,
                     token_count: tokens,
                     wire_dtype: wire_dtype.into(),

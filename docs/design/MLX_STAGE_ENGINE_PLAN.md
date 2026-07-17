@@ -163,6 +163,13 @@ and any conversion/transfer overlap. The 16K cell measured 32 MiB / 0.927 ms
 for F32 versus 16 MiB / 20.187 ms for F16. This makes wire dtype a hardware and
 link policy choice, not a model-format constant.
 
+The next runner, `mlx-stage bench-tcp-boundary`, now wraps the production
+engine-neutral Skippy TCP server around the synthetic sink. Its end-to-end
+sample covers sender activation encode through framing, loopback TCP,
+engine-transport reconstruction, and predicted reply. This tests whether the
+codec-only policy survives actual Skippy framing and host copies; it still does
+not stand in for QUIC or a remote link.
+
 The derivation memory bound is the final packed routed bank, not one expert:
 six preallocated payload buffers total 718,405,632 bytes. Moving those buffers
 to a disk-backed random-write spool is the next step if preparation RSS must

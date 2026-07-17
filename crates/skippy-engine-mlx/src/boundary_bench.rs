@@ -1,5 +1,9 @@
 //! Metrics-server-backed measurements for the MLX activation boundary fence.
 
+mod tcp;
+
+pub use tcp::{MlxTcpBoundaryBenchConfig, MlxTcpBoundaryBenchReport, benchmark_mlx_tcp_boundary};
+
 use std::{
     collections::BTreeMap,
     fs,
