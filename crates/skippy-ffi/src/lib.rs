@@ -28,6 +28,8 @@ use std::ffi::{c_char, c_int, c_void};
 
 pub type LlamaLogCallback =
     Option<unsafe extern "C" fn(level: c_int, text: *const c_char, user_data: *mut c_void)>;
+pub type MtmdProgressCallback =
+    Option<unsafe extern "C" fn(progress: f32, user_data: *mut c_void) -> bool>;
 pub type SkippyRuntimeEventCallback =
     Option<unsafe extern "C" fn(event: *const SkippyRuntimeEventV1, user_data: *mut c_void)>;
 
@@ -333,6 +335,9 @@ pub struct MtmdContextParams {
     pub image_max_tokens: c_int,
     pub cb_eval: *mut c_void,
     pub cb_eval_user_data: *mut c_void,
+    pub batch_max_tokens: c_int,
+    pub progress_callback: MtmdProgressCallback,
+    pub progress_callback_user_data: *mut c_void,
 }
 
 #[repr(C)]
@@ -1822,6 +1827,7 @@ pub type Opaque = c_void;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::mem::{offset_of, size_of};
 
     const fn version(major: u32, minor: u32, patch: u32) -> AbiVersion {
         AbiVersion {
@@ -1866,5 +1872,27 @@ mod tests {
             ABI_VERSION_MINOR + 1,
             ABI_VERSION_PATCH,
         )));
+    }
+
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn mtmd_context_params_matches_native_layout() {
+        assert_eq!(size_of::<MtmdContextParams>(), 80);
+        assert_eq!(offset_of!(MtmdContextParams, batch_max_tokens), 56);
+        assert_eq!(offset_of!(MtmdContextParams, progress_callback), 64);
+        assert_eq!(
+            offset_of!(MtmdContextParams, progress_callback_user_data),
+            72
+        );
+    }
+
+    #[test]
+    #[cfg(not(feature = "dynamic-runtime"))]
+    fn native_mtmd_defaults_cross_the_ffi_boundary() {
+        let params = unsafe { mtmd_context_params_default() };
+
+        assert_eq!(params.batch_max_tokens, 1024);
+        assert!(params.progress_callback.is_none());
+        assert!(params.progress_callback_user_data.is_null());
     }
 }

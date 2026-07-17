@@ -28,6 +28,7 @@ mod native_quantize;
 mod output;
 mod plan_convert;
 mod preflight;
+mod projector_validate;
 mod quantize;
 mod records;
 mod residency;
@@ -69,6 +70,7 @@ use output::{
 };
 use plan_convert::{PlanConvertArgs, run_plan_convert};
 use preflight::run_job_preflight;
+use projector_validate::{ValidateProjectorArgs, run_validate_projector};
 use records::{WindowRunRecordInput, unix_timestamp_ms, write_window_record};
 use residency::remove_dir_if_exists;
 use splits::{
@@ -115,6 +117,7 @@ enum Command {
     VerifyJob(VerifyJobArgs),
     ValidateLlamaLoad(ValidateLlamaLoadArgs),
     ValidateMtpAttach(ValidateMtpAttachArgs),
+    ValidateProjector(ValidateProjectorArgs),
     ValidateTensorTypes(ValidateTensorTypesArgs),
     ValidateSplits(ValidateSplitsArgs),
 }
@@ -517,6 +520,7 @@ fn main() -> Result<()> {
         ),
         Command::ValidateLlamaLoad(args) => run_validate_llama_load(args),
         Command::ValidateMtpAttach(args) => run_validate_mtp_attach(args),
+        Command::ValidateProjector(args) => run_validate_projector(args),
         Command::ValidateTensorTypes(args) => validate_tensor_types_command(&args.file, args.json),
         Command::ValidateSplits(args) => validate_splits_command(
             &args.root,
