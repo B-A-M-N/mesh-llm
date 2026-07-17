@@ -203,6 +203,18 @@ that payload reduction can matter on a constrained path. It does not close the
 wire-dtype policy gate: direct LAN/QUIC, repeated interleaved cells, and
 pipeline-overlap measurements remain.
 
+**Update — two real stages now execute across two hosts.** The M4 Max
+independently fetched only SmolLM2 layers `15..30` (137 range requests,
+162,827,136 tensor bytes) and produced a 45,889,726-byte affine-4 artifact whose
+three shard hashes matched the M5 Max derivation. A real M5 Max `0..15`
+`MlxStageEngine` chained through an SSH local forward to that real M4 Max final
+stage. Two successive F16-wire runs and one F32-wire run all reproduced
+`[260, 2240, 314, 253, 1379, 282, 25801, 28]`. A copied MLX executable also
+requires the build-generated `mlx.metallib` beside it (about 157 MiB in this
+pinned build); `just mlx-stage-build` now exports that sibling resource. This
+closes manual two-host small-Llama execution and per-host range derivation, not
+mesh-managed placement, OpenAI orchestration, or raw LAN/QUIC transport.
+
 The derivation memory bound is the final packed routed bank, not one expert:
 six preallocated payload buffers total 718,405,632 bytes. Moving those buffers
 to a disk-backed random-write spool is the next step if preparation RSS must

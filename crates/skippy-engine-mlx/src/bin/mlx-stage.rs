@@ -193,7 +193,7 @@ mod real {
             connect: SocketAddr,
             #[arg(long, default_value = "1,1531,314,260,3575,28")]
             tokens: String,
-            #[arg(long, default_value = "284,260,2240,314,1343,327,624,8685")]
+            #[arg(long, default_value = "260,2240,314,253,1379,282,25801,28")]
             expected: String,
             #[arg(long, value_enum, default_value_t = WireDtype::F16)]
             wire_dtype: WireDtype,

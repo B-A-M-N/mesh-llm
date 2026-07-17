@@ -495,6 +495,13 @@ Build once:
 just mlx-stage-build
 ```
 
+This writes `target/release/mlx-stage` and the required sibling
+`target/release/mlx.metallib`. Copy both files together when moving the CLI to
+another Apple-Silicon host. For this pinned build the Metal library is about
+157 MiB; its generated size can change with MLX or the Apple toolchain. It is a
+runtime resource shared by every model on that host, not part of a stage
+artifact.
+
 Derive both quantized stage directories directly from immutable source ranges:
 
 ```bash
@@ -525,21 +532,23 @@ Start the final stage:
 
 ```bash
 just mlx-stage serve \
-  --model /tmp/mlx-split-smol/stage1 \
+  --model /tmp/mlx-derived-smol-stage1 \
   --model-id HuggingFaceTB/SmolLM2-135M-Instruct \
   --stage-index 1 --layer-start 15 --layer-end 30 \
   --bind 127.0.0.1:19091 --wire-dtype f16 --compute-dtype bf16
 ```
 
-Add `--weight-quantization affine4` to both stage commands to reproduce the
-JIT-quantized proof, then pass
-`--expected 260,2240,314,253,1379,282,25801,28` to `mlx-stage prove`.
+The directly derived directories are already affine-4. For a separate dense
+`/tmp/mlx-split-smol` proof, use those paths and add
+`--weight-quantization affine4` to both stage commands. The `prove` default is
+the established affine-4 reference
+`260,2240,314,253,1379,282,25801,28`.
 
 Start the first stage in another terminal:
 
 ```bash
 just mlx-stage serve \
-  --model /tmp/mlx-split-smol/stage0 \
+  --model /tmp/mlx-derived-smol-stage0 \
   --model-id HuggingFaceTB/SmolLM2-135M-Instruct \
   --stage-index 0 --layer-start 0 --layer-end 15 \
   --bind 127.0.0.1:19090 --downstream 127.0.0.1:19091 \
@@ -551,6 +560,34 @@ Drive the chain:
 ```bash
 just mlx-stage prove --connect 127.0.0.1:19090 --wire-dtype f16
 ```
+
+### Real two-host split proof
+
+The same M4 Max used for the boundary sweep independently derived only the
+final `15..30` range from the immutable SmolLM2 checkpoint. In this recorded
+pinned run it made 137 tensor payload requests for 162,827,136 source tensor
+bytes and wrote a 45,889,726-byte affine-4 stage in three shards. All three
+shard hashes exactly matched the earlier M5 Max derivation, demonstrating
+deterministic stage-local materialization across the two machines for this
+checkpoint, safemlx revision, and quantization recipe.
+
+The first real `MlxStageEngine` then loaded the pre-derived `0..15` stage on the
+M5 Max and forwarded its width-576 residuals through an SSH local forward to
+the M4 Max's real `15..30` final stage. Both used BF16 compute and the same
+affine-4 artifacts. Two successive F16-wire runs, including session reset and
+reuse, and one F32-wire run all produced the reference sequence:
+
+```text
+[260, 2240, 314, 253, 1379, 282, 25801, 28]
+```
+
+This closes the intentionally unnecessary two-host small-Llama execution
+proof: each layer server can hold only its own directly derived SafeTensors
+stage, and the existing production binary stage protocol composes the two real
+MLX engines. The transport was SSH-forwarded because of the receiver firewall,
+and startup was manual through `mlx-stage`; this is not yet mesh coordinator,
+placement, capability advertisement, OpenAI stage-0 orchestration, or raw
+LAN/QUIC evidence.
 
 ## Deliberate limitations of this checkpoint
 

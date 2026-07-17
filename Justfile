@@ -251,9 +251,12 @@ mlx-safetensors-stage-plan *ARGS:
 mlx-safetensors-split-proof *ARGS:
     DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer just with-lld cargo run --release --manifest-path spikes/mlx-solo/Cargo.toml --bin mlx-split-proof -- {{ ARGS }}
 
-# Build the production-shaped MLX stage server/client over Skippy's binary wire.
+# Build the MLX stage binary and its required sibling Metal library.
 mlx-stage-build:
     DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer just with-lld cargo build --release -p skippy-engine-mlx --features mlx --bin mlx-stage
+    test -s target/release/safemlx-resources/mlx.metallib
+    cp target/release/safemlx-resources/mlx.metallib target/release/mlx.metallib
+    cmp -s target/release/safemlx-resources/mlx.metallib target/release/mlx.metallib
 
 # Run `mlx-stage serve ...` or `mlx-stage prove ...` after `just mlx-stage-build`.
 mlx-stage *ARGS:
