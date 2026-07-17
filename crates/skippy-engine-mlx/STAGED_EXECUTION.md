@@ -217,7 +217,30 @@ just mlx-stage validate-nemotron-h \
   --model /tmp/nemotron-nano-layer1-affine4 --layer 1
 just mlx-stage validate-nemotron-h-stage \
   --model /tmp/nemotron-nano-layer1-affine4 --layer 1
+just mlx-stage validate-nemotron-h-wire \
+  --model /tmp/nemotron-nano-layer1-affine4 --layer 1 --wire-dtype f32
+just mlx-stage validate-nemotron-h-wire \
+  --model /tmp/nemotron-nano-layer1-affine4 --layer 1 --wire-dtype f16
 ```
+
+The last two commands deliberately put the real layer-1 engine in an
+unnecessary two-stage loopback chain. The downstream stage is a synthetic
+capture/final engine, not another Nemotron layer. It asserts the forwarded
+`PrefillFinal` kind, session, token, position, and `[1, 1, 2688]` residual; it
+returns a sentinel prediction; and it records the session reset before the
+upstream Stop/ACK completes. The F32 boundary matched direct block execution
+with maximum absolute error `1.1920929e-7` under `atol=1e-4`, `rtol=1e-4`.
+The F16 boundary had maximum absolute error `0.00062298775` and maximum
+relative error `0.00048053052` under `atol=5e-4`, `rtol=1e-3`. Those thresholds
+are empirical evidence for this layer and deterministic one-token input, not a
+family certification. The input values are multiples of 1/32, so the F16 result
+mostly exercises output-boundary rounding rather than difficult input
+rounding.
+
+This proves the real Skippy TCP framing, activation codec, sideband forwarding,
+predicted reply propagation, and chained Stop/ACK around one real MLX frontier
+layer. It does not prove a second real model stage, multi-token prefill, decode,
+Nemotron recurrent state, host/QUIC orchestration, or end-to-end token logits.
 
 ## Reproduce
 
@@ -299,6 +322,10 @@ just mlx-stage prove --connect 127.0.0.1:19090 --wire-dtype f16
 - Bounded Nemotron-H derivation and execution currently accept exactly one
   internal `E`/MoE layer. They do not expose a hybrid multi-layer stage or
   recurrent state on the wire.
+- The Nemotron binary-wire validator uses a synthetic adjacent final stage and
+  a one-token loopback request. Its three-layer synthetic topology exists only
+  to exercise the transport harness; it is not a deployable 52-layer model
+  topology.
 - Greedy sampling only; sampling metadata is preserved in the contract and
   rejected explicitly when enabled.
 - No KV page import/export, cache trim/checkpoint, MTP, speculative verify,

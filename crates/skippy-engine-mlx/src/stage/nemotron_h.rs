@@ -1,8 +1,19 @@
 //! Stateless Nemotron-H MoE blocks behind the shared stage-engine contract.
 
-use std::path::{Path, PathBuf};
+use std::{
+    io::Write,
+    net::{SocketAddr, TcpListener, TcpStream},
+    path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
+    thread,
+    time::{Duration, Instant},
+};
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use safemlx::{
     Array, Device, DeviceType, Dtype, Stream,
     memory::{active_memory, cache_memory, peak_memory, reset_peak_memory},
@@ -18,6 +29,11 @@ use skippy_engine::{
     StageActivation, StageEngine, StageEngineInfo, StageExecutionKind, StageExecutionOutput,
     StageExecutionRequest,
 };
+use skippy_protocol::binary::{
+    StageStateHeader, StageWireMessage, WireActivationDType, WireMessageKind, WireReplyKind,
+    encode_f32_activation_payload, recv_ready, recv_reply, write_stage_message,
+};
+use skippy_server::engine_transport::{EngineStageServerOptions, serve_stage_engine_until};
 
 use crate::derived::{nemotron_h_validation_values, validate_nemotron_h_moe_stage_output};
 
@@ -45,6 +61,29 @@ pub struct MlxNemotronHStageValidationReport {
     pub reset_max_relative_diff_for_reference_magnitude_above_atol: f32,
     pub comparison_atol: f32,
     pub comparison_rtol: f32,
+    pub mlx_active_memory_bytes: usize,
+    pub mlx_cache_memory_bytes: usize,
+    pub mlx_peak_memory_bytes: usize,
+}
+
+/// Evidence from an intentionally unnecessary two-stage binary-wire chain.
+#[derive(Clone, Debug, Serialize)]
+pub struct MlxNemotronHWireValidationReport {
+    pub model_dir: PathBuf,
+    pub layer: usize,
+    pub wire_dtype: String,
+    pub input_shape: Vec<usize>,
+    pub captured_shape: Vec<usize>,
+    pub output_is_finite: bool,
+    pub output_within_tolerance: bool,
+    pub max_abs_diff: f32,
+    pub max_relative_diff_for_reference_magnitude_above_atol: f32,
+    pub comparison_atol: f32,
+    pub comparison_rtol: f32,
+    pub predicted_sentinel: i32,
+    pub forwarded_kind: String,
+    pub forwarded_session_id: u64,
+    pub downstream_reset_session_id: u64,
     pub mlx_active_memory_bytes: usize,
     pub mlx_cache_memory_bytes: usize,
     pub mlx_peak_memory_bytes: usize,
@@ -149,6 +188,169 @@ pub fn validate_nemotron_h_stage_engine(
     })
 }
 
+/// Sends one deterministic residual through the real binary stage wire and a
+/// synthetic final capture stage, then compares the captured residual with a
+/// direct safemlx block execution.
+pub fn validate_nemotron_h_binary_wire(
+    model_dir: impl AsRef<Path>,
+    layer: usize,
+    wire_dtype: WireActivationDType,
+) -> Result<MlxNemotronHWireValidationReport> {
+    const PREDICTED_SENTINEL: i32 = 424_242;
+    let model_dir = model_dir.as_ref();
+    let (atol, rtol) = wire_tolerances(wire_dtype)?;
+    let (_direct, direct_values) = validate_nemotron_h_moe_stage_output(model_dir, layer)?;
+    reset_peak_memory()?;
+    let engine = Arc::new(MlxStageEngine::spawn(MlxStageEngineConfig {
+        model_dir: model_dir.to_path_buf(),
+        model_id: "nemotron-h-wire-validation".to_string(),
+        stage_index: 1,
+        layer_start: u32::try_from(layer)?,
+        layer_end: u32::try_from(layer.checked_add(1).context("layer index overflow")?)?,
+        compute_dtype: MlxComputeDtype::Bf16,
+        weight_quantization: None,
+        ctx_size: Some(1),
+    })?);
+    let width = usize::try_from(engine.info().activation_width)?;
+    let values = nemotron_h_validation_values(i32::try_from(width)?);
+    let (captured_tx, captured_rx) = mpsc::channel();
+    let (reset_tx, reset_rx) = mpsc::channel();
+    let capture = Arc::new(CaptureStageEngine::new(
+        engine.info(),
+        PREDICTED_SENTINEL,
+        captured_tx,
+        reset_tx,
+    )?);
+    let (capture_server, capture_addr, capture_ready) = WireServer::spawn_ready(
+        capture,
+        EngineStageServerOptions {
+            bind_addr: "127.0.0.1:0".parse()?,
+            downstream_addr: None,
+            wire_dtype,
+        },
+    )?;
+    drop(capture_ready);
+    let (stage_server, _stage_addr, mut client) = WireServer::spawn_ready(
+        engine,
+        EngineStageServerOptions {
+            bind_addr: "127.0.0.1:0".parse()?,
+            downstream_addr: Some(capture_addr),
+            wire_dtype,
+        },
+    )?;
+    let input = StageActivation::from_values(1, width, &values)?;
+    let message = wire_validation_message(&input, wire_dtype)?;
+    write_stage_message(&mut client, &message, wire_dtype)?;
+    client.flush().ok();
+    let reply = recv_reply(&mut client)?;
+    ensure!(
+        reply.kind == WireReplyKind::PredictedToken && reply.predicted == PREDICTED_SENTINEL,
+        "binary wire chain returned the wrong final reply"
+    );
+    let captured = captured_rx
+        .recv_timeout(Duration::from_secs(5))
+        .context("capture stage did not receive the Nemotron-H residual")?;
+    let stop = StageWireMessage::stop_with_identity(wire_dtype, 1, 1);
+    write_stage_message(&mut client, &stop, wire_dtype)?;
+    client.flush().ok();
+    ensure!(
+        recv_reply(&mut client)?.kind == WireReplyKind::Ack,
+        "binary wire chain stop did not return ACK"
+    );
+    let downstream_reset_session_id = reset_rx
+        .recv_timeout(Duration::from_secs(5))
+        .context("capture stage did not receive the forwarded session reset")?;
+    ensure!(
+        downstream_reset_session_id == 1,
+        "capture stage reset the wrong session"
+    );
+    let mlx_active_memory_bytes = active_memory()?;
+    let mlx_cache_memory_bytes = cache_memory()?;
+    let mlx_peak_memory_bytes = peak_memory()?;
+    drop(client);
+    stage_server.stop()?;
+    capture_server.stop()?;
+
+    let captured_values = captured.values();
+    let output_is_finite = captured_values.iter().copied().all(f32::is_finite);
+    ensure!(output_is_finite, "binary wire output is not finite");
+    let comparison = compare_outputs(&direct_values, &captured_values, atol, rtol)?;
+    ensure!(
+        comparison.all_close,
+        "binary wire output differs from direct execution: dtype={} max_abs={} max_relative_for_reference_magnitude_above_atol={} atol={atol} rtol={rtol}",
+        wire_dtype_label(wire_dtype)?,
+        comparison.max_abs,
+        comparison.max_relative_for_reference_magnitude_above_atol,
+    );
+    Ok(MlxNemotronHWireValidationReport {
+        model_dir: model_dir.to_path_buf(),
+        layer,
+        wire_dtype: wire_dtype_label(wire_dtype)?.to_string(),
+        input_shape: vec![1, 1, width],
+        captured_shape: vec![1, captured.token_count, captured.width],
+        output_is_finite,
+        output_within_tolerance: comparison.all_close,
+        max_abs_diff: comparison.max_abs,
+        max_relative_diff_for_reference_magnitude_above_atol: comparison
+            .max_relative_for_reference_magnitude_above_atol,
+        comparison_atol: atol,
+        comparison_rtol: rtol,
+        predicted_sentinel: PREDICTED_SENTINEL,
+        forwarded_kind: "prefill_final".to_string(),
+        forwarded_session_id: 1,
+        downstream_reset_session_id,
+        mlx_active_memory_bytes,
+        mlx_cache_memory_bytes,
+        mlx_peak_memory_bytes,
+    })
+}
+
+fn wire_tolerances(wire_dtype: WireActivationDType) -> Result<(f32, f32)> {
+    match wire_dtype {
+        WireActivationDType::F32 => Ok((1.0e-4, 1.0e-4)),
+        WireActivationDType::F16 => Ok((5.0e-4, 1.0e-3)),
+        other => bail!("Nemotron-H binary-wire validation does not support {other:?}"),
+    }
+}
+
+fn wire_dtype_label(wire_dtype: WireActivationDType) -> Result<&'static str> {
+    match wire_dtype {
+        WireActivationDType::F32 => Ok("f32"),
+        WireActivationDType::F16 => Ok("f16"),
+        other => bail!("Nemotron-H binary-wire validation does not support {other:?}"),
+    }
+}
+
+fn wire_validation_message(
+    input: &StageActivation,
+    wire_dtype: WireActivationDType,
+) -> Result<StageWireMessage> {
+    let kind = WireMessageKind::PrefillFinalEmbd;
+    let mut state = StageStateHeader::new(kind, wire_dtype);
+    state.current_token = 0;
+    state.prompt_token_count = 1;
+    state.source_stage_index = 0;
+    Ok(StageWireMessage {
+        kind,
+        pos_start: 0,
+        token_count: 1,
+        state,
+        request_id: 1,
+        session_id: 1,
+        sampling: None,
+        chat_sampling_metadata: None,
+        tokens: vec![0],
+        positions: vec![0],
+        activation: encode_f32_activation_payload(
+            wire_dtype,
+            1,
+            i32::try_from(input.width)?,
+            &input.f32_le_bytes,
+        )?,
+        raw_bytes: Vec::new(),
+    })
+}
+
 fn execute_validation_input(
     engine: &MlxStageEngine,
     session_id: u64,
@@ -166,6 +368,184 @@ fn execute_validation_input(
         })?
         .activation
         .context("Nemotron-H internal stage returned no activation")
+}
+
+struct CaptureStageEngine {
+    info: StageEngineInfo,
+    predicted_sentinel: i32,
+    captured: mpsc::Sender<StageActivation>,
+    reset: mpsc::Sender<u64>,
+}
+
+impl CaptureStageEngine {
+    fn new(
+        source: &StageEngineInfo,
+        predicted_sentinel: i32,
+        captured: mpsc::Sender<StageActivation>,
+        reset: mpsc::Sender<u64>,
+    ) -> Result<Self> {
+        let stage_index = source
+            .stage_index
+            .checked_add(1)
+            .context("capture stage index overflow")?;
+        let total_layers = source
+            .layer_end
+            .checked_add(1)
+            .context("capture layer index overflow")?;
+        let info = StageEngineInfo {
+            engine: "capture".to_string(),
+            model_id: source.model_id.clone(),
+            stage_index,
+            layer_start: source.layer_end,
+            layer_end: total_layers,
+            total_layers,
+            activation_width: source.activation_width,
+        };
+        info.validate()?;
+        Ok(Self {
+            info,
+            predicted_sentinel,
+            captured,
+            reset,
+        })
+    }
+}
+
+impl StageEngine for CaptureStageEngine {
+    fn info(&self) -> &StageEngineInfo {
+        &self.info
+    }
+
+    fn execute(&self, request: StageExecutionRequest) -> Result<StageExecutionOutput> {
+        ensure!(
+            request.kind == StageExecutionKind::PrefillFinal,
+            "capture stage received the wrong execution kind"
+        );
+        ensure!(
+            request.session_id == 1,
+            "capture stage received the wrong session"
+        );
+        ensure!(
+            request.token_ids == [0],
+            "capture stage received the wrong token sideband"
+        );
+        ensure!(
+            request.positions == [0],
+            "capture stage received the wrong position sideband"
+        );
+        let input = request
+            .input
+            .context("capture stage requires a residual activation")?;
+        self.captured
+            .send(input)
+            .map_err(|_| anyhow!("wire validation capture receiver was dropped"))?;
+        Ok(StageExecutionOutput {
+            activation: None,
+            predicted_tokens: vec![self.predicted_sentinel],
+        })
+    }
+
+    fn reset_session(&self, session_id: u64) -> Result<()> {
+        self.reset
+            .send(session_id)
+            .map_err(|_| anyhow!("wire validation reset receiver was dropped"))
+    }
+}
+
+struct WireServer {
+    shutdown: Arc<AtomicBool>,
+    join: Option<thread::JoinHandle<Result<()>>>,
+}
+
+impl WireServer {
+    fn spawn(engine: Arc<dyn StageEngine>, options: EngineStageServerOptions) -> Self {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let thread_shutdown = Arc::clone(&shutdown);
+        let join =
+            thread::spawn(move || serve_stage_engine_until(engine, options, thread_shutdown));
+        Self {
+            shutdown,
+            join: Some(join),
+        }
+    }
+
+    fn spawn_ready(
+        engine: Arc<dyn StageEngine>,
+        options: EngineStageServerOptions,
+    ) -> Result<(Self, SocketAddr, TcpStream)> {
+        const BIND_ATTEMPTS: usize = 3;
+        let mut last_error = None;
+        for _ in 0..BIND_ATTEMPTS {
+            let addr = reserve_loopback_addr()?;
+            let mut attempt_options = options.clone();
+            attempt_options.bind_addr = addr;
+            let server = Self::spawn(Arc::clone(&engine), attempt_options);
+            match connect_ready(addr) {
+                Ok(client) => return Ok((server, addr, client)),
+                Err(connect_error) => {
+                    let server_error = server.stop().err();
+                    last_error = Some(match server_error {
+                        Some(server_error) => anyhow!(
+                            "connect wire stage at {addr}: {connect_error:#}; server failed: {server_error:#}"
+                        ),
+                        None => connect_error,
+                    });
+                }
+            }
+        }
+        Err(last_error.unwrap_or_else(|| anyhow!("wire stage did not start")))
+            .context("start binary wire validation server")
+    }
+
+    fn stop(mut self) -> Result<()> {
+        self.finish()
+    }
+
+    fn finish(&mut self) -> Result<()> {
+        self.shutdown.store(true, Ordering::SeqCst);
+        let Some(join) = self.join.take() else {
+            return Ok(());
+        };
+        join.join()
+            .map_err(|_| anyhow!("binary wire validation server panicked"))?
+    }
+}
+
+impl Drop for WireServer {
+    fn drop(&mut self) {
+        let _ = self.finish();
+    }
+}
+
+fn reserve_loopback_addr() -> Result<SocketAddr> {
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    Ok(listener.local_addr()?)
+}
+
+fn connect_ready(addr: SocketAddr) -> Result<TcpStream> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let error = match TcpStream::connect(addr) {
+            Ok(mut stream) => {
+                stream.set_nodelay(true).ok();
+                stream
+                    .set_read_timeout(Some(Duration::from_millis(250)))
+                    .ok();
+                match recv_ready(&mut stream) {
+                    Ok(()) => {
+                        stream.set_read_timeout(None).ok();
+                        return Ok(stream);
+                    }
+                    Err(error) => anyhow!(error).context("receive wire ready handshake"),
+                }
+            }
+            Err(error) => anyhow!(error).context("connect TCP socket"),
+        };
+        if Instant::now() >= deadline {
+            return Err(error).with_context(|| format!("connect wire stage at {addr}"));
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
 }
 
 struct OutputComparison {

@@ -15,7 +15,8 @@ mod real {
     use skippy_engine_mlx::{
         MlxComputeDtype, MlxDerivationControl, MlxDerivedStageCacheConfig, MlxDerivedStageConfig,
         MlxStageEngine, MlxStageEngineConfig, MlxWeightQuantization, derive_quantized_stage,
-        derive_quantized_stage_cached, mlx_derived_stage_cache_root, validate_nemotron_h_moe_stage,
+        derive_quantized_stage_cached, mlx_derived_stage_cache_root,
+        validate_nemotron_h_binary_wire, validate_nemotron_h_moe_stage,
         validate_nemotron_h_stage_engine,
     };
     use skippy_protocol::binary::{
@@ -112,6 +113,15 @@ mod real {
             model: PathBuf,
             #[arg(long)]
             layer: usize,
+        },
+        /// Prove a Nemotron-H layer over the real binary stage wire.
+        ValidateNemotronHWire {
+            #[arg(long)]
+            model: PathBuf,
+            #[arg(long)]
+            layer: usize,
+            #[arg(long, value_enum, default_value_t = WireDtype::F16)]
+            wire_dtype: WireDtype,
         },
         /// Drive a stage chain and assert its greedy token sequence.
         Prove {
@@ -260,6 +270,15 @@ mod real {
             }
             Command::ValidateNemotronHStage { model, layer } => {
                 let report = validate_nemotron_h_stage_engine(model, layer)?;
+                println!("{}", serde_json::to_string_pretty(&report)?);
+                Ok(())
+            }
+            Command::ValidateNemotronHWire {
+                model,
+                layer,
+                wire_dtype,
+            } => {
+                let report = validate_nemotron_h_binary_wire(model, layer, wire_dtype.into())?;
                 println!("{}", serde_json::to_string_pretty(&report)?);
                 Ok(())
             }

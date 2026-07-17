@@ -29,8 +29,9 @@ pub use derived::{
 pub use engine::{ChatTurn, GenerateRequest, MlxEngine, MlxEngineConfig};
 #[cfg(all(feature = "mlx", target_os = "macos"))]
 pub use stage::{
-    MlxComputeDtype, MlxNemotronHStageValidationReport, MlxStageEngine, MlxStageEngineConfig,
-    MlxWeightQuantization, validate_nemotron_h_stage_engine,
+    MlxComputeDtype, MlxNemotronHStageValidationReport, MlxNemotronHWireValidationReport,
+    MlxStageEngine, MlxStageEngineConfig, MlxWeightQuantization, validate_nemotron_h_binary_wire,
+    validate_nemotron_h_stage_engine,
 };
 
 /// True when this build actually contains the MLX engine.

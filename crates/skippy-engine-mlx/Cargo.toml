@@ -48,6 +48,9 @@ mlx = [
     "dep:serde",
     "dep:sha2",
     "dep:tokenizers",
+    # SafeMLX and static llama.cpp both export GGUF C symbols such as
+    # `gguf_get_key`; keep the native llama runtime in a separate link unit.
+    "skippy-server/dynamic-native-runtime",
 ]
 
 [dependencies]

@@ -26,7 +26,10 @@ use skippy_engine::{
 };
 
 use self::nemotron_h::NemotronHMoeStage;
-pub use self::nemotron_h::{MlxNemotronHStageValidationReport, validate_nemotron_h_stage_engine};
+pub use self::nemotron_h::{
+    MlxNemotronHStageValidationReport, MlxNemotronHWireValidationReport,
+    validate_nemotron_h_binary_wire, validate_nemotron_h_stage_engine,
+};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum MlxComputeDtype {
