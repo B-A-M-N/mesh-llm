@@ -35,7 +35,10 @@ use skippy_protocol::binary::{
 };
 use skippy_server::engine_transport::{EngineStageServerOptions, serve_stage_engine_until};
 
-use crate::derived::{nemotron_h_validation_values, validate_nemotron_h_moe_stage_output};
+use crate::derived::{
+    nemotron_h_validation_values, validate_nemotron_h_moe_stage_output,
+    validate_nemotron_h_moe_stage_output_for_tokens,
+};
 
 use super::{MlxComputeDtype, MlxStageEngine, MlxStageEngineConfig, array_activation};
 
@@ -71,6 +74,7 @@ pub struct MlxNemotronHStageValidationReport {
 pub struct MlxNemotronHWireValidationReport {
     pub model_dir: PathBuf,
     pub layer: usize,
+    pub token_count: usize,
     pub wire_dtype: String,
     pub input_shape: Vec<usize>,
     pub captured_shape: Vec<usize>,
@@ -110,7 +114,7 @@ pub fn validate_nemotron_h_stage_engine(
         ctx_size: Some(1),
     })?;
     let width = usize::try_from(engine.info().activation_width)?;
-    let values = nemotron_h_validation_values(i32::try_from(width)?);
+    let values = nemotron_h_validation_values(i32::try_from(width)?, 1)?;
     let first = execute_validation_input(&engine, 1, width, &values)?;
     let second_session = execute_validation_input(&engine, 2, width, &values)?;
     engine.reset_session(2)?;
@@ -196,10 +200,23 @@ pub fn validate_nemotron_h_binary_wire(
     layer: usize,
     wire_dtype: WireActivationDType,
 ) -> Result<MlxNemotronHWireValidationReport> {
+    validate_nemotron_h_binary_wire_tokens(model_dir, layer, wire_dtype, 1)
+}
+
+/// Runs [`validate_nemotron_h_binary_wire`] with a configurable prefill size.
+pub fn validate_nemotron_h_binary_wire_tokens(
+    model_dir: impl AsRef<Path>,
+    layer: usize,
+    wire_dtype: WireActivationDType,
+    token_count: usize,
+) -> Result<MlxNemotronHWireValidationReport> {
     const PREDICTED_SENTINEL: i32 = 424_242;
     let model_dir = model_dir.as_ref();
+    ensure!(token_count > 0, "binary wire validation needs tokens");
+    let token_count_u32 = u32::try_from(token_count).context("token count exceeds u32")?;
     let (atol, rtol) = wire_tolerances(wire_dtype)?;
-    let (_direct, direct_values) = validate_nemotron_h_moe_stage_output(model_dir, layer)?;
+    let (_direct, direct_values) =
+        validate_nemotron_h_moe_stage_output_for_tokens(model_dir, layer, token_count)?;
     reset_peak_memory()?;
     let engine = Arc::new(MlxStageEngine::spawn(MlxStageEngineConfig {
         model_dir: model_dir.to_path_buf(),
@@ -209,15 +226,16 @@ pub fn validate_nemotron_h_binary_wire(
         layer_end: u32::try_from(layer.checked_add(1).context("layer index overflow")?)?,
         compute_dtype: MlxComputeDtype::Bf16,
         weight_quantization: None,
-        ctx_size: Some(1),
+        ctx_size: Some(token_count_u32),
     })?);
     let width = usize::try_from(engine.info().activation_width)?;
-    let values = nemotron_h_validation_values(i32::try_from(width)?);
+    let values = nemotron_h_validation_values(i32::try_from(width)?, token_count)?;
     let (captured_tx, captured_rx) = mpsc::channel();
     let (reset_tx, reset_rx) = mpsc::channel();
     let capture = Arc::new(CaptureStageEngine::new(
         engine.info(),
         PREDICTED_SENTINEL,
+        token_count,
         captured_tx,
         reset_tx,
     )?);
@@ -238,7 +256,7 @@ pub fn validate_nemotron_h_binary_wire(
             wire_dtype,
         },
     )?;
-    let input = StageActivation::from_values(1, width, &values)?;
+    let input = StageActivation::from_values(token_count, width, &values)?;
     let message = wire_validation_message(&input, wire_dtype)?;
     write_stage_message(&mut client, &message, wire_dtype)?;
     client.flush().ok();
@@ -285,8 +303,9 @@ pub fn validate_nemotron_h_binary_wire(
     Ok(MlxNemotronHWireValidationReport {
         model_dir: model_dir.to_path_buf(),
         layer,
+        token_count,
         wire_dtype: wire_dtype_label(wire_dtype)?.to_string(),
-        input_shape: vec![1, 1, width],
+        input_shape: vec![1, token_count, width],
         captured_shape: vec![1, captured.token_count, captured.width],
         output_is_finite,
         output_within_tolerance: comparison.all_close,
@@ -326,24 +345,25 @@ fn wire_validation_message(
     wire_dtype: WireActivationDType,
 ) -> Result<StageWireMessage> {
     let kind = WireMessageKind::PrefillFinalEmbd;
+    let token_count = i32::try_from(input.token_count).context("token count exceeds i32")?;
     let mut state = StageStateHeader::new(kind, wire_dtype);
     state.current_token = 0;
-    state.prompt_token_count = 1;
+    state.prompt_token_count = token_count;
     state.source_stage_index = 0;
     Ok(StageWireMessage {
         kind,
         pos_start: 0,
-        token_count: 1,
+        token_count,
         state,
         request_id: 1,
         session_id: 1,
         sampling: None,
         chat_sampling_metadata: None,
-        tokens: vec![0],
-        positions: vec![0],
+        tokens: vec![0; input.token_count],
+        positions: (0..token_count).collect(),
         activation: encode_f32_activation_payload(
             wire_dtype,
-            1,
+            token_count,
             i32::try_from(input.width)?,
             &input.f32_le_bytes,
         )?,
@@ -373,6 +393,8 @@ fn execute_validation_input(
 struct CaptureStageEngine {
     info: StageEngineInfo,
     predicted_sentinel: i32,
+    expected_token_ids: Vec<i32>,
+    expected_positions: Vec<i32>,
     captured: mpsc::Sender<StageActivation>,
     reset: mpsc::Sender<u64>,
 }
@@ -381,6 +403,7 @@ impl CaptureStageEngine {
     fn new(
         source: &StageEngineInfo,
         predicted_sentinel: i32,
+        token_count: usize,
         captured: mpsc::Sender<StageActivation>,
         reset: mpsc::Sender<u64>,
     ) -> Result<Self> {
@@ -402,9 +425,12 @@ impl CaptureStageEngine {
             activation_width: source.activation_width,
         };
         info.validate()?;
+        let token_count = i32::try_from(token_count).context("token count exceeds i32")?;
         Ok(Self {
             info,
             predicted_sentinel,
+            expected_token_ids: vec![0; usize::try_from(token_count)?],
+            expected_positions: (0..token_count).collect(),
             captured,
             reset,
         })
@@ -426,11 +452,11 @@ impl StageEngine for CaptureStageEngine {
             "capture stage received the wrong session"
         );
         ensure!(
-            request.token_ids == [0],
+            request.token_ids == self.expected_token_ids,
             "capture stage received the wrong token sideband"
         );
         ensure!(
-            request.positions == [0],
+            request.positions == self.expected_positions,
             "capture stage received the wrong position sideband"
         );
         let input = request

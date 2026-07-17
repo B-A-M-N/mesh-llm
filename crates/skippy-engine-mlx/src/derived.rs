@@ -29,7 +29,10 @@ use sha2::{Digest, Sha256};
 
 use crate::stage::MlxWeightQuantization;
 use nemotron_h::NemotronHDerivation;
-pub(crate) use nemotron_h::{nemotron_h_validation_values, validate_nemotron_h_moe_stage_output};
+pub(crate) use nemotron_h::{
+    nemotron_h_validation_values, validate_nemotron_h_moe_stage_output,
+    validate_nemotron_h_moe_stage_output_for_tokens,
+};
 
 mod cache;
 mod expert_bank;

@@ -120,24 +120,25 @@ General hybrid-stage execution is still gated on recurrent/attention state and
 boundary work.
 
 **Update — that real Nano layer now crosses the Skippy binary wire.** An
-intentionally unnecessary loopback proof sends one deterministic
+intentionally unnecessary loopback proof sends a deterministic
 `PrefillFinalEmbd` residual through the real affine-4 layer-1 `MlxStageEngine`
 and then into a fabricated capture/final engine. The capture asserts the
-forwarded execution kind, session, token, position, and activation shape;
+forwarded execution kind, session, complete token/position sidebands, and
+activation shape;
 returns a sentinel prediction; and observes the forwarded session reset before
-Stop/ACK completes. F32 matched the direct block with maximum absolute error
-`1.1920929e-7` at `atol=1e-4`, `rtol=1e-4`. F16 produced maximum absolute and
-relative errors `0.00062298775` and `0.00048053052` at `atol=5e-4`,
-`rtol=1e-3`. Runtime MLX active/peak memory remained 730,404,608 / 811,763,256
-bytes. These are empirical thresholds for one layer and one input, not family
-certification. The deterministic input is exactly representable in F16, so the
-F16 delta primarily measures the output boundary.
+Stop/ACK completes. At 32 tokens, F32 matched the direct block with maximum
+absolute error `2.3841858e-7` at `atol=1e-4`, `rtol=1e-4`. F16 produced maximum
+absolute and relative errors `0.000923872` and `0.00048756658` at
+`atol=5e-4`, `rtol=1e-3`. The boundary payloads were 344,064 and 172,032 bytes.
+Runtime MLX active/peak memory was 730,404,608 / 820,697,688 bytes. These are
+empirical thresholds for one layer and one deterministic prefill, not family
+certification. The input is exactly representable in F16, so the F16 delta
+primarily measures the output boundary.
 
 This is concrete codec, forwarding, reply, and control-chain evidence around
 one real frontier layer. The adjacent final stage and its three-layer topology
 are synthetic harness devices. It is not evidence for two real Nemotron
-stages, multi-token prefill, decode, recurrent state, host/QUIC placement, or
-full-model logits.
+stages, decode, recurrent state, host/QUIC placement, or full-model logits.
 
 The derivation memory bound is the final packed routed bank, not one expert:
 six preallocated payload buffers total 718,405,632 bytes. Moving those buffers

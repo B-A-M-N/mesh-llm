@@ -102,7 +102,17 @@ pub(crate) fn validate_nemotron_h_moe_stage_output(
     model_dir: impl AsRef<Path>,
     layer: usize,
 ) -> Result<(MlxNemotronHValidationReport, Vec<f32>)> {
+    validate_nemotron_h_moe_stage_output_for_tokens(model_dir, layer, 1)
+}
+
+pub(crate) fn validate_nemotron_h_moe_stage_output_for_tokens(
+    model_dir: impl AsRef<Path>,
+    layer: usize,
+    token_count: usize,
+) -> Result<(MlxNemotronHValidationReport, Vec<f32>)> {
     let model_dir = model_dir.as_ref();
+    ensure!(token_count > 0, "Nemotron-H validation needs tokens");
+    let token_count_i32 = i32::try_from(token_count).context("token count exceeds i32")?;
     let args = get_nemotron_h_model_args(model_dir)?;
     ensure!(
         args.hybrid_override_pattern
@@ -125,8 +135,8 @@ pub(crate) fn validate_nemotron_h_moe_stage_output(
     )?;
     load_report.finish(&block, &load_config)?;
 
-    let values = nemotron_h_validation_values(args.hidden_size);
-    let input = Array::from_slice(&values, &[1, 1, args.hidden_size])
+    let values = nemotron_h_validation_values(args.hidden_size, token_count)?;
+    let input = Array::from_slice(&values, &[1, token_count_i32, args.hidden_size])
         .as_dtype(safemlx::Dtype::Bfloat16, &stream)?;
     let output = block.forward(
         BlockInput {
@@ -165,10 +175,16 @@ pub(crate) fn validate_nemotron_h_moe_stage_output(
     ))
 }
 
-pub(crate) fn nemotron_h_validation_values(hidden_size: i32) -> Vec<f32> {
-    (0..hidden_size)
+pub(crate) fn nemotron_h_validation_values(
+    hidden_size: i32,
+    token_count: usize,
+) -> Result<Vec<f32>> {
+    let element_count = usize::try_from(hidden_size)?
+        .checked_mul(token_count)
+        .context("Nemotron-H validation input size overflow")?;
+    Ok((0..element_count)
         .map(|index| bf16::from_f32(((index % 31) as f32 - 15.0) / 32.0).to_f32())
-        .collect()
+        .collect())
 }
 
 fn f32_sha256(values: &[f32]) -> String {
@@ -388,6 +404,14 @@ mod tests {
             "n_routed_experts": 2,
             "moe_intermediate_size": 32
         })
+    }
+
+    #[test]
+    fn validation_input_covers_every_token() {
+        let values = nemotron_h_validation_values(3, 2).unwrap();
+        assert_eq!(values.len(), 6);
+        assert_eq!(values[0], -15.0 / 32.0);
+        assert_eq!(values[3], -12.0 / 32.0);
     }
 
     #[test]

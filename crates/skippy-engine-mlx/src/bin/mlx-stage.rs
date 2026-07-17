@@ -16,7 +16,7 @@ mod real {
         MlxComputeDtype, MlxDerivationControl, MlxDerivedStageCacheConfig, MlxDerivedStageConfig,
         MlxStageEngine, MlxStageEngineConfig, MlxWeightQuantization, derive_quantized_stage,
         derive_quantized_stage_cached, mlx_derived_stage_cache_root,
-        validate_nemotron_h_binary_wire, validate_nemotron_h_moe_stage,
+        validate_nemotron_h_binary_wire_tokens, validate_nemotron_h_moe_stage,
         validate_nemotron_h_stage_engine,
     };
     use skippy_protocol::binary::{
@@ -120,6 +120,8 @@ mod real {
             model: PathBuf,
             #[arg(long)]
             layer: usize,
+            #[arg(long, default_value_t = 1)]
+            tokens: usize,
             #[arg(long, value_enum, default_value_t = WireDtype::F16)]
             wire_dtype: WireDtype,
         },
@@ -276,9 +278,15 @@ mod real {
             Command::ValidateNemotronHWire {
                 model,
                 layer,
+                tokens,
                 wire_dtype,
             } => {
-                let report = validate_nemotron_h_binary_wire(model, layer, wire_dtype.into())?;
+                let report = validate_nemotron_h_binary_wire_tokens(
+                    model,
+                    layer,
+                    wire_dtype.into(),
+                    tokens,
+                )?;
                 println!("{}", serde_json::to_string_pretty(&report)?);
                 Ok(())
             }

@@ -31,7 +31,7 @@ pub use engine::{ChatTurn, GenerateRequest, MlxEngine, MlxEngineConfig};
 pub use stage::{
     MlxComputeDtype, MlxNemotronHStageValidationReport, MlxNemotronHWireValidationReport,
     MlxStageEngine, MlxStageEngineConfig, MlxWeightQuantization, validate_nemotron_h_binary_wire,
-    validate_nemotron_h_stage_engine,
+    validate_nemotron_h_binary_wire_tokens, validate_nemotron_h_stage_engine,
 };
 
 /// True when this build actually contains the MLX engine.
