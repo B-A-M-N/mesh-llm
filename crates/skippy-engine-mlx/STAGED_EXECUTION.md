@@ -363,6 +363,30 @@ the same exact-F32 / bounded-F16 gate. Measured samples finish before telemetry
 starts. Each sample then becomes one
 `stage.mlx_boundary_tcp_roundtrip` span in a canonical metrics-server run.
 
+#### TCP V1 evidence
+
+Commit `6350e3a9` ran release-mode F32/F16 pairs on the same M5 Max host as the
+codec matrix, using three warmups and 20 sequential samples over one connection.
+
+| Width | Tokens | F32 payload | F32 p50 / p95 | F16 payload | F16 p50 / p95 |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 2,688 | 32 | 0.328 MiB | 0.396 / 0.428 ms | 0.164 MiB | 0.627 / 0.677 ms |
+| 4,096 | 512 | 8 MiB | 2.764 / 4.336 ms | 4 MiB | 8.086 / 8.231 ms |
+| 8,192 | 512 | 16 MiB | 5.655 / 6.002 ms | 8 MiB | 13.601 / 13.814 ms |
+| 16,384 | 512 | 32 MiB | 4.936 / 9.361 ms | 16 MiB | 25.398 / 25.622 ms |
+
+F32 wins on this high-bandwidth loopback path in every pair, consistent with
+the codec-only prediction that F32 wins above the roughly 7.0 Gbit/s effective
+payload break-even. The non-monotonic 16K F32 p50 and its wider p95 tail also
+show why these numbers must not be converted into a remote-link bandwidth
+claim: same-process allocation, kernel buffering, scheduling, and host copies
+are part of this steady-state round trip.
+
+The eight canonical runs contain exactly 160 round-trip spans with zero drops
+or export errors. F32 warmup reconstruction was exact; F16 maximum absolute
+error was `0.00045216084`. This validates the production TCP framing direction,
+but the next policy gate remains a controlled remote TCP/QUIC sweep.
+
 ```bash
 just mlx-stage bench-tcp-boundary \
   --width 16384 --tokens 512 --wire-dtype f16 \

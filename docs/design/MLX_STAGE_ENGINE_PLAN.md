@@ -170,6 +170,15 @@ engine-transport reconstruction, and predicted reply. This tests whether the
 codec-only policy survives actual Skippy framing and host copies; it still does
 not stand in for QUIC or a remote link.
 
+**Loopback result.** Commit `6350e3a9` produced eight completed canonical TCP
+runs / 160 spans with zero telemetry loss. At 512 tokens, F32/F16 round-trip
+p50 was 2.764/8.086 ms at width 4K, 5.655/13.601 ms at 8K, and 4.936/25.398 ms
+at 16K. F32 won every pair on this high-bandwidth loopback path, which is the
+direction predicted by the codec-only ~7.0 Gbit/s break-even. The non-monotonic
+F32 16K p50 and broad p95 make this evidence a framing/host-copy validation,
+not a link-throughput estimate. A controlled remote TCP/QUIC sweep is still
+required before automatic wire-dtype selection.
+
 The derivation memory bound is the final packed routed bank, not one expert:
 six preallocated payload buffers total 718,405,632 bytes. Moving those buffers
 to a disk-backed random-write spool is the next step if preparation RSS must
