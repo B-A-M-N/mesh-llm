@@ -444,6 +444,49 @@ reply arrived, and `warmup_sink_acknowledged_max_abs_diff` is the value reported
 by that sink. The identical-artifact checksum procedure above is therefore part
 of the controlled evidence, not an optional provenance detail.
 
+#### SSH-forwarded two-host V2 evidence
+
+Commit `27bd5880` was built once in release mode, signed once, and copied
+unchanged to an M4 Max receiver from an M5 Max sender. Both hosts reported the
+same executable SHA-256:
+`ba5d1ea6f2613d0171d36eeaf9dfd86904d3ae19f6d335b3185bbb4ebe5a2222`.
+
+The receiver's application firewall allowed local sink traffic but suppressed
+data after a direct-LAN TCP handshake for the ad-hoc research binary. The
+controlled sweep therefore used one persistent SSH local forward to the
+receiver's loopback-bound sink. Every timed sample still covers production
+sender encoding/framing, cross-host transfer, production receiver
+framing/reconstruction, sink acknowledgement, and the reply, but it also
+includes SSH tunnelling and encryption. These are not raw-LAN or QUIC numbers.
+
+Each cell used three warmups and 20 sequential measured samples. The 16K pair
+was repeated in reverse dtype order on a fresh tunnel after the initial F16 run
+showed a severe transient.
+
+| Width | Tokens | F32 payload | F32 p50 / p95 | F16 payload | F16 p50 / p95 |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 2,688 | 32 | 0.328 MiB | 16.447 / 21.106 ms | 0.164 MiB | 16.532 / 22.415 ms |
+| 4,096 | 512 | 8 MiB | 150.690 / 173.837 ms | 4 MiB | 107.376 / 115.066 ms |
+| 8,192 | 512 | 16 MiB | 288.479 / 874.937 ms | 8 MiB | 200.168 / 677.533 ms |
+| 16,384 A | 512 | 32 MiB | 603.895 / 2346.909 ms | 16 MiB | 1441.627 / 6323.343 ms |
+| 16,384 B | 512 | 32 MiB | 572.663 / 625.476 ms | 16 MiB | 345.498 / 923.549 ms |
+
+The actual 2,688×32 Nemotron boundary was effectively tied, consistent with
+fixed SSH/tunnel overhead being large relative to its small payload. F16
+reduced p50 by about 29% at 4K and 31% at 8K. In the fresh-tunnel 16K repeat it
+reduced p50 by about 40%, but the opposite result and multi-second tails in the
+first 16K pair show that this setup cannot select a production wire dtype. It
+is a functional two-host proof, with results consistent with payload reduction
+mattering on this constrained SSH-forwarded path. Raw LAN/QUIC, repeated
+interleaved trials, and pipeline overlap remain required for automatic policy.
+
+The 10 completed canonical runs contain exactly 200
+`stage.mlx_boundary_tcp_roundtrip` spans. All use schema
+`mlx-tcp-boundary-v2`, revision `27bd588087b8186ccc902b000e79a90cc3b39d43`,
+and transport `external_tcp`, with zero dropped spans or export errors. No span
+falls outside its run lifecycle. F32 acknowledgements were exact and every F16
+acknowledgement reported maximum absolute error `0.00045216084`.
+
 ## Reproduce
 
 Build once:

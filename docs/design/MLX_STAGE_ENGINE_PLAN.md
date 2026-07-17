@@ -190,6 +190,19 @@ is plaintext and unauthenticated, so it is restricted to trusted private
 networks. Until sink revision is added to READY, controlled evidence must copy
 and independently hash the identical release artifact on both hosts.
 
+**Two-host result.** Commit `27bd5880` completed 10 canonical external-TCP
+runs / 200 spans between an M5 Max sender and M4 Max sink with identical binary
+SHA-256, explicit validation acknowledgements, and zero telemetry loss. The
+receiver firewall required an SSH local forward, so the measurements include
+SSH tunnelling and are not raw-LAN or QUIC evidence. F16 and F32 were effectively
+tied at the real 2,688×32 Nemotron boundary; F16 reduced p50 by about 29% at
+4K×512 and 31% at 8K×512. A fresh-tunnel 16K repeat favored F16 by about 40%,
+but the first 16K F16 run suffered multi-second tunnel tails and lost badly.
+This closes the cross-host production-framing functional proof and confirms
+that payload reduction can matter on a constrained path. It does not close the
+wire-dtype policy gate: direct LAN/QUIC, repeated interleaved cells, and
+pipeline-overlap measurements remain.
+
 The derivation memory bound is the final packed routed bank, not one expert:
 six preallocated payload buffers total 718,405,632 bytes. Moving those buffers
 to a disk-backed random-write spool is the next step if preparation RSS must
