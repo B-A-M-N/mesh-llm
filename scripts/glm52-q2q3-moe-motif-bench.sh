@@ -38,6 +38,14 @@ Variants:
               active6 plus Q2 gate/up slot8-split kernel
   active6-rowtile
               active6 plus Q2 gate/up rowtile kernel
+  active6-share-y
+              active6 plus Q2 gate/up shared-activation kernel
+  active6-vecscale
+              active6 plus Q2 gate/up vecscale kernel
+  active6-q8-act
+              active6 plus Q2 gate/up q8 activation kernel
+  active6-half-y
+              active6 plus Q2 gate/up half activation kernel
   active6-inblock
               active6 plus Q2 gate/up in-block repack kernel
   active6-dispatch-log
@@ -128,6 +136,26 @@ variant_env() {
       printf '%s\n' \
         GGML_METAL_EXPERIMENTAL_GLM_MOE_MAX_ACTIVE_EXPERTS=6 \
         GGML_METAL_EXPERIMENTAL_Q2_GATE_UP_SWIGLU_PAIR_SG_ROWTILE=1
+      ;;
+    active6-share-y)
+      printf '%s\n' \
+        GGML_METAL_EXPERIMENTAL_GLM_MOE_MAX_ACTIVE_EXPERTS=6 \
+        GGML_METAL_EXPERIMENTAL_Q2_GATE_UP_SWIGLU_PAIR_SG_SHARE_Y=1
+      ;;
+    active6-vecscale)
+      printf '%s\n' \
+        GGML_METAL_EXPERIMENTAL_GLM_MOE_MAX_ACTIVE_EXPERTS=6 \
+        GGML_METAL_EXPERIMENTAL_Q2_GATE_UP_SWIGLU_PAIR_SG_VECSCALE=1
+      ;;
+    active6-q8-act)
+      printf '%s\n' \
+        GGML_METAL_EXPERIMENTAL_GLM_MOE_MAX_ACTIVE_EXPERTS=6 \
+        GGML_METAL_EXPERIMENTAL_Q2_GATE_UP_SWIGLU_PAIR_SG_Q8_ACT=1
+      ;;
+    active6-half-y)
+      printf '%s\n' \
+        GGML_METAL_EXPERIMENTAL_GLM_MOE_MAX_ACTIVE_EXPERTS=6 \
+        GGML_METAL_EXPERIMENTAL_Q2_GATE_UP_SWIGLU_PAIR_SG_HALF_Y=1
       ;;
     active6-inblock)
       printf '%s\n' \
