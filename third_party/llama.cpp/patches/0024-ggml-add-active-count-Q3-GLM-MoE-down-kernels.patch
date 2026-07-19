@@ -40,7 +40,7 @@ index 0a13d512..bc4365a5 100644
 +
 +    char base[256];
 +    char name[256];
-+    snprintf(base, 256, "kernel_mul_mv_id_q3_K_wr_slots_r8_a%d", active_slots);
++    snprintf(base, 256, "kernel_mul_mv_id_q3_K_weighted_reduce_slots_sg_r8_nb8_w0");
 +    snprintf(name, 256, "%s_nsg=%d_nr0=%d", base, nsg, nr0);
 +
 +    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
@@ -131,7 +131,7 @@ index c8a6074c..a3b1692e 100644
               ggml_metal_glm_dsa_q3_down_slot_parallel_reduce_r6_nb8_w0_enabled() ||
               ggml_metal_glm_dsa_q3_down_slot_parallel_reduce_r10_nb8_w0_enabled() ||
               ggml_metal_glm_dsa_q3_down_slot_parallel_reduce_glm52_w0_enabled() ||
-@@ -5171,29 +5192,61 @@ static int ggml_metal_op_mul_mv_id_weighted_reduce(
+@@ -5171,31 +5192,66 @@ static int ggml_metal_op_mul_mv_id_weighted_reduce(
               ggml_metal_glm_dsa_q3_down_slot_parallel_reduce_r12_nb8_w0_enabled() ||
               ggml_metal_glm_dsa_q3_down_slot_parallel_reduce_r16_enabled() ||
               ggml_metal_glm_dsa_q3_down_slot_split2_reduce_enabled())) {
@@ -216,6 +216,12 @@ index c8a6074c..a3b1692e 100644
          const int nr0_slot_parallel = pipeline_slot_parallel.nr0;
          const int nsg_slot_parallel = pipeline_slot_parallel.nsg;
          const int grid_x_slot_parallel = (ne01 + nr0_slot_parallel - 1)/nr0_slot_parallel;
+         const int grid_y_slot_parallel = ne21;
++        if (nsg_slot_parallel < 8) {
++            extra._pad0 = nsg_slot_parallel;
++        }
+ 
+         ggml_metal_encoder_set_pipeline(enc, pipeline_slot_parallel);
 diff --git a/ggml/src/ggml-metal/ggml-metal.metal b/ggml/src/ggml-metal/ggml-metal.metal
 index 1e068b1f..efdf82dc 100644
 --- a/ggml/src/ggml-metal/ggml-metal.metal
@@ -234,7 +240,7 @@ index 1e068b1f..efdf82dc 100644
          ushort tiisg[[thread_index_in_simdgroup]],
          ushort sgitg[[simdgroup_index_in_threadgroup]]) {
 -    const int n_slots = 8;
-+    const int n_slots = ACTIVE_SLOTS;
++    const int n_slots = extra._pad0 > 0 ? extra._pad0 : ACTIVE_SLOTS;
      const int nb = NB_FIXED == 0 ? args.ne00/QK_K : NB_FIXED;
  
      const int r0 = tgpig.x;
@@ -422,4 +428,3 @@ index 6ae4bc20..073e67b5 100644
      test_cases.emplace_back(new test_glm_moe_down_reduce(GGML_TYPE_Q2_K, 6144, 2048));
 -- 
 2.54.0 (Apple Git-157)
-
