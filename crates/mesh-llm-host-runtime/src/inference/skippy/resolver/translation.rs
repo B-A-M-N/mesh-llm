@@ -241,7 +241,14 @@ impl ResolvedSkippyConfig {
                 None
             },
             speculative_window: self.speculative_window_for_embedded(mode),
-            adaptive_speculative_window: false,
+            // Enable the adaptive verify window whenever speculation actually
+            // proposes a window (ngram or draft mode). Without this the window
+            // is fixed at its max and never shrinks after an early reject, so a
+            // sustained reject storm keeps proposing deep and keeps paying the
+            // full recovery cost per token (measured ~40% throughput loss on a
+            // WAN split). A reject-responsive window narrows toward the observed
+            // accept depth, cutting recovery frequency.
+            adaptive_speculative_window: mode == "ngram" || mode == "draft",
             draft_n_gpu_layers: if mode == "draft" || self.speculative.native_mtp_enabled {
                 self.speculative.draft_n_gpu_layers
             } else {
