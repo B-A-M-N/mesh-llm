@@ -19,12 +19,29 @@ Environment:
   REPEATS     serial samples per variant, default 5
   WARMUPS     unreported warmup samples per variant, default 1
   LOG_DIR     optional directory for raw logs
+  EXTRA_ENV   optional comma-separated KEY=VALUE list applied to every run
 
 Variants:
   top8        normal top8 routed MoE motif
   active6     GGML_METAL_EXPERIMENTAL_GLM_MOE_MAX_ACTIVE_EXPERTS=6
   active4     GGML_METAL_EXPERIMENTAL_GLM_MOE_MAX_ACTIVE_EXPERTS=4
   active2     GGML_METAL_EXPERIMENTAL_GLM_MOE_MAX_ACTIVE_EXPERTS=2
+  active6-slot1-dual
+              active6 plus Q2 gate/up slot1-dual kernel
+  active6-slot2-dual
+              active6 plus Q2 gate/up slot2-dual kernel
+  active6-slot4-dual
+              active6 plus Q2 gate/up slot4-dual kernel
+  active6-slot8
+              active6 plus Q2 gate/up slot8 kernel
+  active6-slot8-split
+              active6 plus Q2 gate/up slot8-split kernel
+  active6-rowtile
+              active6 plus Q2 gate/up rowtile kernel
+  active6-inblock
+              active6 plus Q2 gate/up in-block repack kernel
+  active6-dispatch-log
+              active6 plus Metal MoE dispatch logging
 
 The first variant is treated as the baseline for delta reporting.
 EOF
@@ -82,6 +99,46 @@ variant_env() {
     active6) printf '%s\n' GGML_METAL_EXPERIMENTAL_GLM_MOE_MAX_ACTIVE_EXPERTS=6 ;;
     active4) printf '%s\n' GGML_METAL_EXPERIMENTAL_GLM_MOE_MAX_ACTIVE_EXPERTS=4 ;;
     active2) printf '%s\n' GGML_METAL_EXPERIMENTAL_GLM_MOE_MAX_ACTIVE_EXPERTS=2 ;;
+    active6-slot1-dual)
+      printf '%s\n' \
+        GGML_METAL_EXPERIMENTAL_GLM_MOE_MAX_ACTIVE_EXPERTS=6 \
+        GGML_METAL_EXPERIMENTAL_Q2_GATE_UP_SWIGLU_PAIR_SG_SLOT1_DUAL=1
+      ;;
+    active6-slot2-dual)
+      printf '%s\n' \
+        GGML_METAL_EXPERIMENTAL_GLM_MOE_MAX_ACTIVE_EXPERTS=6 \
+        GGML_METAL_EXPERIMENTAL_Q2_GATE_UP_SWIGLU_PAIR_SG_SLOT2_DUAL=1
+      ;;
+    active6-slot4-dual)
+      printf '%s\n' \
+        GGML_METAL_EXPERIMENTAL_GLM_MOE_MAX_ACTIVE_EXPERTS=6 \
+        GGML_METAL_EXPERIMENTAL_Q2_GATE_UP_SWIGLU_PAIR_SG_SLOT4_DUAL=1
+      ;;
+    active6-slot8)
+      printf '%s\n' \
+        GGML_METAL_EXPERIMENTAL_GLM_MOE_MAX_ACTIVE_EXPERTS=6 \
+        GGML_METAL_EXPERIMENTAL_Q2_GATE_UP_SWIGLU_PAIR_SG_SLOT8=1
+      ;;
+    active6-slot8-split)
+      printf '%s\n' \
+        GGML_METAL_EXPERIMENTAL_GLM_MOE_MAX_ACTIVE_EXPERTS=6 \
+        GGML_METAL_EXPERIMENTAL_Q2_GATE_UP_SWIGLU_PAIR_SG_SLOT8_SPLIT=1
+      ;;
+    active6-rowtile)
+      printf '%s\n' \
+        GGML_METAL_EXPERIMENTAL_GLM_MOE_MAX_ACTIVE_EXPERTS=6 \
+        GGML_METAL_EXPERIMENTAL_Q2_GATE_UP_SWIGLU_PAIR_SG_ROWTILE=1
+      ;;
+    active6-inblock)
+      printf '%s\n' \
+        GGML_METAL_EXPERIMENTAL_GLM_MOE_MAX_ACTIVE_EXPERTS=6 \
+        GGML_METAL_EXPERIMENTAL_Q2_GATE_UP_INBLOCK_REPACK=1
+      ;;
+    active6-dispatch-log)
+      printf '%s\n' \
+        GGML_METAL_EXPERIMENTAL_GLM_MOE_MAX_ACTIVE_EXPERTS=6 \
+        GGML_METAL_MOE_DISPATCH_LOG=1
+      ;;
     *)
       echo "unknown variant: $1" >&2
       usage >&2
@@ -109,6 +166,10 @@ printf 'backend=%s op=%s repeats=%s warmups=%s bench=%s\n' \
 
 for variant in "${variants[@]}"; do
   mapfile -t env_args < <(variant_env "$variant")
+  if [[ -n "${EXTRA_ENV:-}" ]]; then
+    IFS=',' read -r -a extra_env_args <<<"$EXTRA_ENV"
+    env_args+=("${extra_env_args[@]}")
+  fi
   printf '\n== %s ==\n' "$variant"
 
   total_runs=$((warmups + repeats))
