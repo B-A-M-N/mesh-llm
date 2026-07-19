@@ -184,15 +184,15 @@ index c8a6074c..a3b1692e 100644
 +        } else if (ggml_metal_glm_dsa_q3_down_slot_parallel_reduce_active6_enabled() &&
 +                ne00 == 2048 && extra.already_weighted == 0) {
 +            pipeline_slot_parallel =
-+                ggml_metal_library_get_pipeline_mul_mv_id_q3_weighted_reduce_slots_sg_r8_nb8_w0_active6(lib, weighted_sum);
++                ggml_metal_library_get_pipeline_mul_mv_id_q3_weighted_reduce_slots_sg_r8_nb8_w0(lib, weighted_sum);
 +        } else if (ggml_metal_glm_dsa_q3_down_slot_parallel_reduce_active4_enabled() &&
 +                ne00 == 2048 && extra.already_weighted == 0) {
 +            pipeline_slot_parallel =
-+                ggml_metal_library_get_pipeline_mul_mv_id_q3_weighted_reduce_slots_sg_r8_nb8_w0_active4(lib, weighted_sum);
++                ggml_metal_library_get_pipeline_mul_mv_id_q3_weighted_reduce_slots_sg_r8_nb8_w0(lib, weighted_sum);
 +        } else if (ggml_metal_glm_dsa_q3_down_slot_parallel_reduce_active2_enabled() &&
 +                ne00 == 2048 && extra.already_weighted == 0) {
 +            pipeline_slot_parallel =
-+                ggml_metal_library_get_pipeline_mul_mv_id_q3_weighted_reduce_slots_sg_r8_nb8_w0_active2(lib, weighted_sum);
++                ggml_metal_library_get_pipeline_mul_mv_id_q3_weighted_reduce_slots_sg_r8_nb8_w0(lib, weighted_sum);
 +        } else if (q3_f16_w0_shape) {
 +            pipeline_slot_parallel =
 +                ggml_metal_library_get_pipeline_mul_mv_id_q3_weighted_reduce_slots_sg_r8_nb8_w0_f16(lib, weighted_sum);

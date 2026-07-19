@@ -46,6 +46,8 @@ Variants:
               active6 plus Q2 gate/up q8 activation kernel
   active6-half-y
               active6 plus Q2 gate/up half activation kernel
+  active6-tailfusion
+              active6 plus opt-in fused SwiGLU + Q3 down tail
   active6-inblock
               active6 plus Q2 gate/up in-block repack kernel
   active6-dispatch-log
@@ -156,6 +158,11 @@ variant_env() {
       printf '%s\n' \
         GGML_METAL_EXPERIMENTAL_GLM_MOE_MAX_ACTIVE_EXPERTS=6 \
         GGML_METAL_EXPERIMENTAL_Q2_GATE_UP_SWIGLU_PAIR_SG_HALF_Y=1
+      ;;
+    active6-tailfusion)
+      printf '%s\n' \
+        GGML_METAL_EXPERIMENTAL_GLM_MOE_MAX_ACTIVE_EXPERTS=6 \
+        GGML_METAL_ENABLE_GLM_MOE_SWIGLU_Q3_DOWN_FUSION=1
       ;;
     active6-inblock)
       printf '%s\n' \

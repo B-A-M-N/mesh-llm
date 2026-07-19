@@ -1,6 +1,6 @@
-From cf8b9703a10d97610a4baff64626111517fd1bb8 Mon Sep 17 00:00:00 2001
+From b8a75eb1814173a542ddb420f3d4a1a61172e384 Mon Sep 17 00:00:00 2001
 From: Mesh-LLM CI <ci@mesh-llm.local>
-Date: Mon, 20 Jul 2026 01:11:09 +1000
+Date: Mon, 20 Jul 2026 05:19:37 +1000
 Subject: [PATCH] ggml: use GLM max-active policy for Q3 down kernels
 
 ---
@@ -9,7 +9,7 @@ Subject: [PATCH] ggml: use GLM max-active policy for Q3 down kernels
  2 files changed, 32 insertions(+)
 
 diff --git a/ggml/src/ggml-metal/ggml-metal-ops.cpp b/ggml/src/ggml-metal/ggml-metal-ops.cpp
-index a3b1692e..3695c223 100644
+index bcaaa9c0b..015671697 100644
 --- a/ggml/src/ggml-metal/ggml-metal-ops.cpp
 +++ b/ggml/src/ggml-metal/ggml-metal-ops.cpp
 @@ -522,6 +522,11 @@ static bool ggml_metal_glm_dsa_q3_down_slot_parallel_reduce_active2_enabled() {
@@ -71,21 +71,21 @@ index a3b1692e..3695c223 100644
 @@ -5227,6 +5248,15 @@ static int ggml_metal_op_mul_mv_id_weighted_reduce(
                  ne00 == 2048 && extra.already_weighted == 0) {
              pipeline_slot_parallel =
-                 ggml_metal_library_get_pipeline_mul_mv_id_q3_weighted_reduce_slots_sg_r8_nb8_w0_active2(lib, weighted_sum);
+                 ggml_metal_library_get_pipeline_mul_mv_id_q3_weighted_reduce_slots_sg_r8_nb8_w0(lib, weighted_sum);
 +        } else if (q3_active_count_shape && q3_active_count == 6) {
 +            pipeline_slot_parallel =
-+                ggml_metal_library_get_pipeline_mul_mv_id_q3_weighted_reduce_slots_sg_r8_nb8_w0_active6(lib, weighted_sum);
++                ggml_metal_library_get_pipeline_mul_mv_id_q3_weighted_reduce_slots_sg_r8_nb8_w0(lib, weighted_sum);
 +        } else if (q3_active_count_shape && q3_active_count == 4) {
 +            pipeline_slot_parallel =
-+                ggml_metal_library_get_pipeline_mul_mv_id_q3_weighted_reduce_slots_sg_r8_nb8_w0_active4(lib, weighted_sum);
++                ggml_metal_library_get_pipeline_mul_mv_id_q3_weighted_reduce_slots_sg_r8_nb8_w0(lib, weighted_sum);
 +        } else if (q3_active_count_shape && q3_active_count == 2) {
 +            pipeline_slot_parallel =
-+                ggml_metal_library_get_pipeline_mul_mv_id_q3_weighted_reduce_slots_sg_r8_nb8_w0_active2(lib, weighted_sum);
++                ggml_metal_library_get_pipeline_mul_mv_id_q3_weighted_reduce_slots_sg_r8_nb8_w0(lib, weighted_sum);
          } else if (q3_f16_w0_shape) {
              pipeline_slot_parallel =
                  ggml_metal_library_get_pipeline_mul_mv_id_q3_weighted_reduce_slots_sg_r8_nb8_w0_f16(lib, weighted_sum);
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index 073e67b5..1d22d86e 100644
+index 073e67b53..1d22d86e5 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
 @@ -7150,6 +7150,7 @@ struct test_topk_moe_glm_component : public test_case {
