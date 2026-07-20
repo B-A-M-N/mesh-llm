@@ -285,9 +285,10 @@ impl CachedNgramProposer {
             || ngram_min > ngram_max
             || ngram_max > skippy_runtime::NGRAM_CACHE_MAX_NGRAM
         {
-            return Err(OpenAiError::backend(
-                "cache N-gram proposer requires 0 < ngram_min <= ngram_max <= 4",
-            ));
+            return Err(OpenAiError::backend(format!(
+                "cache N-gram proposer requires 0 < ngram_min <= ngram_max <= {}",
+                skippy_runtime::NGRAM_CACHE_MAX_NGRAM
+            )));
         }
         Ok(Self {
             cache: None,

@@ -195,6 +195,9 @@ impl SpeculativeCreditRequest {
 
 impl Drop for SpeculativeCreditRequest {
     fn drop(&mut self) {
+        if !self.registered {
+            return;
+        }
         let Some(pool) = self.pool.upgrade() else {
             return;
         };
@@ -380,6 +383,20 @@ mod tests {
         let attempt = next.try_acquire(1);
         assert!(attempt.credit.is_some());
         assert_eq!(attempt.snapshot.global_in_use, 1);
+    }
+
+    #[test]
+    fn duplicate_registration_drop_does_not_deactivate_owner() {
+        let pool = SpeculativeCreditPool::new(2);
+        let owner = pool.register(1);
+        let duplicate = pool.register(1);
+
+        assert!(!duplicate.registered);
+        drop(duplicate);
+
+        let attempt = owner.try_acquire(1);
+        assert!(attempt.credit.is_some());
+        assert_eq!(attempt.snapshot.active_requests, 1);
     }
 
     #[test]
