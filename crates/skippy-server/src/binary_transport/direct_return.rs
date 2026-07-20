@@ -6,7 +6,7 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
         mpsc,
-        mpsc::TryRecvError,
+        mpsc::{RecvTimeoutError, TryRecvError},
     },
     thread::{self, JoinHandle},
     time::Duration,
@@ -215,21 +215,27 @@ impl PredictionReturnReceiver {
         });
     }
 
-    pub(crate) fn try_recv_expected(&self, expected: WireReplyKind) -> Result<Option<StageReply>> {
-        self.try_recv_one_of(std::slice::from_ref(&expected))
+    pub(crate) fn recv_expected_timeout(
+        &self,
+        expected: WireReplyKind,
+        timeout: Duration,
+    ) -> Result<Option<StageReply>> {
+        let reply = match self.receiver.recv_timeout(timeout) {
+            Ok(Ok(reply)) => reply,
+            Ok(Err(error)) => return Err(anyhow!(error)),
+            Err(RecvTimeoutError::Timeout) => return Ok(None),
+            Err(RecvTimeoutError::Disconnected) => {
+                return Err(anyhow!("prediction return channel disconnected"));
+            }
+        };
+        validate_expected_reply(reply, std::slice::from_ref(&expected)).map(Some)
     }
 
     pub(crate) fn try_recv_one_of(&self, expected: &[WireReplyKind]) -> Result<Option<StageReply>> {
         let Some(reply) = self.try_recv()? else {
             return Ok(None);
         };
-        if !expected.contains(&reply.kind) {
-            bail!(
-                "expected one of {expected:?} from direct prediction return, got {:?}",
-                reply.kind
-            );
-        }
-        Ok(Some(reply))
+        validate_expected_reply(reply, expected).map(Some)
     }
 
     fn try_recv(&self) -> Result<Option<StageReply>> {
@@ -242,6 +248,16 @@ impl PredictionReturnReceiver {
             }
         }
     }
+}
+
+fn validate_expected_reply(reply: StageReply, expected: &[WireReplyKind]) -> Result<StageReply> {
+    if !expected.contains(&reply.kind) {
+        bail!(
+            "expected one of {expected:?} from direct prediction return, got {:?}",
+            reply.kind
+        );
+    }
+    Ok(reply)
 }
 
 impl Drop for PredictionReturnReceiver {
@@ -477,10 +493,28 @@ mod tests {
 
         send_reply_predicted_with_stats(&mut client, 42, Default::default()).unwrap();
 
-        let reply = poll_test_reply(&receiver, WireReplyKind::PredictedToken);
+        let reply = receiver
+            .recv_expected_timeout(WireReplyKind::PredictedToken, Duration::from_secs(1))
+            .unwrap()
+            .expect("prediction return reply");
         assert_eq!(reply.predicted, 42);
         drop(client);
         handle.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn blocking_prediction_return_receive_times_out_without_polling() {
+        let hub = Arc::new(PredictionReturnHub::default());
+        let receiver = hub.register(53, 59).unwrap();
+        let started = std::time::Instant::now();
+
+        assert!(
+            receiver
+                .recv_expected_timeout(WireReplyKind::PredictedTokens, Duration::from_millis(10),)
+                .unwrap()
+                .is_none()
+        );
+        assert!(started.elapsed() >= Duration::from_millis(8));
     }
 
     #[test]
@@ -571,19 +605,5 @@ mod tests {
                 .is_none()
         );
         drop(client);
-    }
-
-    fn poll_test_reply(receiver: &PredictionReturnReceiver, expected: WireReplyKind) -> StageReply {
-        let started = std::time::Instant::now();
-        loop {
-            if let Some(reply) = receiver.try_recv_expected(expected).unwrap() {
-                return reply;
-            }
-            assert!(
-                started.elapsed() < Duration::from_secs(1),
-                "timed out waiting for prediction return reply"
-            );
-            thread::sleep(Duration::from_millis(1));
-        }
     }
 }

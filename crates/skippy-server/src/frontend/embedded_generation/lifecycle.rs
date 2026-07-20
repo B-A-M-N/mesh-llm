@@ -1,3 +1,5 @@
+use std::collections::VecDeque;
+
 use openai_frontend::OpenAiResult;
 use serde_json::json;
 use skippy_protocol::binary::{StageWireMessage, WireReplyKind, recv_reply, write_stage_message};
@@ -15,12 +17,40 @@ use crate::frontend::{
 };
 
 pub(super) struct PipelinedCompositeWindow {
+    pub(super) epoch: u64,
+    pub(super) stale: bool,
     pub(super) window: VerifyWindow,
     pub(super) input_tokens: Vec<i32>,
     pub(super) proposal_tokens: Vec<i32>,
     pub(super) expected_free_target: Option<i32>,
     pub(super) native_mtp_token_count: usize,
     pub(super) dispatched: DispatchedEmbeddedStage,
+}
+
+pub(super) fn queued_active_tokens(windows: &VecDeque<PipelinedCompositeWindow>) -> usize {
+    windows
+        .iter()
+        .filter(|window| !window.stale)
+        .map(|window| window.input_tokens.len())
+        .sum()
+}
+
+pub(super) fn can_seed_pipeline(windows: &VecDeque<PipelinedCompositeWindow>) -> bool {
+    windows.iter().all(|window| window.stale)
+}
+
+pub(super) fn mark_epoch_stale(
+    windows: &mut VecDeque<PipelinedCompositeWindow>,
+    epoch: u64,
+) -> usize {
+    let mut marked = 0usize;
+    for window in windows {
+        if window.epoch == epoch && !window.stale {
+            window.stale = true;
+            marked = marked.saturating_add(1);
+        }
+    }
+    marked
 }
 
 pub(super) struct EmbeddedDecodeSummary<'a> {

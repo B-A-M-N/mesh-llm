@@ -1,3 +1,5 @@
+use crate::binary_transport::AsyncForwardReceipt;
+use crate::binary_transport::AsyncForwarder;
 use crate::binary_transport::BinaryStageExecutionOptions;
 use crate::binary_transport::PredictionReturnReceiver;
 use crate::binary_transport::forwarded_stage_message_timed;
@@ -35,6 +37,7 @@ pub(super) struct DispatchedEmbeddedStage {
     execution: EmbeddedExecutionStats,
     message_kind: WireMessageKind,
     token_count: i32,
+    forward_receipt: Option<AsyncForwardReceipt>,
 }
 
 impl StageOpenAiBackend {
@@ -53,6 +56,7 @@ impl StageOpenAiBackend {
             session_key,
             message,
             token_ids,
+            None,
         )?;
         self.complete_dispatched_stage_message(request, downstream, dispatched, expected_reply)
     }
@@ -64,6 +68,7 @@ impl StageOpenAiBackend {
         session_key: &str,
         message: &StageWireMessage,
         token_ids: &[i32],
+        async_forwarder: Option<&mut AsyncForwarder>,
     ) -> OpenAiResult<DispatchedEmbeddedStage> {
         let started = Instant::now();
         let stats = StageReplyStats::default();
@@ -129,14 +134,29 @@ impl StageOpenAiBackend {
             request.activation_width,
         )
         .map_err(openai_backend_error)?;
+        let forward_activation_bytes = forwarded.message.activation.len();
         let write_timer = PhaseTimer::start();
-        write_stage_message_conditioned(
-            &mut *downstream,
-            &forwarded.message,
-            request.wire_dtype,
-            request.downstream_wire_condition,
-        )
-        .map_err(openai_io_error)?;
+        let forward_receipt = if let Some(forwarder) = async_forwarder {
+            Some(
+                forwarder
+                    .send_tracked(
+                        forwarded.message,
+                        request.wire_dtype,
+                        request.downstream_wire_condition,
+                        self.openai_attrs(request.ids),
+                    )
+                    .map_err(openai_backend_error)?,
+            )
+        } else {
+            write_stage_message_conditioned(
+                &mut *downstream,
+                &forwarded.message,
+                request.wire_dtype,
+                request.downstream_wire_condition,
+            )
+            .map_err(openai_io_error)?;
+            None
+        };
         let forward_write_ms = write_timer.elapsed_ms();
         Ok(DispatchedEmbeddedStage {
             started,
@@ -147,12 +167,13 @@ impl StageOpenAiBackend {
                 runtime_lock_hold_ms: output.runtime_lock_hold_ms,
                 activation_encode_ms: forwarded.activation_encode_ms,
                 output_activation_bytes: output.output.payload.len(),
-                forward_activation_bytes: forwarded.message.activation.len(),
+                forward_activation_bytes,
                 forward_write_ms,
                 downstream_wait_ms: 0.0,
             },
             message_kind: message.kind,
             token_count: message.token_count,
+            forward_receipt,
         })
     }
 
@@ -196,6 +217,10 @@ impl StageOpenAiBackend {
         expected_reply: WireReplyKind,
         require_direct_return: bool,
     ) -> OpenAiResult<EmbeddedStageExecution> {
+        if let Some(receipt) = dispatched.forward_receipt.take() {
+            dispatched.execution.forward_write_ms =
+                receipt.finish().map_err(openai_backend_error)?;
+        }
         let wait_timer = PhaseTimer::start();
         let reply = if require_direct_return {
             receive_direct_prediction_return(request.prediction_return.as_ref(), expected_reply)?
@@ -243,21 +268,14 @@ fn receive_direct_prediction_return(
     let prediction_return = prediction_return.ok_or_else(|| {
         OpenAiError::backend("direct prediction return was required but is not configured")
     })?;
-    let started = Instant::now();
-    loop {
-        if let Some(reply) = prediction_return
-            .try_recv_expected(expected_reply)
-            .map_err(openai_backend_error)?
-        {
-            return Ok(reply);
-        }
-        if started.elapsed() >= DIRECT_RETURN_FALLBACK_TIMEOUT {
-            return Err(OpenAiError::backend(format!(
+    prediction_return
+        .recv_expected_timeout(expected_reply, DIRECT_RETURN_FALLBACK_TIMEOUT)
+        .map_err(openai_backend_error)?
+        .ok_or_else(|| {
+            OpenAiError::backend(format!(
                 "timed out waiting for {expected_reply:?} reply from direct prediction return"
-            )));
-        }
-        std::thread::sleep(DIRECT_RETURN_FALLBACK_POLL);
-    }
+            ))
+        })
 }
 
 pub(crate) fn receive_embedded_stage_reply(

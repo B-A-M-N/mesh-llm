@@ -281,7 +281,7 @@ impl GeneratedText {
         if let Some(telemetry) = self.native_mtp_decode_telemetry {
             telemetry.insert_response_timings(&mut timings);
         }
-        if let Some(stats) = self.verify_window_pipeline_stats {
+        if let Some(stats) = self.verify_window_pipeline_stats.as_ref() {
             stats.insert_response_timings(&mut timings);
         }
         if let Some(stats) = self.speculative_stats.as_ref() {

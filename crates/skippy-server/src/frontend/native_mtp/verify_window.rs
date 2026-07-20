@@ -213,7 +213,8 @@ impl StageOpenAiBackend {
                 profile_width,
                 pipeline_continues,
                 verify.stats.stage0_compute_ms,
-                verify.stats.downstream_wait_ms,
+                verify.stats.forward_write_ms,
+                verify.elapsed_ms,
             );
         }
         let native_mtp_prefix_rejected = proposal_buffer.as_ref().is_some_and(|buffer| {

@@ -12,9 +12,7 @@ use anyhow::{Context, Result, anyhow};
 use skippy_coordinator::{ClaimDecision, ClaimFence, LoadClaimRef};
 use skippy_protocol::{FlashAttentionType, LoadMode, PeerConfig, StageConfig};
 use skippy_server::{
-    EmbeddedServerHandle,
-    binary_transport::{BinaryStageOptions, WireCondition},
-    telemetry::TelemetryLevel,
+    EmbeddedServerHandle, binary_transport::BinaryStageOptions, telemetry::TelemetryLevel,
 };
 use tokio::{
     sync::{Mutex, mpsc},
@@ -375,7 +373,7 @@ impl StageControlState {
             max_inflight: effective_load.lane_count as usize,
             reply_credit_limit: None,
             async_prefill_forward: true,
-            downstream_wire_condition: WireCondition::new(0.0, None)?,
+            downstream_wire_condition: super::benchmark_downstream_wire_condition()?,
             downstream_connect_timeout_secs: 30,
             native_mtp_enabled: effective_load.native_mtp_enabled,
             openai: None,

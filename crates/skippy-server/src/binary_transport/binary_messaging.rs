@@ -32,7 +32,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde_json::json;
 use skippy_protocol::binary::{WireMessageKind, read_stage_message, send_ready};
 
-mod async_forwarder;
+pub(in crate::binary_transport) mod async_forwarder;
 mod connection;
 pub(in crate::binary_transport) mod reply;
 mod summary;

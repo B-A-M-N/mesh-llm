@@ -112,10 +112,12 @@ pub(super) fn handle_binary_connection(
     let mut accumulated_prefill_tokens: BTreeMap<String, Vec<i32>> = BTreeMap::new();
     let mut prediction_return_streams: BTreeMap<(u64, u64), TcpStream> = BTreeMap::new();
     let mut next_message = Some(first_message);
-    let mut async_forwarder = if async_prefill_forward {
+    let mut async_forwarder = if async_prefill_forward || max_inflight > 1 {
         downstream
             .as_ref()
-            .map(|downstream| AsyncForwarder::new(downstream, telemetry.clone()))
+            .map(|downstream| {
+                AsyncForwarder::new(downstream, telemetry.clone(), max_inflight.max(1))
+            })
             .transpose()
             .context("create async activation forwarder")?
     } else {
@@ -850,7 +852,11 @@ pub(super) fn handle_binary_connection(
             let forward_start_unix_nanos = now_unix_nanos() as u64;
             forward_write_start_unix_nanos = Some(forward_start_unix_nanos);
             let forward_started = Instant::now();
-            if async_prefill_forward && early_prefill_ack && max_deferred_prefill_replies > 0 {
+            let async_verify_forward =
+                message.kind == WireMessageKind::VerifyWindow && max_inflight > 1;
+            if (async_prefill_forward && early_prefill_ack && max_deferred_prefill_replies > 0)
+                || async_verify_forward
+            {
                 forward_mode = "async_enqueue";
                 if telemetry.is_debug_enabled() {
                     downstream_write_attrs.insert(
