@@ -602,8 +602,18 @@ pub(super) fn handle_binary_connection(
                     .copied()
                     .unwrap_or(message.state.current_token);
                 let sampling = runtime_sampling_config(message.sampling.as_ref());
+                let target_token_count =
+                    message.authoritative_session_position().ok_or_else(|| {
+                        anyhow::anyhow!("batched decode frame has no authoritative position")
+                    })?;
                 let outcome = decode_frame_batcher
-                    .decode(&session_key, token_id, sampling.as_ref(), input)
+                    .decode(
+                        &session_key,
+                        target_token_count,
+                        token_id,
+                        sampling.as_ref(),
+                        input,
+                    )
                     .context("execute batched binary decode frame")?;
                 runtime_lock_wait_ms = outcome.runtime_lock_wait_ms;
                 runtime_lock_hold_ms = outcome.runtime_lock_hold_ms;

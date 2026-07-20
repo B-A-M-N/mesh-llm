@@ -1628,11 +1628,27 @@ impl StageOpenAiBackend {
                     .decode_frame_batcher
                     .decode(
                         &session_key,
+                        u64::try_from(message.pos_start).map_err(|_| {
+                            OpenAiError::backend("negative authoritative decode position")
+                        })?,
                         current,
                         request.sampling.enabled.then_some(request.sampling),
                         None,
                     )
                     .map_err(openai_backend_error)?;
+                if let Some(align) = batch_outcome.session_alignment {
+                    let mut attrs = self.openai_attrs(request.ids);
+                    attrs.insert(
+                        "llama_stage.session_auto_align_before_tokens".to_string(),
+                        json!(align.before_token_count),
+                    );
+                    attrs.insert(
+                        "llama_stage.session_auto_align_after_tokens".to_string(),
+                        json!(align.after_token_count),
+                    );
+                    self.telemetry
+                        .emit_debug("stage.openai_session_auto_align", attrs);
+                }
                 let token_runtime_lock_wait_ms = batch_outcome.runtime_lock_wait_ms;
                 let token_runtime_lock_hold_ms = batch_outcome.runtime_lock_hold_ms;
                 decode_runtime_lock_wait_ms += token_runtime_lock_wait_ms;

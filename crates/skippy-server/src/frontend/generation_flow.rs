@@ -856,7 +856,15 @@ impl StageOpenAiBackend {
                 let stage0_timer = PhaseTimer::start();
                 let batch_outcome = self
                     .decode_frame_batcher
-                    .decode(&session_key, current, Some(&request.sampling), None)
+                    .decode(
+                        &session_key,
+                        u64::try_from(message.pos_start).map_err(|_| {
+                            OpenAiError::backend("negative authoritative decode position")
+                        })?,
+                        current,
+                        Some(&request.sampling),
+                        None,
+                    )
                     .map_err(openai_backend_error)?;
                 decode_runtime_lock_wait_ms += batch_outcome.runtime_lock_wait_ms;
                 decode_runtime_lock_hold_ms += batch_outcome.runtime_lock_hold_ms;

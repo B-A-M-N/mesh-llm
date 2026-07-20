@@ -284,6 +284,10 @@ impl VerifyWindowWidthProfile {
                 .then_some(PIPELINE_BOOTSTRAP_PROBE_DEPTH)
         })
     }
+
+    fn has_enough_evidence(&self) -> bool {
+        self.observations.len() >= PIPELINE_PROFILE_MIN_OBSERVATIONS
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -299,6 +303,7 @@ pub(super) struct VerifyWindowScheduler {
     next_id: i32,
     in_flight: VecDeque<VerifyWindow>,
     stats: VerifyWindowPipelineStats,
+    aggregate_profile: VerifyWindowWidthProfile,
     width_profiles: BTreeMap<usize, VerifyWindowWidthProfile>,
     target_depth: usize,
     occupancy_ms_by_depth: Vec<f64>,
@@ -323,6 +328,7 @@ impl VerifyWindowScheduler {
                 target_depth_max: 1,
                 ..VerifyWindowPipelineStats::default()
             },
+            aggregate_profile: VerifyWindowWidthProfile::default(),
             width_profiles: BTreeMap::new(),
             target_depth: 1,
             occupancy_ms_by_depth: vec![0.0; config.depth().saturating_add(1)],
@@ -359,6 +365,12 @@ impl VerifyWindowScheduler {
             .stats
             .policy_continuation_windows
             .saturating_add(usize::from(continues));
+        self.aggregate_profile.observe(
+            continues,
+            stage0_compute_ms,
+            forward_write_ms,
+            verify_elapsed_ms,
+        );
         self.width_profiles.entry(width).or_default().observe(
             continues,
             stage0_compute_ms,
@@ -370,11 +382,14 @@ impl VerifyWindowScheduler {
     pub(super) fn permit_pipeline_width(&mut self, width: usize) -> bool {
         self.stats.policy_permit_checks = self.stats.policy_permit_checks.saturating_add(1);
         let target_depth = if self.config.depth() > 1 {
-            self.width_profiles
-                .get(&width)
-                .map_or(Some(PIPELINE_BOOTSTRAP_PROBE_DEPTH), |profile| {
-                    profile.probe_or_recommended_depth(self.config.depth())
-                })
+            match self.width_profiles.get(&width) {
+                Some(profile) if profile.has_enough_evidence() => {
+                    profile.recommended_depth(self.config.depth())
+                }
+                _ => self
+                    .aggregate_profile
+                    .probe_or_recommended_depth(self.config.depth()),
+            }
         } else {
             None
         };
@@ -666,6 +681,16 @@ mod tests {
         scheduler.observe_pipeline_profile(2, true, 20.0, 0.0, 100.0);
 
         assert!(scheduler.permit_pipeline_width(2));
+        assert_eq!(scheduler.target_depth, 5);
+        assert_eq!(scheduler.stats().target_depth_max, 5);
+    }
+
+    #[test]
+    fn pipeline_policy_shares_latency_evidence_across_adaptive_widths() {
+        let mut scheduler = VerifyWindowScheduler::new(VerifyWindowPipelineConfig { depth: 8 });
+        scheduler.observe_pipeline_profile(1, true, 20.0, 0.0, 100.0);
+
+        assert!(scheduler.permit_pipeline_width(3));
         assert_eq!(scheduler.target_depth, 5);
         assert_eq!(scheduler.stats().target_depth_max, 5);
     }
