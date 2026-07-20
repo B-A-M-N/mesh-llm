@@ -225,6 +225,7 @@ fn speculative_overrides_from_cli(
     overrides.verify_window_min_tokens = cli.speculative_verify_window_min_tokens;
     overrides.verify_window_max_tokens = cli.speculative_verify_window_max_tokens;
     overrides.verify_window_pipeline_depth = cli.speculative_verify_window_pipeline_depth;
+    overrides.verify_window_pipeline_force = cli.speculative_verify_window_pipeline_force;
     (overrides != Default::default()).then_some(overrides)
 }
 

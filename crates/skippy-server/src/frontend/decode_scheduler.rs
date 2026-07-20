@@ -9,23 +9,41 @@ const PIPELINE_PROFIT_MARGIN: f64 = 1.15;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct VerifyWindowPipelineConfig {
     depth: usize,
+    force: bool,
 }
 
 impl VerifyWindowPipelineConfig {
     pub(super) fn new(depth: usize) -> Self {
         Self {
             depth: depth.max(1),
+            force: false,
         }
+    }
+
+    /// Force pipelining whenever `depth > 1`, bypassing the adaptive profitability
+    /// gate. This is the shard-style "bet on the pipeline" mode: keep `depth` verify
+    /// windows in flight from the first eligible proposal instead of waiting for the
+    /// profiler to prove profitability first (which, on a low-continuation WAN split,
+    /// it may never do — see `is_profitable`). Mistakes are absorbed by the existing
+    /// FIFO completion + stale-drain + reject-cooldown machinery.
+    pub(super) fn with_force(mut self, force: bool) -> Self {
+        self.force = force;
+        self
     }
 
     pub(super) fn depth(self) -> usize {
         self.depth
+    }
+
+    pub(super) fn force(self) -> bool {
+        self.force
     }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub(super) struct VerifyWindowPipelineStats {
     depth: usize,
+    force: bool,
     direct_prediction_return: bool,
     opened_windows: usize,
     max_in_flight: usize,
@@ -43,6 +61,10 @@ impl VerifyWindowPipelineStats {
         timings.insert(
             "verify_window_depth".to_string(),
             serde_json::json!(self.depth),
+        );
+        timings.insert(
+            "verify_window_force".to_string(),
+            serde_json::json!(self.force),
         );
         timings.insert(
             "verify_window_direct_prediction_return".to_string(),
@@ -167,6 +189,7 @@ impl VerifyWindowScheduler {
             in_flight: VecDeque::new(),
             stats: VerifyWindowPipelineStats {
                 depth: config.depth(),
+                force: config.force(),
                 ..VerifyWindowPipelineStats::default()
             },
             width_profiles: BTreeMap::new(),
@@ -207,7 +230,13 @@ impl VerifyWindowScheduler {
         );
     }
 
+    /// True when the pipeline may be seeded this step. In forced mode (`depth > 1`
+    /// and `force`), this is unconditional — the profiler is bypassed. Otherwise it
+    /// falls back to the adaptive gate: some observed width must be profitable.
     pub(super) fn has_profitable_pipeline_width(&self) -> bool {
+        if self.forced() {
+            return true;
+        }
         self.config.depth() > 1
             && self
                 .width_profiles
@@ -215,13 +244,20 @@ impl VerifyWindowScheduler {
                 .any(VerifyWindowWidthProfile::is_profitable)
     }
 
+    /// Whether pipelining is forced on: `depth > 1` and the operator opted into the
+    /// bet-on-the-pipeline mode.
+    pub(super) fn forced(&self) -> bool {
+        self.config.depth() > 1 && self.config.force()
+    }
+
     pub(super) fn permit_pipeline_width(&mut self, width: usize) -> bool {
         self.stats.policy_permit_checks = self.stats.policy_permit_checks.saturating_add(1);
         let permitted = self.config.depth() > 1
-            && self
-                .width_profiles
-                .get(&width)
-                .is_some_and(VerifyWindowWidthProfile::is_profitable);
+            && (self.config.force()
+                || self
+                    .width_profiles
+                    .get(&width)
+                    .is_some_and(VerifyWindowWidthProfile::is_profitable));
         if permitted {
             self.stats.policy_permits = self.stats.policy_permits.saturating_add(1);
         } else {
@@ -338,7 +374,7 @@ mod tests {
 
     #[test]
     fn bounds_depth_and_requires_fifo_reply_ids() {
-        let config = VerifyWindowPipelineConfig { depth: 2 };
+        let config = VerifyWindowPipelineConfig::new(2);
         let mut scheduler = VerifyWindowScheduler::new(config);
         let first = scheduler.open(10, 0).unwrap();
         let second = scheduler.open(11, 1).unwrap();
@@ -357,7 +393,7 @@ mod tests {
 
     #[test]
     fn discards_stale_windows_after_divergence() {
-        let config = VerifyWindowPipelineConfig { depth: 3 };
+        let config = VerifyWindowPipelineConfig::new(3);
         let mut scheduler = VerifyWindowScheduler::new(config);
         scheduler.open(10, 0).unwrap();
         scheduler.open(11, 1).unwrap();
@@ -371,7 +407,7 @@ mod tests {
 
     #[test]
     fn pipeline_policy_waits_for_enough_width_specific_evidence() {
-        let mut scheduler = VerifyWindowScheduler::new(VerifyWindowPipelineConfig { depth: 2 });
+        let mut scheduler = VerifyWindowScheduler::new(VerifyWindowPipelineConfig::new(2));
         for _ in 0..PIPELINE_PROFILE_MIN_OBSERVATIONS - 1 {
             scheduler.observe_pipeline_profile(2, true, 20.0, 80.0);
         }
@@ -385,7 +421,7 @@ mod tests {
 
     #[test]
     fn pipeline_policy_suppresses_low_acceptance_local_work() {
-        let mut scheduler = VerifyWindowScheduler::new(VerifyWindowPipelineConfig { depth: 2 });
+        let mut scheduler = VerifyWindowScheduler::new(VerifyWindowPipelineConfig::new(2));
         for index in 0..PIPELINE_PROFILE_MIN_OBSERVATIONS {
             scheduler.observe_pipeline_profile(2, index < 2, 31.0, 24.0);
         }
@@ -399,7 +435,7 @@ mod tests {
 
     #[test]
     fn pipeline_policy_profiles_each_verify_width_independently() {
-        let mut scheduler = VerifyWindowScheduler::new(VerifyWindowPipelineConfig { depth: 2 });
+        let mut scheduler = VerifyWindowScheduler::new(VerifyWindowPipelineConfig::new(2));
         for index in 0..PIPELINE_PROFILE_MIN_OBSERVATIONS {
             scheduler.observe_pipeline_profile(1, index < 7, 20.0, 80.0);
             scheduler.observe_pipeline_profile(2, index < 2, 31.0, 24.0);
@@ -411,8 +447,34 @@ mod tests {
     }
 
     #[test]
+    fn forced_mode_pipelines_without_any_profitability_evidence() {
+        let mut scheduler =
+            VerifyWindowScheduler::new(VerifyWindowPipelineConfig::new(4).with_force(true));
+
+        // No observations at all — the adaptive gate would refuse. Forced mode admits.
+        assert!(scheduler.forced());
+        assert!(scheduler.has_profitable_pipeline_width());
+        assert!(scheduler.permit_pipeline_width(2));
+        assert!(scheduler.permit_pipeline_width(4));
+        assert_eq!(scheduler.stats().policy_permits, 2);
+        assert_eq!(scheduler.stats().policy_suppressed, 0);
+        assert!(scheduler.stats().force);
+    }
+
+    #[test]
+    fn forced_mode_is_inert_at_depth_one() {
+        let mut scheduler =
+            VerifyWindowScheduler::new(VerifyWindowPipelineConfig::new(1).with_force(true));
+
+        // depth == 1 can never pipeline dependent work, even when forced.
+        assert!(!scheduler.forced());
+        assert!(!scheduler.has_profitable_pipeline_width());
+        assert!(!scheduler.permit_pipeline_width(2));
+    }
+
+    #[test]
     fn pipeline_depth_one_never_admits_dependent_work() {
-        let mut scheduler = VerifyWindowScheduler::new(VerifyWindowPipelineConfig { depth: 1 });
+        let mut scheduler = VerifyWindowScheduler::new(VerifyWindowPipelineConfig::new(1));
         for _ in 0..PIPELINE_PROFILE_MIN_OBSERVATIONS {
             scheduler.observe_pipeline_profile(2, true, 20.0, 80.0);
         }
@@ -423,7 +485,7 @@ mod tests {
 
     #[test]
     fn pipeline_policy_adapts_when_recent_acceptance_changes() {
-        let mut scheduler = VerifyWindowScheduler::new(VerifyWindowPipelineConfig { depth: 2 });
+        let mut scheduler = VerifyWindowScheduler::new(VerifyWindowPipelineConfig::new(2));
         for _ in 0..PIPELINE_PROFILE_MAX_OBSERVATIONS {
             scheduler.observe_pipeline_profile(2, true, 20.0, 80.0);
         }
@@ -437,7 +499,7 @@ mod tests {
 
     #[test]
     fn pipeline_policy_counters_are_exposed_in_response_timings() {
-        let mut scheduler = VerifyWindowScheduler::new(VerifyWindowPipelineConfig { depth: 2 });
+        let mut scheduler = VerifyWindowScheduler::new(VerifyWindowPipelineConfig::new(2));
         for _ in 0..PIPELINE_PROFILE_MIN_OBSERVATIONS {
             scheduler.observe_pipeline_profile(2, true, 20.0, 80.0);
         }

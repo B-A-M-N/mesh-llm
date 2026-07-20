@@ -228,6 +228,7 @@ mod tests {
                 min_tokens: 1,
                 max_tokens: 6,
                 pipeline_depth: 2,
+                pipeline_force: false,
             },
         }
     }

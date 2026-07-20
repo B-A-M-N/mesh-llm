@@ -888,7 +888,8 @@ impl StageOpenAiBackend {
                 _ => None,
             };
             let mut verify_window_scheduler = VerifyWindowScheduler::new(
-                VerifyWindowPipelineConfig::new(request.speculative.verify_window.pipeline_depth),
+                VerifyWindowPipelineConfig::new(request.speculative.verify_window.pipeline_depth)
+                    .with_force(request.speculative.verify_window.pipeline_force),
             );
             let composite_sidecar_enabled =
                 native_mtp_options.ngram_hybrid && draft_guard.is_none();

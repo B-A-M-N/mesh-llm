@@ -604,6 +604,11 @@ pub struct Cli {
     #[arg(long, hide = true)]
     pub speculative_verify_window_pipeline_depth: Option<u32>,
 
+    /// Force pipelined verify windows whenever depth > 1, bypassing the adaptive
+    /// profitability gate (shard-style "bet on the pipeline" mode for WAN splits).
+    #[arg(long, hide = true)]
+    pub speculative_verify_window_pipeline_force: Option<bool>,
+
     /// Draft model for speculative decoding.
     #[arg(long, hide = true)]
     pub draft: Option<PathBuf>,

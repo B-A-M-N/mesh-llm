@@ -62,6 +62,10 @@ pub struct VerifyWindowConfig {
     pub min_tokens: usize,
     pub max_tokens: usize,
     pub pipeline_depth: usize,
+    /// Bet-on-the-pipeline mode: when `pipeline_depth > 1`, keep windows in flight
+    /// unconditionally instead of waiting for the adaptive profitability gate. See
+    /// `VerifyWindowPipelineConfig::with_force`.
+    pub pipeline_force: bool,
 }
 
 impl Default for SpeculativeDecodeConfig {
@@ -83,6 +87,7 @@ impl Default for SpeculativeDecodeConfig {
                 min_tokens: 1,
                 max_tokens: 4,
                 pipeline_depth: 1,
+                pipeline_force: false,
             },
         }
     }
