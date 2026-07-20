@@ -302,14 +302,24 @@ impl PredictionReturnSinks {
 /// Read timeout for the return-sink ready handshake. `recv_ready` is a blocking
 /// `read_exact`; without this a stalled downstream connection hangs the open
 /// forever, which mid-generation blocks the request from ever falling back to
-/// the upstream reply. Kept short so a genuinely stalled peer fails fast to the
-/// fallback; cleared afterwards so the sink's normal reads stay blocking.
+/// the upstream reply. Cleared afterwards so the sink's normal reads stay
+/// blocking.
+///
+/// Budget sizing (20s): over a WAN mesh the return sink connects to a LOCAL
+/// bridge alias, but the remote `ready` byte only arrives after the bridge
+/// COLD-establishes a fresh stage QUIC connection (up to ~10s) and the remote
+/// inbound handler then dials its local binary server. A 5s budget timed out
+/// during that cold setup (observed EAGAIN on a healthy ~26ms WAN split), even
+/// though the pooled forward lanes — which get a 20s initial connect budget and
+/// are then reused — succeeded on the same bridge. Matching the forward-lane
+/// budget lets the cold return path complete instead of failing to the slower
+/// upstream-reply fallback.
 ///
 /// This is a *single bounded deadline*, not a retry budget: the sink is opened
 /// on the generation hot path, and `connect_downstream_socket` already bounds
 /// the connect itself, so wrapping this in an outer retry only compounds the
 /// worst-case stall (see PR #1011 review).
-const RETURN_SINK_READY_READ_TIMEOUT: Duration = Duration::from_secs(5);
+const RETURN_SINK_READY_READ_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Connect to `return_addr`, complete the ready handshake, and send the
 /// prediction-return open message. Single bounded attempt — on failure the
