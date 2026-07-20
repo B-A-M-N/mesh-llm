@@ -434,9 +434,10 @@ fn package_decode_config(
             max_tokens: 4,
             pipeline_depth: 1,
         });
-    let effective_strategy = match ngram.is_some() {
-        true => "native-mtp+ngram-cache",
-        false => "native-mtp",
+    let effective_strategy = if ngram.is_some() {
+        "native-mtp+ngram-cache"
+    } else {
+        "native-mtp"
     };
     Ok(Some(SpeculativeDecodeConfig {
         requested_strategy: requested_strategy.to_string(),

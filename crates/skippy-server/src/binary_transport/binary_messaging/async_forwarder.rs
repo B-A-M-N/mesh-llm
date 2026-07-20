@@ -14,9 +14,13 @@ use std::collections::BTreeMap;
 use std::collections::VecDeque;
 use std::net::TcpStream;
 use std::sync::mpsc;
+use std::sync::mpsc::RecvTimeoutError;
 use std::sync::mpsc::TryRecvError;
 use std::thread;
+use std::time::Duration;
 use std::time::Instant;
+
+const ASYNC_FORWARD_TERMINAL_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub(crate) struct AsyncForwarder {
     sender: mpsc::SyncSender<AsyncForwardJob>,
@@ -46,6 +50,9 @@ impl AsyncForwarder {
         let mut writer = downstream
             .try_clone()
             .context("clone downstream stream for async activation forwarding")?;
+        writer
+            .set_write_timeout(Some(ASYNC_FORWARD_TERMINAL_TIMEOUT))
+            .context("set async activation forward write timeout")?;
         let (sender, receiver) = mpsc::sync_channel::<AsyncForwardJob>(queue_capacity.max(1));
         thread::spawn(move || run_forwarder(&mut writer, &receiver, &telemetry));
         Ok(Self {
@@ -157,10 +164,19 @@ fn forward_job(writer: &mut TcpStream, telemetry: &Telemetry, job: AsyncForwardJ
 
 impl AsyncForwardReceipt {
     pub(crate) fn finish(self) -> Result<f64> {
-        self.receiver
-            .recv()
-            .map_err(|_| anyhow!("async activation forwarder dropped result"))?
-            .map_err(|error| anyhow!(error))
+        self.finish_with_timeout(ASYNC_FORWARD_TERMINAL_TIMEOUT)
+    }
+
+    fn finish_with_timeout(self, timeout: Duration) -> Result<f64> {
+        match self.receiver.recv_timeout(timeout) {
+            Ok(result) => result.map_err(|error| anyhow!(error)),
+            Err(RecvTimeoutError::Timeout) => {
+                Err(anyhow!("timed out waiting for async activation forward"))
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                Err(anyhow!("async activation forwarder dropped result"))
+            }
+        }
     }
 
     fn try_finish(&self) -> Result<Option<f64>> {
@@ -172,5 +188,22 @@ impl AsyncForwardReceipt {
                 Err(anyhow!("async activation forwarder dropped result"))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn forward_receipt_has_a_terminal_wait_bound() {
+        let (_sender, receiver) = mpsc::channel();
+        let receipt = AsyncForwardReceipt { receiver };
+
+        let error = receipt
+            .finish_with_timeout(Duration::from_millis(1))
+            .unwrap_err();
+
+        assert!(error.to_string().contains("timed out"));
     }
 }

@@ -2,6 +2,9 @@ use std::collections::{BTreeMap, VecDeque};
 use std::time::Instant;
 
 use openai_frontend::{OpenAiError, OpenAiResult};
+use skippy_metrics::attr as attr_key;
+
+use crate::frontend::speculative_credits::{SpeculativeCreditDenial, SpeculativeCreditSnapshot};
 
 const PIPELINE_PROFILE_MIN_OBSERVATIONS: usize = 8;
 const PIPELINE_PROFILE_MAX_OBSERVATIONS: usize = 32;
@@ -36,6 +39,8 @@ pub(super) struct VerifyWindowPipelineStats {
     target_depth_max: usize,
     target_depth_updates: usize,
     direct_prediction_return: bool,
+    direct_prediction_return_upstream_opened: bool,
+    direct_prediction_return_reverse_fallback: bool,
     opened_windows: usize,
     max_in_flight: usize,
     recovery_epochs: usize,
@@ -51,6 +56,22 @@ pub(super) struct VerifyWindowPipelineStats {
     policy_permit_checks: usize,
     policy_permits: usize,
     policy_suppressed: usize,
+    credit_limit: usize,
+    credit_effective_limit_min: usize,
+    credit_unmetered_progress_windows: usize,
+    credit_checks: usize,
+    credit_grants: usize,
+    credit_denials: usize,
+    credit_pipeline_occupied_denials: usize,
+    credit_fair_share_denials: usize,
+    credit_global_limit_denials: usize,
+    credit_fair_queue_denials: usize,
+    credit_disabled_denials: usize,
+    credit_lock_poisoned_denials: usize,
+    credit_global_max_in_use: usize,
+    credit_active_requests_max: usize,
+    credit_request_max_held: usize,
+    credit_queue_max: usize,
     horizon_refill_attempts: usize,
     horizon_refill_successes: usize,
     horizon_refill_tokens: usize,
@@ -91,6 +112,14 @@ impl VerifyWindowPipelineStats {
         timings.insert(
             "verify_window_direct_prediction_return".to_string(),
             serde_json::json!(self.direct_prediction_return),
+        );
+        timings.insert(
+            "verify_window_direct_prediction_return_upstream_opened".to_string(),
+            serde_json::json!(self.direct_prediction_return_upstream_opened),
+        );
+        timings.insert(
+            "verify_window_direct_prediction_return_reverse_fallback".to_string(),
+            serde_json::json!(self.direct_prediction_return_reverse_fallback),
         );
         timings.insert(
             "verify_window_opened".to_string(),
@@ -151,6 +180,62 @@ impl VerifyWindowPipelineStats {
         timings.insert(
             "verify_window_policy_suppressed".to_string(),
             serde_json::json!(self.policy_suppressed),
+        );
+        timings.insert(
+            "verify_window_credit_limit".to_string(),
+            serde_json::json!(self.credit_limit),
+        );
+        timings.insert(
+            "verify_window_credit_effective_limit_min".to_string(),
+            serde_json::json!(self.credit_effective_limit_min),
+        );
+        timings.insert(
+            "verify_window_credit_unmetered_progress_windows".to_string(),
+            serde_json::json!(self.credit_unmetered_progress_windows),
+        );
+        timings.insert(
+            "verify_window_credit_checks".to_string(),
+            serde_json::json!(self.credit_checks),
+        );
+        timings.insert(
+            "verify_window_credit_grants".to_string(),
+            serde_json::json!(self.credit_grants),
+        );
+        timings.insert(
+            "verify_window_credit_serial_fallbacks".to_string(),
+            serde_json::json!(self.credit_denials),
+        );
+        timings.insert(
+            "verify_window_credit_pipeline_occupied_denials".to_string(),
+            serde_json::json!(self.credit_pipeline_occupied_denials),
+        );
+        timings.insert(
+            "verify_window_credit_fair_share_denials".to_string(),
+            serde_json::json!(self.credit_fair_share_denials),
+        );
+        timings.insert(
+            "verify_window_credit_global_limit_denials".to_string(),
+            serde_json::json!(self.credit_global_limit_denials),
+        );
+        timings.insert(
+            "verify_window_credit_fair_queue_denials".to_string(),
+            serde_json::json!(self.credit_fair_queue_denials),
+        );
+        timings.insert(
+            "verify_window_credit_global_max_in_use".to_string(),
+            serde_json::json!(self.credit_global_max_in_use),
+        );
+        timings.insert(
+            "verify_window_credit_active_requests_max".to_string(),
+            serde_json::json!(self.credit_active_requests_max),
+        );
+        timings.insert(
+            "verify_window_credit_request_max_held".to_string(),
+            serde_json::json!(self.credit_request_max_held),
+        );
+        timings.insert(
+            "verify_window_credit_queue_max".to_string(),
+            serde_json::json!(self.credit_queue_max),
         );
         timings.insert(
             "verify_window_horizon_refill_attempts".to_string(),
@@ -339,6 +424,8 @@ impl VerifyWindowScheduler {
             in_flight: VecDeque::new(),
             stats: VerifyWindowPipelineStats {
                 depth: config.depth(),
+                credit_limit: config.depth().saturating_sub(1),
+                credit_effective_limit_min: config.depth().saturating_sub(1),
                 bootstrap_probe_depth: if config.depth() >= PIPELINE_BOOTSTRAP_PROBE_DEPTH {
                     PIPELINE_BOOTSTRAP_PROBE_DEPTH
                 } else {
@@ -365,8 +452,10 @@ impl VerifyWindowScheduler {
         self.config.depth()
     }
 
-    pub(super) fn mark_direct_prediction_return(&mut self) {
+    pub(super) fn mark_direct_prediction_return(&mut self, upstream_opened: bool) {
         self.stats.direct_prediction_return = true;
+        self.stats.direct_prediction_return_upstream_opened = upstream_opened;
+        self.stats.direct_prediction_return_reverse_fallback = !upstream_opened;
     }
 
     pub(super) fn observe_pipeline_profile(
@@ -437,10 +526,83 @@ impl VerifyWindowScheduler {
             .saturating_add(appended_tokens);
     }
 
+    pub(super) fn record_unmetered_progress_window(&mut self) {
+        self.stats.credit_unmetered_progress_windows = self
+            .stats
+            .credit_unmetered_progress_windows
+            .saturating_add(1);
+    }
+
+    pub(super) fn record_credit_attempt(
+        &mut self,
+        snapshot: SpeculativeCreditSnapshot,
+        denial: Option<SpeculativeCreditDenial>,
+    ) {
+        self.stats.credit_checks = self.stats.credit_checks.saturating_add(1);
+        self.stats.credit_effective_limit_min = self
+            .stats
+            .credit_effective_limit_min
+            .min(snapshot.effective_limit);
+        self.stats.credit_global_max_in_use = self
+            .stats
+            .credit_global_max_in_use
+            .max(snapshot.global_max_in_use);
+        self.stats.credit_active_requests_max = self
+            .stats
+            .credit_active_requests_max
+            .max(snapshot.active_requests);
+        self.stats.credit_request_max_held = self
+            .stats
+            .credit_request_max_held
+            .max(snapshot.request_held);
+        self.stats.credit_queue_max = self.stats.credit_queue_max.max(snapshot.queued_requests);
+        let Some(denial) = denial else {
+            self.stats.credit_grants = self.stats.credit_grants.saturating_add(1);
+            return;
+        };
+        self.stats.credit_denials = self.stats.credit_denials.saturating_add(1);
+        match denial {
+            SpeculativeCreditDenial::Disabled => {
+                self.stats.credit_disabled_denials =
+                    self.stats.credit_disabled_denials.saturating_add(1);
+            }
+            SpeculativeCreditDenial::PipelineOccupied => {
+                self.stats.credit_pipeline_occupied_denials = self
+                    .stats
+                    .credit_pipeline_occupied_denials
+                    .saturating_add(1);
+            }
+            SpeculativeCreditDenial::FairShare => {
+                self.stats.credit_fair_share_denials =
+                    self.stats.credit_fair_share_denials.saturating_add(1);
+            }
+            SpeculativeCreditDenial::GlobalLimit => {
+                self.stats.credit_global_limit_denials =
+                    self.stats.credit_global_limit_denials.saturating_add(1);
+            }
+            SpeculativeCreditDenial::FairQueue => {
+                self.stats.credit_fair_queue_denials =
+                    self.stats.credit_fair_queue_denials.saturating_add(1);
+            }
+            SpeculativeCreditDenial::LockPoisoned => {
+                self.stats.credit_lock_poisoned_denials =
+                    self.stats.credit_lock_poisoned_denials.saturating_add(1);
+            }
+        }
+    }
+
     pub(super) fn insert_policy_telemetry_attrs(
         &self,
         attrs: &mut BTreeMap<String, serde_json::Value>,
     ) {
+        attrs.insert(
+            attr_key::VERIFY_WINDOW_DIRECT_RETURN_UPSTREAM_OPENED.to_string(),
+            serde_json::json!(self.stats.direct_prediction_return_upstream_opened),
+        );
+        attrs.insert(
+            attr_key::VERIFY_WINDOW_DIRECT_RETURN_REVERSE_FALLBACK.to_string(),
+            serde_json::json!(self.stats.direct_prediction_return_reverse_fallback),
+        );
         attrs.insert(
             "llama_stage.verify_window.bootstrap_probe_depth".to_string(),
             serde_json::json!(self.stats.bootstrap_probe_depth),
@@ -464,6 +626,66 @@ impl VerifyWindowScheduler {
         attrs.insert(
             "llama_stage.verify_window.pipeline_policy_suppressed".to_string(),
             serde_json::json!(self.stats.policy_suppressed),
+        );
+        attrs.insert(
+            attr_key::VERIFY_WINDOW_CREDIT_LIMIT.to_string(),
+            serde_json::json!(self.stats.credit_limit),
+        );
+        attrs.insert(
+            attr_key::VERIFY_WINDOW_CREDIT_EFFECTIVE_LIMIT_MIN.to_string(),
+            serde_json::json!(self.stats.credit_effective_limit_min),
+        );
+        attrs.insert(
+            attr_key::VERIFY_WINDOW_CREDIT_UNMETERED_PROGRESS_WINDOWS.to_string(),
+            serde_json::json!(self.stats.credit_unmetered_progress_windows),
+        );
+        attrs.insert(
+            attr_key::VERIFY_WINDOW_CREDIT_CHECKS.to_string(),
+            serde_json::json!(self.stats.credit_checks),
+        );
+        attrs.insert(
+            attr_key::VERIFY_WINDOW_CREDIT_GRANTS.to_string(),
+            serde_json::json!(self.stats.credit_grants),
+        );
+        attrs.insert(
+            attr_key::VERIFY_WINDOW_CREDIT_SERIAL_FALLBACKS.to_string(),
+            serde_json::json!(self.stats.credit_denials),
+        );
+        attrs.insert(
+            attr_key::VERIFY_WINDOW_CREDIT_PIPELINE_OCCUPIED_DENIALS.to_string(),
+            serde_json::json!(self.stats.credit_pipeline_occupied_denials),
+        );
+        attrs.insert(
+            attr_key::VERIFY_WINDOW_CREDIT_FAIR_SHARE_DENIALS.to_string(),
+            serde_json::json!(self.stats.credit_fair_share_denials),
+        );
+        attrs.insert(
+            attr_key::VERIFY_WINDOW_CREDIT_GLOBAL_LIMIT_DENIALS.to_string(),
+            serde_json::json!(self.stats.credit_global_limit_denials),
+        );
+        attrs.insert(
+            attr_key::VERIFY_WINDOW_CREDIT_FAIR_QUEUE_DENIALS.to_string(),
+            serde_json::json!(self.stats.credit_fair_queue_denials),
+        );
+        attrs.insert(
+            attr_key::VERIFY_WINDOW_CREDIT_LOCK_POISONED_DENIALS.to_string(),
+            serde_json::json!(self.stats.credit_lock_poisoned_denials),
+        );
+        attrs.insert(
+            attr_key::VERIFY_WINDOW_CREDIT_GLOBAL_MAX_IN_USE.to_string(),
+            serde_json::json!(self.stats.credit_global_max_in_use),
+        );
+        attrs.insert(
+            attr_key::VERIFY_WINDOW_CREDIT_ACTIVE_REQUESTS_MAX.to_string(),
+            serde_json::json!(self.stats.credit_active_requests_max),
+        );
+        attrs.insert(
+            attr_key::VERIFY_WINDOW_CREDIT_REQUEST_MAX_HELD.to_string(),
+            serde_json::json!(self.stats.credit_request_max_held),
+        );
+        attrs.insert(
+            attr_key::VERIFY_WINDOW_CREDIT_QUEUE_MAX.to_string(),
+            serde_json::json!(self.stats.credit_queue_max),
         );
         attrs.insert(
             "llama_stage.verify_window.horizon_refill_attempts".to_string(),
@@ -641,6 +863,28 @@ impl VerifyWindowScheduler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn records_preferred_and_reverse_direct_return_paths() {
+        let mut preferred = VerifyWindowScheduler::new(VerifyWindowPipelineConfig { depth: 2 });
+        preferred.mark_direct_prediction_return(true);
+        assert!(preferred.stats().direct_prediction_return);
+        assert!(preferred.stats().direct_prediction_return_upstream_opened);
+        assert!(!preferred.stats().direct_prediction_return_reverse_fallback);
+
+        let mut reverse = VerifyWindowScheduler::new(VerifyWindowPipelineConfig { depth: 2 });
+        reverse.mark_direct_prediction_return(false);
+        let mut timings = BTreeMap::new();
+        reverse.stats().insert_response_timings(&mut timings);
+        assert_eq!(
+            timings["verify_window_direct_prediction_return_reverse_fallback"],
+            true
+        );
+        assert_eq!(
+            timings["verify_window_direct_prediction_return_upstream_opened"],
+            false
+        );
+    }
 
     #[test]
     fn bounds_depth_and_requires_fifo_reply_ids() {
@@ -877,5 +1121,45 @@ mod tests {
 
         assert_eq!(scheduler.complete_next(first.id).unwrap(), first);
         assert_eq!(scheduler.complete_next(second.id).unwrap(), second);
+    }
+
+    #[test]
+    fn credit_backpressure_is_exposed_without_request_identity() {
+        let mut scheduler = VerifyWindowScheduler::new(VerifyWindowPipelineConfig { depth: 4 });
+        scheduler.record_unmetered_progress_window();
+        let snapshot = SpeculativeCreditSnapshot {
+            global_limit: 3,
+            effective_limit: 2,
+            global_in_use: 2,
+            global_max_in_use: 2,
+            active_requests: 2,
+            request_held: 1,
+            request_fair_share: 2,
+            queued_requests: 1,
+        };
+        scheduler.record_credit_attempt(snapshot, None);
+        scheduler.record_credit_attempt(snapshot, Some(SpeculativeCreditDenial::GlobalLimit));
+
+        let mut timings = BTreeMap::new();
+        scheduler.stats().insert_response_timings(&mut timings);
+        assert_eq!(timings["verify_window_credit_limit"], 3);
+        assert_eq!(timings["verify_window_credit_effective_limit_min"], 2);
+        assert_eq!(timings["verify_window_credit_checks"], 2);
+        assert_eq!(timings["verify_window_credit_grants"], 1);
+        assert_eq!(timings["verify_window_credit_serial_fallbacks"], 1);
+        assert_eq!(timings["verify_window_credit_global_limit_denials"], 1);
+        assert_eq!(timings["verify_window_credit_global_max_in_use"], 2);
+        assert_eq!(timings["verify_window_credit_active_requests_max"], 2);
+        assert_eq!(timings["verify_window_credit_request_max_held"], 1);
+        assert_eq!(timings["verify_window_credit_queue_max"], 1);
+
+        let mut attrs = BTreeMap::new();
+        scheduler.insert_policy_telemetry_attrs(&mut attrs);
+        assert_eq!(attrs[attr_key::VERIFY_WINDOW_CREDIT_LIMIT], 3);
+        assert_eq!(attrs[attr_key::VERIFY_WINDOW_CREDIT_CHECKS], 2);
+        assert_eq!(attrs[attr_key::VERIFY_WINDOW_CREDIT_GRANTS], 1);
+        assert_eq!(attrs[attr_key::VERIFY_WINDOW_CREDIT_SERIAL_FALLBACKS], 1);
+        assert_eq!(attrs[attr_key::VERIFY_WINDOW_CREDIT_QUEUE_MAX], 1);
+        assert!(!attrs.keys().any(|key| key.contains("request_id")));
     }
 }

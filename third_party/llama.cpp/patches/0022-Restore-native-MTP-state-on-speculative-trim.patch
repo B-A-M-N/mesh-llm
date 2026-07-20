@@ -1,0 +1,149 @@
+From 4f4db51df45c589839107a8284e655f66a069390 Mon Sep 17 00:00:00 2001
+From: Mesh-LLM CI <ci@mesh-llm.local>
+Date: Tue, 21 Jul 2026 15:42:00 +1000
+Subject: [PATCH] Restore native MTP state on speculative trim
+
+Protocol-v9 speculative retirement can trim a stage session to an earlier
+authoritative token position. Clearing the whole native MTP sidecar in that
+path throws away valid prefix state, so later native drafts are generated
+from an incompletely re-primed context and acceptance collapses.
+
+Keep a bounded per-session ring of the small MTP host-side state keyed by
+authoritative token position. On trim, remove only the speculative sidecar
+KV suffix and restore the matching checkpoint. If the position is no longer
+in the bounded ring, retain the conservative full-clear fallback.
+---
+ src/skippy.cpp | 69 ++++++++++++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 68 insertions(+), 1 deletion(-)
+
+diff --git a/src/skippy.cpp b/src/skippy.cpp
+index 7f561a8d..a1a7b708 100644
+--- a/src/skippy.cpp
++++ b/src/skippy.cpp
+@@ -23,6 +23,7 @@
+ #include <cstdint>
+ #include <cstdlib>
+ #include <cstring>
++#include <deque>
+ #include <exception>
+ #include <fstream>
+ #include <cstdio>
+@@ -55,6 +56,13 @@ struct skippy_model {
+     std::vector<std::vector<llama_token>> lane_resident_prefix_tokens;
+ };
+ 
++struct skippy_mtp_checkpoint {
++    int32_t token_count = 0;
++    bool prefix_valid = false;
++    bool has_pending_h = false;
++    std::vector<float> pending_h;
++};
++
+ struct skippy_session {
+     skippy_model * stage_model = nullptr;
+     llama_context * ctx = nullptr;
+@@ -80,6 +88,7 @@ struct skippy_session {
+     bool mtp_has_pending_draft = false;
+     llama_pos mtp_pending_draft_pos = 0;
+     llama_token mtp_pending_draft_token = -1;
++    std::deque<skippy_mtp_checkpoint> mtp_checkpoints;
+ };
+ 
+ struct skippy_tensor_meta {
+@@ -1317,6 +1326,26 @@ static bool skippy_mtp_greedy_sampling_fastpath_enabled() {
+     return skippy_env_enabled("SKIPPY_NATIVE_MTP_GREEDY_SAMPLING_FASTPATH");
+ }
+ 
++static constexpr size_t SKIPPY_MTP_CHECKPOINT_LIMIT = 64;
++
++static void skippy_mtp_checkpoint_session_state(skippy_session * session, int32_t token_count) {
++    if (!skippy_mtp_available(session)) {
++        return;
++    }
++    while (!session->mtp_checkpoints.empty() && session->mtp_checkpoints.back().token_count >= token_count) {
++        session->mtp_checkpoints.pop_back();
++    }
++    session->mtp_checkpoints.push_back({
++        token_count,
++        session->mtp_prefix_valid,
++        session->mtp_has_pending_h,
++        session->mtp_pending_h,
++    });
++    while (session->mtp_checkpoints.size() > SKIPPY_MTP_CHECKPOINT_LIMIT) {
++        session->mtp_checkpoints.pop_front();
++    }
++}
++
+ static void skippy_mtp_clear_session_state(skippy_session * session) {
+     if (session == nullptr) {
+         return;
+@@ -1328,6 +1357,7 @@ static void skippy_mtp_clear_session_state(skippy_session * session) {
+     session->mtp_has_pending_draft = false;
+     session->mtp_pending_draft_pos = 0;
+     session->mtp_pending_draft_token = -1;
++    session->mtp_checkpoints.clear();
+     if (skippy_mtp_available(session)) {
+         if (llama_memory_t memory = session->stage_model->mtp_ctx->get_memory()) {
+             llama_memory_seq_rm(memory, session->seq_id, -1, -1);
+@@ -1335,6 +1365,39 @@ static void skippy_mtp_clear_session_state(skippy_session * session) {
+     }
+ }
+ 
++static bool skippy_mtp_restore_session_checkpoint(skippy_session * session, int32_t token_count) {
++    if (!skippy_mtp_available(session)) {
++        return false;
++    }
++    const auto checkpoint_it = std::find_if(
++            session->mtp_checkpoints.rbegin(),
++            session->mtp_checkpoints.rend(),
++            [token_count](const skippy_mtp_checkpoint & checkpoint) {
++                return checkpoint.token_count == token_count;
++            });
++    if (checkpoint_it == session->mtp_checkpoints.rend()) {
++        return false;
++    }
++    const skippy_mtp_checkpoint checkpoint = *checkpoint_it;
++    session->stage_model->mtp_ctx->synchronize();
++    if (llama_memory_t memory = session->stage_model->mtp_ctx->get_memory()) {
++        if (!llama_memory_seq_rm(memory, session->seq_id, token_count, -1)) {
++            return false;
++        }
++    }
++    session->mtp_next_pos = token_count;
++    session->mtp_prefix_valid = checkpoint.prefix_valid;
++    session->mtp_has_pending_h = checkpoint.has_pending_h;
++    session->mtp_pending_h = checkpoint.pending_h;
++    session->mtp_has_pending_draft = false;
++    session->mtp_pending_draft_pos = 0;
++    session->mtp_pending_draft_token = -1;
++    while (!session->mtp_checkpoints.empty() && session->mtp_checkpoints.back().token_count > token_count) {
++        session->mtp_checkpoints.pop_back();
++    }
++    return true;
++}
++
+ static enum skippy_status skippy_mtp_sync_target_tokens(
+         skippy_session * session,
+         const llama_token * token_ids,
+@@ -1357,6 +1420,7 @@ static enum skippy_status skippy_mtp_sync_target_tokens(
+         session->mtp_pending_h.assign(static_cast<size_t>(n_embd), 0.0f);
+         session->mtp_has_pending_h = false;
+     }
++    skippy_mtp_checkpoint_session_state(session, token_start);
+ 
+     if (!session->mtp_prefix_valid && !session->mtp_has_pending_h) {
+         const float * h_last = llama_get_embeddings_nextn_ith(session->ctx, static_cast<int32_t>(token_count - 1));
+@@ -4706,7 +4770,9 @@ enum skippy_status skippy_trim_session(
+     if (session->signal_history.size() > token_count) {
+         session->signal_history.resize(static_cast<size_t>(token_count));
+     }
+-    skippy_mtp_clear_session_state(session);
++    if (!skippy_mtp_restore_session_checkpoint(session, static_cast<int32_t>(token_count))) {
++        skippy_mtp_clear_session_state(session);
++    }
+     session->ctx->synchronize();
+ 
+     return skippy_success(out_error);
+-- 
+2.54.0 (Apple Git-157)
+

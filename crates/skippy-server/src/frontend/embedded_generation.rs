@@ -3,55 +3,42 @@ use std::collections::VecDeque;
 mod lifecycle;
 
 use super::*;
-use crate::binary_transport::AsyncForwarder;
-use crate::binary_transport::BinaryStageExecutionOptions;
-use crate::binary_transport::forwarded_stage_message;
-use crate::binary_transport::forwarded_stage_message_timed;
-use crate::binary_transport::run_binary_stage_message;
-use crate::binary_transport::write_stage_message_conditioned;
-use crate::frontend::NativeMtpDecodeCounters;
-use crate::frontend::NativeMtpDecodeOptions;
-use crate::frontend::NativeMtpDraft;
-use crate::frontend::NativeMtpDraftOrigin;
-use crate::frontend::NativeMtpVerifier;
-use crate::frontend::generation::EmbeddedStageZeroGeneration;
-use crate::frontend::generation::GenerationCacheStats;
-use crate::frontend::generation::PhaseTimer;
-use crate::frontend::generation::StageOpenAiBackend;
-use crate::frontend::generation::TokenControl;
-use crate::frontend::generation::attrs_insert_prefill_chunk_policy;
-use crate::frontend::generation::decode_token_phase;
-use crate::frontend::prefill::PrefillChunkObservation;
-use crate::frontend::prefill::drain_embedded_prefill_replies;
-use crate::frontend::prefill::drain_one_embedded_prefill_reply;
+use crate::binary_transport::{
+    AsyncForwarder, BinaryStageExecutionOptions, forwarded_stage_message,
+    forwarded_stage_message_timed, run_binary_stage_message, write_stage_message_conditioned,
+};
 use crate::frontend::request::wire_sampling_config;
-use crate::frontend::speculative::OpenAiSpeculativeStats;
-use crate::frontend::speculative::classify_verify_window;
-use crate::frontend::speculative::verify_inputs_for_proposals;
-use crate::frontend::util::ms_to_us;
-use crate::frontend::util::openai_backend_error;
-use crate::frontend::util::openai_io_error;
-use crate::frontend::util::saturating_u32;
-use crate::frontend::util::token_is_eog_with_runtime;
-use crate::frontend::wire_messages::OpenAiPrefillChunk;
-use crate::frontend::wire_messages::ReusableDecodeMessage;
-use crate::frontend::wire_messages::ReusableDecodeMessageArgs;
-use crate::frontend::wire_messages::VerifyWindowMessageArgs;
-use crate::frontend::wire_messages::embedded_prefill_message;
-use crate::frontend::wire_messages::embedded_verify_window_message;
-use crate::frontend::wire_messages::generation_config_message;
+use crate::frontend::speculative::{
+    OpenAiSpeculativeStats, classify_verify_window, verify_inputs_for_proposals,
+};
+use crate::frontend::speculative_credits::SpeculativeCreditDenial;
+use crate::frontend::util::{
+    ms_to_us, openai_backend_error, openai_io_error, saturating_u32, token_is_eog_with_runtime,
+};
+use crate::frontend::wire_messages::{
+    OpenAiPrefillChunk, ReusableDecodeMessage, ReusableDecodeMessageArgs, VerifyWindowMessageArgs,
+    embedded_prefill_message, embedded_verify_window_message, generation_config_message,
+};
+use crate::frontend::{
+    NativeMtpDecodeCounters, NativeMtpDecodeOptions, NativeMtpDraft, NativeMtpDraftOrigin,
+    NativeMtpVerifier,
+    generation::{
+        EmbeddedStageZeroGeneration, GenerationCacheStats, PhaseTimer, StageOpenAiBackend,
+        TokenControl, attrs_insert_prefill_chunk_policy, decode_token_phase,
+    },
+    prefill::{
+        PrefillChunkObservation, drain_embedded_prefill_replies, drain_one_embedded_prefill_reply,
+    },
+};
 use crate::telemetry::now_unix_nanos;
 use lifecycle::{
-    EmbeddedDecodeSummary, PipelinedCompositeWindow, can_seed_pipeline,
-    decode_uses_context_sideband, mark_epoch_stale, queued_active_tokens,
-    refill_pipeline_ngram_candidates,
+    DirectPredictionReturnPath, EmbeddedDecodeSummary, PipelinedCompositeWindow, can_seed_pipeline,
+    decode_uses_context_sideband, direct_prediction_return_path, mark_epoch_stale,
+    queued_active_tokens, refill_pipeline_ngram_candidates,
 };
-use openai_frontend::OpenAiError;
-use openai_frontend::OpenAiResult;
+use openai_frontend::{OpenAiError, OpenAiResult};
 use serde_json::json;
-use skippy_protocol::binary::StageReplyStats;
-use skippy_protocol::binary::WireReplyKind;
-use skippy_protocol::binary::recv_reply;
+use skippy_protocol::binary::{StageReplyStats, WireReplyKind, recv_reply};
 
 impl StageOpenAiBackend {
     pub(super) fn generate_embedded_stage_zero_tokens(
@@ -131,9 +118,27 @@ impl StageOpenAiBackend {
             if prefill_token_count > 0 {
                 let prefill_tokens = &request.prompt_token_ids[..prefill_token_count];
                 if self.kv.is_some() {
-                    cache_stats.status = "miss";
+                    cache_stats.status = if request.native_mtp_enabled {
+                        "bypass_native_mtp"
+                    } else {
+                        "miss"
+                    };
                 }
-                if request.max_tokens > 0 && request.draft.is_none() {
+                let prefix_restore_allowed = !request.native_mtp_enabled;
+                if !prefix_restore_allowed && self.kv.is_some() {
+                    let mut attrs = self.openai_attrs(request.ids);
+                    attrs.insert(
+                        "skippy.kv.decision".to_string(),
+                        json!("bypass_native_mtp_sidecar"),
+                    );
+                    attrs.insert(
+                        "skippy.kv.prompt_token_count".to_string(),
+                        json!(prefill_token_count),
+                    );
+                    self.telemetry
+                        .emit("stage.openai_kv_lookup_decision", attrs);
+                }
+                if prefix_restore_allowed && request.max_tokens > 0 && request.draft.is_none() {
                     let current = *request
                         .prompt_token_ids
                         .last()
@@ -194,16 +199,17 @@ impl StageOpenAiBackend {
                         fused_first_decode = Some(fused);
                     }
                 }
-                let split_prefill_restore = if prefill_chain_cache_restored {
-                    None
-                } else {
-                    self.try_restore_embedded_split_prefill(
-                        &request,
-                        &session_key,
-                        downstream,
-                        prefill_tokens,
-                    )?
-                };
+                let split_prefill_restore =
+                    if prefill_chain_cache_restored || !prefix_restore_allowed {
+                        None
+                    } else {
+                        self.try_restore_embedded_split_prefill(
+                            &request,
+                            &session_key,
+                            downstream,
+                            prefill_tokens,
+                        )?
+                    };
                 if let Some(restore) = split_prefill_restore {
                     prefill_chain_restored_tokens = restore.restored_tokens;
                     prefill_chain_cache_restored =
@@ -256,13 +262,17 @@ impl StageOpenAiBackend {
                     )?;
                     let stage0_timer = PhaseTimer::start();
                     let pending_prefill_replies_before = pending_prefill_replies;
-                    let mut output = self.restore_embedded_stage0_prefill(
-                        &session_key,
-                        request.ids,
-                        pos_start as u64,
-                        chunk,
-                        request.activation_width,
-                    )?;
+                    let mut output = if prefix_restore_allowed {
+                        self.restore_embedded_stage0_prefill(
+                            &session_key,
+                            request.ids,
+                            pos_start as u64,
+                            chunk,
+                            request.activation_width,
+                        )?
+                    } else {
+                        None
+                    };
                     if output.is_some() {
                         prefill_stage0_cache_hits += 1;
                     } else {
@@ -271,6 +281,14 @@ impl StageOpenAiBackend {
                     let output = match output.take() {
                         Some(output) => output,
                         None => {
+                            self.evict_embedded_stage0_resident_prefix(
+                                &session_key,
+                                request.ids,
+                                Some(
+                                    u64::try_from(prefill_tokens.len().saturating_sub(pos_start))
+                                        .unwrap_or(u64::MAX),
+                                ),
+                            )?;
                             let lock_timer = PhaseTimer::start();
                             let mut runtime = self
                                 .runtime
@@ -654,6 +672,9 @@ impl StageOpenAiBackend {
                     reply.kind
                 )));
             }
+            if prefill_chain_cache_restored {
+                self.evict_embedded_stage0_resident_prefix(&session_key, request.ids, None)?;
+            }
 
             let decode_timer = PhaseTimer::start();
             let mut decoded_tokens = 0usize;
@@ -896,23 +917,26 @@ impl StageOpenAiBackend {
                 (request.native_mtp_enabled || composite_sidecar_enabled) && draft_guard.is_none();
             let pipelined_decode_enabled =
                 composite_sidecar_enabled && verify_window_scheduler.depth() > 1;
-            let mut verify_window_forwarder = pipelined_decode_enabled
-                .then(|| {
-                    AsyncForwarder::new(
-                        &*downstream,
-                        self.telemetry.clone(),
-                        verify_window_scheduler.depth(),
-                    )
-                })
-                .transpose()
-                .map_err(openai_backend_error)?;
-            if native_mtp_verify_windows_enabled && !direct_prediction_return_opened {
-                return Err(OpenAiError::backend(
-                    "native MTP verify windows require direct prediction return",
+            // Allocate pipeline-only resources only after N-gram earns
+            // admission. Non-draftable requests must remain on the native-MTP
+            // path without spawning a writer thread or entering the global
+            // fairness pool.
+            let mut speculative_credit_request = None;
+            let mut pipeline_occupied_fallback_recorded = false;
+            let mut verify_window_forwarder = None;
+            if let Some(direct_return_path) = direct_prediction_return_path(
+                native_mtp_verify_windows_enabled,
+                request.prediction_return.is_some(),
+                direct_prediction_return_opened,
+            )? {
+                // The final stage first consumes the upstream-opened sink, then
+                // falls back to opening the v9 direct-return stream back to the
+                // registered stage-0 receiver. A transient failure opening the
+                // preferred sink must not fail an otherwise healthy request.
+                verify_window_scheduler.mark_direct_prediction_return(matches!(
+                    direct_return_path,
+                    DirectPredictionReturnPath::UpstreamOpened
                 ));
-            }
-            if native_mtp_verify_windows_enabled {
-                verify_window_scheduler.mark_direct_prediction_return();
             }
             let mut pipelined_windows = VecDeque::new();
             let mut pipelined = None;
@@ -935,10 +959,45 @@ impl StageOpenAiBackend {
                     break;
                 }
                 let token_timer = PhaseTimer::start();
+                let active_generation_requests = self
+                    .generation_queue_limit
+                    .saturating_sub(self.generation_limit.available_permits())
+                    .max(1);
+                let credit_capacity = self
+                    .speculative_credits
+                    .capacity_snapshot(active_generation_requests);
+                // A profitable positional pipeline needs at least two
+                // dependent positions per live generation. A smaller rotating
+                // budget serializes N-gram tail verification and competes with
+                // useful native MTP work, so fall back until load drops again.
+                let optional_pipeline_capacity_available =
+                    credit_capacity.effective_limit >= active_generation_requests.saturating_mul(2);
+                if composite_sidecar_enabled
+                    && !optional_pipeline_capacity_available
+                    && !pipeline_occupied_fallback_recorded
+                {
+                    verify_window_scheduler.record_credit_attempt(
+                        credit_capacity,
+                        Some(SpeculativeCreditDenial::PipelineOccupied),
+                    );
+                    pipeline_occupied_fallback_recorded = true;
+                }
+                let effective_native_mtp_options = if optional_pipeline_capacity_available {
+                    native_mtp_options
+                } else {
+                    native_mtp_options.without_ngram()
+                };
+                if !optional_pipeline_capacity_available {
+                    composite_proposal_buffer = None;
+                    if pipelined_windows.is_empty() {
+                        pipelined = None;
+                    }
+                }
                 let native_mtp_remaining =
                     (request.max_tokens as usize).saturating_sub(decoded_tokens);
                 let mut pipeline_seed = None;
                 if pipelined_decode_enabled
+                    && optional_pipeline_capacity_available
                     && pipelined.is_none()
                     && can_seed_pipeline(&pipelined_windows)
                 {
@@ -970,35 +1029,30 @@ impl StageOpenAiBackend {
                             native_mtp_tokens,
                             &context_tokens,
                             native_mtp_remaining,
-                            ngram_sidecar_controller.extension_limit(
-                                native_mtp_tokens,
-                                native_mtp_remaining.saturating_sub(native_mtp_tokens.len()),
+                            NgramExtensionPolicy::new(
+                                ngram_sidecar_controller.extension_limit(
+                                    native_mtp_tokens,
+                                    native_mtp_remaining.saturating_sub(native_mtp_tokens.len()),
+                                ),
+                                ngram_sidecar_controller.minimum_support(),
+                                request.prompt_token_ids.len(),
                             ),
                             cached_ngram_proposer.as_mut(),
                         )?;
-                    match proposal.parallel_verify_width(
-                        adaptive_verify_window.width(proposal.tokens().len()),
-                        verify_window_scheduler.depth(),
-                    ) {
-                        Some(parallel_verify_width)
-                            if verify_window_scheduler
-                                .permit_pipeline_width(parallel_verify_width) =>
-                        {
-                            pipeline_seed = Some((
-                                proposal,
-                                if native_mtp_tokens.is_empty() {
-                                    None
-                                } else {
-                                    native_mtp_origin
-                                },
-                                parallel_verify_width,
-                            ));
-                        }
-                        _ => {
-                            if let Some(pending) = pending {
-                                native_mtp.restore_pending_draft(pending);
-                            }
-                        }
+                    if proposal.supports_positional_pipeline(verify_window_scheduler.depth())
+                        && ngram_sidecar_controller.permit_pipeline_start()
+                        && verify_window_scheduler.permit_pipeline_width(1)
+                    {
+                        pipeline_seed = Some((
+                            proposal,
+                            if native_mtp_tokens.is_empty() {
+                                None
+                            } else {
+                                native_mtp_origin
+                            },
+                        ));
+                    } else if let Some(pending) = pending {
+                        native_mtp.restore_pending_draft(pending);
                     }
                 }
                 if native_mtp_verify_windows_enabled
@@ -1021,7 +1075,7 @@ impl StageOpenAiBackend {
                         session_id,
                         prefill_token_count,
                         &wire_sampling,
-                        &native_mtp_options,
+                        &effective_native_mtp_options,
                         &mut verify_window_scheduler,
                         pending_native_mtp_draft,
                         &mut composite_proposal_buffer,
@@ -1056,19 +1110,33 @@ impl StageOpenAiBackend {
                     }
                 }
                 if pipelined_decode_enabled {
-                    if let Some((proposal, origin, parallel_verify_width)) = pipeline_seed {
+                    if let Some((proposal, origin)) = pipeline_seed {
+                        if verify_window_forwarder.is_none() {
+                            verify_window_forwarder = Some(
+                                AsyncForwarder::new(
+                                    &*downstream,
+                                    self.telemetry.clone(),
+                                    verify_window_scheduler.depth(),
+                                )
+                                .map_err(openai_backend_error)?,
+                            );
+                        }
+                        if speculative_credit_request.is_none() {
+                            speculative_credit_request =
+                                Some(self.speculative_credits.register(request_id));
+                        }
                         pipeline_epoch = pipeline_epoch.checked_add(1).ok_or_else(|| {
                             OpenAiError::backend("verify window pipeline epoch overflow")
                         })?;
                         pipelined_current = current;
-                        pipelined = Some(CompositeProposalPipeline::new(
-                            proposal,
-                            origin,
-                            parallel_verify_width,
-                        ));
+                        pipelined = Some(CompositeProposalPipeline::new(proposal, origin));
                     }
                     if let Some(pipeline) = pipelined.as_mut() {
+                        let pipeline_in_flight_limit = ngram_sidecar_controller
+                            .pipeline_in_flight_limit(verify_window_scheduler.depth());
                         while verify_window_scheduler.has_capacity()
+                            && optional_pipeline_capacity_available
+                            && verify_window_scheduler.in_flight_len() < pipeline_in_flight_limit
                             && decoded_tokens + queued_active_tokens(&pipelined_windows)
                                 < request.max_tokens as usize
                         {
@@ -1076,11 +1144,16 @@ impl StageOpenAiBackend {
                                 .width(pipeline.candidate_len())
                                 .saturating_add(1);
                             if pipeline.candidate_len() < refill_threshold {
-                                let refill_budget =
+                                let available_refill_tokens =
                                     native_mtp_options.ngram_max_proposal_tokens.min(
                                         native_mtp_remaining
                                             .saturating_sub(pipeline.optimistic_suffix().len()),
                                     );
+                                let refill_budget = if optional_pipeline_capacity_available {
+                                    ngram_sidecar_controller.refill_limit(available_refill_tokens)
+                                } else {
+                                    0
+                                };
                                 let appended = refill_pipeline_ngram_candidates(
                                     pipeline,
                                     &context_tokens,
@@ -1089,22 +1162,36 @@ impl StageOpenAiBackend {
                                 )?;
                                 verify_window_scheduler.record_horizon_refill(appended);
                             }
-                            let Some(planned) = pipeline.next_window(
-                                adaptive_verify_window.width(pipeline.candidate_len()),
-                            ) else {
+                            if !pipeline.has_remaining_candidates() {
+                                break;
+                            }
+                            let speculative_credit = if verify_window_scheduler.in_flight_len() == 0
+                            {
+                                verify_window_scheduler.record_unmetered_progress_window();
+                                None
+                            } else {
+                                let attempt = speculative_credit_request
+                                    .as_ref()
+                                    .expect("pipelined decode registered speculative credits")
+                                    .try_acquire(active_generation_requests);
+                                verify_window_scheduler
+                                    .record_credit_attempt(attempt.snapshot, attempt.denial);
+                                let Some(credit) = attempt.credit else {
+                                    break;
+                                };
+                                Some(credit)
+                            };
+                            let Some(planned) = pipeline.next_window() else {
                                 break;
                             };
-                            let proposal_tokens = planned.proposal_tokens().to_vec();
-                            let expected_free_target = planned.expected_free_target();
+                            let proposal_token = planned.proposal_token();
                             let native_mtp_token_count = planned.native_mtp_token_count();
                             let offset = queued_active_tokens(&pipelined_windows);
                             let window = verify_window_scheduler.open(
                                 prefill_token_count + decoded_tokens + offset,
                                 decoded_tokens + offset,
                             )?;
-                            let mut input_tokens = Vec::with_capacity(proposal_tokens.len() + 1);
-                            input_tokens.push(pipelined_current);
-                            input_tokens.extend_from_slice(&proposal_tokens);
+                            let input_tokens = vec![pipelined_current];
                             let message = embedded_verify_window_message(
                                 request.wire_dtype,
                                 VerifyWindowMessageArgs {
@@ -1131,15 +1218,12 @@ impl StageOpenAiBackend {
                                 stale: false,
                                 window,
                                 input_tokens,
-                                proposal_tokens,
-                                expected_free_target,
+                                proposal_token,
                                 native_mtp_token_count,
+                                _speculative_credit: speculative_credit,
                                 dispatched,
                             });
-                            let Some(next_current) = expected_free_target else {
-                                break;
-                            };
-                            pipelined_current = next_current;
+                            pipelined_current = proposal_token;
                         }
                     }
                     if let Some(window) = pipelined_windows.pop_front() {
@@ -1188,45 +1272,26 @@ impl StageOpenAiBackend {
                                 "active verify window has no matching proposal epoch",
                             ));
                         }
-                        let native_mtp_verify_decision = classify_native_mtp_verify_window(
-                            &window.proposal_tokens,
+                        let native_mtp_verify_decision = classify_native_mtp_position(
+                            window.proposal_token,
                             &verify.reply.predicted_tokens,
-                            decoded_tokens,
-                            request.max_tokens as usize,
-                            |token| token_is_eog_with_runtime(&self.runtime, token),
                         )?;
                         let fully_accepted_window = !native_mtp_verify_decision.rejected
-                            && native_mtp_verify_decision.accepted_proposal_tokens
-                                == window.proposal_tokens.len();
-                        let free_target_matches =
-                            window.expected_free_target.is_none_or(|expected| {
-                                verify
-                                    .reply
-                                    .predicted_tokens
-                                    .get(window.proposal_tokens.len())
-                                    == Some(&expected)
-                            });
-                        let pipeline_continues = fully_accepted_window && free_target_matches;
-                        if window.expected_free_target.is_some() {
-                            verify_window_scheduler.observe_pipeline_profile(
-                                window.proposal_tokens.len(),
-                                pipeline_continues,
-                                verify.stats.stage0_compute_ms,
-                                verify.stats.forward_write_ms,
-                                verify.elapsed_ms,
-                            );
-                        }
-                        let accepted_candidate_tokens = native_mtp_verify_decision
-                            .accepted_proposal_tokens
-                            + usize::from(
-                                fully_accepted_window
-                                    && window.expected_free_target.is_some()
-                                    && free_target_matches,
-                            );
+                            && native_mtp_verify_decision.accepted_proposal_tokens == 1;
+                        let pipeline_continues = fully_accepted_window;
+                        verify_window_scheduler.observe_pipeline_profile(
+                            1,
+                            pipeline_continues,
+                            verify.stats.stage0_compute_ms,
+                            verify.stats.forward_write_ms,
+                            verify.elapsed_ms,
+                        );
+                        let accepted_candidate_tokens =
+                            native_mtp_verify_decision.accepted_proposal_tokens;
                         if window.native_mtp_token_count > 0 {
                             let pipeline = pipelined.as_ref().expect("pipeline retained");
                             let span = native_mtp.observe_taken_draft_span(
-                                &window.proposal_tokens[..window.native_mtp_token_count],
+                                std::slice::from_ref(&window.proposal_token),
                                 &verify.reply.predicted_tokens,
                                 ms_to_us(verify.elapsed_ms),
                             );
@@ -1238,7 +1303,7 @@ impl StageOpenAiBackend {
                             }
                         }
                         speculative_stats.windows += 1;
-                        speculative_stats.draft_tokens += window.proposal_tokens.len();
+                        speculative_stats.draft_tokens += 1;
                         speculative_stats.primary_verify_requests += 1;
                         speculative_stats.primary_verify_tokens += window.input_tokens.len();
                         speculative_stats.primary_verify_elapsed_ms += verify.elapsed_ms;
@@ -1321,7 +1386,7 @@ impl StageOpenAiBackend {
                         let previous_verify_width = adaptive_verify_window.current_tokens();
                         adaptive_verify_window.observe(pipeline_continues);
                         native_mtp_counters.observe_adaptive_verify_window(
-                            window.proposal_tokens.len(),
+                            1,
                             previous_verify_width,
                             adaptive_verify_window.current_tokens(),
                         );
@@ -1883,6 +1948,14 @@ impl StageOpenAiBackend {
                     .observe_hybrid_proposal(pipeline.proposal(), pipeline.accepted_tokens());
                 native_mtp.clear_pending_draft();
             }
+            let mut ngram_admission_stats = ngram_sidecar_controller.stats();
+            ngram_admission_stats.low_support_suppressions = cached_ngram_proposer
+                .as_ref()
+                .map_or(0, CachedNgramProposer::low_support_suppression_count);
+            native_mtp_counters.observe_ngram_admission(
+                ngram_admission_stats,
+                ngram_sidecar_controller.is_active(),
+            );
             let native_mtp_stats = native_mtp.stats();
             self.record_embedded_decode_summary(
                 &request,

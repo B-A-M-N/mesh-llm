@@ -265,8 +265,11 @@ pub(super) struct OpenAiSpeculativeStats {
 /// Request-local, cache-based N-gram proposer. It mirrors only committed
 /// history into native state; speculative candidates remain read-only inputs.
 pub(super) struct CachedNgramProposer {
-    cache: skippy_runtime::NgramCache,
+    cache: Option<skippy_runtime::NgramCache>,
     committed_history: Vec<i32>,
+    ngram_min: usize,
+    ngram_max: usize,
+    low_support_suppression_count: usize,
 }
 
 impl CachedNgramProposer {
@@ -278,11 +281,20 @@ impl CachedNgramProposer {
     }
 
     pub(super) fn new(ngram_min: usize, ngram_max: usize) -> OpenAiResult<Self> {
-        let cache =
-            skippy_runtime::NgramCache::new(ngram_min, ngram_max).map_err(openai_backend_error)?;
+        if ngram_min == 0
+            || ngram_min > ngram_max
+            || ngram_max > skippy_runtime::NGRAM_CACHE_MAX_NGRAM
+        {
+            return Err(OpenAiError::backend(
+                "cache N-gram proposer requires 0 < ngram_min <= ngram_max <= 4",
+            ));
+        }
         Ok(Self {
-            cache,
+            cache: None,
             committed_history: Vec::new(),
+            ngram_min,
+            ngram_max,
+            low_support_suppression_count: 0,
         })
     }
 
@@ -292,22 +304,153 @@ impl CachedNgramProposer {
         continuation_prefix: &[i32],
         max_proposed_tokens: usize,
     ) -> OpenAiResult<Vec<i32>> {
+        self.propose_with_minimum_support(
+            committed_history,
+            continuation_prefix,
+            max_proposed_tokens,
+            0,
+            0,
+        )
+    }
+
+    pub(super) fn propose_with_minimum_support(
+        &mut self,
+        committed_history: &[i32],
+        continuation_prefix: &[i32],
+        max_proposed_tokens: usize,
+        minimum_support: usize,
+        support_history_start: usize,
+    ) -> OpenAiResult<Vec<i32>> {
+        // Probation must be effectively free on non-repetitive output. Avoid
+        // crossing the native cache boundary until the committed target
+        // history contains at least one usable occurrence of the current
+        // N-gram anchor. A later call syncs all skipped committed tokens in one
+        // append, so this changes neither cache contents nor correctness.
+        if minimum_support > 0
+            && !self.has_candidate_anchor(
+                committed_history,
+                continuation_prefix,
+                support_history_start,
+            )
+        {
+            self.low_support_suppression_count =
+                self.low_support_suppression_count.saturating_add(1);
+            return Ok(Vec::new());
+        }
         self.sync(committed_history)?;
-        self.cache
+        let proposal = self
+            .cache
+            .as_mut()
+            .expect("N-gram cache initialized by sync")
             .draft_after(continuation_prefix, max_proposed_tokens)
-            .map_err(openai_backend_error)
+            .map_err(openai_backend_error)?;
+        if minimum_support == 0
+            || proposal.is_empty()
+            || self.has_consistent_support(
+                continuation_prefix,
+                &proposal,
+                minimum_support,
+                support_history_start,
+            )
+        {
+            return Ok(proposal);
+        }
+        self.low_support_suppression_count = self.low_support_suppression_count.saturating_add(1);
+        Ok(Vec::new())
+    }
+
+    pub(super) fn low_support_suppression_count(&self) -> usize {
+        self.low_support_suppression_count
+    }
+
+    fn has_consistent_support(
+        &self,
+        continuation_prefix: &[i32],
+        proposal: &[i32],
+        minimum_support: usize,
+        support_history_start: usize,
+    ) -> bool {
+        const CONFIRMATION_TOKENS: usize = 4;
+        const CONFIDENCE_MATCH_MIN: usize = 8;
+        const CONFIDENCE_MATCH_MAX: usize = 32;
+        if proposal.len() < CONFIRMATION_TOKENS {
+            return false;
+        }
+        let mut context =
+            Vec::with_capacity(self.committed_history.len() + continuation_prefix.len());
+        context.extend_from_slice(&self.committed_history);
+        context.extend_from_slice(continuation_prefix);
+        let min_match = self.ngram_min.max(CONFIDENCE_MATCH_MIN);
+        let max_match = CONFIDENCE_MATCH_MAX.min(context.len());
+        for match_tokens in (min_match..=max_match).rev() {
+            let suffix = &context[context.len() - match_tokens..];
+            let evidence_width = match_tokens + CONFIRMATION_TOKENS;
+            let mut matching_support = 0usize;
+            let mut contradictory_support = false;
+            let support_history = self
+                .committed_history
+                .get(support_history_start..)
+                .unwrap_or_default();
+            for evidence in support_history.windows(evidence_width) {
+                if &evidence[..match_tokens] != suffix {
+                    continue;
+                }
+                if evidence[match_tokens..] == proposal[..CONFIRMATION_TOKENS] {
+                    matching_support = matching_support.saturating_add(1);
+                } else {
+                    contradictory_support = true;
+                }
+            }
+            if matching_support >= minimum_support && !contradictory_support {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn has_candidate_anchor(
+        &self,
+        committed_history: &[i32],
+        continuation_prefix: &[i32],
+        support_history_start: usize,
+    ) -> bool {
+        let anchor_width = self.ngram_min;
+        let context_len = committed_history.len() + continuation_prefix.len();
+        if anchor_width == 0 || context_len < anchor_width {
+            return false;
+        }
+        let anchor = committed_history
+            .iter()
+            .chain(continuation_prefix)
+            .rev()
+            .take(anchor_width)
+            .copied()
+            .collect::<Vec<_>>();
+        let support_history = committed_history
+            .get(support_history_start..)
+            .unwrap_or_default();
+        support_history
+            .windows(anchor_width.saturating_add(1))
+            .any(|window| window[..anchor_width].iter().rev().eq(anchor.iter()))
     }
 
     fn sync(&mut self, committed_history: &[i32]) -> OpenAiResult<()> {
+        if self.cache.is_none() {
+            self.cache = Some(
+                skippy_runtime::NgramCache::new(self.ngram_min, self.ngram_max)
+                    .map_err(openai_backend_error)?,
+            );
+        }
+        let cache = self.cache.as_mut().expect("N-gram cache initialized");
         if self.committed_history.is_empty() {
-            self.cache
+            cache
                 .reset(committed_history)
                 .map_err(openai_backend_error)?;
         } else if committed_history.starts_with(&self.committed_history) {
             let appended = &committed_history[self.committed_history.len()..];
-            self.cache.append(appended).map_err(openai_backend_error)?;
+            cache.append(appended).map_err(openai_backend_error)?;
         } else {
-            self.cache
+            cache
                 .reset(committed_history)
                 .map_err(openai_backend_error)?;
         }
@@ -567,6 +710,97 @@ mod ngram_tests {
             Vec::<i32>::new()
         );
         assert_eq!(proposer.propose(&history, &[], 2).unwrap(), vec![3, 1]);
+    }
+
+    #[test]
+    fn probation_support_accepts_repeated_agreeing_continuations() {
+        let mut proposer = CachedNgramProposer::new(1, 1).unwrap();
+        let block = (1..=12).collect::<Vec<_>>();
+        let mut history = block.clone();
+        history.extend_from_slice(&block);
+        history.extend_from_slice(&block[..8]);
+
+        assert_eq!(
+            proposer
+                .propose_with_minimum_support(&history, &[], 4, 2, 0)
+                .unwrap(),
+            vec![9, 10, 11, 12]
+        );
+        assert_eq!(proposer.low_support_suppression_count(), 0);
+    }
+
+    #[test]
+    fn probation_support_accepts_one_unambiguous_long_continuation() {
+        let mut proposer = CachedNgramProposer::new(3, 4).unwrap();
+        let block = (1..=12).collect::<Vec<_>>();
+        let mut history = block.clone();
+        history.extend_from_slice(&block[..8]);
+
+        assert_eq!(
+            proposer.propose(&history, &[], 4).unwrap(),
+            vec![9, 10, 11, 12]
+        );
+        assert_eq!(
+            proposer
+                .propose_with_minimum_support(&history, &[], 4, 1, 0)
+                .unwrap(),
+            vec![9, 10, 11, 12]
+        );
+        assert_eq!(proposer.low_support_suppression_count(), 0);
+    }
+
+    #[test]
+    fn probation_support_suppresses_ambiguous_continuations() {
+        let mut proposer = CachedNgramProposer::new(1, 1).unwrap();
+        let prefix = (1..=8).collect::<Vec<_>>();
+        let mut history = prefix.clone();
+        history.extend_from_slice(&[9, 10, 11, 12]);
+        for _ in 0..2 {
+            history.extend_from_slice(&prefix);
+            history.extend_from_slice(&[90, 91, 92, 93]);
+        }
+        history.extend_from_slice(&prefix);
+
+        assert!(
+            proposer
+                .propose_with_minimum_support(&history, &[], 4, 2, 0)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(proposer.low_support_suppression_count(), 1);
+    }
+
+    #[test]
+    fn probation_support_does_not_count_prompt_occurrences() {
+        let mut proposer = CachedNgramProposer::new(1, 1).unwrap();
+        let block = (1..=12).collect::<Vec<_>>();
+        let mut history = block.clone();
+        history.extend_from_slice(&block);
+        history.extend_from_slice(&block[..8]);
+
+        assert!(
+            proposer
+                .propose_with_minimum_support(&history, &[], 4, 2, block.len() * 2)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(proposer.low_support_suppression_count(), 1);
+    }
+
+    #[test]
+    fn probation_anchor_miss_avoids_native_cache_sync() {
+        let mut proposer = CachedNgramProposer::new(3, 4).unwrap();
+        let history = (1..=32).collect::<Vec<_>>();
+
+        assert!(
+            proposer
+                .propose_with_minimum_support(&history, &[], 4, 2, 0)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(proposer.committed_history.is_empty());
+        assert!(proposer.cache.is_none());
+        assert_eq!(proposer.low_support_suppression_count(), 1);
     }
 }
 

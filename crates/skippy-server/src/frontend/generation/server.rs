@@ -19,6 +19,7 @@ use crate::frontend::generation::prewarm_generation_sessions;
 use crate::frontend::prefill::PrefillChunkPolicy;
 use crate::frontend::prefill::PrefillChunkPolicyArgs;
 use crate::frontend::speculative::{SpeculativeDecodeConfig, load_standalone_speculative_config};
+use crate::frontend::speculative_credits::SpeculativeCreditPool;
 use crate::kv_integration::{KvStageIntegration, model_requires_recurrent_state};
 use crate::runtime_state::RuntimeState;
 use crate::runtime_state::load_runtime;
@@ -134,6 +135,7 @@ pub async fn serve_openai(args: ServeOpenAiArgs) -> Result<()> {
         generation_queue_depth: Arc::new(AtomicUsize::new(0)),
         generation_queue_limit: args.generation_concurrency,
         generation_token_budget: Arc::new(GenerationTokenBudget::new(ctx_size)),
+        speculative_credits: SpeculativeCreditPool::new(0),
         hook_policy: None,
         kv,
         decode_batcher,
@@ -365,6 +367,11 @@ pub fn embedded_openai_backend(args: EmbeddedOpenAiArgs) -> Result<EmbeddedOpenA
     let decode_batcher = DecodeBatcher::new(args.runtime.clone(), args.generation_concurrency);
     let decode_frame_batcher =
         DecodeFrameBatcher::new(args.runtime.clone(), args.generation_concurrency);
+    let speculative_credit_limit = args
+        .speculative
+        .verify_window
+        .pipeline_depth
+        .saturating_sub(1);
     let backend: Arc<dyn OpenAiBackend> = Arc::new(StageOpenAiBackend {
         runtime: args.runtime,
         config: args.config.clone(),
@@ -382,6 +389,7 @@ pub fn embedded_openai_backend(args: EmbeddedOpenAiArgs) -> Result<EmbeddedOpenA
         generation_queue_depth: Arc::new(AtomicUsize::new(0)),
         generation_queue_limit: args.generation_concurrency,
         generation_token_budget: Arc::new(GenerationTokenBudget::new(ctx_size)),
+        speculative_credits: SpeculativeCreditPool::new(speculative_credit_limit),
         hook_policy: args.hook_policy,
         kv,
         decode_batcher,

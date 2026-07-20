@@ -6,6 +6,7 @@ pub(super) use super::{
     prefill::{
         PrefillChunkObservation, PrefillChunkPolicy, PrefillChunkPolicyArgs, PrefillChunkSchedule,
     },
+    speculative_credits::SpeculativeCreditPool,
 };
 pub(super) use crate::binary_transport::{DecodeFrameBatcher, WireCondition};
 pub(super) use crate::kv_integration::PrefillKvIdentity;

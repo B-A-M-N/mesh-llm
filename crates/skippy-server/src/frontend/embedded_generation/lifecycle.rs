@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 
-use openai_frontend::OpenAiResult;
+use openai_frontend::{OpenAiError, OpenAiResult};
 use serde_json::json;
 use skippy_protocol::binary::{StageWireMessage, WireReplyKind, recv_reply, write_stage_message};
 
@@ -14,6 +14,7 @@ use crate::frontend::{
         PersistentStageLanePool, PhaseTimer, StageOpenAiBackend, TokenControl,
     },
     speculative::OpenAiSpeculativeStats,
+    speculative_credits::SpeculativeCredit,
     util::openai_io_error,
 };
 
@@ -22,10 +23,36 @@ pub(super) struct PipelinedCompositeWindow {
     pub(super) stale: bool,
     pub(super) window: VerifyWindow,
     pub(super) input_tokens: Vec<i32>,
-    pub(super) proposal_tokens: Vec<i32>,
-    pub(super) expected_free_target: Option<i32>,
+    pub(super) proposal_token: i32,
     pub(super) native_mtp_token_count: usize,
+    pub(super) _speculative_credit: Option<SpeculativeCredit>,
     pub(super) dispatched: DispatchedEmbeddedStage,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum DirectPredictionReturnPath {
+    UpstreamOpened,
+    ReverseFallback,
+}
+
+pub(super) fn direct_prediction_return_path(
+    verify_windows_enabled: bool,
+    receiver_registered: bool,
+    upstream_opened: bool,
+) -> OpenAiResult<Option<DirectPredictionReturnPath>> {
+    if !verify_windows_enabled {
+        return Ok(None);
+    }
+    if !receiver_registered {
+        return Err(OpenAiError::backend(
+            "native MTP verify windows require direct prediction return",
+        ));
+    }
+    Ok(Some(if upstream_opened {
+        DirectPredictionReturnPath::UpstreamOpened
+    } else {
+        DirectPredictionReturnPath::ReverseFallback
+    }))
 }
 
 pub(super) fn queued_active_tokens(windows: &VecDeque<PipelinedCompositeWindow>) -> usize {
@@ -211,6 +238,16 @@ impl StageOpenAiBackend {
         result: &OpenAiResult<()>,
         session_key: &str,
     ) -> OpenAiResult<()> {
+        if result.is_err() {
+            // The generation error may be the downstream peer disappearing.
+            // A graceful Stop/ACK exchange would then turn the bounded decode
+            // failure into an unbounded teardown wait. Retire the suspect lane
+            // immediately; replacement uses its own bounded handshake.
+            self.drop_embedded_runtime_session(request, session_key);
+            lane_pool.replace_lane(lane.id);
+            return Ok(());
+        }
+
         let stop_result = write_stage_message(
             &mut lane.stream,
             &StageWireMessage::stop_with_identity(
@@ -235,13 +272,11 @@ impl StageOpenAiBackend {
 
         let lane_id = lane.id;
         let stop_result = stop_result.map_err(openai_io_error);
-        match (result, &stop_result) {
-            (Ok(_), Ok(_)) => lane_pool.return_lane(lane),
-            _ => lane_pool.replace_lane(lane_id),
+        match &stop_result {
+            Ok(_) => lane_pool.return_lane(lane),
+            Err(_) => lane_pool.replace_lane(lane_id),
         }
-        if result.is_ok() {
-            stop_result?;
-        }
+        stop_result?;
         Ok(())
     }
 
@@ -303,13 +338,26 @@ mod tests {
     use crate::frontend::NativeMtpHybridProposal;
 
     #[test]
+    fn direct_return_falls_back_only_with_a_registered_receiver() {
+        assert_eq!(
+            direct_prediction_return_path(true, true, false).unwrap(),
+            Some(DirectPredictionReturnPath::ReverseFallback)
+        );
+        assert!(direct_prediction_return_path(true, false, false).is_err());
+        assert_eq!(
+            direct_prediction_return_path(false, false, false).unwrap(),
+            None
+        );
+    }
+
+    #[test]
     fn refills_from_an_optimistic_suffix_without_indexing_it() {
         let committed = vec![1, 2, 3, 1, 2, 3, 1, 2];
         let mut cache = Some(CachedNgramProposer::new(2, 2).unwrap());
         let initial = cache.as_mut().unwrap().propose(&committed, &[], 2).unwrap();
         assert_eq!(initial, vec![3, 1]);
         let proposal = NativeMtpHybridProposal::from_parts(initial, 0, true);
-        let mut pipeline = CompositeProposalPipeline::new(proposal, None, 1);
+        let mut pipeline = CompositeProposalPipeline::new(proposal, None);
 
         let appended =
             refill_pipeline_ngram_candidates(&mut pipeline, &committed, &mut cache, 2).unwrap();

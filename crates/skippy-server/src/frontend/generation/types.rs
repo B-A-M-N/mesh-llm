@@ -17,6 +17,7 @@ use crate::frontend::generation::PreparedGenerationPrompt;
 use crate::frontend::native_mtp::NativeMtpDecodeTelemetry;
 use crate::frontend::prefill::PrefillChunkPolicy;
 use crate::frontend::speculative::OpenAiSpeculativeStats;
+use crate::frontend::speculative_credits::SpeculativeCreditPool;
 use crate::kv_integration::KvStageIntegration;
 use crate::runtime_state::RuntimeState;
 use crate::telemetry::Telemetry;
@@ -57,6 +58,7 @@ pub(in crate::frontend) struct StageOpenAiBackend {
     pub(in crate::frontend) generation_queue_depth: Arc<AtomicUsize>,
     pub(in crate::frontend) generation_queue_limit: usize,
     pub(in crate::frontend) generation_token_budget: Arc<GenerationTokenBudget>,
+    pub(in crate::frontend) speculative_credits: SpeculativeCreditPool,
     pub(in crate::frontend) hook_policy: Option<Arc<dyn OpenAiHookPolicy>>,
     pub(in crate::frontend) kv: Option<Arc<KvStageIntegration>>,
     pub(in crate::frontend) decode_batcher: DecodeBatcher,
@@ -85,10 +87,6 @@ impl OpenAiBackendMode {
             Self::LocalRuntime => "local-runtime",
             Self::EmbeddedStageZero { .. } => "embedded-stage0",
         }
-    }
-
-    pub(in crate::frontend) fn reserves_local_kv_tokens(&self) -> bool {
-        matches!(self, Self::LocalRuntime)
     }
 }
 

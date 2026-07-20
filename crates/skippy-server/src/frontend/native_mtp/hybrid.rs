@@ -6,6 +6,19 @@ use super::NativeMtpDecodeOptions;
 use crate::frontend::speculative::CachedNgramProposer;
 
 const MIN_NGRAM_EXTENSION_TOKENS: usize = 2;
+const NGRAM_PROBATION_EXTENSION_TOKENS: usize = 1;
+const NGRAM_PROBATION_EVIDENCE_TOKENS: usize = 4;
+const NGRAM_PROMOTION_FULL_ACCEPTS: usize = 2;
+// One prior unambiguous 8-token suffix plus its matching 4-token continuation
+// is already strong historical evidence. Requiring two such occurrences made
+// a third repeated block necessary before probation could even start, which
+// left short and medium responses almost entirely on the serial MTP path.
+// Target verification still has to fully accept two probationary tails before
+// the positional pipeline is admitted.
+const NGRAM_PROBATION_MINIMUM_SUPPORT: usize = 1;
+const NGRAM_PROBATION_MAX_REJECTIONS: usize = 3;
+const NGRAM_PIPELINE_PROOF_TOKENS: usize = 16;
+const NGRAM_PIPELINE_SLOW_START_DEPTH: usize = 2;
 
 /// Builds one speculative candidate from a native-MTP prefix and an optional
 /// N-gram continuation. The N-gram proposal must independently predict the
@@ -14,6 +27,32 @@ const MIN_NGRAM_EXTENSION_TOKENS: usize = 2;
 pub(in crate::frontend) struct CompositeProposalProvider {
     enabled: bool,
     max_proposal_tokens: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(in crate::frontend) struct NgramExtensionPolicy {
+    max_tokens: usize,
+    minimum_support: usize,
+    support_history_start: usize,
+}
+
+impl NgramExtensionPolicy {
+    pub(in crate::frontend) fn new(
+        max_tokens: usize,
+        minimum_support: usize,
+        support_history_start: usize,
+    ) -> Self {
+        Self {
+            max_tokens,
+            minimum_support,
+            support_history_start,
+        }
+    }
+
+    #[cfg(test)]
+    pub(in crate::frontend) fn unrestricted(max_tokens: usize) -> Self {
+        Self::new(max_tokens, 0, 0)
+    }
 }
 
 impl CompositeProposalProvider {
@@ -31,12 +70,12 @@ impl CompositeProposalProvider {
         native_mtp_tokens: &[i32],
         context_tokens: &[i32],
         max_proposal_tokens: usize,
-        max_ngram_extension_tokens: usize,
+        extension_policy: NgramExtensionPolicy,
         cached_ngram_proposer: Option<&mut CachedNgramProposer>,
     ) -> OpenAiResult<NativeMtpHybridProposal> {
         let native_mtp_tokens =
             &native_mtp_tokens[..native_mtp_tokens.len().min(max_proposal_tokens)];
-        if !self.enabled || self.max_proposal_tokens == 0 || max_ngram_extension_tokens == 0 {
+        if !self.enabled || self.max_proposal_tokens == 0 || extension_policy.max_tokens == 0 {
             return Ok(NativeMtpHybridProposal::from_native_mtp_tokens(
                 native_mtp_tokens.to_vec(),
             ));
@@ -45,18 +84,33 @@ impl CompositeProposalProvider {
         let ngram_limit = max_proposal_tokens
             .saturating_sub(native_mtp_tokens.len())
             .min(self.max_proposal_tokens)
-            .min(max_ngram_extension_tokens);
+            .min(extension_policy.max_tokens);
         let (ngram_tokens, ngram_span_available) = if let Some(cache) = cached_ngram_proposer {
             // The cache sees only committed target history. Native MTP is
             // an optional read-only continuation, so this returns the
             // sidecar tail directly rather than trying to re-predict it.
-            let tail = cache.propose(context_tokens, native_mtp_tokens, ngram_limit)?;
+            let evidence_limit = if extension_policy.minimum_support > 0 {
+                ngram_limit
+                    .max(NGRAM_PROBATION_EVIDENCE_TOKENS)
+                    .min(self.max_proposal_tokens)
+            } else {
+                ngram_limit
+            };
+            let mut tail = cache.propose_with_minimum_support(
+                context_tokens,
+                native_mtp_tokens,
+                evidence_limit,
+                extension_policy.minimum_support,
+                extension_policy.support_history_start,
+            )?;
+            tail.truncate(ngram_limit);
             let available = !tail.is_empty();
             (tail, available)
         } else {
             (Vec::new(), false)
         };
-        let ngram_tokens = if ngram_tokens.len() >= MIN_NGRAM_EXTENSION_TOKENS {
+        let minimum_extension_tokens = MIN_NGRAM_EXTENSION_TOKENS.min(extension_policy.max_tokens);
+        let ngram_tokens = if ngram_tokens.len() >= minimum_extension_tokens {
             ngram_tokens
         } else {
             Vec::new()
@@ -147,23 +201,10 @@ impl NativeMtpHybridProposal {
             && accepted_proposal_tokens < self.tokens.len()
     }
 
-    /// The first pipelined verify may consume a wider prefix, while a later
-    /// in-flight window safely consumes the remaining suffix. Reserve one
-    /// optimistic target plus one remaining candidate so depth actually buys
-    /// overlap for short MTP-plus-N-gram spans.
-    pub(in crate::frontend) fn parallel_verify_width(
-        &self,
-        adaptive_verify_width: usize,
-        pipeline_depth: usize,
-    ) -> Option<usize> {
-        if pipeline_depth < 2 || self.tokens.len() < 3 {
-            return None;
-        }
-        Some(
-            adaptive_verify_width
-                .min(self.tokens.len().saturating_sub(2))
-                .max(1),
-        )
+    /// Positional speculation needs at least two consecutive candidates so
+    /// more than one exact-shape target evaluation can be in flight.
+    pub(in crate::frontend) fn supports_positional_pipeline(&self, pipeline_depth: usize) -> bool {
+        pipeline_depth >= 2 && self.tokens.len() >= 2
     }
 }
 
@@ -181,6 +222,31 @@ pub(in crate::frontend) struct NgramSidecarController {
     initial_extension_tokens: usize,
     current_extension_tokens: usize,
     max_extension_tokens: usize,
+    consecutive_full_accepts: usize,
+    pipeline_proven_tokens: usize,
+    active: bool,
+    probation_failed: bool,
+    stats: NgramAdmissionStats,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(in crate::frontend) struct NgramAdmissionStats {
+    pub(in crate::frontend) observed_proposals: usize,
+    pub(in crate::frontend) full_accept_proposals: usize,
+    pub(in crate::frontend) probe_attempts: usize,
+    pub(in crate::frontend) promotions: usize,
+    pub(in crate::frontend) revocations: usize,
+    pub(in crate::frontend) probation_fallbacks: usize,
+    pub(in crate::frontend) probation_rejections: usize,
+    pub(in crate::frontend) suppressed_after_fallback: usize,
+    pub(in crate::frontend) suppressed_unanchored_proposals: usize,
+    pub(in crate::frontend) suppressed_refills: usize,
+    pub(in crate::frontend) suppressed_pipeline_starts: usize,
+    pub(in crate::frontend) serial_probation_verify_windows: usize,
+    pub(in crate::frontend) low_support_suppressions: usize,
+    pub(in crate::frontend) slow_start_accepted_tokens: usize,
+    pub(in crate::frontend) slow_start_full_accept_proposals: usize,
+    pub(in crate::frontend) slow_start_refill_suppressions: usize,
 }
 
 impl NgramSidecarController {
@@ -194,6 +260,11 @@ impl NgramSidecarController {
             initial_extension_tokens,
             current_extension_tokens: initial_extension_tokens,
             max_extension_tokens,
+            consecutive_full_accepts: 0,
+            pipeline_proven_tokens: 0,
+            active: false,
+            probation_failed: false,
+            stats: NgramAdmissionStats::default(),
         }
     }
 
@@ -204,14 +275,119 @@ impl NgramSidecarController {
         native_mtp_tokens: &[i32],
         available_tokens: usize,
     ) -> usize {
+        if self.max_extension_tokens < MIN_NGRAM_EXTENSION_TOKENS
+            || available_tokens < MIN_NGRAM_EXTENSION_TOKENS
+        {
+            return 0;
+        }
+        if self.probation_failed {
+            self.stats.suppressed_after_fallback =
+                self.stats.suppressed_after_fallback.saturating_add(1);
+            return 0;
+        }
         if native_mtp_tokens.is_empty() {
+            if !self.active || self.remaining_proposals > 0 {
+                self.stats.suppressed_unanchored_proposals =
+                    self.stats.suppressed_unanchored_proposals.saturating_add(1);
+                return 0;
+            }
             return available_tokens.min(self.max_extension_tokens);
         }
         if self.remaining_proposals > 0 {
             self.remaining_proposals -= 1;
             return 0;
         }
+        if !self.active {
+            self.stats.probe_attempts = self.stats.probe_attempts.saturating_add(1);
+            return available_tokens.min(NGRAM_PROBATION_EXTENSION_TOKENS);
+        }
         self.current_extension_tokens.min(available_tokens)
+    }
+
+    /// Refills are predictor-ahead work and therefore require target-verified
+    /// confidence from earlier anchored tails. Probation may only spend the
+    /// bounded tail attached to a native-MTP proposal.
+    pub(in crate::frontend) fn refill_limit(&mut self, available_tokens: usize) -> usize {
+        if self.max_extension_tokens < MIN_NGRAM_EXTENSION_TOKENS
+            || available_tokens < MIN_NGRAM_EXTENSION_TOKENS
+        {
+            return 0;
+        }
+        if self.probation_failed || !self.active || self.remaining_proposals > 0 {
+            self.stats.suppressed_refills = self.stats.suppressed_refills.saturating_add(1);
+            return 0;
+        }
+        if !self.pipeline_proven() {
+            self.stats.slow_start_refill_suppressions =
+                self.stats.slow_start_refill_suppressions.saturating_add(1);
+            return 0;
+        }
+        available_tokens.min(self.max_extension_tokens)
+    }
+
+    /// A newly promoted stream gets one speculative credit beyond its
+    /// unmetered progress window. It must first accept a bounded amount of
+    /// active N-gram work without rollback before it may fill the configured
+    /// pipeline. This caps first-miss waste on locally repetitive text whose
+    /// continuation later diverges.
+    pub(in crate::frontend) fn pipeline_in_flight_limit(&self, configured_depth: usize) -> usize {
+        if self.pipeline_proven() {
+            configured_depth
+        } else {
+            configured_depth.min(NGRAM_PIPELINE_SLOW_START_DEPTH)
+        }
+    }
+
+    /// Probationary tails are verified serially. Starting dependent work is
+    /// reserved for N-gram that has already earned active admission.
+    pub(in crate::frontend) fn permit_pipeline_start(&mut self) -> bool {
+        if self.active && !self.probation_failed {
+            return true;
+        }
+        self.stats.suppressed_pipeline_starts =
+            self.stats.suppressed_pipeline_starts.saturating_add(1);
+        false
+    }
+
+    /// Keep the ordinary batched verifier for the native-MTP prefix. Once the
+    /// buffer reaches an N-gram tail, target evaluations stay one position
+    /// wide so promoted work can overlap without changing target sampling.
+    pub(in crate::frontend) fn verify_width(
+        &mut self,
+        requested_width: usize,
+        remaining_native_mtp_tokens: usize,
+    ) -> usize {
+        if self.max_extension_tokens < MIN_NGRAM_EXTENSION_TOKENS
+            || self.probation_failed
+            || requested_width <= 1
+        {
+            return requested_width;
+        }
+        if remaining_native_mtp_tokens > 0 {
+            return requested_width.min(remaining_native_mtp_tokens).max(1);
+        }
+        if !self.active {
+            self.stats.serial_probation_verify_windows =
+                self.stats.serial_probation_verify_windows.saturating_add(1);
+        }
+        1
+    }
+
+    /// N-gram-only positions retain native decode's one-input target shape.
+    /// Active admission may overlap those same one-position evaluations
+    /// through the positional pipeline.
+    pub(in crate::frontend) fn exact_positional_verify(&self) -> bool {
+        self.max_extension_tokens >= MIN_NGRAM_EXTENSION_TOKENS && !self.probation_failed
+    }
+
+    pub(in crate::frontend) fn minimum_support(&self) -> usize {
+        if self.max_extension_tokens >= MIN_NGRAM_EXTENSION_TOKENS
+            && !self.active
+            && !self.probation_failed
+        {
+            return NGRAM_PROBATION_MINIMUM_SUPPORT;
+        }
+        0
     }
 
     /// Applies the result of a completed composite candidate. Returns true
@@ -223,22 +399,84 @@ impl NgramSidecarController {
         accepted_proposal_tokens: usize,
         cooldown_proposals: usize,
     ) -> bool {
-        if proposal.native_mtp_token_count() == 0 || proposal.ngram_token_count() == 0 {
+        if proposal.ngram_token_count() == 0 {
             return false;
         }
+        if proposal.native_mtp_token_count() > 0
+            && accepted_proposal_tokens < proposal.native_mtp_token_count()
+        {
+            return false;
+        }
+        self.stats.observed_proposals = self.stats.observed_proposals.saturating_add(1);
         if accepted_proposal_tokens >= proposal.tokens().len() {
-            self.current_extension_tokens = self
-                .current_extension_tokens
-                .saturating_add(1)
-                .min(self.max_extension_tokens);
+            let was_active = self.active;
+            self.stats.full_accept_proposals = self.stats.full_accept_proposals.saturating_add(1);
+            self.consecutive_full_accepts = self.consecutive_full_accepts.saturating_add(1);
+            if !self.active && self.consecutive_full_accepts >= NGRAM_PROMOTION_FULL_ACCEPTS {
+                self.active = true;
+                self.pipeline_proven_tokens = 0;
+                self.current_extension_tokens = self.initial_extension_tokens;
+                self.stats.promotions = self.stats.promotions.saturating_add(1);
+            }
+            if was_active {
+                let accepted_tail_tokens = proposal.ngram_token_count();
+                if !self.pipeline_proven() {
+                    self.stats.slow_start_full_accept_proposals = self
+                        .stats
+                        .slow_start_full_accept_proposals
+                        .saturating_add(1);
+                    self.stats.slow_start_accepted_tokens = self
+                        .stats
+                        .slow_start_accepted_tokens
+                        .saturating_add(accepted_tail_tokens);
+                }
+                self.pipeline_proven_tokens = self
+                    .pipeline_proven_tokens
+                    .saturating_add(accepted_tail_tokens);
+                self.current_extension_tokens = self
+                    .current_extension_tokens
+                    .saturating_add(1)
+                    .min(self.max_extension_tokens);
+            }
             return false;
         }
-        if !proposal.ngram_tail_rejected(accepted_proposal_tokens) {
+        if proposal.native_mtp_token_count() > 0
+            && !proposal.ngram_tail_rejected(accepted_proposal_tokens)
+        {
             return false;
+        }
+        self.consecutive_full_accepts = 0;
+        self.pipeline_proven_tokens = 0;
+        if self.active {
+            self.active = false;
+            self.stats.revocations = self.stats.revocations.saturating_add(1);
+        } else {
+            self.stats.probation_rejections = self.stats.probation_rejections.saturating_add(1);
+            if self.stats.probation_rejections >= NGRAM_PROBATION_MAX_REJECTIONS {
+                self.probation_failed = true;
+                self.stats.probation_fallbacks = self.stats.probation_fallbacks.saturating_add(1);
+            }
         }
         self.current_extension_tokens = self.initial_extension_tokens;
         self.remaining_proposals = cooldown_proposals;
         cooldown_proposals > 0
+    }
+
+    pub(in crate::frontend) fn is_active(&self) -> bool {
+        self.active
+    }
+
+    fn pipeline_proven(&self) -> bool {
+        self.pipeline_proven_tokens >= NGRAM_PIPELINE_PROOF_TOKENS
+    }
+
+    #[cfg(test)]
+    pub(in crate::frontend) fn probation_failed(&self) -> bool {
+        self.probation_failed
+    }
+
+    pub(in crate::frontend) fn stats(&self) -> NgramAdmissionStats {
+        self.stats
     }
 
     #[cfg(test)]
@@ -279,10 +517,6 @@ impl BufferedCompositeProposal {
         self.remaining_tokens.iter().copied().take(width).collect()
     }
 
-    pub(in crate::frontend) fn expected_free_target(&self, width: usize) -> Option<i32> {
-        self.remaining_tokens.get(width).copied()
-    }
-
     pub(in crate::frontend) fn remaining_len(&self) -> usize {
         self.remaining_tokens.len()
     }
@@ -293,6 +527,16 @@ impl BufferedCompositeProposal {
 
     pub(in crate::frontend) fn accepted_tokens(&self) -> usize {
         self.accepted_tokens
+    }
+
+    /// Returns how much of the unverified buffer still belongs to native MTP.
+    /// Verification may consume one extra buffered token from the target's
+    /// already-produced next prediction, so cap the count by the live buffer.
+    pub(in crate::frontend) fn remaining_native_mtp_tokens(&self) -> usize {
+        self.proposal
+            .native_mtp_token_count()
+            .saturating_sub(self.accepted_tokens)
+            .min(self.remaining_tokens.len())
     }
 
     pub(in crate::frontend) fn native_mtp_prefix_rejected_after(
@@ -307,19 +551,22 @@ impl BufferedCompositeProposal {
         &mut self,
         verified_tokens: &[i32],
         next_target_token: Option<i32>,
-    ) {
+    ) -> bool {
         for expected in verified_tokens {
-            debug_assert_eq!(self.remaining_tokens.pop_front(), Some(*expected));
+            let consumed = self.remaining_tokens.pop_front();
+            debug_assert_eq!(consumed, Some(*expected));
         }
         self.accepted_tokens += verified_tokens.len();
         if let Some(next_target_token) = next_target_token {
             if self.remaining_tokens.front() == Some(&next_target_token) {
                 self.remaining_tokens.pop_front();
                 self.accepted_tokens += 1;
-            } else {
+            } else if !self.remaining_tokens.is_empty() {
                 self.remaining_tokens.clear();
+                return true;
             }
         }
+        false
     }
 
     pub(in crate::frontend) fn reject_window(&mut self, accepted_tokens: usize) {
@@ -338,6 +585,23 @@ pub(in crate::frontend) struct NativeMtpVerifyWindowDecision {
     pub(in crate::frontend) accepted_proposal_tokens: usize,
     pub(in crate::frontend) commit_count: usize,
     pub(in crate::frontend) rejected: bool,
+}
+
+pub(in crate::frontend) fn classify_native_mtp_position(
+    proposal_token: i32,
+    predicted_tokens: &[i32],
+) -> OpenAiResult<NativeMtpVerifyWindowDecision> {
+    let Some(predicted) = predicted_tokens.first().copied() else {
+        return Err(OpenAiError::backend(
+            "positional native MTP verify returned no target token",
+        ));
+    };
+    let accepted = predicted == proposal_token;
+    Ok(NativeMtpVerifyWindowDecision {
+        accepted_proposal_tokens: usize::from(accepted),
+        commit_count: 1,
+        rejected: !accepted,
+    })
 }
 
 pub(in crate::frontend) fn classify_native_mtp_verify_window<F>(
@@ -417,7 +681,13 @@ mod tests {
         let provider = CompositeProposalProvider::from_options(options);
 
         let proposal = provider
-            .propose_with_ngram_extension(&[9, 10, 11], &[], 2, 2, None)
+            .propose_with_ngram_extension(
+                &[9, 10, 11],
+                &[],
+                2,
+                NgramExtensionPolicy::unrestricted(2),
+                None,
+            )
             .unwrap();
 
         assert_eq!(proposal.tokens(), &[9, 10]);
@@ -432,7 +702,13 @@ mod tests {
         let provider = CompositeProposalProvider::from_options(options);
 
         let proposal = provider
-            .propose_with_ngram_extension(&[9, 10, 11], &[], 3, 1, None)
+            .propose_with_ngram_extension(
+                &[9, 10, 11],
+                &[],
+                3,
+                NgramExtensionPolicy::unrestricted(1),
+                None,
+            )
             .unwrap();
 
         assert_eq!(proposal.tokens(), &[9, 10, 11]);
@@ -444,7 +720,13 @@ mod tests {
     fn retains_native_mtp_prefix_when_no_ngram_span_exists() {
         let provider = CompositeProposalProvider::from_options(options());
         let proposal = provider
-            .propose_with_ngram_extension(&[9, 10], &[1, 2, 3, 4], 4, 4, None)
+            .propose_with_ngram_extension(
+                &[9, 10],
+                &[1, 2, 3, 4],
+                4,
+                NgramExtensionPolicy::unrestricted(4),
+                None,
+            )
             .unwrap();
 
         assert_eq!(proposal.tokens(), &[9, 10]);
@@ -460,12 +742,42 @@ mod tests {
         let context = [1, 9, 7, 1, 9, 7, 1];
 
         let proposal = provider
-            .propose_with_ngram_extension(&[9], &context, 3, 2, Some(&mut cache))
+            .propose_with_ngram_extension(
+                &[9],
+                &context,
+                3,
+                NgramExtensionPolicy::unrestricted(2),
+                Some(&mut cache),
+            )
             .unwrap();
 
         assert_eq!(proposal.tokens(), &[9, 7, 1]);
         assert_eq!(proposal.native_mtp_token_count(), 1);
         assert_eq!(proposal.ngram_token_count(), 2);
+        assert!(proposal.ngram_span_available());
+    }
+
+    #[test]
+    fn probation_keeps_one_token_after_collecting_four_token_evidence() {
+        let provider = CompositeProposalProvider::from_options(options());
+        let mut cache = CachedNgramProposer::new(1, 1).unwrap();
+        let block = (1..=12).collect::<Vec<_>>();
+        let mut context = block.clone();
+        context.extend_from_slice(&block);
+        context.extend_from_slice(&block[..8]);
+
+        let proposal = provider
+            .propose_with_ngram_extension(
+                &[],
+                &context,
+                1,
+                NgramExtensionPolicy::new(1, 2, 0),
+                Some(&mut cache),
+            )
+            .unwrap();
+
+        assert_eq!(proposal.tokens(), &[9]);
+        assert_eq!(proposal.ngram_token_count(), 1);
         assert!(proposal.ngram_span_available());
     }
 
@@ -481,17 +793,27 @@ mod tests {
     }
 
     #[test]
-    fn tail_rejection_resets_and_backs_off_only_mtp_extensions() {
+    fn probation_tail_rejections_exhaust_a_bounded_request_budget() {
         let proposal = NativeMtpHybridProposal::from_parts(vec![9, 10, 11], 1, true);
         let mut controller = NgramSidecarController::new(2, 4);
 
-        assert!(controller.observe_tail_outcome(&proposal, 1, 2));
+        for rejection in 1..=NGRAM_PROBATION_MAX_REJECTIONS {
+            assert!(controller.observe_tail_outcome(&proposal, 1, 2));
+            assert_eq!(controller.stats().probation_rejections, rejection);
+            assert_eq!(
+                controller.probation_failed(),
+                rejection == NGRAM_PROBATION_MAX_REJECTIONS
+            );
+        }
         assert_eq!(controller.remaining_proposals(), 2);
         assert_eq!(controller.current_extension_tokens(), 2);
         assert_eq!(controller.extension_limit(&[9], 3), 0);
         assert_eq!(controller.extension_limit(&[9], 3), 0);
-        assert_eq!(controller.extension_limit(&[9], 3), 2);
-        assert_eq!(controller.extension_limit(&[], 4), 4);
+        assert_eq!(controller.extension_limit(&[9], 3), 0);
+        assert_eq!(controller.extension_limit(&[], 4), 0);
+        assert!(controller.probation_failed());
+        assert_eq!(controller.stats().probation_fallbacks, 1);
+        assert_eq!(controller.stats().suppressed_after_fallback, 4);
     }
 
     #[test]
@@ -502,34 +824,144 @@ mod tests {
         assert!(controller.observe_tail_outcome(&rejected_tail, 1, 1));
 
         let native_only = provider
-            .propose_with_ngram_extension(&[9], &[], 4, controller.extension_limit(&[9], 3), None)
+            .propose_with_ngram_extension(
+                &[9],
+                &[],
+                4,
+                NgramExtensionPolicy::unrestricted(controller.extension_limit(&[9], 3)),
+                None,
+            )
             .unwrap();
         assert_eq!(native_only.tokens(), &[9]);
     }
 
     #[test]
-    fn fully_accepted_tail_grows_the_next_extension_budget() {
-        let proposal = NativeMtpHybridProposal::from_parts(vec![9, 1, 2], 1, true);
+    fn two_fully_accepted_anchored_tails_promote_ngram_admission() {
+        let proposal = NativeMtpHybridProposal::from_parts(vec![9, 1], 1, true);
         let mut controller = NgramSidecarController::new(3, 6);
 
-        assert_eq!(controller.extension_limit(&[9], 5), 3);
-        assert!(!controller.observe_tail_outcome(&proposal, 3, 4));
-        assert_eq!(controller.current_extension_tokens(), 4);
-        assert_eq!(controller.extension_limit(&[9], 5), 4);
+        assert_eq!(controller.extension_limit(&[9], 5), 1);
+        assert_eq!(controller.minimum_support(), 1);
+        assert!(!controller.observe_tail_outcome(&proposal, 2, 4));
+        assert!(!controller.is_active());
+        assert_eq!(controller.extension_limit(&[], 5), 0);
+        assert_eq!(controller.refill_limit(5), 0);
+
+        assert!(!controller.observe_tail_outcome(&proposal, 2, 4));
+        assert!(controller.is_active());
+        assert_eq!(controller.minimum_support(), 0);
+        assert_eq!(controller.extension_limit(&[], 5), 5);
+        assert_eq!(controller.pipeline_in_flight_limit(8), 2);
+        assert_eq!(controller.refill_limit(5), 0);
+
+        let proven_span = NativeMtpHybridProposal::from_parts((1..=16).collect(), 0, true);
+        assert!(!controller.observe_tail_outcome(&proven_span, 16, 4));
+        assert_eq!(controller.pipeline_in_flight_limit(8), 8);
+        assert_eq!(controller.refill_limit(5), 5);
+        assert_eq!(controller.stats().promotions, 1);
+        assert_eq!(controller.stats().probe_attempts, 1);
+        assert_eq!(controller.stats().suppressed_unanchored_proposals, 1);
+        assert_eq!(controller.stats().suppressed_refills, 1);
+        assert_eq!(controller.stats().slow_start_accepted_tokens, 16);
+        assert_eq!(controller.stats().slow_start_full_accept_proposals, 1);
+        assert_eq!(controller.stats().slow_start_refill_suppressions, 1);
+        assert!(controller.permit_pipeline_start());
     }
 
     #[test]
-    fn caps_parallel_verify_width_to_the_available_candidate_depth() {
-        let too_shallow = NativeMtpHybridProposal::from_parts(vec![1, 2], 1, true);
-        let deep_enough = NativeMtpHybridProposal::from_parts(vec![1, 2, 3], 1, true);
-        let four_tokens = NativeMtpHybridProposal::from_parts(vec![1, 2, 3, 4], 1, true);
-        let wider = NativeMtpHybridProposal::from_parts(vec![1, 2, 3, 4, 5], 1, true);
+    fn active_ngram_rejection_revokes_unanchored_and_refill_admission() {
+        let accepted = NativeMtpHybridProposal::from_parts(vec![9, 1, 2], 1, true);
+        let rejected = NativeMtpHybridProposal::from_parts(vec![7, 8, 9], 0, true);
+        let mut controller = NgramSidecarController::new(2, 6);
+        controller.observe_tail_outcome(&accepted, 3, 2);
+        controller.observe_tail_outcome(&accepted, 3, 2);
+        assert!(controller.is_active());
 
-        assert_eq!(too_shallow.parallel_verify_width(4, 2), None);
-        assert_eq!(deep_enough.parallel_verify_width(4, 2), Some(1));
-        assert_eq!(four_tokens.parallel_verify_width(4, 2), Some(2));
-        assert_eq!(wider.parallel_verify_width(4, 2), Some(3));
-        assert_eq!(wider.parallel_verify_width(4, 1), None);
+        assert!(controller.observe_tail_outcome(&rejected, 1, 2));
+        assert!(!controller.is_active());
+        assert!(!controller.probation_failed());
+        assert_eq!(controller.extension_limit(&[], 6), 0);
+        assert_eq!(controller.refill_limit(6), 0);
+        assert_eq!(controller.pipeline_in_flight_limit(8), 2);
+        assert_eq!(controller.stats().revocations, 1);
+        assert_eq!(controller.stats().observed_proposals, 3);
+        assert_eq!(controller.stats().full_accept_proposals, 2);
+    }
+
+    #[test]
+    fn probation_suppresses_dependent_pipeline_work() {
+        let mut controller = NgramSidecarController::new(2, 6);
+
+        assert!(!controller.permit_pipeline_start());
+        assert_eq!(controller.stats().suppressed_pipeline_starts, 1);
+    }
+
+    #[test]
+    fn hybrid_preserves_native_batches_and_uses_exact_ngram_positions() {
+        let accepted = NativeMtpHybridProposal::from_parts(vec![9, 1, 2], 1, true);
+        let rejected = NativeMtpHybridProposal::from_parts(vec![7, 8, 9], 1, true);
+        let mut controller = NgramSidecarController::new(2, 6);
+
+        assert_eq!(controller.verify_width(3, 3), 3);
+        assert_eq!(controller.verify_width(3, 1), 1);
+        assert_eq!(controller.verify_width(3, 0), 1);
+        controller.observe_tail_outcome(&accepted, 3, 2);
+        assert_eq!(controller.verify_width(3, 0), 1);
+        controller.observe_tail_outcome(&accepted, 3, 2);
+        assert_eq!(controller.verify_width(3, 3), 3);
+        assert_eq!(controller.verify_width(3, 0), 1);
+
+        let mut failed = NgramSidecarController::new(2, 6);
+        for _ in 0..NGRAM_PROBATION_MAX_REJECTIONS {
+            failed.observe_tail_outcome(&rejected, 2, 2);
+        }
+        assert!(failed.probation_failed());
+        assert_eq!(failed.verify_width(3, 0), 3);
+        assert_eq!(controller.stats().serial_probation_verify_windows, 2);
+    }
+
+    #[test]
+    fn disabled_ngram_does_not_change_native_verify_width() {
+        let mut controller = NgramSidecarController::new(0, 0);
+
+        assert_eq!(controller.verify_width(4, 0), 4);
+        assert_eq!(controller.stats().serial_probation_verify_windows, 0);
+    }
+
+    #[test]
+    fn probation_can_promote_after_an_early_rejection() {
+        let accepted = NativeMtpHybridProposal::from_parts(vec![9, 1, 2], 1, true);
+        let rejected = NativeMtpHybridProposal::from_parts(vec![9, 3, 4], 1, true);
+        let mut controller = NgramSidecarController::new(2, 6);
+
+        controller.observe_tail_outcome(&rejected, 1, 2);
+        controller.observe_tail_outcome(&accepted, 3, 2);
+        controller.observe_tail_outcome(&accepted, 3, 2);
+
+        assert!(controller.is_active());
+        assert!(!controller.probation_failed());
+        assert_eq!(controller.stats().probation_rejections, 1);
+        assert_eq!(controller.stats().promotions, 1);
+    }
+
+    #[test]
+    fn native_prefix_rejection_does_not_count_as_ngram_evidence() {
+        let proposal = NativeMtpHybridProposal::from_parts(vec![9, 1, 2], 1, true);
+        let mut controller = NgramSidecarController::new(2, 6);
+
+        assert!(!controller.observe_tail_outcome(&proposal, 0, 2));
+        assert_eq!(controller.stats().observed_proposals, 0);
+        assert_eq!(controller.remaining_proposals(), 0);
+    }
+
+    #[test]
+    fn positional_pipeline_requires_two_candidates_and_depth() {
+        let too_shallow = NativeMtpHybridProposal::from_parts(vec![1], 1, false);
+        let ready = NativeMtpHybridProposal::from_parts(vec![1, 2], 1, true);
+
+        assert!(!too_shallow.supports_positional_pipeline(2));
+        assert!(ready.supports_positional_pipeline(2));
+        assert!(!ready.supports_positional_pipeline(1));
     }
 
     #[test]
@@ -540,7 +972,7 @@ mod tests {
             true,
         ));
 
-        buffer.accept_window(&[9, 1], Some(2));
+        assert!(!buffer.accept_window(&[9, 1], Some(2)));
         assert_eq!(buffer.verify_tokens(4), vec![3]);
         assert_eq!(buffer.accepted_tokens(), 3);
 
@@ -563,19 +995,6 @@ mod tests {
     }
 
     #[test]
-    fn buffer_exposes_only_a_real_dependent_free_target() {
-        let buffer = BufferedCompositeProposal::new(NativeMtpHybridProposal::from_parts(
-            vec![9, 1, 2],
-            1,
-            true,
-        ));
-
-        assert_eq!(buffer.expected_free_target(1), Some(1));
-        assert_eq!(buffer.expected_free_target(2), Some(2));
-        assert_eq!(buffer.expected_free_target(3), None);
-    }
-
-    #[test]
     fn later_tail_rejection_does_not_reject_an_accepted_native_prefix() {
         let mut buffer = BufferedCompositeProposal::new(NativeMtpHybridProposal::from_parts(
             vec![9, 10, 11, 12],
@@ -583,9 +1002,32 @@ mod tests {
             true,
         ));
 
-        buffer.accept_window(&[9, 10], Some(11));
+        assert!(!buffer.accept_window(&[9, 10], Some(11)));
 
         assert!(!buffer.native_mtp_prefix_rejected_after(0));
+    }
+
+    #[test]
+    fn buffer_reports_a_rejected_dependent_free_target() {
+        let mut buffer = BufferedCompositeProposal::new(NativeMtpHybridProposal::from_parts(
+            vec![9, 10],
+            1,
+            true,
+        ));
+
+        assert!(buffer.accept_window(&[9], Some(42)));
+        assert!(buffer.is_empty());
+        assert_eq!(buffer.accepted_tokens(), 1);
+    }
+
+    #[test]
+    fn native_only_buffer_consumes_verified_token_in_release_builds() {
+        let mut buffer =
+            BufferedCompositeProposal::new(NativeMtpHybridProposal::from_parts(vec![9], 1, false));
+
+        assert!(!buffer.accept_window(&[9], Some(10)));
+        assert!(buffer.is_empty());
+        assert_eq!(buffer.accepted_tokens(), 1);
     }
 
     #[test]
@@ -609,6 +1051,24 @@ mod tests {
 
         assert_eq!(decision.accepted_proposal_tokens, 1);
         assert_eq!(decision.commit_count, 2);
+        assert!(decision.rejected);
+    }
+
+    #[test]
+    fn positional_verify_commits_exactly_one_accepted_target() {
+        let decision = classify_native_mtp_position(11, &[11]).unwrap();
+
+        assert_eq!(decision.accepted_proposal_tokens, 1);
+        assert_eq!(decision.commit_count, 1);
+        assert!(!decision.rejected);
+    }
+
+    #[test]
+    fn positional_verify_commits_exactly_one_target_correction() {
+        let decision = classify_native_mtp_position(11, &[42]).unwrap();
+
+        assert_eq!(decision.accepted_proposal_tokens, 0);
+        assert_eq!(decision.commit_count, 1);
         assert!(decision.rejected);
     }
 }

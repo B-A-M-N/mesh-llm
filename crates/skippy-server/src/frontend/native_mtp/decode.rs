@@ -1,8 +1,11 @@
 use std::collections::BTreeMap;
 
 use serde_json::{Value, json};
+use skippy_metrics::attr as attr_key;
 
-use super::{NativeMtpDraftOrigin, NativeMtpHybridProposal};
+#[cfg(test)]
+use super::NgramExtensionPolicy;
+use super::{NativeMtpDraftOrigin, NativeMtpHybridProposal, NgramAdmissionStats};
 use crate::frontend::SpeculativeDecodeConfig;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -54,6 +57,17 @@ impl NativeMtpDecodeOptions {
     pub(in crate::frontend) fn verify_window_bounds(self) -> (usize, usize) {
         let min = self.verify_window_min_tokens.max(1);
         (min, self.verify_window_max_tokens.max(min))
+    }
+
+    pub(in crate::frontend) fn without_ngram(self) -> Self {
+        Self {
+            ngram_hybrid: false,
+            ngram_size: 0,
+            ngram_initial_extension_tokens: 0,
+            ngram_max_proposal_tokens: 0,
+            ngram_tail_backoff_proposals: 0,
+            ..self
+        }
     }
 }
 
@@ -116,6 +130,24 @@ pub(in crate::frontend) struct NativeMtpDecodeCounters {
     hybrid_accepted_native_mtp_token_count: usize,
     hybrid_ngram_tail_rejection_count: usize,
     hybrid_ngram_sidecar_backoff_count: usize,
+    hybrid_ngram_admission_observed_proposal_count: usize,
+    hybrid_ngram_admission_full_accept_proposal_count: usize,
+    hybrid_ngram_admission_probe_attempt_count: usize,
+    hybrid_ngram_admission_promotion_count: usize,
+    hybrid_ngram_admission_revocation_count: usize,
+    hybrid_ngram_admission_probation_fallback_count: usize,
+    hybrid_ngram_admission_probation_rejection_count: usize,
+    hybrid_ngram_admission_suppressed_after_fallback_count: usize,
+    hybrid_ngram_admission_suppressed_unanchored_count: usize,
+    hybrid_ngram_admission_suppressed_refill_count: usize,
+    hybrid_ngram_admission_suppressed_pipeline_start_count: usize,
+    hybrid_ngram_admission_serial_probation_verify_window_count: usize,
+    hybrid_ngram_admission_low_support_suppression_count: usize,
+    hybrid_ngram_admission_slow_start_accepted_token_count: usize,
+    hybrid_ngram_admission_slow_start_full_accept_proposal_count: usize,
+    hybrid_ngram_admission_slow_start_refill_suppression_count: usize,
+    hybrid_ngram_admission_active: bool,
+    hybrid_ngram_admission_probation_failed: bool,
     adaptive_verify_window_count: usize,
     adaptive_verify_window_width_sum: usize,
     adaptive_verify_window_width_min: usize,
@@ -201,6 +233,38 @@ impl NativeMtpDecodeCounters {
     pub(in crate::frontend) fn observe_ngram_tail_rejection(&mut self) {
         self.hybrid_ngram_tail_rejection_count += 1;
         self.hybrid_ngram_sidecar_backoff_count += 1;
+    }
+
+    pub(in crate::frontend) fn observe_ngram_admission(
+        &mut self,
+        stats: NgramAdmissionStats,
+        active: bool,
+    ) {
+        self.hybrid_ngram_admission_observed_proposal_count = stats.observed_proposals;
+        self.hybrid_ngram_admission_full_accept_proposal_count = stats.full_accept_proposals;
+        self.hybrid_ngram_admission_probe_attempt_count = stats.probe_attempts;
+        self.hybrid_ngram_admission_promotion_count = stats.promotions;
+        self.hybrid_ngram_admission_revocation_count = stats.revocations;
+        self.hybrid_ngram_admission_probation_fallback_count = stats.probation_fallbacks;
+        self.hybrid_ngram_admission_probation_rejection_count = stats.probation_rejections;
+        self.hybrid_ngram_admission_suppressed_after_fallback_count =
+            stats.suppressed_after_fallback;
+        self.hybrid_ngram_admission_suppressed_unanchored_count =
+            stats.suppressed_unanchored_proposals;
+        self.hybrid_ngram_admission_suppressed_refill_count = stats.suppressed_refills;
+        self.hybrid_ngram_admission_suppressed_pipeline_start_count =
+            stats.suppressed_pipeline_starts;
+        self.hybrid_ngram_admission_serial_probation_verify_window_count =
+            stats.serial_probation_verify_windows;
+        self.hybrid_ngram_admission_low_support_suppression_count = stats.low_support_suppressions;
+        self.hybrid_ngram_admission_slow_start_accepted_token_count =
+            stats.slow_start_accepted_tokens;
+        self.hybrid_ngram_admission_slow_start_full_accept_proposal_count =
+            stats.slow_start_full_accept_proposals;
+        self.hybrid_ngram_admission_slow_start_refill_suppression_count =
+            stats.slow_start_refill_suppressions;
+        self.hybrid_ngram_admission_active = active;
+        self.hybrid_ngram_admission_probation_failed = stats.probation_fallbacks > 0;
     }
 
     pub(in crate::frontend) fn observe_adaptive_verify_window(
@@ -355,6 +419,82 @@ impl NativeMtpDecodeCounters {
             json!(self.hybrid_ngram_sidecar_backoff_count),
         );
         attrs.insert(
+            "llama_stage.native_mtp.hybrid_ngram_admission_observed_proposal_count".to_string(),
+            json!(self.hybrid_ngram_admission_observed_proposal_count),
+        );
+        attrs.insert(
+            "llama_stage.native_mtp.hybrid_ngram_admission_full_accept_proposal_count".to_string(),
+            json!(self.hybrid_ngram_admission_full_accept_proposal_count),
+        );
+        attrs.insert(
+            "llama_stage.native_mtp.hybrid_ngram_admission_probe_attempt_count".to_string(),
+            json!(self.hybrid_ngram_admission_probe_attempt_count),
+        );
+        attrs.insert(
+            "llama_stage.native_mtp.hybrid_ngram_admission_promotion_count".to_string(),
+            json!(self.hybrid_ngram_admission_promotion_count),
+        );
+        attrs.insert(
+            "llama_stage.native_mtp.hybrid_ngram_admission_revocation_count".to_string(),
+            json!(self.hybrid_ngram_admission_revocation_count),
+        );
+        attrs.insert(
+            "llama_stage.native_mtp.hybrid_ngram_admission_probation_fallback_count".to_string(),
+            json!(self.hybrid_ngram_admission_probation_fallback_count),
+        );
+        attrs.insert(
+            "llama_stage.native_mtp.hybrid_ngram_admission_probation_rejection_count".to_string(),
+            json!(self.hybrid_ngram_admission_probation_rejection_count),
+        );
+        attrs.insert(
+            "llama_stage.native_mtp.hybrid_ngram_admission_suppressed_after_fallback_count"
+                .to_string(),
+            json!(self.hybrid_ngram_admission_suppressed_after_fallback_count),
+        );
+        attrs.insert(
+            "llama_stage.native_mtp.hybrid_ngram_admission_suppressed_unanchored_count".to_string(),
+            json!(self.hybrid_ngram_admission_suppressed_unanchored_count),
+        );
+        attrs.insert(
+            "llama_stage.native_mtp.hybrid_ngram_admission_suppressed_refill_count".to_string(),
+            json!(self.hybrid_ngram_admission_suppressed_refill_count),
+        );
+        attrs.insert(
+            "llama_stage.native_mtp.hybrid_ngram_admission_suppressed_pipeline_start_count"
+                .to_string(),
+            json!(self.hybrid_ngram_admission_suppressed_pipeline_start_count),
+        );
+        attrs.insert(
+            "llama_stage.native_mtp.hybrid_ngram_admission_serial_probation_verify_window_count"
+                .to_string(),
+            json!(self.hybrid_ngram_admission_serial_probation_verify_window_count),
+        );
+        attrs.insert(
+            "llama_stage.native_mtp.hybrid_ngram_admission_low_support_suppression_count"
+                .to_string(),
+            json!(self.hybrid_ngram_admission_low_support_suppression_count),
+        );
+        attrs.insert(
+            attr_key::NGRAM_SLOW_START_ACCEPTED_TOKENS.to_string(),
+            json!(self.hybrid_ngram_admission_slow_start_accepted_token_count),
+        );
+        attrs.insert(
+            attr_key::NGRAM_SLOW_START_FULL_ACCEPT_PROPOSALS.to_string(),
+            json!(self.hybrid_ngram_admission_slow_start_full_accept_proposal_count),
+        );
+        attrs.insert(
+            attr_key::NGRAM_SLOW_START_REFILL_SUPPRESSIONS.to_string(),
+            json!(self.hybrid_ngram_admission_slow_start_refill_suppression_count),
+        );
+        attrs.insert(
+            "llama_stage.native_mtp.hybrid_ngram_admission_active".to_string(),
+            json!(self.hybrid_ngram_admission_active),
+        );
+        attrs.insert(
+            "llama_stage.native_mtp.hybrid_ngram_admission_probation_failed".to_string(),
+            json!(self.hybrid_ngram_admission_probation_failed),
+        );
+        attrs.insert(
             "llama_stage.native_mtp.hybrid_pure_ngram_proposal_count".to_string(),
             json!(self.hybrid_pure_ngram_proposal_count),
         );
@@ -428,6 +568,78 @@ impl NativeMtpDecodeCounters {
         timings.insert(
             "native_mtp_hybrid_ngram_sidecar_backoffs".to_string(),
             json!(self.hybrid_ngram_sidecar_backoff_count),
+        );
+        timings.insert(
+            "native_mtp_hybrid_ngram_admission_observed_proposals".to_string(),
+            json!(self.hybrid_ngram_admission_observed_proposal_count),
+        );
+        timings.insert(
+            "native_mtp_hybrid_ngram_admission_full_accept_proposals".to_string(),
+            json!(self.hybrid_ngram_admission_full_accept_proposal_count),
+        );
+        timings.insert(
+            "native_mtp_hybrid_ngram_admission_probe_attempts".to_string(),
+            json!(self.hybrid_ngram_admission_probe_attempt_count),
+        );
+        timings.insert(
+            "native_mtp_hybrid_ngram_admission_promotions".to_string(),
+            json!(self.hybrid_ngram_admission_promotion_count),
+        );
+        timings.insert(
+            "native_mtp_hybrid_ngram_admission_revocations".to_string(),
+            json!(self.hybrid_ngram_admission_revocation_count),
+        );
+        timings.insert(
+            "native_mtp_hybrid_ngram_admission_probation_fallbacks".to_string(),
+            json!(self.hybrid_ngram_admission_probation_fallback_count),
+        );
+        timings.insert(
+            "native_mtp_hybrid_ngram_admission_probation_rejections".to_string(),
+            json!(self.hybrid_ngram_admission_probation_rejection_count),
+        );
+        timings.insert(
+            "native_mtp_hybrid_ngram_admission_suppressed_after_fallback".to_string(),
+            json!(self.hybrid_ngram_admission_suppressed_after_fallback_count),
+        );
+        timings.insert(
+            "native_mtp_hybrid_ngram_admission_suppressed_unanchored".to_string(),
+            json!(self.hybrid_ngram_admission_suppressed_unanchored_count),
+        );
+        timings.insert(
+            "native_mtp_hybrid_ngram_admission_suppressed_refills".to_string(),
+            json!(self.hybrid_ngram_admission_suppressed_refill_count),
+        );
+        timings.insert(
+            "native_mtp_hybrid_ngram_admission_suppressed_pipeline_starts".to_string(),
+            json!(self.hybrid_ngram_admission_suppressed_pipeline_start_count),
+        );
+        timings.insert(
+            "native_mtp_hybrid_ngram_admission_serial_probation_verify_windows".to_string(),
+            json!(self.hybrid_ngram_admission_serial_probation_verify_window_count),
+        );
+        timings.insert(
+            "native_mtp_hybrid_ngram_admission_low_support_suppressions".to_string(),
+            json!(self.hybrid_ngram_admission_low_support_suppression_count),
+        );
+        timings.insert(
+            "native_mtp_hybrid_ngram_admission_slow_start_accepted_tokens".to_string(),
+            json!(self.hybrid_ngram_admission_slow_start_accepted_token_count),
+        );
+        timings.insert(
+            "native_mtp_hybrid_ngram_admission_slow_start_full_accept_proposals".to_string(),
+            json!(self.hybrid_ngram_admission_slow_start_full_accept_proposal_count),
+        );
+        timings.insert(
+            "native_mtp_hybrid_ngram_admission_slow_start_refill_suppressions".to_string(),
+            json!(self.hybrid_ngram_admission_slow_start_refill_suppression_count),
+        );
+        timings.insert(
+            "native_mtp_hybrid_ngram_admission_active".to_string(),
+            json!(self.hybrid_ngram_admission_active),
+        );
+        timings.insert(
+            "native_mtp_hybrid_ngram_admission_probation_failed".to_string(),
+            json!(self.hybrid_ngram_admission_probation_failed),
         );
         timings.insert(
             "native_mtp_hybrid_pure_ngram_proposals".to_string(),
@@ -544,7 +756,13 @@ mod tests {
         let context = [1, 2, 3, 1, 2, 3, 1, 2];
         let mut cache = CachedNgramProposer::new(2, 2).unwrap();
         CompositeProposalProvider::from_options(options())
-            .propose_with_ngram_extension(&[3], &context, 4, 4, Some(&mut cache))
+            .propose_with_ngram_extension(
+                &[3],
+                &context,
+                4,
+                NgramExtensionPolicy::unrestricted(4),
+                Some(&mut cache),
+            )
             .unwrap()
     }
 
@@ -581,6 +799,27 @@ mod tests {
         counters.observe_suppressed_cooldown_draft();
         counters.observe_hybrid_proposal(&composite_proposal(), 3);
         counters.observe_ngram_tail_rejection();
+        counters.observe_ngram_admission(
+            NgramAdmissionStats {
+                observed_proposals: 4,
+                full_accept_proposals: 2,
+                probe_attempts: 3,
+                promotions: 1,
+                revocations: 1,
+                probation_fallbacks: 1,
+                probation_rejections: 3,
+                suppressed_after_fallback: 4,
+                suppressed_unanchored_proposals: 5,
+                suppressed_refills: 6,
+                suppressed_pipeline_starts: 7,
+                serial_probation_verify_windows: 8,
+                low_support_suppressions: 9,
+                slow_start_accepted_tokens: 10,
+                slow_start_full_accept_proposals: 11,
+                slow_start_refill_suppressions: 12,
+            },
+            false,
+        );
         counters.observe_adaptive_verify_window(2, 2, 3);
 
         let mut attrs = BTreeMap::new();
@@ -655,6 +894,57 @@ mod tests {
             Some(&json!(1))
         );
         assert_eq!(
+            attrs.get("llama_stage.native_mtp.hybrid_ngram_admission_suppressed_unanchored_count"),
+            Some(&json!(5))
+        );
+        assert_eq!(
+            attrs.get("llama_stage.native_mtp.hybrid_ngram_admission_suppressed_refill_count"),
+            Some(&json!(6))
+        );
+        assert_eq!(
+            attrs.get(
+                "llama_stage.native_mtp.hybrid_ngram_admission_suppressed_pipeline_start_count"
+            ),
+            Some(&json!(7))
+        );
+        assert_eq!(
+            attrs.get("llama_stage.native_mtp.hybrid_ngram_admission_probation_failed"),
+            Some(&json!(true))
+        );
+        assert_eq!(
+            attrs.get(
+                "llama_stage.native_mtp.hybrid_ngram_admission_serial_probation_verify_window_count"
+            ),
+            Some(&json!(8))
+        );
+        assert_eq!(
+            attrs
+                .get("llama_stage.native_mtp.hybrid_ngram_admission_low_support_suppression_count"),
+            Some(&json!(9))
+        );
+        assert_eq!(
+            attrs.get(
+                "llama_stage.native_mtp.hybrid_ngram_admission_slow_start_accepted_token_count"
+            ),
+            Some(&json!(10))
+        );
+        assert_eq!(
+            attrs.get(
+                "llama_stage.native_mtp.hybrid_ngram_admission_slow_start_full_accept_proposal_count"
+            ),
+            Some(&json!(11))
+        );
+        assert_eq!(
+            attrs.get(
+                "llama_stage.native_mtp.hybrid_ngram_admission_slow_start_refill_suppression_count"
+            ),
+            Some(&json!(12))
+        );
+        assert_eq!(
+            attrs.get("llama_stage.native_mtp.hybrid_ngram_admission_active"),
+            Some(&json!(false))
+        );
+        assert_eq!(
             attrs.get("llama_stage.native_mtp.adaptive_verify_window_grow_count"),
             Some(&json!(1))
         );
@@ -700,6 +990,16 @@ mod tests {
         let mut counters = NativeMtpDecodeCounters::default();
         counters.observe_verify_window_verification(NativeMtpDraftOrigin::InitialSerial, true);
         counters.observe_hybrid_proposal(&composite_proposal(), 3);
+        counters.observe_ngram_admission(
+            NgramAdmissionStats {
+                observed_proposals: 2,
+                full_accept_proposals: 2,
+                probe_attempts: 2,
+                promotions: 1,
+                ..NgramAdmissionStats::default()
+            },
+            true,
+        );
         counters.observe_adaptive_verify_window(2, 2, 3);
         let telemetry = NativeMtpDecodeTelemetry::new(
             NativeMtpDecodeOptions {
@@ -743,6 +1043,14 @@ mod tests {
             Some(&json!(1))
         );
         assert_eq!(
+            timings.get("native_mtp_hybrid_ngram_admission_promotions"),
+            Some(&json!(1))
+        );
+        assert_eq!(
+            timings.get("native_mtp_hybrid_ngram_admission_active"),
+            Some(&json!(true))
+        );
+        assert_eq!(
             timings.get("native_mtp_adaptive_verify_window_grows"),
             Some(&json!(1))
         );
@@ -769,7 +1077,13 @@ mod tests {
         let context = [1, 2, 3, 1, 2, 3, 1, 2];
         let mut cache = CachedNgramProposer::new(2, 2).unwrap();
         let proposal = CompositeProposalProvider::from_options(options())
-            .propose_with_ngram_extension(&[], &context, 4, 4, Some(&mut cache))
+            .propose_with_ngram_extension(
+                &[],
+                &context,
+                4,
+                NgramExtensionPolicy::unrestricted(4),
+                Some(&mut cache),
+            )
             .unwrap();
         counters.observe_hybrid_proposal(&proposal, 4);
 

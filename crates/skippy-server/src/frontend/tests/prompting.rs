@@ -224,7 +224,13 @@ fn generated_text_timings_prefer_composite_proposal_totals() {
         verify_window_max_tokens: 4,
     };
     let proposal = CompositeProposalProvider::from_options(options)
-        .propose_with_ngram_extension(&[], &context, 4, 4, Some(&mut cache))
+        .propose_with_ngram_extension(
+            &[],
+            &context,
+            4,
+            NgramExtensionPolicy::new(4, 0, 0),
+            Some(&mut cache),
+        )
         .unwrap();
     counters.observe_hybrid_proposal(&proposal, 4);
     let output = GeneratedText {

@@ -632,6 +632,8 @@ pub(super) fn handle_binary_connection(
                     message.kind,
                     restored_prefill,
                     executable_token_ids.len(),
+                    (message.state.prompt_token_count.max(0) as usize)
+                        .saturating_sub(message.pos_start.max(0) as usize),
                 );
                 if eviction_plan.required {
                     proactive_eviction = Some(evict_binary_resident_prefix_for_decode(

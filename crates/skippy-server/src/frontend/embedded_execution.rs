@@ -29,7 +29,13 @@ use std::time::Duration;
 use std::time::Instant;
 
 const DIRECT_RETURN_FALLBACK_POLL: Duration = Duration::from_millis(10);
-const DIRECT_RETURN_FALLBACK_TIMEOUT: Duration = Duration::from_secs(300);
+// A dead downstream tunnel can leave both the persistent lane and the direct
+// return reader open without producing EOF. Bound every reply wait so the
+// request reaches lane replacement and session teardown instead of occupying
+// a generation permit indefinitely. This is deliberately much larger than a
+// normal WAN verify traversal while remaining shorter than the HTTP client's
+// request timeout.
+const DIRECT_RETURN_FALLBACK_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub(super) struct DispatchedEmbeddedStage {
     started: Instant,

@@ -2,21 +2,16 @@ use std::collections::VecDeque;
 
 use super::{NativeMtpDraft, NativeMtpDraftOrigin, NativeMtpHybridProposal};
 
-/// The candidate portion of one dispatched asynchronous verify window.
+/// One candidate predicted by one exact-shape positional target evaluation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(in crate::frontend) struct PipelinedCandidateWindow {
-    proposal_tokens: Vec<i32>,
-    expected_free_target: Option<i32>,
+    proposal_token: i32,
     native_mtp_token_count: usize,
 }
 
 impl PipelinedCandidateWindow {
-    pub(in crate::frontend) fn proposal_tokens(&self) -> &[i32] {
-        &self.proposal_tokens
-    }
-
-    pub(in crate::frontend) fn expected_free_target(&self) -> Option<i32> {
-        self.expected_free_target
+    pub(in crate::frontend) fn proposal_token(&self) -> i32 {
+        self.proposal_token
     }
 
     pub(in crate::frontend) fn native_mtp_token_count(&self) -> usize {
@@ -24,15 +19,16 @@ impl PipelinedCandidateWindow {
     }
 }
 
-/// Owns a deeper composite candidate while asynchronous windows consume it.
-/// Each planned window reserves the target's free-advance candidate as the
-/// next window's optimistic current token, preventing duplicate KV positions.
+/// Owns a composite candidate while positional windows consume it.
+///
+/// Every window evaluates exactly one input token and predicts exactly one
+/// candidate token, matching native target decode's batch shape. Pipeline depth
+/// comes only from consecutive positions in flight, never a wider target batch.
 #[derive(Debug)]
 pub(in crate::frontend) struct CompositeProposalPipeline {
     proposal: NativeMtpHybridProposal,
     origin: Option<NativeMtpDraftOrigin>,
     candidates: VecDeque<i32>,
-    parallel_verify_width: usize,
     dispatched_native_mtp_token_count: usize,
     accepted_tokens: usize,
     next_draft: Option<NativeMtpDraft>,
@@ -42,39 +38,27 @@ impl CompositeProposalPipeline {
     pub(in crate::frontend) fn new(
         proposal: NativeMtpHybridProposal,
         origin: Option<NativeMtpDraftOrigin>,
-        parallel_verify_width: usize,
     ) -> Self {
         Self {
             candidates: proposal.tokens().iter().copied().collect(),
             proposal,
             origin,
-            parallel_verify_width: parallel_verify_width.max(1),
             dispatched_native_mtp_token_count: 0,
             accepted_tokens: 0,
             next_draft: None,
         }
     }
 
-    pub(in crate::frontend) fn next_window(
-        &mut self,
-        verify_width: usize,
-    ) -> Option<PipelinedCandidateWindow> {
-        let verify_width = verify_width
-            .min(self.parallel_verify_width)
-            .min(self.candidates.len());
-        if verify_width == 0 {
-            return None;
-        }
+    pub(in crate::frontend) fn next_window(&mut self) -> Option<PipelinedCandidateWindow> {
+        let proposal_token = self.candidates.pop_front()?;
         let native_mtp_token_count = self
             .proposal
             .native_mtp_token_count()
             .saturating_sub(self.dispatched_native_mtp_token_count)
-            .min(verify_width);
-        let proposal_tokens = self.candidates.drain(..verify_width).collect();
+            .min(1);
         self.dispatched_native_mtp_token_count += native_mtp_token_count;
         Some(PipelinedCandidateWindow {
-            proposal_tokens,
-            expected_free_target: self.candidates.pop_front(),
+            proposal_token,
             native_mtp_token_count,
         })
     }
@@ -143,38 +127,34 @@ mod tests {
     }
 
     #[test]
-    fn reserves_free_target_as_the_next_optimistic_current_token() {
+    fn plans_one_exact_target_position_per_window() {
         let mut pipeline = CompositeProposalPipeline::new(
-            proposal(vec![9, 1, 2, 3, 4], 1),
+            proposal(vec![9, 1, 2], 1),
             Some(NativeMtpDraftOrigin::InitialSerial),
-            2,
         );
 
-        let first = pipeline.next_window(2).unwrap();
-        assert_eq!(first.proposal_tokens(), &[9, 1]);
-        assert_eq!(first.expected_free_target(), Some(2));
+        let first = pipeline.next_window().unwrap();
+        assert_eq!(first.proposal_token(), 9);
         assert_eq!(first.native_mtp_token_count(), 1);
 
-        let second = pipeline.next_window(2).unwrap();
-        assert_eq!(second.proposal_tokens(), &[3, 4]);
-        assert_eq!(second.expected_free_target(), None);
+        let second = pipeline.next_window().unwrap();
+        assert_eq!(second.proposal_token(), 1);
         assert_eq!(second.native_mtp_token_count(), 0);
     }
 
     #[test]
     fn supports_a_pure_ngram_candidate() {
-        let mut pipeline = CompositeProposalPipeline::new(proposal(vec![1, 2, 3], 0), None, 2);
+        let mut pipeline = CompositeProposalPipeline::new(proposal(vec![1, 2, 3], 0), None);
 
-        let window = pipeline.next_window(2).unwrap();
-        assert_eq!(window.proposal_tokens(), &[1, 2]);
-        assert_eq!(window.expected_free_target(), Some(3));
+        let window = pipeline.next_window().unwrap();
+        assert_eq!(window.proposal_token(), 1);
         assert_eq!(window.native_mtp_token_count(), 0);
-        assert!(!pipeline.has_remaining_candidates());
+        assert!(pipeline.has_remaining_candidates());
     }
 
     #[test]
     fn pure_ngram_pipeline_discards_verify_next_native_mtp_drafts() {
-        let mut pipeline = CompositeProposalPipeline::new(proposal(vec![1, 2, 3], 0), None, 2);
+        let mut pipeline = CompositeProposalPipeline::new(proposal(vec![1, 2, 3], 0), None);
 
         pipeline.set_next_draft(
             false,
@@ -188,24 +168,13 @@ mod tests {
     }
 
     #[test]
-    fn caps_each_dispatched_window_to_the_parallel_width() {
-        let mut pipeline = CompositeProposalPipeline::new(proposal(vec![1, 2, 3], 0), None, 1);
-
-        let window = pipeline.next_window(4).unwrap();
-
-        assert_eq!(window.proposal_tokens(), &[1]);
-        assert_eq!(window.expected_free_target(), Some(2));
-    }
-
-    #[test]
     fn records_the_matching_prefix_of_a_rejected_window() {
         let mut pipeline = CompositeProposalPipeline::new(
             proposal(vec![9, 1, 2, 3], 1),
             Some(NativeMtpDraftOrigin::InitialSerial),
-            2,
         );
 
-        let _ = pipeline.next_window(2).unwrap();
+        let _ = pipeline.next_window().unwrap();
         pipeline.observe_accepted(1);
 
         assert_eq!(pipeline.accepted_tokens(), 1);
@@ -219,18 +188,16 @@ mod tests {
     #[test]
     fn later_ngram_rejection_does_not_reject_an_accepted_native_prefix() {
         let mut pipeline = CompositeProposalPipeline::new(
-            proposal(vec![9, 1, 2, 3, 4], 1),
+            proposal(vec![9, 1, 2, 3], 1),
             Some(NativeMtpDraftOrigin::InitialSerial),
-            2,
         );
 
-        let first = pipeline.next_window(2).unwrap();
-        assert_eq!(first.proposal_tokens(), &[9, 1]);
-        assert_eq!(first.expected_free_target(), Some(2));
-        pipeline.observe_accepted(3);
+        let first = pipeline.next_window().unwrap();
+        assert_eq!(first.proposal_token(), 9);
+        pipeline.observe_accepted(1);
 
-        let second = pipeline.next_window(2).unwrap();
-        assert_eq!(second.proposal_tokens(), &[3, 4]);
+        let second = pipeline.next_window().unwrap();
+        assert_eq!(second.proposal_token(), 1);
         pipeline.observe_accepted(0);
 
         assert!(
@@ -250,23 +217,20 @@ mod tests {
         let mut pipeline = CompositeProposalPipeline::new(
             proposal(vec![9, 1, 2, 3], 1),
             Some(NativeMtpDraftOrigin::InitialSerial),
-            2,
         );
 
-        let first = pipeline.next_window(2).unwrap();
-        assert_eq!(first.proposal_tokens(), &[9, 1]);
-        assert_eq!(first.expected_free_target(), Some(2));
+        let first = pipeline.next_window().unwrap();
+        assert_eq!(first.proposal_token(), 9);
         assert_eq!(pipeline.optimistic_suffix(), &[9, 1, 2, 3]);
 
-        pipeline.observe_accepted(3);
-        assert_eq!(pipeline.optimistic_suffix(), &[3]);
+        pipeline.observe_accepted(1);
+        assert_eq!(pipeline.optimistic_suffix(), &[1, 2, 3]);
         assert_eq!(pipeline.append_ngram_candidates(&[4, 5]), 2);
-        assert_eq!(pipeline.optimistic_suffix(), &[3, 4, 5]);
+        assert_eq!(pipeline.optimistic_suffix(), &[1, 2, 3, 4, 5]);
         assert_eq!(pipeline.proposal().tokens(), &[9, 1, 2, 3, 4, 5]);
         assert_eq!(pipeline.proposal().ngram_token_count(), 5);
 
-        let second = pipeline.next_window(2).unwrap();
-        assert_eq!(second.proposal_tokens(), &[3, 4]);
-        assert_eq!(second.expected_free_target(), Some(5));
+        let second = pipeline.next_window().unwrap();
+        assert_eq!(second.proposal_token(), 1);
     }
 }
