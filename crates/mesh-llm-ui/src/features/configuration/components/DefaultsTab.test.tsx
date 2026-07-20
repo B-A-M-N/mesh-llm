@@ -90,7 +90,7 @@ const dependencySettings = [
       presentation: 'segmented',
       options: [
         { value: 'off', label: 'off' },
-        { value: 'draft_model', label: 'draft model' },
+        { value: 'draft_model', label: 'draft model' }
       ]
     }
   },
