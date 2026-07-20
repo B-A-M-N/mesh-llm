@@ -95,6 +95,19 @@ impl CompositeProposalPipeline {
         self.candidates.len()
     }
 
+    /// The uncommitted optimistic suffix, including tokens already dispatched
+    /// but not yet committed. The N-gram cache may read this suffix while its
+    /// index remains restricted to committed target history.
+    pub(in crate::frontend) fn optimistic_suffix(&self) -> &[i32] {
+        &self.proposal.tokens()[self.accepted_tokens.min(self.proposal.tokens().len())..]
+    }
+
+    pub(in crate::frontend) fn append_ngram_candidates(&mut self, tokens: &[i32]) -> usize {
+        self.proposal.append_ngram_tokens(tokens);
+        self.candidates.extend(tokens.iter().copied());
+        tokens.len()
+    }
+
     pub(in crate::frontend) fn observe_accepted(&mut self, count: usize) {
         self.accepted_tokens += count;
     }
@@ -230,5 +243,30 @@ mod tests {
                 .proposal()
                 .ngram_tail_rejected(pipeline.accepted_tokens())
         );
+    }
+
+    #[test]
+    fn appends_an_optimistic_ngram_suffix_without_committing_it() {
+        let mut pipeline = CompositeProposalPipeline::new(
+            proposal(vec![9, 1, 2, 3], 1),
+            Some(NativeMtpDraftOrigin::InitialSerial),
+            2,
+        );
+
+        let first = pipeline.next_window(2).unwrap();
+        assert_eq!(first.proposal_tokens(), &[9, 1]);
+        assert_eq!(first.expected_free_target(), Some(2));
+        assert_eq!(pipeline.optimistic_suffix(), &[9, 1, 2, 3]);
+
+        pipeline.observe_accepted(3);
+        assert_eq!(pipeline.optimistic_suffix(), &[3]);
+        assert_eq!(pipeline.append_ngram_candidates(&[4, 5]), 2);
+        assert_eq!(pipeline.optimistic_suffix(), &[3, 4, 5]);
+        assert_eq!(pipeline.proposal().tokens(), &[9, 1, 2, 3, 4, 5]);
+        assert_eq!(pipeline.proposal().ngram_token_count(), 5);
+
+        let second = pipeline.next_window(2).unwrap();
+        assert_eq!(second.proposal_tokens(), &[3, 4]);
+        assert_eq!(second.expected_free_target(), Some(5));
     }
 }

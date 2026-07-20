@@ -44,6 +44,7 @@ use crate::telemetry::now_unix_nanos;
 use lifecycle::{
     EmbeddedDecodeSummary, PipelinedCompositeWindow, can_seed_pipeline,
     decode_uses_context_sideband, mark_epoch_stale, queued_active_tokens,
+    refill_pipeline_ngram_candidates,
 };
 use openai_frontend::OpenAiError;
 use openai_frontend::OpenAiResult;
@@ -1071,6 +1072,23 @@ impl StageOpenAiBackend {
                             && decoded_tokens + queued_active_tokens(&pipelined_windows)
                                 < request.max_tokens as usize
                         {
+                            let refill_threshold = adaptive_verify_window
+                                .width(pipeline.candidate_len())
+                                .saturating_add(1);
+                            if pipeline.candidate_len() < refill_threshold {
+                                let refill_budget =
+                                    native_mtp_options.ngram_max_proposal_tokens.min(
+                                        native_mtp_remaining
+                                            .saturating_sub(pipeline.optimistic_suffix().len()),
+                                    );
+                                let appended = refill_pipeline_ngram_candidates(
+                                    pipeline,
+                                    &context_tokens,
+                                    &mut cached_ngram_proposer,
+                                    refill_budget,
+                                )?;
+                                verify_window_scheduler.record_horizon_refill(appended);
+                            }
                             let Some(planned) = pipeline.next_window(
                                 adaptive_verify_window.width(pipeline.candidate_len()),
                             ) else {

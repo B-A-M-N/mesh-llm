@@ -377,6 +377,7 @@ telemetry supplies per-window and per-stage detail.
 | Did the sidecar widen MTP? | `native_mtp_hybrid_native_tokens`, `native_mtp_hybrid_ngram_tokens`, `native_mtp_hybrid_proposed_tokens` |
 | Were tails useful? | `native_mtp_hybrid_accepted_tail_tokens`, `native_mtp_hybrid_ngram_tail_rejections`, `native_mtp_hybrid_ngram_sidecar_backoffs` |
 | Was it pipelined? | `verify_window_depth`, `verify_window_opened`, `verify_window_max_in_flight`, `verify_window_stale_discarded` |
+| Did the proposer keep supplying horizon? | `verify_window_horizon_refill_attempts`, `verify_window_horizon_refill_successes`, `verify_window_horizon_refill_tokens`, `verify_window_horizon_refill_misses` |
 | Why was depth used or suppressed? | `verify_window_policy_observed_windows`, `verify_window_policy_continuation_windows`, `verify_window_policy_profitable_widths`, `verify_window_policy_permit_checks`, `verify_window_policy_permits`, `verify_window_policy_suppressed` |
 | Where was time spent? | `verify_window_downstream_wait_ms`, `verify_window_forward_write_ms`, `verify_window_stage0_compute_ms`, `verify_window_verify_elapsed_ms` |
 
@@ -387,3 +388,5 @@ throughput higher than the native-MTP control.
 Pipeline-policy telemetry contains only bounded numeric counts and stage timing;
 it does not include prompts, completions, token IDs, paths, endpoints, or node
 identifiers. Debug OTLP export remains explicitly configured by the operator.
+Horizon refills query speculative suffixes only in request-local memory; the
+telemetry exports counts, never those suffixes or their token IDs.

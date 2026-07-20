@@ -119,6 +119,15 @@ impl NativeMtpHybridProposal {
         self.ngram_span_available
     }
 
+    pub(in crate::frontend) fn append_ngram_tokens(&mut self, tokens: &[i32]) {
+        if tokens.is_empty() {
+            return;
+        }
+        self.tokens.extend_from_slice(tokens);
+        self.ngram_token_count = self.ngram_token_count.saturating_add(tokens.len());
+        self.ngram_span_available = true;
+    }
+
     /// A tail mismatch is not evidence that the native MTP prefix was bad.
     /// Keep the native reject cooldown scoped to mismatches inside that prefix.
     pub(in crate::frontend) fn native_mtp_prefix_rejected(

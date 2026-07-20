@@ -51,6 +51,10 @@ pub(super) struct VerifyWindowPipelineStats {
     policy_permit_checks: usize,
     policy_permits: usize,
     policy_suppressed: usize,
+    horizon_refill_attempts: usize,
+    horizon_refill_successes: usize,
+    horizon_refill_tokens: usize,
+    horizon_refill_misses: usize,
     occupancy_ms_by_depth: Vec<f64>,
     occupancy_total_ms: f64,
     occupancy_parallel_ms: f64,
@@ -147,6 +151,22 @@ impl VerifyWindowPipelineStats {
         timings.insert(
             "verify_window_policy_suppressed".to_string(),
             serde_json::json!(self.policy_suppressed),
+        );
+        timings.insert(
+            "verify_window_horizon_refill_attempts".to_string(),
+            serde_json::json!(self.horizon_refill_attempts),
+        );
+        timings.insert(
+            "verify_window_horizon_refill_successes".to_string(),
+            serde_json::json!(self.horizon_refill_successes),
+        );
+        timings.insert(
+            "verify_window_horizon_refill_tokens".to_string(),
+            serde_json::json!(self.horizon_refill_tokens),
+        );
+        timings.insert(
+            "verify_window_horizon_refill_misses".to_string(),
+            serde_json::json!(self.horizon_refill_misses),
         );
         timings.insert(
             "verify_window_occupancy_ms_by_depth".to_string(),
@@ -404,6 +424,19 @@ impl VerifyWindowScheduler {
         permitted
     }
 
+    pub(super) fn record_horizon_refill(&mut self, appended_tokens: usize) {
+        self.stats.horizon_refill_attempts = self.stats.horizon_refill_attempts.saturating_add(1);
+        if appended_tokens == 0 {
+            self.stats.horizon_refill_misses = self.stats.horizon_refill_misses.saturating_add(1);
+            return;
+        }
+        self.stats.horizon_refill_successes = self.stats.horizon_refill_successes.saturating_add(1);
+        self.stats.horizon_refill_tokens = self
+            .stats
+            .horizon_refill_tokens
+            .saturating_add(appended_tokens);
+    }
+
     pub(super) fn insert_policy_telemetry_attrs(
         &self,
         attrs: &mut BTreeMap<String, serde_json::Value>,
@@ -431,6 +464,22 @@ impl VerifyWindowScheduler {
         attrs.insert(
             "llama_stage.verify_window.pipeline_policy_suppressed".to_string(),
             serde_json::json!(self.stats.policy_suppressed),
+        );
+        attrs.insert(
+            "llama_stage.verify_window.horizon_refill_attempts".to_string(),
+            serde_json::json!(self.stats.horizon_refill_attempts),
+        );
+        attrs.insert(
+            "llama_stage.verify_window.horizon_refill_successes".to_string(),
+            serde_json::json!(self.stats.horizon_refill_successes),
+        );
+        attrs.insert(
+            "llama_stage.verify_window.horizon_refill_tokens".to_string(),
+            serde_json::json!(self.stats.horizon_refill_tokens),
+        );
+        attrs.insert(
+            "llama_stage.verify_window.horizon_refill_misses".to_string(),
+            serde_json::json!(self.stats.horizon_refill_misses),
         );
         attrs.insert(
             "llama_stage.verify_window.pipeline_policy_profitable_widths".to_string(),
@@ -751,6 +800,8 @@ mod tests {
             scheduler.observe_pipeline_profile(2, true, 20.0, 0.0, 100.0);
         }
         assert!(scheduler.permit_pipeline_width(2));
+        scheduler.record_horizon_refill(7);
+        scheduler.record_horizon_refill(0);
         let mut timings = BTreeMap::new();
         scheduler.stats().insert_response_timings(&mut timings);
 
@@ -765,6 +816,10 @@ mod tests {
         assert_eq!(timings["verify_window_policy_permit_checks"], 1);
         assert_eq!(timings["verify_window_policy_permits"], 1);
         assert_eq!(timings["verify_window_policy_suppressed"], 0);
+        assert_eq!(timings["verify_window_horizon_refill_attempts"], 2);
+        assert_eq!(timings["verify_window_horizon_refill_successes"], 1);
+        assert_eq!(timings["verify_window_horizon_refill_tokens"], 7);
+        assert_eq!(timings["verify_window_horizon_refill_misses"], 1);
         assert_eq!(
             timings["verify_window_bootstrap_probe_depth"],
             PIPELINE_BOOTSTRAP_PROBE_DEPTH
@@ -788,6 +843,16 @@ mod tests {
             attrs["llama_stage.verify_window.pipeline_policy_profitable_widths"],
             1
         );
+        assert_eq!(
+            attrs["llama_stage.verify_window.horizon_refill_attempts"],
+            2
+        );
+        assert_eq!(
+            attrs["llama_stage.verify_window.horizon_refill_successes"],
+            1
+        );
+        assert_eq!(attrs["llama_stage.verify_window.horizon_refill_tokens"], 7);
+        assert_eq!(attrs["llama_stage.verify_window.horizon_refill_misses"], 1);
     }
 
     #[test]

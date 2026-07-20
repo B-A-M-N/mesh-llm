@@ -5,7 +5,8 @@ use serde_json::json;
 use skippy_protocol::binary::{StageWireMessage, WireReplyKind, recv_reply, write_stage_message};
 
 use crate::frontend::{
-    NativeMtpDecodeCounters, NativeMtpDecodeOptions, NativeMtpDecodeTelemetry, NativeMtpStats,
+    CachedNgramProposer, CompositeProposalPipeline, NativeMtpDecodeCounters,
+    NativeMtpDecodeOptions, NativeMtpDecodeTelemetry, NativeMtpStats,
     decode_scheduler::{VerifyWindow, VerifyWindowScheduler},
     embedded_execution::DispatchedEmbeddedStage,
     generation::{
@@ -51,6 +52,25 @@ pub(super) fn mark_epoch_stale(
         }
     }
     marked
+}
+
+/// Extends the optimistic branch without adding speculative tokens to the
+/// committed N-gram index. This removes the wait-for-empty bubble between
+/// bounded proposal spans while preserving target-owned commit order.
+pub(super) fn refill_pipeline_ngram_candidates(
+    pipeline: &mut CompositeProposalPipeline,
+    committed_tokens: &[i32],
+    cached_ngram_proposer: &mut Option<CachedNgramProposer>,
+    max_tokens: usize,
+) -> OpenAiResult<usize> {
+    if max_tokens == 0 {
+        return Ok(0);
+    }
+    let Some(cache) = cached_ngram_proposer.as_mut() else {
+        return Ok(0);
+    };
+    let tokens = cache.propose(committed_tokens, pipeline.optimistic_suffix(), max_tokens)?;
+    Ok(pipeline.append_ngram_candidates(&tokens))
 }
 
 pub(super) struct EmbeddedDecodeSummary<'a> {
@@ -275,4 +295,31 @@ pub(super) fn decode_uses_context_sideband(
 ) -> bool {
     context_token_ids.len() <= sideband_capacity
         && context_token_ids.last().copied() == Some(current)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::frontend::NativeMtpHybridProposal;
+
+    #[test]
+    fn refills_from_an_optimistic_suffix_without_indexing_it() {
+        let committed = vec![1, 2, 3, 1, 2, 3, 1, 2];
+        let mut cache = Some(CachedNgramProposer::new(2, 2).unwrap());
+        let initial = cache.as_mut().unwrap().propose(&committed, &[], 2).unwrap();
+        assert_eq!(initial, vec![3, 1]);
+        let proposal = NativeMtpHybridProposal::from_parts(initial, 0, true);
+        let mut pipeline = CompositeProposalPipeline::new(proposal, None, 1);
+
+        let appended =
+            refill_pipeline_ngram_candidates(&mut pipeline, &committed, &mut cache, 2).unwrap();
+
+        assert_eq!(appended, 2);
+        assert_eq!(pipeline.proposal().tokens(), &[3, 1, 2, 3]);
+        assert_eq!(pipeline.candidate_len(), 4);
+        assert_eq!(
+            cache.as_mut().unwrap().propose(&committed, &[], 2).unwrap(),
+            vec![3, 1]
+        );
+    }
 }
