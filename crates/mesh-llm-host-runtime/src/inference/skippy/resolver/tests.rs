@@ -816,43 +816,6 @@ draft_max_tokens = 8
 }
 
 #[test]
-fn ngram_speculation_enables_adaptive_verify_window() {
-    // When N-gram speculation is active the adaptive verify window must be on so
-    // the window shrinks after early rejects instead of staying fixed at its max
-    // and paying the full recovery cost per token (regression guard for the
-    // measured WAN split -40% throughput loss when the window never shrank).
-    let mesh_config = parse_config(
-        r#"
-[defaults.speculative]
-ngram_proposer = "cache"
-ngram_min = 2
-ngram_max = 4
-"#,
-    );
-    let model_file = temp_model_file();
-
-    let resolved = resolve_skippy_config(SkippyConfigResolveRequest {
-        mesh_config: &mesh_config,
-        model_id: "Qwen/Qwen3-0.6B:Q4_K_M",
-        model_path: model_file.path(),
-        model_bytes: 4 * 1024 * 1024 * 1024,
-        allocatable_memory_bytes: None,
-        request_defaults: None,
-        package_generation: None,
-    })
-    .expect("config should resolve");
-
-    let openai = resolved
-        .to_embedded_openai_args(4096, true)
-        .expect("embedded args should build");
-
-    assert!(
-        openai.adaptive_speculative_window,
-        "ngram speculation must enable the adaptive verify window"
-    );
-}
-
-#[test]
 fn layer_package_translation_does_not_treat_hf_ref_as_direct_gguf() {
     let config = MeshConfig::default();
     let package_ref = "hf://meshllm/Qwen3-8B-Q4_K_M-layers";
@@ -904,74 +867,6 @@ draft_selection_policy = "auto"
     assert_eq!(resolved.speculative.mode, "disabled");
     assert!(resolved.speculative.draft_model_path.is_none());
     assert!(!resolved.speculative.explicit);
-}
-
-#[test]
-fn speculative_ngram_translates_for_staged_embedded_openai() {
-    let mesh_config = parse_config(
-        r#"
-[defaults.speculative]
-mode = "ngram"
-ngram_min = 2
-ngram_max = 6
-"#,
-    );
-    let model_file = temp_model_file();
-
-    let resolved = resolve_skippy_config(SkippyConfigResolveRequest {
-        mesh_config: &mesh_config,
-        model_id: "Qwen/Qwen3-0.6B:Q4_K_M",
-        model_path: model_file.path(),
-        model_bytes: 4 * 1024 * 1024 * 1024,
-        allocatable_memory_bytes: None,
-        request_defaults: None,
-        package_generation: None,
-    })
-    .expect("ngram speculative config should resolve");
-
-    assert_eq!(resolved.speculative.mode, "ngram");
-    assert_eq!(resolved.speculative.ngram_min, 2);
-    assert_eq!(resolved.speculative.ngram_max, 6);
-    let openai = resolved
-        .to_embedded_openai_args(4096, true)
-        .expect("staged embedded OpenAI args should allow ngram");
-    assert_eq!(openai.speculative_window, 6);
-    assert_eq!(openai.ngram_min, 2);
-    assert_eq!(openai.ngram_max, 6);
-}
-
-#[test]
-fn speculative_ngram_translates_for_direct_embedded_openai() {
-    let mesh_config = parse_config(
-        r#"
-[defaults.speculative]
-mode = "ngram"
-ngram_min = 2
-ngram_max = 6
-"#,
-    );
-    let model_file = temp_model_file();
-
-    let resolved = resolve_skippy_config(SkippyConfigResolveRequest {
-        mesh_config: &mesh_config,
-        model_id: "Qwen/Qwen3-0.6B:Q4_K_M",
-        model_path: model_file.path(),
-        model_bytes: 4 * 1024 * 1024 * 1024,
-        allocatable_memory_bytes: None,
-        request_defaults: None,
-        package_generation: None,
-    })
-    .expect("ngram speculative config should resolve");
-
-    resolved
-        .to_model_load_options(SkippyTelemetryOptions::off())
-        .expect("direct model load options should allow ngram speculation");
-    let openai = resolved
-        .to_embedded_openai_args(0, false)
-        .expect("direct embedded OpenAI args should allow ngram");
-    assert_eq!(openai.speculative_window, 6);
-    assert_eq!(openai.ngram_min, 2);
-    assert_eq!(openai.ngram_max, 6);
 }
 
 #[test]
@@ -1318,56 +1213,6 @@ spec_default = true
             err.contains(field) && err.contains("not supported by the embedded runtime"),
             "{field} diagnostic should be explicit, got: {err}"
         );
-    }
-}
-
-#[test]
-fn invalid_ngram_speculative_pairs_fail_before_launch() {
-    let cases = [
-        (
-            r#"
-[defaults.speculative]
-mode = "ngram"
-ngram_max = 4
-"#,
-            "ngram_min > 0",
-        ),
-        (
-            r#"
-[defaults.speculative]
-mode = "ngram"
-ngram_min = 8
-"#,
-            "ngram_max > 0",
-        ),
-        (
-            r#"
-[defaults.speculative]
-mode = "ngram"
-ngram_min = 8
-ngram_max = 4
-"#,
-            "ngram_min must be less than or equal to ngram_max",
-        ),
-    ];
-
-    for (toml, expected) in cases {
-        let mesh_config = parse_config(toml);
-        let model_file = temp_model_file();
-
-        let err = resolve_skippy_config(SkippyConfigResolveRequest {
-            mesh_config: &mesh_config,
-            model_id: "Qwen/Qwen3-0.6B:Q4_K_M",
-            model_path: model_file.path(),
-            model_bytes: 4 * 1024 * 1024 * 1024,
-            allocatable_memory_bytes: None,
-            request_defaults: None,
-            package_generation: None,
-        })
-        .unwrap_err()
-        .to_string();
-
-        assert!(err.contains(expected), "got: {err}");
     }
 }
 

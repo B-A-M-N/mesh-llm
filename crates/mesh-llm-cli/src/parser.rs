@@ -6,7 +6,7 @@ mod validation;
 pub use commands::{
     AuthCommand, BinaryFlavor, Cli, Command, ConfigCommand, DiscoveryScope, DoctorCommand,
     GpuCommand, MeshDiscoveryMode, MeshGuardrailCliMode, PluginCommand, SkillAgentArg,
-    SkillCommand, SpeculativeNgramProposerCli, TrustCommand, TrustPolicy,
+    SkillCommand, TrustCommand, TrustPolicy,
 };
 pub use normalization::{
     NormalizedRuntimeArgs, RuntimeSurface, legacy_runtime_surface_warning,

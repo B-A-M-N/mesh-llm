@@ -284,7 +284,6 @@ mod tests {
         state.prompt_token_count = 128;
         state.decode_step = 7;
         state.current_token = 1001;
-        state.flags |= state_flags::SKIP_VERIFY_CHECKPOINT;
         let message = StageWireMessage {
             kind: WireMessageKind::VerifyWindow,
             pos_start: 135,
@@ -308,9 +307,34 @@ mod tests {
         assert_eq!(decoded.verify_window_id(), Some(42));
         assert_eq!(decoded.verify_window_base_position(), Some(135));
         assert_eq!(decoded.verify_window_token_count(), Some(4));
+        assert_eq!(decoded.authoritative_session_position(), Some(135));
         assert_eq!(decoded.tokens, vec![1001, 1002, 1003, 1004]);
         assert_eq!(decoded.state.decode_step, 7);
-        assert_ne!(decoded.state.flags & state_flags::SKIP_VERIFY_CHECKPOINT, 0);
+    }
+
+    #[test]
+    fn only_decode_messages_carry_authoritative_session_positions() {
+        let mut decode = StageWireMessage {
+            kind: WireMessageKind::DecodeEmbd,
+            pos_start: 17,
+            token_count: 1,
+            state: StageStateHeader::new(WireMessageKind::DecodeEmbd, WireActivationDType::F32),
+            request_id: 1,
+            session_id: 2,
+            sampling: None,
+            chat_sampling_metadata: None,
+            tokens: vec![3],
+            positions: Vec::new(),
+            activation: Vec::new(),
+            raw_bytes: Vec::new(),
+        };
+        assert_eq!(decode.authoritative_session_position(), Some(17));
+
+        decode.pos_start = -1;
+        assert_eq!(decode.authoritative_session_position(), None);
+
+        decode.kind = WireMessageKind::PrefillEmbd;
+        assert_eq!(decode.authoritative_session_position(), None);
     }
 
     #[test]
@@ -610,35 +634,30 @@ mod tests {
 
     #[test]
     fn session_control_messages_are_fixed_header_only() {
-        for kind in [
-            WireMessageKind::CheckpointSession,
-            WireMessageKind::RestoreSession,
-            WireMessageKind::TrimSession,
-        ] {
-            let message = StageWireMessage {
-                kind,
-                pos_start: 0,
-                token_count: 0,
-                state: StageStateHeader::new(kind, WireActivationDType::F32),
-                request_id: 23,
-                session_id: 29,
-                sampling: None,
-                chat_sampling_metadata: None,
-                tokens: Vec::new(),
-                positions: Vec::new(),
-                activation: Vec::new(),
-                raw_bytes: Vec::new(),
-            };
-            let mut bytes = Vec::new();
-            write_stage_message(&mut bytes, &message, WireActivationDType::F32).unwrap();
-            assert_eq!(bytes.len(), STAGE_WIRE_FIXED_HEADER_BYTES);
-            let decoded = read_stage_message(Cursor::new(bytes), 2048).unwrap();
-            assert_eq!(decoded.kind, kind);
-            assert_eq!(decoded.request_id, 23);
-            assert_eq!(decoded.session_id, 29);
-            assert!(decoded.tokens.is_empty());
-            assert!(decoded.activation.is_empty());
-        }
+        let kind = WireMessageKind::TrimSession;
+        let message = StageWireMessage {
+            kind,
+            pos_start: 0,
+            token_count: 0,
+            state: StageStateHeader::new(kind, WireActivationDType::F32),
+            request_id: 23,
+            session_id: 29,
+            sampling: None,
+            chat_sampling_metadata: None,
+            tokens: Vec::new(),
+            positions: Vec::new(),
+            activation: Vec::new(),
+            raw_bytes: Vec::new(),
+        };
+        let mut bytes = Vec::new();
+        write_stage_message(&mut bytes, &message, WireActivationDType::F32).unwrap();
+        assert_eq!(bytes.len(), STAGE_WIRE_FIXED_HEADER_BYTES);
+        let decoded = read_stage_message(Cursor::new(bytes), 2048).unwrap();
+        assert_eq!(decoded.kind, kind);
+        assert_eq!(decoded.request_id, 23);
+        assert_eq!(decoded.session_id, 29);
+        assert!(decoded.tokens.is_empty());
+        assert!(decoded.activation.is_empty());
     }
 
     #[test]

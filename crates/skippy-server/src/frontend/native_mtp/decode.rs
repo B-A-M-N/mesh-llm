@@ -21,23 +21,6 @@ pub(in crate::frontend) struct NativeMtpDecodeOptions {
     pub(in crate::frontend) verify_window_max_tokens: usize,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(in crate::frontend) enum NativeMtpTrimAction {
-    None,
-    FullSession,
-}
-
-pub(in crate::frontend) fn native_mtp_trim_action(
-    committed_positions: usize,
-    consumed_positions: usize,
-) -> NativeMtpTrimAction {
-    if committed_positions == consumed_positions {
-        NativeMtpTrimAction::None
-    } else {
-        NativeMtpTrimAction::FullSession
-    }
-}
-
 impl NativeMtpDecodeOptions {
     pub(in crate::frontend) fn from_config(config: &SpeculativeDecodeConfig) -> Self {
         Self {
@@ -124,8 +107,6 @@ pub(in crate::frontend) struct NativeMtpDecodeCounters {
     verify_next_draft_adopted_count: usize,
     hybrid_native_prefix_available_count: usize,
     hybrid_ngram_continuation_available_count: usize,
-    hybrid_ngram_mtp_prefix_agreement_count: usize,
-    hybrid_ngram_mtp_prefix_disagreement_count: usize,
     hybrid_proposal_token_count: usize,
     hybrid_accepted_token_count: usize,
     hybrid_accepted_tail_token_count: usize,
@@ -198,14 +179,14 @@ impl NativeMtpDecodeCounters {
         proposal: &NativeMtpHybridProposal,
         accepted_token_count: usize,
     ) {
+        // A fully accepted verify window may also commit the target's free
+        // next token. That advances generation but is not a drafted token and
+        // must never make acceptance exceed the proposal length.
+        let accepted_token_count = accepted_token_count.min(proposal.tokens().len());
         self.hybrid_native_prefix_available_count +=
             usize::from(proposal.native_mtp_token_count() > 0);
         self.hybrid_ngram_continuation_available_count +=
             usize::from(proposal.ngram_span_available());
-        self.hybrid_ngram_mtp_prefix_agreement_count +=
-            usize::from(proposal.ngram_mtp_prefix_agreed());
-        self.hybrid_ngram_mtp_prefix_disagreement_count +=
-            usize::from(proposal.ngram_mtp_prefix_disagreed());
         self.hybrid_proposal_token_count += proposal.tokens().len();
         self.hybrid_accepted_token_count += accepted_token_count;
         self.hybrid_accepted_tail_token_count +=
@@ -342,14 +323,6 @@ impl NativeMtpDecodeCounters {
             json!(self.hybrid_ngram_continuation_available_count),
         );
         attrs.insert(
-            "llama_stage.native_mtp.hybrid_ngram_mtp_prefix_agreement_count".to_string(),
-            json!(self.hybrid_ngram_mtp_prefix_agreement_count),
-        );
-        attrs.insert(
-            "llama_stage.native_mtp.hybrid_ngram_mtp_prefix_disagreement_count".to_string(),
-            json!(self.hybrid_ngram_mtp_prefix_disagreement_count),
-        );
-        attrs.insert(
             "llama_stage.native_mtp.hybrid_proposal_token_count".to_string(),
             json!(self.hybrid_proposal_token_count),
         );
@@ -423,14 +396,6 @@ impl NativeMtpDecodeCounters {
         timings.insert(
             "native_mtp_hybrid_ngram_continuation_available".to_string(),
             json!(self.hybrid_ngram_continuation_available_count),
-        );
-        timings.insert(
-            "native_mtp_hybrid_ngram_mtp_prefix_agreements".to_string(),
-            json!(self.hybrid_ngram_mtp_prefix_agreement_count),
-        );
-        timings.insert(
-            "native_mtp_hybrid_ngram_mtp_prefix_disagreements".to_string(),
-            json!(self.hybrid_ngram_mtp_prefix_disagreement_count),
         );
         timings.insert(
             "native_mtp_hybrid_proposed_tokens".to_string(),
@@ -556,6 +521,7 @@ impl NativeMtpDecodeTelemetry {
 mod tests {
     use super::super::CompositeProposalProvider;
     use super::*;
+    use crate::frontend::CachedNgramProposer;
 
     fn options() -> NativeMtpDecodeOptions {
         NativeMtpDecodeOptions {
@@ -575,11 +541,11 @@ mod tests {
     }
 
     fn composite_proposal() -> NativeMtpHybridProposal {
-        CompositeProposalProvider::from_options(options()).propose(
-            &[9],
-            &[1, 2, 3, 9, 1, 2, 3, 9, 1, 2, 3],
-            4,
-        )
+        let context = [1, 2, 3, 1, 2, 3, 1, 2];
+        let mut cache = CachedNgramProposer::new(2, 2).unwrap();
+        CompositeProposalProvider::from_options(options())
+            .propose_with_ngram_extension(&[3], &context, 4, 4, Some(&mut cache))
+            .unwrap()
     }
 
     #[test]
@@ -591,7 +557,6 @@ mod tests {
                 tail_backoff_proposals: 2,
             }),
             ngram: Some(crate::frontend::NgramProposalConfig {
-                kind: crate::frontend::NgramProposerKind::Cache,
                 min_ngram: 2,
                 max_ngram: 4,
                 max_proposal_tokens: 7,
@@ -682,14 +647,6 @@ mod tests {
             Some(&json!(1))
         );
         assert_eq!(
-            attrs.get("llama_stage.native_mtp.hybrid_ngram_mtp_prefix_agreement_count"),
-            Some(&json!(1))
-        );
-        assert_eq!(
-            attrs.get("llama_stage.native_mtp.hybrid_ngram_mtp_prefix_disagreement_count"),
-            Some(&json!(0))
-        );
-        assert_eq!(
             attrs.get("llama_stage.native_mtp.hybrid_ngram_tail_rejection_count"),
             Some(&json!(1))
         );
@@ -701,6 +658,19 @@ mod tests {
             attrs.get("llama_stage.native_mtp.adaptive_verify_window_grow_count"),
             Some(&json!(1))
         );
+    }
+
+    #[test]
+    fn proposal_acceptance_excludes_the_targets_free_token() {
+        let mut counters = NativeMtpDecodeCounters::default();
+        let proposal = NativeMtpHybridProposal::from_native_mtp_tokens(vec![9]);
+
+        counters.observe_hybrid_proposal(&proposal, 2);
+
+        assert_eq!(counters.hybrid_proposal_token_count, 1);
+        assert_eq!(counters.hybrid_accepted_token_count, 1);
+        assert_eq!(counters.hybrid_accepted_native_mtp_token_count, 1);
+        assert_eq!(counters.hybrid_accepted_tail_token_count, 0);
     }
 
     #[test]
@@ -773,10 +743,6 @@ mod tests {
             Some(&json!(1))
         );
         assert_eq!(
-            timings.get("native_mtp_hybrid_ngram_mtp_prefix_agreements"),
-            Some(&json!(1))
-        );
-        assert_eq!(
             timings.get("native_mtp_adaptive_verify_window_grows"),
             Some(&json!(1))
         );
@@ -800,11 +766,11 @@ mod tests {
     #[test]
     fn composite_proposal_totals_include_pure_ngram_candidates() {
         let mut counters = NativeMtpDecodeCounters::default();
-        let proposal = CompositeProposalProvider::from_options(options()).propose(
-            &[],
-            &[0, 0, 2, 3, 9, 1, 7, 8, 2, 3],
-            4,
-        );
+        let context = [1, 2, 3, 1, 2, 3, 1, 2];
+        let mut cache = CachedNgramProposer::new(2, 2).unwrap();
+        let proposal = CompositeProposalProvider::from_options(options())
+            .propose_with_ngram_extension(&[], &context, 4, 4, Some(&mut cache))
+            .unwrap();
         counters.observe_hybrid_proposal(&proposal, 4);
 
         assert_eq!(

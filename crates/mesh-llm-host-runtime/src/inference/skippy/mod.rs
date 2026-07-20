@@ -428,8 +428,6 @@ fn embedded_openai_args_from(
         adaptive_speculative_window: embedded_args.adaptive_speculative_window,
         draft_n_gpu_layers: embedded_args.draft_n_gpu_layers,
         speculative: embedded_args.speculative,
-        ngram_min: embedded_args.ngram_min,
-        ngram_max: embedded_args.ngram_max,
         native_mtp_enabled: embedded_args.native_mtp_enabled,
         native_mtp_draft_model_path: embedded_args.native_mtp_draft_model_path,
         native_mtp_max_tokens: embedded_args.native_mtp_max_tokens,
@@ -1258,7 +1256,6 @@ mod tests {
                 tracked_token_counts: 0,
                 max_session_tokens: 2048,
                 total_session_tokens: 0,
-                checkpoints: 0,
                 lanes: vec![],
             },
             telemetry: TelemetryStats {

@@ -241,32 +241,13 @@ impl ResolvedSkippyConfig {
                 None
             },
             speculative_window: self.speculative_window_for_embedded(mode),
-            // Enable the adaptive verify window whenever speculation actually
-            // proposes a window (ngram or draft mode). Without this the window
-            // is fixed at its max and never shrinks after an early reject, so a
-            // sustained reject storm keeps proposing deep and keeps paying the
-            // full recovery cost per token (measured ~40% throughput loss on a
-            // WAN split). A reject-responsive window narrows toward the observed
-            // accept depth, cutting recovery frequency.
-            adaptive_speculative_window: mode == "ngram" || mode == "draft",
+            adaptive_speculative_window: mode == "draft",
             draft_n_gpu_layers: if mode == "draft" || self.speculative.native_mtp_enabled {
                 self.speculative.draft_n_gpu_layers
             } else {
                 None
             },
             speculative: self.speculative_decode_config(),
-            ngram_min: self
-                .speculative
-                .decode
-                .ngram
-                .as_ref()
-                .map_or(0, |ngram| ngram.min_ngram),
-            ngram_max: self
-                .speculative
-                .decode
-                .ngram
-                .as_ref()
-                .map_or(0, |ngram| ngram.max_proposal_tokens),
             native_mtp_enabled: self.speculative.native_mtp_enabled,
             native_mtp_draft_model_path: if self.speculative.native_mtp_enabled {
                 self.speculative.draft_model_path.clone()
@@ -304,10 +285,6 @@ impl ResolvedSkippyConfig {
     fn speculative_mode_for_embedded(&self, _staged: bool) -> &'static str {
         if self.speculative.mode == "draft" && self.speculative.draft_model_path.is_some() {
             "draft"
-        } else if self.speculative.decode.ngram.is_some()
-            && !self.speculative.decode.native_mtp.enabled
-        {
-            "ngram"
         } else {
             "disabled"
         }
@@ -316,14 +293,6 @@ impl ResolvedSkippyConfig {
     fn speculative_window_for_embedded(&self, mode: &str) -> usize {
         match mode {
             "draft" => self.speculative.draft_max_tokens as usize,
-            "ngram" => self
-                .speculative
-                .decode
-                .ngram
-                .as_ref()
-                .map_or(self.speculative.ngram_max as usize, |ngram| {
-                    ngram.max_proposal_tokens
-                }),
             _ => 0,
         }
     }
@@ -417,8 +386,6 @@ impl ResolvedEmbeddedOpenAiArgs {
                 },
                 ..SpeculativeDecodeConfig::default()
             },
-            ngram_min: 0,
-            ngram_max: 0,
             native_mtp_enabled,
             native_mtp_draft_model_path: None,
             native_mtp_max_tokens: if native_mtp_enabled {
@@ -477,8 +444,6 @@ impl ResolvedEmbeddedOpenAiArgs {
                 },
                 ..SpeculativeDecodeConfig::default()
             },
-            ngram_min: 0,
-            ngram_max: 0,
             native_mtp_enabled,
             native_mtp_draft_model_path: None,
             native_mtp_max_tokens: if native_mtp_enabled {
@@ -521,8 +486,6 @@ impl ResolvedEmbeddedOpenAiArgs {
             adaptive_speculative_window: self.adaptive_speculative_window,
             draft_n_gpu_layers: self.draft_n_gpu_layers,
             speculative: self.speculative,
-            ngram_min: self.ngram_min,
-            ngram_max: self.ngram_max,
             native_mtp_enabled: self.native_mtp_enabled,
             native_mtp_draft_model_path: self.native_mtp_draft_model_path,
             native_mtp_max_tokens: self.native_mtp_max_tokens,

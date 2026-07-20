@@ -17,7 +17,7 @@ OpenAI-compatible API retain their normal compatibility guarantees.
 |---|---|
 | Target | The full staged model, authoritative for every emitted token. |
 | Native MTP | Model-provided typed draft attached to a target reply. GLM 4.7 Flash currently supplies a narrow `N+1` candidate. |
-| N-gram sidecar | An upstream llama.cpp `ngram-simple` lookup or request-local `ngram-cache` proposer over target-committed tokens. |
+| N-gram sidecar | A request-local llama.cpp `ngram-cache` proposer over target-committed tokens. |
 | Composite proposal | Native-MTP prefix plus an optional N-gram suffix. |
 | VerifyWindow | Versioned target request that verifies a candidate span at one session position. |
 | Free target token | Target's next token after a fully verified span. |
@@ -44,7 +44,7 @@ This invariant also applies when multiple windows are in flight.
 
 ## Wire Protocol
 
-`STAGE_STATE_VERSION` is `8`. `VerifyWindow` is wire message kind `21`; the
+`STAGE_STATE_VERSION` is `9`. `VerifyWindow` is wire message kind `21`; the
 legacy kind `10` is rejected. An old/new staged-runtime pairing therefore fails
 clearly instead of silently interpreting requests with different semantics.
 
@@ -65,24 +65,19 @@ that sink is unavailable.
 
 ## Composite Proposals
 
-The sidecar extends native MTP; it never replaces it. Skippy uses upstream
-llama.cpp proposers rather than a second Rust history scanner. `ngram-simple`
-requires a historical continuation to begin with every MTP token before its
-remaining tokens can become the sidecar tail. The request-local `ngram-cache`
-instead reads directly after the provisional MTP prefix and returns only the
-tail.
+The sidecar exists only inside the native-MTP composite strategy. Skippy uses
+llama.cpp's request-local `ngram-cache` rather than a second Rust history
+scanner. It reads after the provisional MTP prefix and may provide the entire
+candidate on a step where the model returns no MTP token.
 
 ```mermaid
 flowchart TD
   D["Receive typed MTP draft"] --> Q{"MTP tokens?"}
-  Q -->|"no"| P["Pure N-gram fallback\nfrom accepted context"]
-  Q -->|"yes"| H["Find latest earlier suffix match"]
-  H --> A{"Historical continuation\nstarts with full MTP prefix?"}
-  A -->|"yes"| X["Append useful suffix only"]
-  A -->|"no"| M["Keep MTP prefix only"]
+  Q -->|"no"| P["Cache candidate\nfrom accepted context"]
+  Q -->|"yes"| H["Read cache after\nprovisional MTP prefix"]
+  H --> X["Append useful suffix only"]
   P --> C["Composite proposal"]
   X --> C
-  M --> C
   C --> V["One VerifyWindow"]
 ```
 
@@ -167,15 +162,17 @@ sequenceDiagram
 ```
 
 Replies complete in FIFO window-id order. An earlier divergence invalidates
-later optimistic windows. Skippy drains them, records them as stale, trims to
-the committed target state, and resumes from the target correction.
+later optimistic windows. Skippy drains and records them as stale. The next
+decode or verify message carries the corrected absolute position, and every
+stage rewinds its local attention KV to that position before executing it.
+There is no rollback control message or repair replay.
 
 ```mermaid
 flowchart LR
   W0["Earlier window\npartial accept"] --> C["Commit matching prefix\n+ correction"]
   W0 --> D["Discard later windows\nas stale"]
-  D --> R["Trim/replay to target state"]
-  R --> N["Create candidate at corrected position"]
+  D --> R["Next message names corrected position"]
+  R --> N["Each stage rewinds locally and continues"]
 ```
 
 ## Verification Outcomes
@@ -241,15 +238,11 @@ package can expose native MTP plus a request-local cache sidecar as follows:
 }
 ```
 
-Use the following stable strategy names when a package exposes the complete
-native-MTP/N-gram menu:
+Use the following stable strategy names:
 
 | Strategy | Composition | Benchmark condition |
 |---|---|---|
 | `mtp` | Native MTP proposer | MTP |
-| `ngram-simple` | Pure prompt/history N-gram proposer | N-gram simple |
-| `ngram-cache` | Pure request-local cache N-gram proposer | N-gram cache |
-| `mtp-simple` | Native MTP primary plus simple N-gram tail | MTP + N-gram simple |
 | `mtp-cache` | Native MTP primary plus request-local cache N-gram tail | MTP + N-gram cache |
 
 `disabled` is an operator control rather than a package strategy; it supplies
@@ -261,8 +254,8 @@ Choose a package strategy with `speculative.strategy`. `auto` uses the package
 default; `disabled` turns speculation off; `mtp` preserves the direct native
 MTP path. A named strategy such as `mtp-cache` is valid only when the selected
 package declares it. Packages provide the recommended bounds and topology for
-a model, while an explicit direct-GGUF configuration may select the built-in
-simple or request-local cache N-gram proposer with its required bounds.
+a model, while an explicit direct-GGUF configuration enables the request-local
+cache by combining native MTP with valid N-gram bounds.
 
 ```toml
 [defaults.speculative]
@@ -312,7 +305,6 @@ the built-in request-local cache proposer explicitly:
 ```toml
 [models.speculative]
 strategy = "mtp"
-ngram_proposer = "cache"
 ngram_min = 2
 ngram_max = 4
 ngram_max_proposal_tokens = 6
@@ -327,14 +319,13 @@ composite plan. The package remains the preferred way to publish tested values.
 `mesh-llm serve` may temporarily override a package-selected strategy without
 editing `config.toml`. CLI settings have highest precedence, then the selected
 model entry, then `[defaults.speculative]`; unspecified CLI fields retain the
-lower-layer value. Named package strategies remain package-declared. The CLI
-may explicitly select the built-in simple or request-local cache proposer for
-a direct GGUF only when it supplies valid N-gram bounds.
+lower-layer value. Named package strategies remain package-declared. For a
+direct GGUF, the CLI may enable only the request-local cache extension, and
+only when it supplies valid N-gram bounds alongside native MTP.
 
 ```bash
 mesh-llm serve meshllm/GLM-4.7-Flash-MTP-GGUF:Q4_K_M --split --no-draft \
   --speculative-strategy mtp \
-  --speculative-ngram-proposer cache \
   --speculative-ngram-min 2 \
   --speculative-ngram-max 4 \
   --speculative-extension-max-tokens 8 \
@@ -384,7 +375,6 @@ telemetry supplies per-window and per-stage detail.
 | Which plan actually ran? | `llama_stage.spec.requested_strategy`, `llama_stage.spec.effective_strategy` |
 | Are proposals accepted? | `draft_n`, `draft_n_accepted` |
 | Did the sidecar widen MTP? | `native_mtp_hybrid_native_tokens`, `native_mtp_hybrid_ngram_tokens`, `native_mtp_hybrid_proposed_tokens` |
-| Did anchors agree? | `native_mtp_hybrid_ngram_mtp_prefix_agreements`, `native_mtp_hybrid_ngram_mtp_prefix_disagreements` |
 | Were tails useful? | `native_mtp_hybrid_accepted_tail_tokens`, `native_mtp_hybrid_ngram_tail_rejections`, `native_mtp_hybrid_ngram_sidecar_backoffs` |
 | Was it pipelined? | `verify_window_depth`, `verify_window_opened`, `verify_window_max_in_flight`, `verify_window_stale_discarded` |
 | Why was depth used or suppressed? | `verify_window_policy_observed_windows`, `verify_window_policy_continuation_windows`, `verify_window_policy_profitable_widths`, `verify_window_policy_permit_checks`, `verify_window_policy_permits`, `verify_window_policy_suppressed` |

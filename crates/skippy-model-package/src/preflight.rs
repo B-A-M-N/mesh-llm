@@ -531,7 +531,7 @@ fn validate_speculative_proposer(
             layer_count,
             report,
         ),
-        "ngram-simple" | "ngram-cache" => validate_ngram_proposer(name, proposer, report),
+        "ngram-cache" => validate_ngram_proposer(name, proposer, report),
         _ => report.error(
             "unsupported_speculative_proposer_type",
             format!(
@@ -539,7 +539,7 @@ fn validate_speculative_proposer(
                 proposer.proposer_type
             ),
             Some("model-package.json".to_string()),
-            "use native-mtp, ngram-simple, or ngram-cache",
+            "use native-mtp or ngram-cache",
         ),
     }
 }
@@ -570,23 +570,24 @@ fn validate_speculative_strategy(
     if let Some(proposer) = &strategy.proposer {
         validate_proposer_reference(name, "proposer", proposer, proposers, report);
     }
-    if strategy.strategy_type == "native-mtp" {
-        validate_native_mtp_strategy_proposer_or_inline(
+    match strategy.strategy_type.as_str() {
+        "native-mtp" => validate_native_mtp_strategy_proposer_or_inline(
             name,
             strategy,
             proposers,
             layer_count,
             report,
-        );
-    }
-    if matches!(
-        strategy.strategy_type.as_str(),
-        "ngram-simple" | "ngram-cache"
-    ) {
-        validate_ngram_strategy_proposer_type(name, strategy, proposers, report);
-    }
-    if strategy.strategy_type == "composite" {
-        validate_composite_strategy(name, strategy, proposers, report);
+        ),
+        "composite" => validate_composite_strategy(name, strategy, proposers, report),
+        _ => report.error(
+            "unsupported_speculative_strategy_type",
+            format!(
+                "speculative strategy {name} has unsupported type {}",
+                strategy.strategy_type
+            ),
+            Some("model-package.json".to_string()),
+            "use native-mtp or composite",
+        ),
     }
     if let Some(policy) = &strategy.extension_policy {
         validate_extension_policy(name, policy, report);
@@ -623,37 +624,6 @@ fn validate_native_mtp_strategy_proposer_or_inline(
     }
 }
 
-fn validate_ngram_strategy_proposer_type(
-    strategy_name: &str,
-    strategy: &PackageSpeculativeStrategy,
-    proposers: &BTreeMap<String, PackageSpeculativeProposer>,
-    report: &mut PackagePreflightReport,
-) {
-    let Some(proposer_name) = strategy.proposer.as_deref() else {
-        report.error(
-            "missing_ngram_strategy_proposer",
-            format!("N-gram speculative strategy {strategy_name} must declare a proposer"),
-            Some("model-package.json".to_string()),
-            "set proposer to a declared ngram-simple or ngram-cache proposer",
-        );
-        return;
-    };
-    let Some(proposer) = proposers.get(proposer_name) else {
-        return;
-    };
-    if proposer.proposer_type != strategy.strategy_type {
-        report.error(
-            "ngram_strategy_proposer_type_mismatch",
-            format!(
-                "N-gram speculative strategy {strategy_name} type {} does not match proposer {proposer_name} type {}",
-                strategy.strategy_type, proposer.proposer_type
-            ),
-            Some("model-package.json".to_string()),
-            "make the strategy type match its referenced N-gram proposer",
-        );
-    }
-}
-
 fn validate_proposer_reference(
     strategy_name: &str,
     field: &str,
@@ -677,6 +647,14 @@ fn validate_composite_strategy(
     proposers: &BTreeMap<String, PackageSpeculativeProposer>,
     report: &mut PackagePreflightReport,
 ) {
+    if strategy.extension_policy.is_none() {
+        report.error(
+            "missing_composite_extension_policy",
+            format!("composite speculative strategy {name} must declare extension_policy"),
+            Some("model-package.json".to_string()),
+            "configure the cache N-gram extension width and backoff policy",
+        );
+    }
     let Some(primary) = strategy.primary.as_deref() else {
         report.error(
             "missing_composite_primary",
@@ -691,7 +669,7 @@ fn validate_composite_strategy(
             "missing_composite_extender",
             format!("composite speculative strategy {name} must declare extender"),
             Some("model-package.json".to_string()),
-            "set extender to a declared ngram-simple or ngram-cache proposer",
+            "set extender to a declared ngram-cache proposer",
         );
         return;
     };
@@ -708,17 +686,15 @@ fn validate_composite_strategy(
             "set primary to a native-mtp proposer",
         );
     }
-    if proposers.get(extender).is_some_and(|proposer| {
-        !matches!(
-            proposer.proposer_type.as_str(),
-            "ngram-simple" | "ngram-cache"
-        )
-    }) {
+    if proposers
+        .get(extender)
+        .is_some_and(|proposer| proposer.proposer_type != "ngram-cache")
+    {
         report.error(
             "invalid_composite_extender_type",
             format!("composite speculative strategy {name} extender {extender} must be an N-gram proposer"),
             Some("model-package.json".to_string()),
-            "set extender to an ngram-simple or ngram-cache proposer",
+            "set extender to an ngram-cache proposer",
         );
     }
 }
@@ -798,9 +774,7 @@ fn validate_ngram_proposer(
             "set max_proposal_tokens to a positive value",
         );
     }
-    if proposer.proposer_type == "ngram-cache"
-        && max as usize > skippy_runtime::NGRAM_CACHE_MAX_NGRAM
-    {
+    if max as usize > skippy_runtime::NGRAM_CACHE_MAX_NGRAM {
         report.error(
             "unsupported_ngram_cache_max_window",
             format!(
@@ -814,9 +788,7 @@ fn validate_ngram_proposer(
             ),
         );
     }
-    if proposer.proposer_type == "ngram-cache"
-        && proposer.history_scope.as_deref() != Some("request")
-    {
+    if proposer.history_scope.as_deref() != Some("request") {
         report.error(
             "invalid_ngram_cache_history_scope",
             format!("N-gram cache proposer {name} must set history_scope to request"),
@@ -1638,103 +1610,14 @@ mod tests {
     }
 
     #[test]
-    fn preflight_accepts_complete_native_and_ngram_strategy_matrix() {
-        let dir = unique_test_dir("complete-speculative-matrix");
+    fn preflight_rejects_native_mtp_strategy_with_ngram_proposer() {
+        let dir = unique_test_dir("native-mtp-strategy-type-mismatch");
         let package = write_package_fixture(&dir, true);
         write_generation_to_manifest(
             &package,
             serde_json::json!({
                 "speculative_decoding": {
                     "default": "mtp",
-                    "proposers": {
-                        "mtp": {
-                            "type": "native-mtp",
-                            "prediction_depth": 1,
-                            "layer_indices": [1]
-                        },
-                        "simple": {
-                            "type": "ngram-simple",
-                            "ngram_min": 2,
-                            "ngram_max": 6,
-                            "max_proposal_tokens": 6
-                        },
-                        "cache": {
-                            "type": "ngram-cache",
-                            "ngram_min": 2,
-                            "ngram_max": 4,
-                            "max_proposal_tokens": 6,
-                            "history_scope": "request"
-                        }
-                    },
-                    "strategies": {
-                        "mtp": {
-                            "type": "native-mtp",
-                            "proposer": "mtp"
-                        },
-                        "ngram-simple": {
-                            "type": "ngram-simple",
-                            "proposer": "simple"
-                        },
-                        "ngram-cache": {
-                            "type": "ngram-cache",
-                            "proposer": "cache"
-                        },
-                        "mtp-simple": {
-                            "type": "composite",
-                            "primary": "mtp",
-                            "extender": "simple",
-                            "extension_policy": {
-                                "initial_tokens": 2,
-                                "max_tokens": 6,
-                                "tail_backoff_proposals": 2
-                            }
-                        },
-                        "mtp-cache": {
-                            "type": "composite",
-                            "primary": "mtp",
-                            "extender": "cache",
-                            "extension_policy": {
-                                "initial_tokens": 2,
-                                "max_tokens": 6,
-                                "tail_backoff_proposals": 2
-                            }
-                        }
-                    }
-                }
-            }),
-        );
-
-        let report = preflight_package(&package, &PackagePreflightOptions::default());
-
-        assert!(report.valid, "{:?}", report.issues);
-        let strategies = report
-            .generation
-            .and_then(|generation| generation.speculative_decoding)
-            .expect("generation strategies should be reported")
-            .strategies;
-        assert_eq!(strategies.len(), 5);
-        assert!(
-            strategies
-                .iter()
-                .any(|strategy| strategy.name == "mtp-simple")
-        );
-        assert!(
-            strategies
-                .iter()
-                .any(|strategy| strategy.name == "mtp-cache")
-        );
-        fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn preflight_rejects_ngram_strategy_with_mismatched_proposer_type() {
-        let dir = unique_test_dir("ngram-strategy-type-mismatch");
-        let package = write_package_fixture(&dir, true);
-        write_generation_to_manifest(
-            &package,
-            serde_json::json!({
-                "speculative_decoding": {
-                    "default": "simple",
                     "proposers": {
                         "cache": {
                             "type": "ngram-cache",
@@ -1745,38 +1628,7 @@ mod tests {
                         }
                     },
                     "strategies": {
-                        "simple": { "type": "ngram-simple", "proposer": "cache" }
-                    }
-                }
-            }),
-        );
-
-        let report = preflight_package(&package, &PackagePreflightOptions::default());
-
-        assert!(!report.valid);
-        assert_issue(&report, "ngram_strategy_proposer_type_mismatch");
-        fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn preflight_rejects_native_mtp_strategy_with_ngram_proposer() {
-        let dir = unique_test_dir("native-mtp-strategy-type-mismatch");
-        let package = write_package_fixture(&dir, true);
-        write_generation_to_manifest(
-            &package,
-            serde_json::json!({
-                "speculative_decoding": {
-                    "default": "mtp",
-                    "proposers": {
-                        "simple": {
-                            "type": "ngram-simple",
-                            "ngram_min": 2,
-                            "ngram_max": 4,
-                            "max_proposal_tokens": 4
-                        }
-                    },
-                    "strategies": {
-                        "mtp": { "type": "native-mtp", "proposer": "simple" }
+                        "mtp": { "type": "native-mtp", "proposer": "cache" }
                     }
                 }
             }),
@@ -1797,8 +1649,13 @@ mod tests {
             &package,
             serde_json::json!({
                 "speculative_decoding": {
-                    "default": "cache",
+                    "default": "mtp-cache",
                     "proposers": {
+                        "mtp": {
+                            "type": "native-mtp",
+                            "prediction_depth": 1,
+                            "layer_indices": [1]
+                        },
                         "cache": {
                             "type": "ngram-cache",
                             "ngram_min": 2,
@@ -1808,7 +1665,11 @@ mod tests {
                         }
                     },
                     "strategies": {
-                        "cache": { "type": "ngram-cache", "proposer": "cache" }
+                        "mtp-cache": {
+                            "type": "composite",
+                            "primary": "mtp",
+                            "extender": "cache"
+                        }
                     }
                 }
             }),
@@ -1829,8 +1690,13 @@ mod tests {
             &package,
             serde_json::json!({
                 "speculative_decoding": {
-                    "default": "cache",
+                    "default": "mtp-cache",
                     "proposers": {
+                        "mtp": {
+                            "type": "native-mtp",
+                            "prediction_depth": 1,
+                            "layer_indices": [1]
+                        },
                         "cache": {
                             "type": "ngram-cache",
                             "ngram_min": 2,
@@ -1840,7 +1706,11 @@ mod tests {
                         }
                     },
                     "strategies": {
-                        "cache": { "type": "ngram-cache", "proposer": "cache" }
+                        "mtp-cache": {
+                            "type": "composite",
+                            "primary": "mtp",
+                            "extender": "cache"
+                        }
                     }
                 }
             }),

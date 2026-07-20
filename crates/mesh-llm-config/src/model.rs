@@ -559,7 +559,6 @@ pub struct SpeculativeConfig {
     pub draft_cache_type_v: Option<String>,
     pub ngram_min: Option<u32>,
     pub ngram_max: Option<u32>,
-    pub ngram_proposer: Option<String>,
     pub ngram_max_proposal_tokens: Option<u32>,
     pub extension_initial_tokens: Option<u32>,
     pub extension_max_tokens: Option<u32>,
@@ -610,7 +609,6 @@ impl SpeculativeConfig {
             draft_cache_type_v: pick!(draft_cache_type_v),
             ngram_min: pick!(ngram_min),
             ngram_max: pick!(ngram_max),
-            ngram_proposer: pick!(ngram_proposer),
             ngram_max_proposal_tokens: pick!(ngram_max_proposal_tokens),
             extension_initial_tokens: pick!(extension_initial_tokens),
             extension_max_tokens: pick!(extension_max_tokens),
@@ -639,7 +637,7 @@ impl SpeculativeConfig {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SpeculativeConfigRaw {
-    #[serde(default, deserialize_with = "deserialize_speculative_strategy")]
+    #[serde(default)]
     strategy: Option<String>,
     #[serde(default)]
     mode: Option<String>,
@@ -677,8 +675,6 @@ struct SpeculativeConfigRaw {
     ngram_min: Option<u32>,
     #[serde(default)]
     ngram_max: Option<u32>,
-    #[serde(default)]
-    ngram_proposer: Option<String>,
     #[serde(default)]
     ngram_max_proposal_tokens: Option<u32>,
     #[serde(default)]
@@ -735,7 +731,6 @@ impl<'de> Deserialize<'de> for SpeculativeConfig {
             draft_cache_type_v: raw.draft_cache_type_v,
             ngram_min: raw.ngram_min,
             ngram_max: raw.ngram_max,
-            ngram_proposer: raw.ngram_proposer,
             ngram_max_proposal_tokens: raw.ngram_max_proposal_tokens,
             extension_initial_tokens: raw.extension_initial_tokens,
             extension_max_tokens: raw.extension_max_tokens,
@@ -787,7 +782,6 @@ impl Serialize for SpeculativeConfig {
         map.serialize_entry("draft_cache_type_v", &self.draft_cache_type_v)?;
         map.serialize_entry("ngram_min", &self.ngram_min)?;
         map.serialize_entry("ngram_max", &self.ngram_max)?;
-        map.serialize_entry("ngram_proposer", &self.ngram_proposer)?;
         map.serialize_entry("ngram_max_proposal_tokens", &self.ngram_max_proposal_tokens)?;
         map.serialize_entry("extension_initial_tokens", &self.extension_initial_tokens)?;
         map.serialize_entry("extension_max_tokens", &self.extension_max_tokens)?;
@@ -816,23 +810,6 @@ impl Serialize for SpeculativeConfig {
         map.serialize_entry("spec_default", &self.spec_default)?;
         map.end()
     }
-}
-
-fn deserialize_speculative_strategy<'de, D>(
-    deserializer: D,
-) -> std::result::Result<Option<String>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    Ok(
-        Option::<String>::deserialize(deserializer)?.map(|strategy| {
-            if strategy == "native-mtp-n1" {
-                "mtp".to_string()
-            } else {
-                strategy
-            }
-        }),
-    )
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]

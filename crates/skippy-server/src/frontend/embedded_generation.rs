@@ -26,21 +26,16 @@ use crate::frontend::prefill::drain_one_embedded_prefill_reply;
 use crate::frontend::request::wire_sampling_config;
 use crate::frontend::speculative::OpenAiSpeculativeStats;
 use crate::frontend::speculative::classify_verify_window;
-use crate::frontend::speculative::propose_ngram_tokens;
-use crate::frontend::speculative::repaired_commit_tokens;
 use crate::frontend::speculative::verify_inputs_for_proposals;
 use crate::frontend::util::ms_to_us;
 use crate::frontend::util::openai_backend_error;
 use crate::frontend::util::openai_io_error;
 use crate::frontend::util::saturating_u32;
 use crate::frontend::util::token_is_eog_with_runtime;
-use crate::frontend::util::us_to_ms;
-use crate::frontend::wire_messages::DecodeMessageArgs;
 use crate::frontend::wire_messages::OpenAiPrefillChunk;
 use crate::frontend::wire_messages::ReusableDecodeMessage;
 use crate::frontend::wire_messages::ReusableDecodeMessageArgs;
 use crate::frontend::wire_messages::VerifyWindowMessageArgs;
-use crate::frontend::wire_messages::embedded_decode_message;
 use crate::frontend::wire_messages::embedded_prefill_message;
 use crate::frontend::wire_messages::embedded_verify_window_message;
 use crate::frontend::wire_messages::generation_config_message;
@@ -850,7 +845,7 @@ impl StageOpenAiBackend {
                 adaptive_window_start: adaptive_window,
                 adaptive_window_final: adaptive_window,
                 adaptive_window_max: max_speculative_window,
-                adaptive_window_min: if request.draft.is_some() || request.ngram_max > 0 {
+                adaptive_window_min: if request.draft.is_some() {
                     adaptive_window
                 } else {
                     0
@@ -1093,7 +1088,6 @@ impl StageOpenAiBackend {
                                     decode_step: window.decode_step,
                                     tokens: &input_tokens,
                                     sampling: wire_sampling.clone(),
-                                    checkpoint: false,
                                 },
                             )?;
                             let dispatched = self.dispatch_embedded_stage_message(
@@ -1309,17 +1303,6 @@ impl StageOpenAiBackend {
                                     native_mtp_suppress_cooldown_drafts_remaining =
                                         native_mtp_options.suppress_cooldown_draft_limit;
                                 }
-                                if native_mtp_verify_decision.rejected || stale_count > 0 {
-                                    let trim = self.trim_embedded_stage_session(
-                                        &request,
-                                        downstream,
-                                        &session_key,
-                                        request_id,
-                                        session_id,
-                                        prefill_token_count + decoded_tokens,
-                                    )?;
-                                    speculative_stats.recovery_ms += trim.elapsed_ms;
-                                }
                                 pipelined_current = current;
                                 if reached_stop {
                                     break;
@@ -1387,7 +1370,7 @@ impl StageOpenAiBackend {
                         }
                     }
                 }
-                if draft_guard.is_some() || request.ngram_max > 0 {
+                if draft_guard.is_some() {
                     let remaining = (request.max_tokens as usize).saturating_sub(decoded_tokens);
                     if remaining == 0 {
                         break;
@@ -1407,28 +1390,6 @@ impl StageOpenAiBackend {
                             proposal_source = "draft-model";
                         }
                     }
-                    if let (true, Some(cache)) =
-                        (draft_tokens.is_empty(), cached_ngram_proposer.as_mut())
-                    {
-                        draft_tokens = cache.propose(
-                            &context_tokens,
-                            &[],
-                            proposal_limit.min(request.ngram_max),
-                        )?;
-                        if !draft_tokens.is_empty() {
-                            proposal_source = "ngram-cache";
-                        }
-                    }
-                    if draft_tokens.is_empty() && request.ngram_max > 0 {
-                        draft_tokens = propose_ngram_tokens(
-                            &context_tokens,
-                            request.ngram_min,
-                            proposal_limit.min(request.ngram_max),
-                        )?;
-                        if !draft_tokens.is_empty() {
-                            proposal_source = "ngram";
-                        }
-                    }
                     let draft_propose_ms = propose_timer.elapsed_ms();
                     speculative_stats.draft_propose_ms += draft_propose_ms;
                     if !draft_tokens.is_empty() {
@@ -1445,7 +1406,6 @@ impl StageOpenAiBackend {
                                 decode_step: decoded_tokens,
                                 tokens: &verify_inputs,
                                 sampling: wire_sampling.clone(),
-                                checkpoint: true,
                             },
                         )?;
                         let verify = self.execute_embedded_stage_message(
@@ -1496,8 +1456,6 @@ impl StageOpenAiBackend {
                             .saturating_add(verify.stats.forward_activation_bytes);
                         decode_forward_write_ms += verify.stats.forward_write_ms;
                         decode_downstream_wait_ms += verify.stats.downstream_wait_ms;
-                        speculative_stats.checkpoint_ms +=
-                            us_to_ms(verify.reply.stats.checkpoint_total_us);
                         let decision = classify_verify_window(
                             &draft_tokens,
                             &verify.reply.predicted_tokens,
@@ -1511,122 +1469,8 @@ impl StageOpenAiBackend {
                             request.adaptive_speculative_window,
                             max_speculative_window,
                         );
-                        let mut commit_tokens =
+                        let commit_tokens =
                             verify.reply.predicted_tokens[..decision.commit_count].to_vec();
-                        if decision.requires_repair() {
-                            speculative_stats.recovery_restores += 1;
-                            let restore = self.restore_embedded_stage_session(
-                                &request,
-                                downstream,
-                                &session_key,
-                                request_id,
-                                session_id,
-                            )?;
-                            speculative_stats.recovery_ms += restore.elapsed_ms;
-                            speculative_stats.recovery_restore_ms += restore.elapsed_ms;
-                            speculative_stats.recovery_restore_local_ms += restore.local_ms;
-                            speculative_stats.recovery_restore_downstream_write_ms +=
-                                restore.downstream_write_ms;
-                            speculative_stats.recovery_restore_downstream_wait_ms +=
-                                restore.downstream_wait_ms;
-                            let repair_input_count = decision
-                                .repair_input_count
-                                .ok_or_else(|| OpenAiError::backend("missing repair count"))?;
-                            if repair_input_count == 1 {
-                                let repair_message = embedded_decode_message(
-                                    request.wire_dtype,
-                                    DecodeMessageArgs {
-                                        request_id,
-                                        session_id,
-                                        prompt_token_count: request.prompt_token_ids.len(),
-                                        pos_start: prefill_token_count + decoded_tokens,
-                                        decode_step: decoded_tokens,
-                                        current,
-                                        sampling: wire_sampling.clone(),
-                                    },
-                                )?;
-                                let repair = self.execute_embedded_stage_message(
-                                    &request,
-                                    downstream,
-                                    &session_key,
-                                    &repair_message,
-                                    &[current],
-                                    WireReplyKind::PredictedToken,
-                                )?;
-                                commit_tokens = vec![repair.reply.predicted];
-                                decode_stage0_compute_ms += repair.stats.stage0_compute_ms;
-                                decode_runtime_lock_wait_ms += repair.stats.runtime_lock_wait_ms;
-                                decode_runtime_lock_wait_max_ms = decode_runtime_lock_wait_max_ms
-                                    .max(repair.stats.runtime_lock_wait_ms);
-                                decode_runtime_lock_hold_ms += repair.stats.runtime_lock_hold_ms;
-                                decode_runtime_lock_hold_max_ms = decode_runtime_lock_hold_max_ms
-                                    .max(repair.stats.runtime_lock_hold_ms);
-                                decode_runtime_lock_acquires += 1;
-                                decode_forward_activation_encode_ms +=
-                                    repair.stats.activation_encode_ms;
-                                decode_output_activation_bytes = decode_output_activation_bytes
-                                    .saturating_add(repair.stats.output_activation_bytes);
-                                decode_forward_activation_bytes = decode_forward_activation_bytes
-                                    .saturating_add(repair.stats.forward_activation_bytes);
-                                decode_forward_write_ms += repair.stats.forward_write_ms;
-                                decode_downstream_wait_ms += repair.stats.downstream_wait_ms;
-                                speculative_stats.recovery_decode_repairs += 1;
-                                speculative_stats.recovery_ms += repair.elapsed_ms;
-                                speculative_stats.recovery_decode_elapsed_ms += repair.elapsed_ms;
-                            } else {
-                                let repair_inputs = &verify_inputs[..repair_input_count];
-                                let repair_message = embedded_verify_window_message(
-                                    request.wire_dtype,
-                                    VerifyWindowMessageArgs {
-                                        window_id: i32::try_from(decoded_tokens).map_err(|_| {
-                                            OpenAiError::backend("decode step exceeds i32")
-                                        })?,
-                                        request_id,
-                                        session_id,
-                                        prompt_token_count: request.prompt_token_ids.len(),
-                                        pos_start: prefill_token_count + decoded_tokens,
-                                        decode_step: decoded_tokens,
-                                        tokens: repair_inputs,
-                                        sampling: wire_sampling.clone(),
-                                        checkpoint: false,
-                                    },
-                                )?;
-                                let repair = self.execute_embedded_stage_message(
-                                    &request,
-                                    downstream,
-                                    &session_key,
-                                    &repair_message,
-                                    repair_inputs,
-                                    WireReplyKind::PredictedTokens,
-                                )?;
-                                commit_tokens = repaired_commit_tokens(
-                                    &draft_tokens,
-                                    decision.accepted_before_reject,
-                                    repair_input_count,
-                                    &repair.reply.predicted_tokens,
-                                )?;
-                                decode_stage0_compute_ms += repair.stats.stage0_compute_ms;
-                                decode_runtime_lock_wait_ms += repair.stats.runtime_lock_wait_ms;
-                                decode_runtime_lock_wait_max_ms = decode_runtime_lock_wait_max_ms
-                                    .max(repair.stats.runtime_lock_wait_ms);
-                                decode_runtime_lock_hold_ms += repair.stats.runtime_lock_hold_ms;
-                                decode_runtime_lock_hold_max_ms = decode_runtime_lock_hold_max_ms
-                                    .max(repair.stats.runtime_lock_hold_ms);
-                                decode_runtime_lock_acquires += 1;
-                                decode_forward_activation_encode_ms +=
-                                    repair.stats.activation_encode_ms;
-                                decode_output_activation_bytes = decode_output_activation_bytes
-                                    .saturating_add(repair.stats.output_activation_bytes);
-                                decode_forward_activation_bytes = decode_forward_activation_bytes
-                                    .saturating_add(repair.stats.forward_activation_bytes);
-                                decode_forward_write_ms += repair.stats.forward_write_ms;
-                                decode_downstream_wait_ms += repair.stats.downstream_wait_ms;
-                                speculative_stats.recovery_reverify_tokens += repair_inputs.len();
-                                speculative_stats.recovery_ms += repair.elapsed_ms;
-                                speculative_stats.recovery_reverify_elapsed_ms += repair.elapsed_ms;
-                            }
-                        }
-
                         let mut reached_stop = false;
                         for token in commit_tokens {
                             current = token;
@@ -1947,15 +1791,6 @@ impl StageOpenAiBackend {
                 }
                 verify_window_scheduler
                     .record_stale_discarded(stale_count, stale_drain_timer.elapsed_ms());
-                let trim = self.trim_embedded_stage_session(
-                    &request,
-                    downstream,
-                    &session_key,
-                    request_id,
-                    session_id,
-                    prefill_token_count + decoded_tokens,
-                )?;
-                speculative_stats.recovery_ms += trim.elapsed_ms;
             }
             if let Some(pipeline) = pipelined.take() {
                 native_mtp_counters

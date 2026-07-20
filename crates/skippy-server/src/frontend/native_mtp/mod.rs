@@ -7,8 +7,7 @@ mod verifier;
 mod verify_window;
 
 pub(super) use decode::{
-    AdaptiveVerifyWindow, NativeMtpDecodeCounters, NativeMtpDecodeOptions,
-    NativeMtpDecodeTelemetry, NativeMtpTrimAction, native_mtp_trim_action,
+    AdaptiveVerifyWindow, NativeMtpDecodeCounters, NativeMtpDecodeOptions, NativeMtpDecodeTelemetry,
 };
 pub(super) use draft::{NativeMtpDraft, NativeMtpDraftOrigin, PendingNativeMtpDraft};
 pub(super) use hybrid::{

@@ -6,7 +6,6 @@ use crate::binary_transport::stage_output_activation_capacity;
 use crate::binary_transport::write_stage_message_conditioned;
 use crate::frontend::generation::EmbeddedExecutionStats;
 use crate::frontend::generation::EmbeddedLocalOutput;
-use crate::frontend::generation::EmbeddedSessionControl;
 use crate::frontend::generation::EmbeddedStageExecution;
 use crate::frontend::generation::EmbeddedStageZeroGeneration;
 use crate::frontend::generation::PhaseTimer;
@@ -14,17 +13,15 @@ use crate::frontend::generation::StageOpenAiBackend;
 use crate::frontend::util::ms_to_us;
 use crate::frontend::util::openai_backend_error;
 use crate::frontend::util::openai_io_error;
-use crate::frontend::wire_messages::embedded_session_control_message;
-use crate::frontend::wire_messages::embedded_trim_session_message;
 use openai_frontend::OpenAiError;
 use openai_frontend::OpenAiResult;
+use serde_json::json;
 use skippy_protocol::binary::StageReply;
 use skippy_protocol::binary::StageReplyStats;
 use skippy_protocol::binary::StageWireMessage;
 use skippy_protocol::binary::WireMessageKind;
 use skippy_protocol::binary::WireReplyKind;
 use skippy_protocol::binary::recv_reply;
-use skippy_protocol::binary::state_flags;
 use std::net::TcpStream;
 use std::time::Duration;
 use std::time::Instant;
@@ -69,7 +66,7 @@ impl StageOpenAiBackend {
         token_ids: &[i32],
     ) -> OpenAiResult<DispatchedEmbeddedStage> {
         let started = Instant::now();
-        let mut stats = StageReplyStats::default();
+        let stats = StageReplyStats::default();
         let stage0_timer = PhaseTimer::start();
         let output = {
             let lock_timer = PhaseTimer::start();
@@ -79,19 +76,22 @@ impl StageOpenAiBackend {
                 .map_err(|_| OpenAiError::backend("runtime lock poisoned"))?;
             let lock_wait_ms = lock_timer.elapsed_ms();
             let hold_timer = PhaseTimer::start();
-            if message.kind == WireMessageKind::VerifyWindow
-                && (message.state.flags & state_flags::SKIP_VERIFY_CHECKPOINT) == 0
+            if let Some(target_token_count) = message.authoritative_session_position()
+                && let Some(align) = runtime
+                    .align_session_to_token_count_if_ahead(session_key, target_token_count)
+                    .map_err(openai_backend_error)?
             {
-                let checkpoint_timer = PhaseTimer::start();
-                runtime
-                    .checkpoint_session(session_key)
-                    .map_err(openai_backend_error)?;
-                let checkpoint_us = ms_to_us(checkpoint_timer.elapsed_ms());
-                stats.checkpoint_local_us += checkpoint_us;
-                stats.checkpoint_total_us += checkpoint_us;
-                stats.verify_window_checkpointed_requests += 1;
-            } else if message.kind == WireMessageKind::VerifyWindow {
-                stats.verify_window_skip_checkpoint_requests += 1;
+                let mut attrs = self.openai_attrs(request.ids);
+                attrs.insert(
+                    "llama_stage.session_auto_align_before_tokens".to_string(),
+                    json!(align.before_token_count),
+                );
+                attrs.insert(
+                    "llama_stage.session_auto_align_after_tokens".to_string(),
+                    json!(align.after_token_count),
+                );
+                self.telemetry
+                    .emit_debug("stage.openai_session_auto_align", attrs);
             }
             let output = run_binary_stage_message(
                 &mut runtime,
@@ -232,107 +232,6 @@ impl StageOpenAiBackend {
             },
             stats: dispatched.execution,
             elapsed_ms: dispatched.started.elapsed().as_secs_f64() * 1000.0,
-        })
-    }
-
-    pub(super) fn restore_embedded_stage_session(
-        &self,
-        request: &EmbeddedStageZeroGeneration<'_>,
-        downstream: &mut TcpStream,
-        session_key: &str,
-        request_id: u64,
-        session_id: u64,
-    ) -> OpenAiResult<EmbeddedSessionControl> {
-        let timer = PhaseTimer::start();
-        let local_timer = PhaseTimer::start();
-        {
-            let mut runtime = self
-                .runtime
-                .lock()
-                .map_err(|_| OpenAiError::backend("runtime lock poisoned"))?;
-            runtime
-                .restore_session(session_key)
-                .map_err(openai_backend_error)?;
-        }
-        let local_ms = local_timer.elapsed_ms();
-        let message = embedded_session_control_message(
-            request.wire_dtype,
-            WireMessageKind::RestoreSession,
-            request_id,
-            session_id,
-        );
-        let write_timer = PhaseTimer::start();
-        write_stage_message_conditioned(
-            &mut *downstream,
-            &message,
-            request.wire_dtype,
-            request.downstream_wire_condition,
-        )
-        .map_err(openai_io_error)?;
-        let downstream_write_ms = write_timer.elapsed_ms();
-        let wait_timer = PhaseTimer::start();
-        let reply = recv_reply(&mut *downstream).map_err(openai_io_error)?;
-        let downstream_wait_ms = wait_timer.elapsed_ms();
-        if reply.kind != WireReplyKind::Ack {
-            return Err(OpenAiError::backend(format!(
-                "restore expected ACK from downstream, got {:?}",
-                reply.kind
-            )));
-        }
-        Ok(EmbeddedSessionControl {
-            elapsed_ms: timer.elapsed_ms(),
-            local_ms,
-            downstream_write_ms,
-            downstream_wait_ms,
-        })
-    }
-
-    pub(super) fn trim_embedded_stage_session(
-        &self,
-        request: &EmbeddedStageZeroGeneration<'_>,
-        downstream: &mut TcpStream,
-        session_key: &str,
-        request_id: u64,
-        session_id: u64,
-        token_count: usize,
-    ) -> OpenAiResult<EmbeddedSessionControl> {
-        let timer = PhaseTimer::start();
-        let local_timer = PhaseTimer::start();
-        {
-            let mut runtime = self
-                .runtime
-                .lock()
-                .map_err(|_| OpenAiError::backend("runtime lock poisoned"))?;
-            runtime
-                .trim_session(session_key, token_count as u64)
-                .map_err(openai_backend_error)?;
-        }
-        let local_ms = local_timer.elapsed_ms();
-        let message =
-            embedded_trim_session_message(request.wire_dtype, request_id, session_id, token_count)?;
-        let write_timer = PhaseTimer::start();
-        write_stage_message_conditioned(
-            &mut *downstream,
-            &message,
-            request.wire_dtype,
-            request.downstream_wire_condition,
-        )
-        .map_err(openai_io_error)?;
-        let downstream_write_ms = write_timer.elapsed_ms();
-        let wait_timer = PhaseTimer::start();
-        let reply = recv_reply(&mut *downstream).map_err(openai_io_error)?;
-        let downstream_wait_ms = wait_timer.elapsed_ms();
-        if reply.kind != WireReplyKind::Ack {
-            return Err(OpenAiError::backend(format!(
-                "trim expected ACK from downstream, got {:?}",
-                reply.kind
-            )));
-        }
-        Ok(EmbeddedSessionControl {
-            elapsed_ms: timer.elapsed_ms(),
-            local_ms,
-            downstream_write_ms,
-            downstream_wait_ms,
         })
     }
 }

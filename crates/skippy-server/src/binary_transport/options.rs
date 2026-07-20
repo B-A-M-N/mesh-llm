@@ -4,9 +4,7 @@ use anyhow::{Context, Result, bail};
 use skippy_protocol::{StageConfig, StageTopology, binary::WireActivationDType};
 
 use crate::{
-    cli::ServeBinaryArgs,
-    config::load_json,
-    frontend::{NgramProposalConfig, NgramProposerKind, SpeculativeDecodeConfig},
+    cli::ServeBinaryArgs, config::load_json, frontend::SpeculativeDecodeConfig,
     telemetry::TelemetryLevel,
 };
 
@@ -76,13 +74,13 @@ impl BinaryStageOptions {
             None => None,
         };
         let bind_addr = args.bind_addr.unwrap_or(config.bind_addr.parse()?);
-        let openai_speculative = args
+        let openai_speculative: SpeculativeDecodeConfig = args
             .openai_speculative_config
             .as_ref()
             .map(load_json)
             .transpose()
             .context("load --openai-speculative-config")?
-            .unwrap_or_else(|| legacy_speculative_config(&args));
+            .unwrap_or_default();
         openai_speculative.validate()?;
         let openai = args
             .openai_bind_addr
@@ -126,20 +124,6 @@ impl BinaryStageOptions {
     }
 }
 
-fn legacy_speculative_config(args: &ServeBinaryArgs) -> SpeculativeDecodeConfig {
-    let mut config = SpeculativeDecodeConfig::default();
-    if args.openai_ngram_min > 0 && args.openai_ngram_max > 0 {
-        config.effective_strategy = "ngram-simple".to_string();
-        config.ngram = Some(NgramProposalConfig {
-            kind: NgramProposerKind::Simple,
-            min_ngram: args.openai_ngram_min,
-            max_ngram: args.openai_ngram_max,
-            max_proposal_tokens: args.openai_ngram_max,
-        });
-    }
-    config
-}
-
 pub fn parse_wire_dtype(value: &str) -> Result<WireActivationDType> {
     match value {
         "fp32" | "f32" => Ok(WireActivationDType::F32),
@@ -159,7 +143,9 @@ mod tests {
     use super::*;
     use crate::{
         cli::{Cli, Command},
-        frontend::{NativeMtpProposalConfig, NgramExtensionConfig, VerifyWindowConfig},
+        frontend::{
+            NativeMtpProposalConfig, NgramExtensionConfig, NgramProposalConfig, VerifyWindowConfig,
+        },
     };
 
     fn stage_config() -> StageConfig {
@@ -214,7 +200,6 @@ mod tests {
                 suppress_cooldown_draft_limit: 0,
             },
             ngram: Some(NgramProposalConfig {
-                kind: NgramProposerKind::Cache,
                 min_ngram: 2,
                 max_ngram: 4,
                 max_proposal_tokens: 6,
@@ -278,10 +263,7 @@ mod tests {
         let plan = cache_composite_plan();
         let json = serde_json::to_value(&plan).expect("serialize speculative plan");
 
-        assert_eq!(
-            json["ngram"]["kind"],
-            serde_json::Value::String("cache".to_string())
-        );
+        assert_eq!(json["ngram"]["min_ngram"], 2);
         assert_eq!(json["verify_window"]["pipeline_depth"], 2);
     }
 }

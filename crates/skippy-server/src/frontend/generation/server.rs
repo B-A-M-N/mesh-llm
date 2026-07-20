@@ -18,11 +18,8 @@ use crate::frontend::generation::open_draft_runner;
 use crate::frontend::generation::prewarm_generation_sessions;
 use crate::frontend::prefill::PrefillChunkPolicy;
 use crate::frontend::prefill::PrefillChunkPolicyArgs;
-use crate::frontend::speculative::{
-    SpeculativeDecodeConfig, load_standalone_speculative_config, standalone_simple_ngram_max,
-    standalone_simple_ngram_min,
-};
-use crate::kv_integration::KvStageIntegration;
+use crate::frontend::speculative::{SpeculativeDecodeConfig, load_standalone_speculative_config};
+use crate::kv_integration::{KvStageIntegration, model_requires_recurrent_state};
 use crate::runtime_state::RuntimeState;
 use crate::runtime_state::load_runtime;
 use crate::telemetry::Telemetry;
@@ -132,8 +129,6 @@ pub async fn serve_openai(args: ServeOpenAiArgs) -> Result<()> {
         draft: None,
         speculative_window: 0,
         adaptive_speculative_window: false,
-        ngram_min: standalone_simple_ngram_min(&speculative),
-        ngram_max: standalone_simple_ngram_max(&speculative),
         speculative,
         generation_limit: Arc::new(Semaphore::new(args.generation_concurrency)),
         generation_queue_depth: Arc::new(AtomicUsize::new(0)),
@@ -177,8 +172,6 @@ pub struct EmbeddedOpenAiArgs {
     pub adaptive_speculative_window: bool,
     pub draft_n_gpu_layers: Option<i32>,
     pub speculative: SpeculativeDecodeConfig,
-    pub ngram_min: usize,
-    pub ngram_max: usize,
     pub native_mtp_enabled: bool,
     pub native_mtp_draft_model_path: Option<PathBuf>,
     pub native_mtp_max_tokens: usize,
@@ -301,8 +294,13 @@ pub fn embedded_openai_backend(args: EmbeddedOpenAiArgs) -> Result<EmbeddedOpenA
     if args.native_mtp_draft_model_path.is_some() && !args.native_mtp_enabled {
         bail!("native MTP must be enabled when an MTP draft model is set");
     }
-    if args.ngram_min > args.ngram_max && args.ngram_max > 0 {
-        bail!("--openai-ngram-min must be less than or equal to --openai-ngram-max");
+    let speculative_windows_enabled = args.draft_model_path.is_some()
+        || args.speculative.native_mtp.enabled
+        || args.speculative.ngram.is_some();
+    if speculative_windows_enabled && model_requires_recurrent_state(&args.config) {
+        bail!(
+            "stage-state v9 positional speculation requires attention-only model stages; recurrent-state speculation is unsupported"
+        );
     }
     if args.config.stage_index != 0 || args.config.layer_start != 0 {
         bail!("embedded OpenAI serving is only supported on stage 0");
@@ -379,8 +377,6 @@ pub fn embedded_openai_backend(args: EmbeddedOpenAiArgs) -> Result<EmbeddedOpenA
         draft,
         speculative_window: args.speculative_window,
         adaptive_speculative_window: args.adaptive_speculative_window,
-        ngram_min: args.ngram_min,
-        ngram_max: args.ngram_max,
         speculative: args.speculative,
         generation_limit: Arc::new(Semaphore::new(args.generation_concurrency)),
         generation_queue_depth: Arc::new(AtomicUsize::new(0)),

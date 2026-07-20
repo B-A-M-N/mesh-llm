@@ -395,21 +395,6 @@ impl MeshGuardrailCliMode {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
-pub enum SpeculativeNgramProposerCli {
-    Simple,
-    Cache,
-}
-
-impl SpeculativeNgramProposerCli {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Simple => "simple",
-            Self::Cache => "cache",
-        }
-    }
-}
-
 #[derive(Parser, Debug)]
 #[command(
     name = "mesh-llm",
@@ -544,15 +529,11 @@ pub struct Cli {
     #[arg(long, hide = true)]
     pub speculative_strategy: Option<String>,
 
-    /// Override the N-gram proposer kind for this invocation.
-    #[arg(long, value_enum, hide = true)]
-    pub speculative_ngram_proposer: Option<SpeculativeNgramProposerCli>,
-
-    /// Minimum matching N-gram length for a direct N-gram proposer.
+    /// Minimum matching N-gram length for the request-local MTP cache extension.
     #[arg(long, hide = true)]
     pub speculative_ngram_min: Option<u32>,
 
-    /// Maximum matching N-gram length for a direct N-gram proposer.
+    /// Maximum matching N-gram length for the request-local MTP cache extension.
     #[arg(long, hide = true)]
     pub speculative_ngram_max: Option<u32>,
 
@@ -1160,8 +1141,6 @@ mod tests {
             "serve",
             "--speculative-strategy",
             "mtp-cache",
-            "--speculative-ngram-proposer",
-            "cache",
             "--speculative-ngram-min",
             "2",
             "--speculative-ngram-max",
@@ -1174,10 +1153,6 @@ mod tests {
         ]);
         let cli = Cli::try_parse_from(normalized.normalized).expect("clap parse");
         assert_eq!(cli.speculative_strategy.as_deref(), Some("mtp-cache"));
-        assert_eq!(
-            cli.speculative_ngram_proposer,
-            Some(SpeculativeNgramProposerCli::Cache)
-        );
         assert_eq!(cli.speculative_ngram_min, Some(2));
         assert_eq!(cli.speculative_ngram_max, Some(6));
         assert_eq!(cli.speculative_extension_max_tokens, Some(8));
@@ -1256,7 +1231,7 @@ mod tests {
             "--mlock-values",
             "true,false",
             "--speculative-types",
-            "mtp,draft,ngram,disabled",
+            "mtp,draft,mtp-ngram,disabled",
             "--spec-draft-models",
             "/models/qwen-draft.gguf",
             "--spec-draft-max-tokens",
@@ -1264,9 +1239,9 @@ mod tests {
             "--spec-draft-min-tokens",
             "1,2",
             "--spec-ngram-min",
-            "12,24",
+            "2,3",
             "--spec-ngram-max",
-            "48,64",
+            "3,4",
             "--throughput-tolerance-pct",
             "2.5",
             "--max-tokens",
@@ -1333,7 +1308,7 @@ mod tests {
             vec![
                 crate::benchmark::BenchmarkSpeculativeType::Mtp,
                 crate::benchmark::BenchmarkSpeculativeType::Draft,
-                crate::benchmark::BenchmarkSpeculativeType::Ngram,
+                crate::benchmark::BenchmarkSpeculativeType::MtpNgram,
                 crate::benchmark::BenchmarkSpeculativeType::Disabled,
             ]
         );
@@ -1344,8 +1319,8 @@ mod tests {
         );
         assert_eq!(tune.spec_draft_max_tokens, vec![4, 8]);
         assert_eq!(tune.spec_draft_min_tokens, vec![1, 2]);
-        assert_eq!(tune.spec_ngram_min, vec![12, 24]);
-        assert_eq!(tune.spec_ngram_max, vec![48, 64]);
+        assert_eq!(tune.spec_ngram_min, vec![2, 3]);
+        assert_eq!(tune.spec_ngram_max, vec![3, 4]);
     }
 
     #[test]
@@ -1373,8 +1348,8 @@ mod tests {
             ("--spec-draft-models", "/models/draft.gguf"),
             ("--spec-draft-max-tokens", "8"),
             ("--spec-draft-min-tokens", "2"),
-            ("--spec-ngram-min", "12"),
-            ("--spec-ngram-max", "48"),
+            ("--spec-ngram-min", "2"),
+            ("--spec-ngram-max", "4"),
         ] {
             let err = Cli::try_parse_from([
                 "mesh-llm",

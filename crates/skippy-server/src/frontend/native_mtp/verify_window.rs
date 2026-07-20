@@ -5,12 +5,12 @@ use skippy_protocol::binary::{StageNativeMtpDraft, WireReplyKind};
 
 use super::super::{
     AdaptiveVerifyWindow, BufferedCompositeProposal, CachedNgramProposer,
-    CompositeProposalProvider, EmbeddedSessionControl, EmbeddedStageZeroGeneration,
-    NativeMtpDecodeCounters, NativeMtpDecodeOptions, NativeMtpDraft, NativeMtpDraftOrigin,
-    NativeMtpTrimAction, NativeMtpVerifier, NgramSidecarController, PendingNativeMtpDraft,
-    PhaseTimer, StageOpenAiBackend, TokenControl, VerifyWindowMessageArgs, VerifyWindowScheduler,
-    WireSamplingConfig, classify_native_mtp_verify_window, embedded_verify_window_message,
-    ms_to_us, native_mtp_trim_action, token_is_eog_with_runtime,
+    CompositeProposalProvider, EmbeddedStageZeroGeneration, NativeMtpDecodeCounters,
+    NativeMtpDecodeOptions, NativeMtpDraft, NativeMtpDraftOrigin, NativeMtpVerifier,
+    NgramSidecarController, PendingNativeMtpDraft, PhaseTimer, StageOpenAiBackend, TokenControl,
+    VerifyWindowMessageArgs, VerifyWindowScheduler, WireSamplingConfig,
+    classify_native_mtp_verify_window, embedded_verify_window_message, ms_to_us,
+    token_is_eog_with_runtime,
 };
 
 /// Control signal returned after processing a batched native MTP verify step.
@@ -127,7 +127,6 @@ impl StageOpenAiBackend {
                 decode_step: *decoded_tokens,
                 tokens: &verify_inputs,
                 sampling: wire_sampling.clone(),
-                checkpoint: false,
             },
         )?;
         let verify = self.execute_embedded_stage_message(
@@ -285,22 +284,6 @@ impl StageOpenAiBackend {
             native_mtp_counters
                 .observe_hybrid_proposal(buffer.proposal(), buffer.accepted_tokens());
         }
-        let mut trim_control: Option<EmbeddedSessionControl> = None;
-        match native_mtp_trim_action(committed_positions, consumed_positions) {
-            NativeMtpTrimAction::None => {}
-            NativeMtpTrimAction::FullSession => {
-                let target_token_count = prefill_token_count + *decoded_tokens;
-                let trim = self.trim_embedded_stage_session(
-                    request,
-                    downstream,
-                    session_key,
-                    request_id,
-                    session_id,
-                    target_token_count,
-                )?;
-                trim_control = Some(trim);
-            }
-        }
         *decode_stage0_compute_ms += verify.stats.stage0_compute_ms;
         *decode_runtime_lock_wait_ms += verify.stats.runtime_lock_wait_ms;
         *decode_runtime_lock_wait_max_ms =
@@ -407,24 +390,6 @@ impl StageOpenAiBackend {
                 "llama_stage.native_mtp.reject_cooldown_remaining".to_string(),
                 serde_json::json!(*native_mtp_reject_cooldown_remaining),
             );
-            if let Some(trim) = trim_control.as_ref() {
-                token_attrs.insert(
-                    "llama_stage.native_mtp.trim_ms".to_string(),
-                    serde_json::json!(trim.elapsed_ms),
-                );
-                token_attrs.insert(
-                    "llama_stage.native_mtp.trim_local_ms".to_string(),
-                    serde_json::json!(trim.local_ms),
-                );
-                token_attrs.insert(
-                    "llama_stage.native_mtp.trim_downstream_write_ms".to_string(),
-                    serde_json::json!(trim.downstream_write_ms),
-                );
-                token_attrs.insert(
-                    "llama_stage.native_mtp.trim_downstream_wait_ms".to_string(),
-                    serde_json::json!(trim.downstream_wait_ms),
-                );
-            }
             token_attrs.insert(
                 "llama_stage.stage0_compute_ms".to_string(),
                 serde_json::json!(verify.stats.stage0_compute_ms),
