@@ -4,9 +4,12 @@ use ahash::AHashMap;
 
 use super::SUFFIX_NGRAM_MAX_WINDOW;
 
+/// Smallest seed length the suffix index will key on.
 pub(super) const SUFFIX_MIN_SEED_LEN: usize = 3;
+/// Largest seed length; bounds the fixed-size seed key.
 const SUFFIX_MAX_SEED_LEN: usize = 8;
 
+/// Per-request lookup counters surfaced through response timings.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(super) struct SuffixProposalStats {
     pub(super) match_length: usize,
@@ -17,11 +20,13 @@ pub(super) struct SuffixProposalStats {
     pub(super) lookup_us: u64,
 }
 
+/// A draft together with the stats gathered while producing it.
 pub(super) struct SuffixProposal {
     pub(super) tokens: Vec<i32>,
     pub(super) stats: SuffixProposalStats,
 }
 
+/// Fixed-size exact key for the seed index, avoiding hash collisions.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 struct SeedKey {
     len: u8,
@@ -29,6 +34,7 @@ struct SeedKey {
 }
 
 impl SeedKey {
+    /// Builds a key from the final `seed_len` tokens of `tokens`.
     fn from_tail(tokens: &[i32], seed_len: usize) -> Self {
         debug_assert!((SUFFIX_MIN_SEED_LEN..=SUFFIX_MAX_SEED_LEN).contains(&seed_len));
         debug_assert!(tokens.len() >= seed_len);
@@ -40,6 +46,7 @@ impl SeedKey {
         }
     }
 
+    /// Builds a key from the final `seed_len` tokens of the query.
     fn from_query(query_len: usize, seed_len: usize, token_at: impl Fn(usize) -> i32) -> Self {
         let mut seed = [0; SUFFIX_MAX_SEED_LEN];
         for (offset, slot) in seed[..seed_len].iter_mut().enumerate() {
@@ -52,6 +59,7 @@ impl SeedKey {
     }
 }
 
+/// Bookkeeping returned by an index sync.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct SyncStats {
     appended_tokens: usize,
@@ -73,6 +81,7 @@ pub(super) struct SuffixNgramProposer {
 }
 
 impl SuffixNgramProposer {
+    /// Builds a proposer, validating the match-length and window bounds.
     pub(super) fn new(
         min_match: usize,
         max_window: usize,
@@ -101,6 +110,8 @@ impl SuffixNgramProposer {
         })
     }
 
+    /// Brings the index in line with committed history: appends on the fast
+    /// path, rebuilds when history diverges.
     fn sync(&mut self, committed_history: &[i32]) -> SyncStats {
         let started = Instant::now();
         let (first_new_end, appended_tokens, rebuilt) =
@@ -128,6 +139,7 @@ impl SuffixNgramProposer {
         }
     }
 
+    /// Syncs the index, then returns the longest-suffix draft for the query.
     pub(super) fn propose(
         &mut self,
         committed_history: &[i32],
@@ -147,6 +159,8 @@ impl SuffixNgramProposer {
         SuffixProposal { tokens, stats }
     }
 
+    /// Finds the longest verbatim earlier occurrence of the query suffix and
+    /// returns the tokens that followed it.
     fn lookup(
         &self,
         continuation_prefix: &[i32],
@@ -186,6 +200,9 @@ impl SuffixNgramProposer {
                 best_match = match_len;
                 best_end = end;
             }
+            if best_match >= self.max_window {
+                break;
+            }
         }
         stats.match_length = best_match;
         if best_match < self.min_match {
@@ -198,6 +215,7 @@ impl SuffixNgramProposer {
         self.committed_history[best_end + 1..best_end + 1 + draft_len].to_vec()
     }
 
+    /// Counts matching tokens walking backward from `hist_end`, capped at `max_window`.
     fn match_len_backward(
         &self,
         hist_end: usize,
@@ -216,6 +234,7 @@ impl SuffixNgramProposer {
     }
 }
 
+/// Microseconds elapsed since `started`, saturating into a `u64`.
 fn elapsed_us(started: Instant) -> u64 {
     u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX)
 }

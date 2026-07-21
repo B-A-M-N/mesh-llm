@@ -4,11 +4,13 @@ use super::{
     HistoryNgramProposer, NgramProposerKind, SpeculativeDecodeConfig, propose_ngram_tokens,
 };
 
+/// A standalone N-gram draft plus the proposer kind that produced it.
 pub(in crate::frontend) struct ConfiguredNgramProposal {
     pub(in crate::frontend) tokens: Vec<i32>,
     pub(in crate::frontend) source: &'static str,
 }
 
+/// Maximum draft length the configured N-gram proposer may emit, or 0 when none.
 pub(in crate::frontend) fn standalone_ngram_proposal_limit(
     config: &SpeculativeDecodeConfig,
 ) -> usize {
@@ -18,6 +20,8 @@ pub(in crate::frontend) fn standalone_ngram_proposal_limit(
         .map_or(0, |ngram| ngram.max_proposal_tokens)
 }
 
+/// Runs the configured standalone N-gram proposer (simple, cache, or suffix)
+/// over committed history and returns its draft.
 pub(in crate::frontend) fn propose_configured_ngram_tokens(
     config: &SpeculativeDecodeConfig,
     history_proposer: &mut Option<HistoryNgramProposer>,

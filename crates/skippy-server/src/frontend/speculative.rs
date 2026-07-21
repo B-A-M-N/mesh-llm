@@ -17,6 +17,7 @@ mod suffix;
 pub(super) use standalone::{propose_configured_ngram_tokens, standalone_ngram_proposal_limit};
 use suffix::{SUFFIX_MIN_SEED_LEN, SuffixNgramProposer};
 
+/// Resolved speculative decoding plan for a served model.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SpeculativeDecodeConfig {
@@ -28,6 +29,7 @@ pub struct SpeculativeDecodeConfig {
     pub verify_window: VerifyWindowConfig,
 }
 
+/// Native multi-token-prediction draft settings.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct NativeMtpProposalConfig {
@@ -39,6 +41,8 @@ pub struct NativeMtpProposalConfig {
     pub suppress_cooldown_draft_limit: usize,
 }
 
+/// Which N-gram draft proposer to run: llama.cpp `simple`/`cache`, or the
+/// pure-Rust longest-suffix `suffix`.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum NgramProposerKind {
@@ -48,6 +52,7 @@ pub enum NgramProposerKind {
 }
 
 impl NgramProposerKind {
+    /// Stable string name used in config and telemetry.
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Simple => "simple",
@@ -57,8 +62,10 @@ impl NgramProposerKind {
     }
 }
 
+/// Longest suffix match window, and upper bound for a suffix proposer's `max_ngram`.
 pub const SUFFIX_NGRAM_MAX_WINDOW: usize = 64;
 
+/// N-gram proposer kind and its match-length and draft-length bounds.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct NgramProposalConfig {
@@ -68,6 +75,7 @@ pub struct NgramProposalConfig {
     pub max_proposal_tokens: usize,
 }
 
+/// Bounds for extending an MTP prefix with an N-gram tail.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct NgramExtensionConfig {
@@ -76,6 +84,7 @@ pub struct NgramExtensionConfig {
     pub tail_backoff_proposals: usize,
 }
 
+/// Pipelined verify-window sizing.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct VerifyWindowConfig {
@@ -109,6 +118,8 @@ impl Default for SpeculativeDecodeConfig {
 }
 
 impl SpeculativeDecodeConfig {
+    /// Checks the plan's internal invariants (bounds, proposer limits, extension
+    /// and verify-window constraints).
     pub fn validate(&self) -> Result<()> {
         if self.requested_strategy.trim().is_empty() || self.effective_strategy.trim().is_empty() {
             bail!("speculative decode strategies must not be empty");
@@ -161,6 +172,7 @@ impl SpeculativeDecodeConfig {
         Ok(())
     }
 
+    /// Adds the requested and effective strategy names to a telemetry attr map.
     pub(super) fn insert_telemetry_attrs(&self, attrs: &mut BTreeMap<String, Value>) {
         attrs.insert(
             "llama_stage.spec.requested_strategy".to_string(),
@@ -173,6 +185,7 @@ impl SpeculativeDecodeConfig {
     }
 }
 
+/// Loads a speculative decode plan from JSON (or the default), then validates it.
 pub(super) fn load_standalone_speculative_config(
     path: Option<&PathBuf>,
 ) -> Result<SpeculativeDecodeConfig> {
@@ -386,6 +399,7 @@ pub(super) struct CachedNgramProposer {
 }
 
 impl CachedNgramProposer {
+    /// Creates a cache-backed proposer with the given match bounds.
     pub(super) fn new(ngram_min: usize, ngram_max: usize) -> OpenAiResult<Self> {
         let cache =
             skippy_runtime::NgramCache::new(ngram_min, ngram_max).map_err(openai_backend_error)?;
@@ -395,6 +409,7 @@ impl CachedNgramProposer {
         })
     }
 
+    /// Syncs committed history, then drafts after the continuation prefix.
     pub(super) fn propose(
         &mut self,
         committed_history: &[i32],
@@ -407,6 +422,7 @@ impl CachedNgramProposer {
             .map_err(openai_backend_error)
     }
 
+    /// Mirrors committed history into native cache state (append or reset).
     fn sync(&mut self, committed_history: &[i32]) -> OpenAiResult<()> {
         if committed_history.starts_with(&self.committed_history) {
             let appended = &committed_history[self.committed_history.len()..];
@@ -422,11 +438,13 @@ impl CachedNgramProposer {
     }
 }
 
+/// The concrete history-backed proposer behind [`HistoryNgramProposer`].
 enum HistoryNgramProposerImpl {
     Cache(CachedNgramProposer),
     Suffix(SuffixNgramProposer),
 }
 
+/// Aggregate proposer counters surfaced through response timings.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(super) struct HistoryNgramProposerStats {
     pub(super) attempts: usize,
@@ -441,12 +459,14 @@ pub(super) struct HistoryNgramProposerStats {
     pub(super) lookup_us: u64,
 }
 
+/// Config-selected history N-gram proposer (cache or suffix) with running stats.
 pub(super) struct HistoryNgramProposer {
     proposer: HistoryNgramProposerImpl,
     stats: HistoryNgramProposerStats,
 }
 
 impl HistoryNgramProposer {
+    /// Builds the configured history proposer, or `None` for simple/no proposer.
     pub(super) fn from_config(config: &SpeculativeDecodeConfig) -> OpenAiResult<Option<Self>> {
         let Some(ngram) = config.ngram.as_ref() else {
             return Ok(None);
@@ -469,6 +489,7 @@ impl HistoryNgramProposer {
         }
     }
 
+    /// Wraps a concrete proposer with zeroed stats.
     fn new(proposer: HistoryNgramProposerImpl) -> Self {
         Self {
             proposer,
@@ -476,6 +497,7 @@ impl HistoryNgramProposer {
         }
     }
 
+    /// Runs the proposer and accumulates per-request stats.
     pub(super) fn propose(
         &mut self,
         committed_history: &[i32],
@@ -522,10 +544,12 @@ impl HistoryNgramProposer {
         Ok(tokens)
     }
 
+    /// Returns the accumulated proposer stats.
     pub(super) fn stats(&self) -> HistoryNgramProposerStats {
         self.stats
     }
 
+    /// Test-only constructor for the cache variant.
     #[cfg(test)]
     pub(super) fn new_cache(ngram_min: usize, ngram_max: usize) -> OpenAiResult<Self> {
         CachedNgramProposer::new(ngram_min, ngram_max)
@@ -534,6 +558,7 @@ impl HistoryNgramProposer {
     }
 }
 
+/// Microseconds elapsed since `started`, saturating into a `u64`.
 fn elapsed_us(started: Instant) -> u64 {
     u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX)
 }
