@@ -346,8 +346,9 @@ spec_default               = "auto"          # bool or "auto"
 # draft_cache_type_v = "q8_0"
 
 # N-gram proposer and MTP extension. `simple` scans accepted history;
-# `cache` is request-local and currently requires ngram_max <= 4.
-# ngram_proposer            = "cache"  # simple cache
+# `cache` is request-local and requires ngram_max <= 4; `suffix` is a pure-Rust
+# longest-suffix (prompt-lookup) matcher allowing ngram_max <= 64.
+# ngram_proposer            = "cache"  # simple | cache | suffix
 # ngram_min                 = 2
 # ngram_max                 = 4
 # ngram_max_proposal_tokens = 6        # output budget, separate from ngram_max
@@ -754,6 +755,26 @@ The request-local `cache` proposer is limited to `ngram_max <= 4`; `simple`
 searches accepted history instead. Extension settings require both native MTP
 and an N-gram proposer. All combinations are verified together by the target,
 so tuning these values changes speculative work, not output correctness.
+
+A third proposer, `suffix`, is a pure-Rust longest-suffix matcher
+("prompt-lookup decoding"). Unlike `simple`/`cache` it is not bound by
+llama.cpp's 4-token match window, so it can match long verbatim repeats in the
+context (up to `ngram_max <= 64`) and copy long, high-confidence drafts. It
+shines on input-grounded, repetitive workloads — re-emitting a file with a
+small edit, echoed tool output, repeated identifiers — and stays silent
+(proposes nothing) when no sufficiently long match exists, so it is roughly
+neutral on freeform prose. `ngram_min` is the minimum verbatim match length
+before it drafts; draft length scales with match length up to
+`ngram_max_proposal_tokens`.
+
+```toml
+[models.speculative]
+strategy = "ngram"
+ngram_proposer = "suffix"
+ngram_min = 5
+ngram_max = 32
+ngram_max_proposal_tokens = 48
+```
 
 For package-authoring rules, see
 [Layer Package Repositories](specs/layer-package-repos.md#generation-defaults).
