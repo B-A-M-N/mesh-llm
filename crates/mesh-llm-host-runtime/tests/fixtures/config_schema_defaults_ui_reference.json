@@ -939,6 +939,13 @@
       }
     },
     {
+      "canonical_path": "defaults.speculative.verify_window_pipeline_force",
+      "support": "supported",
+      "source": {
+        "kind": "built_in"
+      }
+    },
+    {
       "canonical_path": "defaults.throughput.continuous_batching",
       "support": "supported",
       "source": {
