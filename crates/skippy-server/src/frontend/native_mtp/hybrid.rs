@@ -460,6 +460,7 @@ mod tests {
             suppress_cooldown_drafts: false,
             suppress_cooldown_draft_limit: 0,
             ngram_hybrid: true,
+            ngram_proposer: "cache",
             ngram_size: 2,
             ngram_initial_extension_tokens: 2,
             ngram_max_proposal_tokens: 4,

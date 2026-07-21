@@ -69,6 +69,7 @@ license = "MIT OR Apache-2.0"
 version = "0.72.1"
 
 [workspace.dependencies]
+ahash = "0.8.12"
 anyhow = "1"
 blake3 = "1"
 clap = { version = "4", features = ["derive"] }

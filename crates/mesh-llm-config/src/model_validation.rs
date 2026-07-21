@@ -547,6 +547,20 @@ fn validate_speculative_proposer_controls(
         &["simple", "cache", "suffix"],
         &format!("{base_path}.ngram_proposer"),
     )?;
+    if config.ngram_proposer.as_deref() == Some("suffix") {
+        if config.ngram_min.is_some_and(|min| min < 3) {
+            return Err(validation_diagnostic(
+                &format!("{base_path}.ngram_min"),
+                format!("{base_path}.ngram_min must be at least 3 for the suffix proposer"),
+            ));
+        }
+        if config.ngram_max.is_some_and(|max| max > 64) {
+            return Err(validation_diagnostic(
+                &format!("{base_path}.ngram_max"),
+                format!("{base_path}.ngram_max must not exceed 64 for the suffix proposer"),
+            ));
+        }
+    }
     validate_optional_u32_range(
         config.ngram_max_proposal_tokens,
         &format!("{base_path}.ngram_max_proposal_tokens"),
@@ -1268,5 +1282,45 @@ ctx_size = 8192
             !text.contains("duplicate model entry"),
             "expected no duplicate error for different derived profiles, got: {text}"
         );
+    }
+
+    #[test]
+    fn suffix_proposer_rejects_matches_shorter_than_its_seed() {
+        let config: MeshConfig = toml::from_str(
+            r#"
+version = 1
+
+[defaults.speculative]
+strategy = "mtp"
+ngram_proposer = "suffix"
+ngram_min = 2
+ngram_max = 32
+ngram_max_proposal_tokens = 16
+"#,
+        )
+        .expect("config should parse before validation");
+
+        let text = legacy_validation_error_text(&validate_config_diagnostics(&config));
+        assert!(text.contains("ngram_min must be at least 3"), "{text}");
+    }
+
+    #[test]
+    fn suffix_proposer_rejects_windows_above_runtime_limit() {
+        let config: MeshConfig = toml::from_str(
+            r#"
+version = 1
+
+[defaults.speculative]
+strategy = "mtp"
+ngram_proposer = "suffix"
+ngram_min = 5
+ngram_max = 65
+ngram_max_proposal_tokens = 16
+"#,
+        )
+        .expect("config should parse before validation");
+
+        let text = legacy_validation_error_text(&validate_config_diagnostics(&config));
+        assert!(text.contains("ngram_max must not exceed 64"), "{text}");
     }
 }

@@ -1359,7 +1359,14 @@ impl StageOpenAiBackend {
                                 );
                                 attrs.insert(
                                     "llama_stage.spec.proposal_source".to_string(),
-                                    json!("composite_mtp_ngram"),
+                                    json!(format!(
+                                        "composite_mtp_{}",
+                                        request
+                                            .speculative
+                                            .ngram
+                                            .as_ref()
+                                            .map_or("none", |ngram| ngram.kind.as_str())
+                                    )),
                                 );
                                 attrs.insert(
                                     "llama_stage.verify_window_id".to_string(),
@@ -1410,13 +1417,14 @@ impl StageOpenAiBackend {
                     if let (true, Some(cache)) =
                         (draft_tokens.is_empty(), cached_ngram_proposer.as_mut())
                     {
+                        let source = cache.source_label();
                         draft_tokens = cache.propose(
                             &context_tokens,
                             &[],
                             proposal_limit.min(request.ngram_max),
                         )?;
                         if !draft_tokens.is_empty() {
-                            proposal_source = "ngram-cache";
+                            proposal_source = source;
                         }
                     }
                     if draft_tokens.is_empty() && request.ngram_max > 0 {
@@ -1961,6 +1969,9 @@ impl StageOpenAiBackend {
                 native_mtp_counters
                     .observe_hybrid_proposal(pipeline.proposal(), pipeline.accepted_tokens());
                 native_mtp.clear_pending_draft();
+            }
+            if let Some(proposer) = cached_ngram_proposer.as_ref() {
+                native_mtp_counters.observe_history_ngram_proposer(proposer.stats());
             }
             let native_mtp_stats = native_mtp.stats();
             self.record_embedded_decode_summary(

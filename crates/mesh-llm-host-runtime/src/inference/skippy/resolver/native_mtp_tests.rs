@@ -467,6 +467,65 @@ ngram_max_proposal_tokens = 6
 }
 
 #[test]
+fn direct_native_mtp_can_use_a_request_local_suffix_extension() {
+    let mesh_config = parse_config(
+        r#"
+[defaults.speculative]
+strategy = "mtp"
+ngram_proposer = "suffix"
+ngram_min = 5
+ngram_max = 32
+ngram_max_proposal_tokens = 48
+extension_initial_tokens = 2
+extension_max_tokens = 48
+extension_tail_backoff_proposals = 2
+verify_window_min_tokens = 1
+verify_window_max_tokens = 32
+verify_window_pipeline_depth = 2
+"#,
+    );
+    let model_file = temp_model_file_with_tensor_names(&["blk.23.nextn.eh_proj.weight"], None);
+
+    let resolved = resolve_skippy_config(SkippyConfigResolveRequest {
+        mesh_config: &mesh_config,
+        model_id: "meshllm/GLM-4.7-Flash-MTP-GGUF",
+        model_path: model_file.path(),
+        model_bytes: 4 * 1024 * 1024 * 1024,
+        allocatable_memory_bytes: None,
+        request_defaults: None,
+        package_generation: None,
+    })
+    .expect("direct native MTP with suffix extension should resolve");
+
+    assert!(resolved.speculative.native_mtp_enabled);
+    assert_eq!(
+        resolved.speculative.decode.effective_strategy,
+        "native-mtp+ngram-suffix"
+    );
+    let ngram = resolved
+        .speculative
+        .decode
+        .ngram
+        .as_ref()
+        .expect("suffix proposer should resolve");
+    assert_eq!(ngram.kind, skippy_server::NgramProposerKind::Suffix);
+    assert_eq!(ngram.min_ngram, 5);
+    assert_eq!(ngram.max_ngram, 32);
+    assert_eq!(ngram.max_proposal_tokens, 48);
+    let extension = resolved
+        .speculative
+        .decode
+        .extension
+        .as_ref()
+        .expect("suffix strategy should synthesize an extension plan");
+    assert_eq!(extension.initial_tokens, 2);
+    assert_eq!(extension.max_tokens, 48);
+    assert_eq!(extension.tail_backoff_proposals, 2);
+    assert_eq!(resolved.speculative.decode.verify_window.max_tokens, 32);
+    assert_eq!(resolved.speculative.decode.verify_window.pipeline_depth, 2);
+}
+
+#[test]
 fn direct_cache_strategy_rejects_an_unsupported_cache_window() {
     let mesh_config = parse_config(
         r#"

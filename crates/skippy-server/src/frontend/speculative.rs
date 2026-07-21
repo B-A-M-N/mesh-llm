@@ -6,9 +6,14 @@ use serde_json::Value;
 use serde_json::json;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::time::Instant;
 
 use crate::config::load_json;
 use crate::frontend::util::openai_backend_error;
+
+mod suffix;
+
+use suffix::{SUFFIX_MIN_SEED_LEN, SuffixNgramProposer};
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -38,6 +43,16 @@ pub enum NgramProposerKind {
     Simple,
     Cache,
     Suffix,
+}
+
+impl NgramProposerKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Simple => "simple",
+            Self::Cache => "cache",
+            Self::Suffix => "suffix",
+        }
+    }
 }
 
 pub const SUFFIX_NGRAM_MAX_WINDOW: usize = 64;
@@ -102,10 +117,10 @@ impl SpeculativeDecodeConfig {
         if let Some(ngram) = &self.ngram
             && (ngram.min_ngram == 0
                 || ngram.min_ngram > ngram.max_ngram
-                || ngram.max_proposal_tokens < ngram.min_ngram)
+                || ngram.max_proposal_tokens == 0)
         {
             bail!(
-                "N-gram proposer requires 0 < min_ngram <= max_ngram and max_proposal_tokens >= min_ngram"
+                "N-gram proposer requires 0 < min_ngram <= max_ngram and max_proposal_tokens > 0"
             );
         }
         if let Some(ngram) = &self.ngram
@@ -119,10 +134,10 @@ impl SpeculativeDecodeConfig {
         }
         if let Some(ngram) = &self.ngram
             && ngram.kind == NgramProposerKind::Suffix
-            && ngram.max_ngram > SUFFIX_NGRAM_MAX_WINDOW
+            && (ngram.min_ngram < SUFFIX_MIN_SEED_LEN || ngram.max_ngram > SUFFIX_NGRAM_MAX_WINDOW)
         {
             bail!(
-                "suffix N-gram proposer max_ngram must not exceed {SUFFIX_NGRAM_MAX_WINDOW}"
+                "suffix N-gram proposer requires {SUFFIX_MIN_SEED_LEN} <= min_ngram <= max_ngram <= {SUFFIX_NGRAM_MAX_WINDOW}"
             );
         }
         if self.extension.is_some() && (!self.native_mtp.enabled || self.ngram.is_none()) {
@@ -286,7 +301,7 @@ mod standalone_speculative_config_tests {
         let config = SpeculativeDecodeConfig {
             ngram: Some(NgramProposalConfig {
                 kind: NgramProposerKind::Suffix,
-                min_ngram: 2,
+                min_ngram: 3,
                 max_ngram: SUFFIX_NGRAM_MAX_WINDOW + 1,
                 max_proposal_tokens: 6,
             }),
@@ -295,11 +310,26 @@ mod standalone_speculative_config_tests {
 
         let error = config.validate().expect_err("suffix max must be bounded");
 
-        assert!(
-            error
-                .to_string()
-                .contains("suffix N-gram proposer max_ngram")
-        );
+        assert!(error.to_string().contains("min_ngram <= max_ngram <= 64"));
+    }
+
+    #[test]
+    fn standalone_speculative_config_rejects_suffix_matches_below_seed_length() {
+        let config = SpeculativeDecodeConfig {
+            ngram: Some(NgramProposalConfig {
+                kind: NgramProposerKind::Suffix,
+                min_ngram: 2,
+                max_ngram: 16,
+                max_proposal_tokens: 4,
+            }),
+            ..SpeculativeDecodeConfig::default()
+        };
+
+        let error = config
+            .validate()
+            .expect_err("suffix minimum must cover the exact seed");
+
+        assert!(error.to_string().contains("3 <= min_ngram"));
     }
 }
 
@@ -352,9 +382,7 @@ pub(super) struct OpenAiSpeculativeStats {
     pub(super) adaptive_window_enabled: bool,
 }
 
-/// Uses llama.cpp's ngram-simple self-speculative proposer. The accepted
-/// history includes the current token; the upstream API keeps it separate
-/// from the preceding history internally.
+/// Uses llama.cpp's stateless N-gram proposer over target-accepted history.
 pub(super) fn propose_ngram_tokens(
     history: &[i32],
     min_match_tokens: usize,
@@ -408,142 +436,28 @@ impl CachedNgramProposer {
     }
 }
 
-const SUFFIX_SEED_LEN: usize = 3;
-const SUFFIX_MAX_POSITIONS_PER_SEED: usize = 8;
-
-pub(super) struct SuffixNgramProposer {
-    min_match: usize,
-    max_window: usize,
-    max_proposal_tokens: usize,
-    committed_history: Vec<i32>,
-    index: std::collections::HashMap<u64, Vec<u32>>,
-}
-
-impl SuffixNgramProposer {
-    pub(super) fn new(
-        min_match: usize,
-        max_window: usize,
-        max_proposal_tokens: usize,
-    ) -> OpenAiResult<Self> {
-        if min_match == 0 || min_match > max_window || max_proposal_tokens < min_match {
-            return Err(openai_backend_error(anyhow::anyhow!(
-                "suffix N-gram proposer requires 0 < min_match <= max_window and max_proposal_tokens >= min_match"
-            )));
-        }
-        if max_window > SUFFIX_NGRAM_MAX_WINDOW {
-            return Err(openai_backend_error(anyhow::anyhow!(
-                "suffix N-gram proposer max_window {max_window} exceeds {SUFFIX_NGRAM_MAX_WINDOW}"
-            )));
-        }
-        Ok(Self {
-            min_match,
-            max_window,
-            max_proposal_tokens,
-            committed_history: Vec::new(),
-            index: std::collections::HashMap::new(),
-        })
-    }
-
-    fn seed_hash(tokens: &[i32]) -> u64 {
-        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-        for &token in tokens {
-            hash ^= u64::from(token as u32);
-            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-        }
-        hash
-    }
-
-    fn sync(&mut self, committed_history: &[i32]) {
-        let start = if committed_history.starts_with(&self.committed_history) {
-            self.committed_history.len()
-        } else {
-            self.index.clear();
-            0
-        };
-        self.committed_history.clear();
-        self.committed_history.extend_from_slice(committed_history);
-        let first = start.max(SUFFIX_SEED_LEN - 1);
-        for end in first..self.committed_history.len() {
-            let seed = &self.committed_history[end + 1 - SUFFIX_SEED_LEN..=end];
-            let bucket = self.index.entry(Self::seed_hash(seed)).or_default();
-            if bucket.len() == SUFFIX_MAX_POSITIONS_PER_SEED {
-                bucket.remove(0);
-            }
-            bucket.push(end as u32);
-        }
-    }
-
-    fn match_len_backward(&self, hist_end: usize, query: &[i32]) -> usize {
-        let mut len = 0;
-        while len < self.max_window
-            && len <= hist_end
-            && len < query.len()
-            && self.committed_history[hist_end - len] == query[query.len() - 1 - len]
-        {
-            len += 1;
-        }
-        len
-    }
-
-    pub(super) fn propose(
-        &mut self,
-        committed_history: &[i32],
-        continuation_prefix: &[i32],
-        max_proposed_tokens: usize,
-    ) -> Vec<i32> {
-        self.sync(committed_history);
-        if max_proposed_tokens == 0 {
-            return Vec::new();
-        }
-        let committed_len = self.committed_history.len();
-        let query_len = committed_len + continuation_prefix.len();
-        if query_len < SUFFIX_SEED_LEN || query_len < self.min_match {
-            return Vec::new();
-        }
-        let token_at = |idx: usize| -> i32 {
-            if idx < committed_len {
-                self.committed_history[idx]
-            } else {
-                continuation_prefix[idx - committed_len]
-            }
-        };
-        let mut seed = [0_i32; SUFFIX_SEED_LEN];
-        for (offset, slot) in seed.iter_mut().enumerate() {
-            *slot = token_at(query_len - SUFFIX_SEED_LEN + offset);
-        }
-        let Some(bucket) = self.index.get(&Self::seed_hash(&seed)) else {
-            return Vec::new();
-        };
-        let tail_len = self.max_window.min(query_len);
-        let query_tail: Vec<i32> = (query_len - tail_len..query_len).map(token_at).collect();
-
-        let mut best_match = 0;
-        let mut best_end = 0;
-        for &end in bucket.iter().rev() {
-            let end = end as usize;
-            if end + 1 >= committed_len {
-                continue;
-            }
-            let match_len = self.match_len_backward(end, &query_tail);
-            if match_len > best_match {
-                best_match = match_len;
-                best_end = end;
-            }
-        }
-        if best_match < self.min_match {
-            return Vec::new();
-        }
-        let draft_len = max_proposed_tokens
-            .min(self.max_proposal_tokens)
-            .min((2 * best_match).max(4))
-            .min(committed_len - (best_end + 1));
-        self.committed_history[best_end + 1..best_end + 1 + draft_len].to_vec()
-    }
-}
-
-pub(super) enum HistoryNgramProposer {
+enum HistoryNgramProposerImpl {
     Cache(CachedNgramProposer),
     Suffix(SuffixNgramProposer),
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) struct HistoryNgramProposerStats {
+    pub(super) attempts: usize,
+    pub(super) hits: usize,
+    pub(super) proposed_tokens: usize,
+    pub(super) match_length_sum: usize,
+    pub(super) match_length_max: usize,
+    pub(super) candidates_examined: usize,
+    pub(super) appended_tokens: usize,
+    pub(super) rebuilds: usize,
+    pub(super) sync_us: u64,
+    pub(super) lookup_us: u64,
+}
+
+pub(super) struct HistoryNgramProposer {
+    proposer: HistoryNgramProposerImpl,
+    stats: HistoryNgramProposerStats,
 }
 
 impl HistoryNgramProposer {
@@ -553,13 +467,26 @@ impl HistoryNgramProposer {
         };
         match ngram.kind {
             NgramProposerKind::Simple => Ok(None),
-            NgramProposerKind::Cache => {
-                CachedNgramProposer::new(ngram.min_ngram, ngram.max_ngram).map(|c| Some(Self::Cache(c)))
-            }
-            NgramProposerKind::Suffix => {
-                SuffixNgramProposer::new(ngram.min_ngram, ngram.max_ngram, ngram.max_proposal_tokens)
-                    .map(|s| Some(Self::Suffix(s)))
-            }
+            NgramProposerKind::Cache => CachedNgramProposer::new(ngram.min_ngram, ngram.max_ngram)
+                .map(HistoryNgramProposerImpl::Cache)
+                .map(Self::new)
+                .map(Some),
+            NgramProposerKind::Suffix => SuffixNgramProposer::new(
+                ngram.min_ngram,
+                ngram.max_ngram,
+                ngram.max_proposal_tokens,
+            )
+            .map_err(OpenAiError::backend)
+            .map(HistoryNgramProposerImpl::Suffix)
+            .map(Self::new)
+            .map(Some),
+        }
+    }
+
+    fn new(proposer: HistoryNgramProposerImpl) -> Self {
+        Self {
+            proposer,
+            stats: HistoryNgramProposerStats::default(),
         }
     }
 
@@ -569,20 +496,67 @@ impl HistoryNgramProposer {
         continuation_prefix: &[i32],
         max_proposed_tokens: usize,
     ) -> OpenAiResult<Vec<i32>> {
-        match self {
-            Self::Cache(cache) => {
-                cache.propose(committed_history, continuation_prefix, max_proposed_tokens)
+        self.stats.attempts += 1;
+        let tokens = match &mut self.proposer {
+            HistoryNgramProposerImpl::Cache(cache) => {
+                let started = Instant::now();
+                let tokens =
+                    cache.propose(committed_history, continuation_prefix, max_proposed_tokens)?;
+                self.stats.lookup_us = self.stats.lookup_us.saturating_add(elapsed_us(started));
+                tokens
             }
-            Self::Suffix(suffix) => {
-                Ok(suffix.propose(committed_history, continuation_prefix, max_proposed_tokens))
+            HistoryNgramProposerImpl::Suffix(suffix) => {
+                let proposal =
+                    suffix.propose(committed_history, continuation_prefix, max_proposed_tokens);
+                self.stats.match_length_sum = self
+                    .stats
+                    .match_length_sum
+                    .saturating_add(proposal.stats.match_length);
+                self.stats.match_length_max =
+                    self.stats.match_length_max.max(proposal.stats.match_length);
+                self.stats.candidates_examined = self
+                    .stats
+                    .candidates_examined
+                    .saturating_add(proposal.stats.candidates_examined);
+                self.stats.appended_tokens = self
+                    .stats
+                    .appended_tokens
+                    .saturating_add(proposal.stats.appended_tokens);
+                self.stats.rebuilds += usize::from(proposal.stats.rebuilt);
+                self.stats.sync_us = self.stats.sync_us.saturating_add(proposal.stats.sync_us);
+                self.stats.lookup_us = self
+                    .stats
+                    .lookup_us
+                    .saturating_add(proposal.stats.lookup_us);
+                proposal.tokens
             }
+        };
+        self.stats.hits += usize::from(!tokens.is_empty());
+        self.stats.proposed_tokens = self.stats.proposed_tokens.saturating_add(tokens.len());
+        Ok(tokens)
+    }
+
+    pub(super) fn source_label(&self) -> &'static str {
+        match &self.proposer {
+            HistoryNgramProposerImpl::Cache(_) => NgramProposerKind::Cache.as_str(),
+            HistoryNgramProposerImpl::Suffix(_) => NgramProposerKind::Suffix.as_str(),
         }
+    }
+
+    pub(super) fn stats(&self) -> HistoryNgramProposerStats {
+        self.stats
     }
 
     #[cfg(test)]
     pub(super) fn new_cache(ngram_min: usize, ngram_max: usize) -> OpenAiResult<Self> {
-        CachedNgramProposer::new(ngram_min, ngram_max).map(Self::Cache)
+        CachedNgramProposer::new(ngram_min, ngram_max)
+            .map(HistoryNgramProposerImpl::Cache)
+            .map(Self::new)
     }
+}
+
+fn elapsed_us(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX)
 }
 
 impl OpenAiSpeculativeStats {
@@ -886,51 +860,6 @@ mod ngram_tests {
             Vec::<i32>::new()
         );
         assert_eq!(proposer.propose(&history, &[], 2).unwrap(), vec![3, 1]);
-    }
-
-    #[test]
-    fn suffix_prefers_the_longest_match_over_the_most_recent() {
-        let mut proposer = SuffixNgramProposer::new(3, 16, 8).unwrap();
-        let committed = [1, 2, 3, 4, 5, 6, 8, 9, 2, 3, 4, 7, 8];
-
-        assert_eq!(proposer.propose(&committed, &[1, 2, 3, 4], 2), vec![5, 6]);
-    }
-
-    #[test]
-    fn suffix_drafts_a_long_run_on_an_edit_workload() {
-        let mut proposer = SuffixNgramProposer::new(3, 16, 7).unwrap();
-        let mut committed = vec![11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22];
-        committed.extend_from_slice(&[11, 12, 13, 14, 15]); // re-emission so far
-
-        let draft = proposer.propose(&committed, &[], 16);
-        assert_eq!(draft, vec![16, 17, 18, 19, 20, 21, 22]);
-        assert!(draft.len() > skippy_runtime::NGRAM_CACHE_MAX_NGRAM);
-    }
-
-    #[test]
-    fn suffix_stays_silent_below_min_match() {
-        let mut proposer = SuffixNgramProposer::new(5, 16, 8).unwrap();
-        let committed = [1, 2, 3, 4, 9, 2, 3, 4];
-
-        assert!(proposer.propose(&committed, &[], 4).is_empty());
-    }
-
-    #[test]
-    fn suffix_treats_the_continuation_prefix_as_read_only() {
-        let mut proposer = SuffixNgramProposer::new(3, 16, 4).unwrap();
-        let committed = [1, 2, 3, 1, 2, 3, 1, 2];
-
-        assert_eq!(proposer.propose(&committed, &[], 2), vec![3, 1]);
-        assert!(proposer.propose(&committed, &[9], 2).is_empty());
-        assert_eq!(proposer.propose(&committed, &[], 2), vec![3, 1]);
-    }
-
-    #[test]
-    fn suffix_syncs_incrementally_then_rebuilds_on_divergence() {
-        let mut proposer = SuffixNgramProposer::new(3, 16, 4).unwrap();
-        assert!(proposer.propose(&[1, 2, 3, 4], &[], 4).is_empty());
-        assert_eq!(proposer.propose(&[1, 2, 3, 4, 1, 2, 3], &[], 4), vec![4, 1, 2, 3]);
-        assert!(proposer.propose(&[9, 1, 2, 3], &[], 4).is_empty());
     }
 }
 
