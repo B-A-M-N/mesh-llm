@@ -152,6 +152,7 @@ impl PredictionReturnHub {
             key,
             hub: self.clone(),
             receiver,
+            direct_reply_seen: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -202,6 +203,15 @@ pub(crate) struct PredictionReturnReceiver {
     key: PredictionReturnKey,
     hub: Arc<PredictionReturnHub>,
     receiver: mpsc::Receiver<Result<StageReply, String>>,
+    /// Trips the first time a reply is actually delivered over the direct route.
+    ///
+    /// This is the implicit "selection confirmation": the tail sends replies on
+    /// this socket ONLY if it selected it as the return route for this request.
+    /// A successful `PredictionReturnOpen` write does not prove selection (the
+    /// tail may still reply on the forward lane), but an actual delivered direct
+    /// reply does. Pipelining (depth > 1, direct-only completion) must gate on
+    /// this to avoid a 300s hang waiting on a route the tail never chose.
+    direct_reply_seen: Arc<AtomicBool>,
 }
 
 impl PredictionReturnReceiver {
@@ -213,6 +223,27 @@ impl PredictionReturnReceiver {
                 eprintln!("direct prediction return reader failed: {error:#}");
             }
         });
+    }
+
+    /// Whether a reply has been observed on the direct return route. Once true,
+    /// the tail has committed to replying directly for this request (route
+    /// selection is stable after generation configuration), so dependent
+    /// (pipelined) direct-only windows are safe to dispatch.
+    pub(crate) fn direct_confirmed(&self) -> bool {
+        self.direct_reply_seen.load(Ordering::Acquire)
+    }
+
+    /// Clear the confirmation flag. Called once right after the generation-config
+    /// ACK so that only POST-config direct replies count as route confirmation.
+    ///
+    /// Pre-config phases (prefix-cache restore, prefill) can send one-off direct
+    /// replies over sockets that are NOT the persistent generation return route;
+    /// counting those would falsely confirm the route and seed a direct-only
+    /// pipeline that then hangs waiting on a route the tail did not actually
+    /// select. Resetting here is safe because those pre-config replies are
+    /// consumed synchronously before generation config completes.
+    pub(crate) fn reset_direct_confirmation(&self) {
+        self.direct_reply_seen.store(false, Ordering::Release);
     }
 
     pub(crate) fn try_recv_expected(&self, expected: WireReplyKind) -> Result<Option<StageReply>> {
@@ -234,7 +265,11 @@ impl PredictionReturnReceiver {
 
     fn try_recv(&self) -> Result<Option<StageReply>> {
         match self.receiver.try_recv() {
-            Ok(Ok(reply)) => Ok(Some(reply)),
+            Ok(Ok(reply)) => {
+                // A delivered direct reply confirms the tail selected this route.
+                self.direct_reply_seen.store(true, Ordering::Release);
+                Ok(Some(reply))
+            }
             Ok(Err(error)) => Err(anyhow!(error)),
             Err(TryRecvError::Empty) => Ok(None),
             Err(TryRecvError::Disconnected) => {
@@ -321,15 +356,20 @@ impl PredictionReturnSinks {
 /// worst-case stall (see PR #1011 review).
 const RETURN_SINK_READY_READ_TIMEOUT: Duration = Duration::from_secs(20);
 
-/// Connect to `return_addr`, complete the ready handshake, and send the
-/// prediction-return open message. Single bounded attempt — on failure the
-/// caller falls back to the upstream reply path.
-fn open_return_sink_once(
+/// Connect to `return_addr` and complete the ready handshake, WITHOUT sending a
+/// `PredictionReturnOpen` message. This is the expensive, WAN-flaky half of
+/// opening a return sink (fresh TCP connect through the local bridge alias +
+/// QUIC bi-stream setup + blocking `recv_ready`). Splitting it out lets a pool
+/// pre-warm return sockets off the generation hot path, exactly like the
+/// forward `PersistentStageLanePool`.
+///
+/// A prepared-but-unbound socket is safe to park: the remote binary stage
+/// server's first-message read is an untimed blocking read, so it simply waits
+/// until we later send `PredictionReturnOpen` to bind the socket to a specific
+/// `(request_id, session_id)`.
+fn prepare_return_sink_socket(
     return_addr: SocketAddr,
     source_ip: Option<IpAddr>,
-    request_id: u64,
-    session_id: u64,
-    wire_dtype: WireActivationDType,
     not_ready_context: &'static str,
 ) -> Result<TcpStream> {
     let mut stream = connect_downstream_socket(return_addr, source_ip, Duration::from_secs(2))
@@ -352,12 +392,40 @@ fn open_return_sink_once(
         .set_read_timeout(None)
         .context("clear prediction return ready read timeout")?;
     ready?;
+    Ok(stream)
+}
+
+/// Bind a prepared (connected + ready) return socket to a specific request by
+/// writing the `PredictionReturnOpen` message. Cheap: a single write, safe to
+/// run on the generation hot path.
+fn bind_prepared_return_sink(
+    stream: &mut TcpStream,
+    request_id: u64,
+    session_id: u64,
+    wire_dtype: WireActivationDType,
+) -> Result<()> {
     write_stage_message(
-        &mut stream,
+        stream,
         &prediction_return_open_message(request_id, session_id),
         wire_dtype,
     )
-    .context("open prediction return stream")?;
+    .context("open prediction return stream")
+}
+
+/// Connect to `return_addr`, complete the ready handshake, and send the
+/// prediction-return open message. Single bounded attempt — on failure the
+/// caller falls back to the upstream reply path. This is the cold path used
+/// when no pre-warmed socket is available.
+fn open_return_sink_once(
+    return_addr: SocketAddr,
+    source_ip: Option<IpAddr>,
+    request_id: u64,
+    session_id: u64,
+    wire_dtype: WireActivationDType,
+    not_ready_context: &'static str,
+) -> Result<TcpStream> {
+    let mut stream = prepare_return_sink_socket(return_addr, source_ip, not_ready_context)?;
+    bind_prepared_return_sink(&mut stream, request_id, session_id, wire_dtype)?;
     Ok(stream)
 }
 
@@ -405,6 +473,41 @@ pub(crate) fn open_downstream_prediction_return_stream(
         "downstream prediction return sink did not become ready",
     )
     .with_context(|| format!("connect downstream prediction return sink at {endpoint}"))
+}
+
+/// Pre-warm a downstream return sink: perform the WAN-flaky connect + ready
+/// handshake WITHOUT binding it to a request. The returned socket is parked and
+/// can later be bound cheaply on the generation hot path via
+/// [`bind_downstream_prediction_return_socket`]. Used by the prepared-return
+/// pool so the cold, unreliable half of opening a return sink happens off the
+/// request path (mirrors the forward `PersistentStageLanePool` pre-warm).
+pub(crate) fn prepare_downstream_prediction_return_socket(
+    config: &StageConfig,
+) -> Result<TcpStream> {
+    let downstream = config
+        .downstream
+        .as_ref()
+        .ok_or_else(|| anyhow!("direct prediction return requires downstream stage"))?;
+    let endpoint = strip_tcp_prefix(&downstream.endpoint);
+    let return_addr = resolve_downstream_endpoint(endpoint)?;
+    let source_ip = downstream_source_ip(config)?;
+    prepare_return_sink_socket(
+        return_addr,
+        source_ip,
+        "downstream prediction return sink did not become ready",
+    )
+    .with_context(|| format!("prewarm downstream prediction return sink at {endpoint}"))
+}
+
+/// Bind a pre-warmed downstream return socket to a specific request by writing
+/// the `PredictionReturnOpen` message. Cheap; safe on the generation hot path.
+pub(crate) fn bind_downstream_prediction_return_socket(
+    stream: &mut TcpStream,
+    request_id: u64,
+    session_id: u64,
+    wire_dtype: WireActivationDType,
+) -> Result<()> {
+    bind_prepared_return_sink(stream, request_id, session_id, wire_dtype)
 }
 
 pub(crate) fn send_direct_prediction_return(
@@ -461,6 +564,94 @@ fn prediction_return_open_message(request_id: u64, session_id: u64) -> StageWire
         positions: Vec::new(),
         activation: Vec::new(),
         raw_bytes: Vec::new(),
+    }
+}
+
+/// Classify a return-sink open/bind failure into a bounded, privacy-safe phase
+/// label for telemetry. Raw endpoints and full error chains stay in local
+/// stderr logs only; OTLP attributes must not carry them.
+///
+/// Phase meanings (see the return-sink open sequence in `open_return_sink_once`
+/// and `prepare_return_sink_socket`):
+/// - `connect_refused` — local bridge listener gone/wrong (no one accepted).
+/// - `connect_timeout` — TCP connect to the (local bridge) endpoint timed out.
+/// - `ready_timeout` — local connect ok; no `ready` handshake byte in time
+///   (bridge/QUIC/remote-accept problem — the WAN leg).
+/// - `remote_eof` — remote/bridge accepted then closed before handshake.
+/// - `open_write_failed` — handshake ok but the open message write failed.
+/// - `other` — anything else; inspect local logs.
+pub(crate) fn classify_return_failure_phase(error_detail: &str) -> &'static str {
+    let lower = error_detail.to_ascii_lowercase();
+    if lower.contains("did not become ready") || lower.contains("ready read timeout") {
+        "ready_timeout"
+    } else if lower.contains("connection refused") {
+        "connect_refused"
+    } else if lower.contains("timed out") || lower.contains("timeout") {
+        "connect_timeout"
+    } else if lower.contains("unexpectedeof")
+        || lower.contains("unexpected eof")
+        || lower.contains("connection reset")
+    {
+        "remote_eof"
+    } else if lower.contains("open prediction return stream") || lower.contains("broken pipe") {
+        "open_write_failed"
+    } else {
+        "other"
+    }
+}
+
+#[cfg(test)]
+mod failure_phase_tests {
+    use super::classify_return_failure_phase;
+
+    #[test]
+    fn maps_ready_timeout_the_wan_leg() {
+        assert_eq!(
+            classify_return_failure_phase("downstream prediction return sink did not become ready"),
+            "ready_timeout"
+        );
+    }
+
+    #[test]
+    fn maps_connect_refused_local_bridge_gone() {
+        assert_eq!(
+            classify_return_failure_phase(
+                "connect downstream prediction return sink at 127.0.0.1:54321: Connection refused (os error 61)"
+            ),
+            "connect_refused"
+        );
+    }
+
+    #[test]
+    fn maps_remote_eof() {
+        assert_eq!(
+            classify_return_failure_phase("read direct prediction return: UnexpectedEof"),
+            "remote_eof"
+        );
+    }
+
+    #[test]
+    fn maps_open_write_failed() {
+        assert_eq!(
+            classify_return_failure_phase("open prediction return stream: broken pipe"),
+            "open_write_failed"
+        );
+    }
+
+    #[test]
+    fn unknown_is_other() {
+        assert_eq!(
+            classify_return_failure_phase("some unexpected condition"),
+            "other"
+        );
+    }
+
+    #[test]
+    fn connect_timeout_distinct_from_ready_timeout() {
+        assert_eq!(
+            classify_return_failure_phase("connect ...: operation timed out"),
+            "connect_timeout"
+        );
     }
 }
 

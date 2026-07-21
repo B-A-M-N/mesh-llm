@@ -158,6 +158,7 @@ impl StageOpenAiBackend {
                 prefill_reply_credit_limit,
                 lane_pool,
                 prediction_returns,
+                prepared_return_pool,
             } => self.generate_embedded_stage_zero_tokens(
                 EmbeddedStageZeroGeneration {
                     config: &config,
@@ -172,6 +173,7 @@ impl StageOpenAiBackend {
                         .map(|hub| hub.register(ids.request_id, ids.session_id))
                         .transpose()
                         .map_err(openai_backend_error)?,
+                    prepared_return_pool,
                     draft: self.draft.clone(),
                     speculative_window: self.speculative_window,
                     adaptive_speculative_window: self.adaptive_speculative_window,

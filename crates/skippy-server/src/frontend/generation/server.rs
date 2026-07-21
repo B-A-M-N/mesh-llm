@@ -11,6 +11,7 @@ use crate::frontend::decode_batcher::DecodeBatcher;
 use crate::frontend::generation::OpenAiBackendMode;
 use crate::frontend::generation::PersistentStageLanePool;
 use crate::frontend::generation::PhaseTimer;
+use crate::frontend::generation::PreparedPredictionReturnPool;
 use crate::frontend::generation::StageOpenAiBackend;
 use crate::frontend::generation::attach_native_mtp_draft_model;
 use crate::frontend::generation::ensure_generation_concurrency_fits_lanes;
@@ -332,6 +333,16 @@ pub fn embedded_openai_backend(args: EmbeddedOpenAiArgs) -> Result<EmbeddedOpenA
         args.telemetry.clone(),
     )
     .context("create embedded OpenAI persistent downstream lanes")?;
+    // Pre-warm a pool of direct-prediction-return sockets alongside the forward
+    // lanes so the WAN-flaky connect+ready handshake happens off the generation
+    // hot path. `capacity = generation_concurrency` (per expert review): a single
+    // global pool sized to the number of concurrent requests, not per request.
+    let prepared_return_pool = PreparedPredictionReturnPool::new(
+        &args.config,
+        args.generation_concurrency,
+        args.wire_dtype,
+        args.telemetry.clone(),
+    );
     let prefill_reply_credit_limit = args.reply_credit_limit.unwrap_or(3);
     let mode = OpenAiBackendMode::EmbeddedStageZero {
         config: args.config.clone(),
@@ -351,6 +362,7 @@ pub fn embedded_openai_backend(args: EmbeddedOpenAiArgs) -> Result<EmbeddedOpenA
         prefill_reply_credit_limit,
         lane_pool,
         prediction_returns: args.prediction_returns.clone(),
+        prepared_return_pool,
     };
     args.telemetry
         .emit("stage.openai_server_start", lifecycle_attrs(&args.config));

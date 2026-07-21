@@ -388,6 +388,7 @@ async fn real_multimodal_split_smoke_when_fixture_is_set() -> Result<()> {
             prefill_reply_credit_limit: 0,
             lane_pool: Some(lane_pool),
             prediction_returns: None,
+            prepared_return_pool: None,
         },
         draft: None,
         speculative_window: 0,

@@ -2,6 +2,7 @@ mod cache_hints;
 mod draft_runner;
 mod parsing;
 mod persistent_lanes;
+mod prepared_return_pool;
 mod queue;
 mod server;
 mod streaming;
@@ -24,6 +25,7 @@ pub(in crate::frontend) use cache_hints::{
 pub(in crate::frontend) use draft_runner::*;
 pub(in crate::frontend) use parsing::*;
 pub(in crate::frontend) use persistent_lanes::*;
+pub(in crate::frontend) use prepared_return_pool::PreparedPredictionReturnPool;
 pub(in crate::frontend) use queue::*;
 pub(in crate::frontend) use streaming::*;
 pub(in crate::frontend) use types::*;

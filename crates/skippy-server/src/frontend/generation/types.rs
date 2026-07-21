@@ -14,6 +14,7 @@ use crate::frontend::generation::GenerationTokenLimit;
 use crate::frontend::generation::OpenAiGenerationIds;
 use crate::frontend::generation::PersistentStageLanePool;
 use crate::frontend::generation::PreparedGenerationPrompt;
+use crate::frontend::generation::PreparedPredictionReturnPool;
 use crate::frontend::native_mtp::NativeMtpDecodeTelemetry;
 use crate::frontend::prefill::PrefillChunkPolicy;
 use crate::frontend::speculative::OpenAiSpeculativeStats;
@@ -78,6 +79,7 @@ pub(in crate::frontend) enum OpenAiBackendMode {
         prefill_reply_credit_limit: usize,
         lane_pool: Option<Arc<PersistentStageLanePool>>,
         prediction_returns: Option<Arc<PredictionReturnHub>>,
+        prepared_return_pool: Option<Arc<PreparedPredictionReturnPool>>,
     },
 }
 
@@ -149,6 +151,7 @@ pub(in crate::frontend) struct EmbeddedStageZeroGeneration<'a> {
     pub(in crate::frontend) prefill_reply_credit_limit: usize,
     pub(in crate::frontend) lane_pool: Option<Arc<PersistentStageLanePool>>,
     pub(in crate::frontend) prediction_return: Option<PredictionReturnReceiver>,
+    pub(in crate::frontend) prepared_return_pool: Option<Arc<PreparedPredictionReturnPool>>,
     pub(in crate::frontend) draft: Option<Arc<Mutex<DraftRunner>>>,
     pub(in crate::frontend) speculative_window: usize,
     pub(in crate::frontend) adaptive_speculative_window: bool,

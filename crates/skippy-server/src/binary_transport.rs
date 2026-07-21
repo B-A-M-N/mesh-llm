@@ -18,6 +18,7 @@ pub(crate) use self::decode_batcher::DecodeFrameBatcher;
 pub use self::direct_return::PredictionReturnHub;
 pub use self::direct_return::PredictionReturnListener;
 pub(crate) use self::direct_return::PredictionReturnReceiver;
+pub(crate) use self::direct_return::classify_return_failure_phase;
 pub(crate) use self::forwarding::{forwarded_stage_message, forwarded_stage_message_timed};
 pub use self::options::{BinaryStageOptions, EmbeddedOpenAiStageOptions, parse_wire_dtype};
 pub(crate) use self::stage_execution::{

@@ -75,7 +75,32 @@ impl StageOpenAiBackend {
         let mut direct_prediction_return_opened = false;
         let mut direct_prediction_return_error: Option<String> = None;
         if let Some(prediction_return) = request.prediction_return.as_ref() {
-            match crate::binary_transport::direct_return::open_downstream_prediction_return_stream(
+            // Prefer a pre-warmed return socket (connect + ready handshake already
+            // done off the hot path). Binding it is a cheap write. Only if the pool
+            // is empty/stale do we fall back to the cold open, which does the
+            // WAN-flaky connect+handshake inline.
+            // `checkout_bound` signals the pool's own maintenance worker to
+            // refill the consumed slot; no per-request thread is spawned here.
+            let pooled = request
+                .prepared_return_pool
+                .as_ref()
+                .and_then(|pool| pool.checkout_bound(request_id, session_id));
+            if let Some(stream) = pooled {
+                prediction_return.attach_opened_stream(stream);
+                direct_prediction_return_opened = true;
+                let mut attrs = self.openai_attrs(request.ids);
+                attrs.insert(
+                    "llama_stage.direct_prediction_return.opened".to_string(),
+                    json!(true),
+                );
+                attrs.insert(
+                    "llama_stage.direct_prediction_return.source".to_string(),
+                    json!("prewarmed_pool"),
+                );
+                self.telemetry
+                    .emit("stage.direct_prediction_return_opened", attrs);
+            } else {
+                match crate::binary_transport::direct_return::open_downstream_prediction_return_stream(
                 request.config,
                 request_id,
                 session_id,
@@ -95,7 +120,8 @@ impl StageOpenAiBackend {
                         request.config.downstream.as_ref().map(|d| &d.endpoint),
                     );
                     // OTLP: bounded, privacy-safe fields only.
-                    let failure_phase = classify_direct_return_failure_phase(&detail);
+                    let failure_phase =
+                        crate::binary_transport::classify_return_failure_phase(&detail);
                     let mut attrs = self.openai_attrs(request.ids);
                     attrs.insert(
                         "llama_stage.direct_prediction_return.opened".to_string(),
@@ -108,6 +134,7 @@ impl StageOpenAiBackend {
                     self.telemetry
                         .emit("stage.direct_prediction_return_unavailable", attrs);
                     direct_prediction_return_error = Some(failure_phase.to_string());
+                }
                 }
             }
         }
@@ -674,6 +701,14 @@ impl StageOpenAiBackend {
                     reply.kind
                 )));
             }
+            // Phase-scope direct-return confirmation: only replies observed AFTER
+            // generation config count as proof the tail selected the direct route
+            // for decode. Pre-config phases (prefix-cache restore, prefill) can
+            // send one-off direct replies over non-generation sockets, which would
+            // otherwise falsely confirm and seed a direct-only pipeline that hangs.
+            if let Some(prediction_return) = request.prediction_return.as_ref() {
+                prediction_return.reset_direct_confirmation();
+            }
 
             let decode_timer = PhaseTimer::start();
             let mut decoded_tokens = 0usize;
@@ -974,8 +1009,22 @@ impl StageOpenAiBackend {
                 let token_timer = PhaseTimer::start();
                 let native_mtp_remaining =
                     (request.max_tokens as usize).saturating_sub(decoded_tokens);
+                // Implicit selection confirmation (expert-reviewed safety
+                // invariant): more than one VerifyWindow may be in flight only
+                // after a reply has actually been observed on this request's
+                // direct return route. A successful `PredictionReturnOpen` write
+                // does not prove the tail chose the direct route — it may still
+                // reply on the forward lane — so seeding the direct-only pipeline
+                // on bind success risks a 300s hang. While unconfirmed we stay
+                // serial (depth 1), whose completion polls BOTH the direct
+                // receiver and the forward lane; the first direct reply trips
+                // confirmation and unlocks pipelining for the rest of the request.
+                let direct_return_confirmed = request.prediction_return.as_ref().is_some_and(
+                    crate::binary_transport::PredictionReturnReceiver::direct_confirmed,
+                );
                 let mut pipeline_seed = None;
                 if pipelined_decode_enabled
+                    && direct_return_confirmed
                     && pipelined.is_none()
                     && pipelined_windows.is_empty()
                     && native_mtp_reject_cooldown_remaining == 0
@@ -2044,96 +2093,5 @@ impl StageOpenAiBackend {
         self.finish_embedded_generation_session(&request, lane_pool, lane, &result, &session_key)?;
         result?;
         Ok(cache_stats)
-    }
-}
-
-/// Classify a direct-prediction-return sink-open failure into a bounded,
-/// privacy-safe phase label for telemetry. Raw endpoints and full error chains
-/// stay in local stderr logs only; OTLP attributes must not carry them.
-///
-/// Phase meanings (see docs/skippy/PIPELINED_VERIFY_WINDOW.md and the return-sink
-/// open sequence in `binary_transport::direct_return::open_return_sink_once`):
-/// - `connect_refused` — local bridge listener gone/wrong (no one accepted).
-/// - `connect_timeout` — TCP connect to the (local bridge) endpoint timed out.
-/// - `ready_timeout` — local connect ok; no `ready` handshake byte in time
-///   (bridge/QUIC/remote-accept problem — the WAN leg).
-/// - `remote_eof` — remote/bridge accepted then closed before handshake.
-/// - `open_write_failed` — handshake ok but the open message write failed.
-/// - `other` — anything else; inspect local logs.
-fn classify_direct_return_failure_phase(error_detail: &str) -> &'static str {
-    let lower = error_detail.to_ascii_lowercase();
-    if lower.contains("did not become ready") || lower.contains("ready read timeout") {
-        "ready_timeout"
-    } else if lower.contains("connection refused") {
-        "connect_refused"
-    } else if lower.contains("timed out") || lower.contains("timeout") {
-        "connect_timeout"
-    } else if lower.contains("unexpectedeof")
-        || lower.contains("unexpected eof")
-        || lower.contains("connection reset")
-    {
-        "remote_eof"
-    } else if lower.contains("open prediction return stream") || lower.contains("broken pipe") {
-        "open_write_failed"
-    } else {
-        "other"
-    }
-}
-
-#[cfg(test)]
-mod direct_return_failure_phase_tests {
-    use super::classify_direct_return_failure_phase;
-
-    #[test]
-    fn maps_ready_timeout_the_wan_leg() {
-        assert_eq!(
-            classify_direct_return_failure_phase(
-                "downstream prediction return sink did not become ready"
-            ),
-            "ready_timeout"
-        );
-    }
-
-    #[test]
-    fn maps_connect_refused_local_bridge_gone() {
-        assert_eq!(
-            classify_direct_return_failure_phase(
-                "connect downstream prediction return sink at 127.0.0.1:54321: Connection refused (os error 61)"
-            ),
-            "connect_refused"
-        );
-    }
-
-    #[test]
-    fn maps_remote_eof() {
-        assert_eq!(
-            classify_direct_return_failure_phase("read direct prediction return: UnexpectedEof"),
-            "remote_eof"
-        );
-    }
-
-    #[test]
-    fn maps_open_write_failed() {
-        assert_eq!(
-            classify_direct_return_failure_phase("open prediction return stream: broken pipe"),
-            "open_write_failed"
-        );
-    }
-
-    #[test]
-    fn unknown_is_other() {
-        assert_eq!(
-            classify_direct_return_failure_phase("some unexpected condition"),
-            "other"
-        );
-    }
-
-    #[test]
-    fn connect_timeout_distinct_from_ready_timeout() {
-        // A bare connect timeout (no "did not become ready") is the connect phase.
-        assert_eq!(
-            classify_direct_return_failure_phase("connect ...: operation timed out"),
-            "connect_timeout"
-        );
     }
 }
