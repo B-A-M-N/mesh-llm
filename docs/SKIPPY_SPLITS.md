@@ -106,9 +106,10 @@ fail-closed topology. Create the same JSON file on every serving node:
 ```
 
 `node` accepts either a full iroh endpoint id or an advertised hostname. Node
-selectors must resolve uniquely among eligible split participants. Ranges must
-be non-empty, contiguous, cover `0..layer_count`, and assign each node once.
-The model and manifest digest must match the resolved package.
+selectors must resolve uniquely among eligible split participants. Ranges are
+half-open: `layer_start` is inclusive and `layer_end` is exclusive. They must be
+non-empty, contiguous, cover `0..layer_count`, and assign each node once. The
+model and manifest digest must match the resolved package.
 
 Pass the lock together with `--split` on every node:
 

@@ -250,7 +250,8 @@ The runtime verifies the resolved package and manifest digest, resolves each
 node selector uniquely, requires contiguous ranges covering the full model,
 and applies the normal context, KV-cache, headroom, and VRAM checks to those
 exact assignments. A node selector may be a full iroh endpoint ID or an
-advertised hostname.
+advertised hostname. Ranges are half-open: `layer_start` is inclusive and
+`layer_end` is exclusive.
 
 The lock is fail-closed, not a placement hint. If the requested topology cannot
 be reproduced, startup fails. If an assigned stage is later lost, mesh-llm

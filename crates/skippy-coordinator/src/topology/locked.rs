@@ -162,3 +162,156 @@ fn fit_locked_candidate(
         total_remaining_vram,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::topology::TopologyNode;
+
+    const GIB: u64 = 1024 * 1024 * 1024;
+
+    fn node(id: &str, gib: u64) -> TopologyNode {
+        TopologyNode {
+            node_id: id.to_string(),
+            detected_vram_bytes: gib * GIB,
+            max_vram_bytes: None,
+            runtime_headroom_bytes: 0,
+            stage_transfer_latency_ms: None,
+        }
+    }
+
+    fn input(nodes: Vec<TopologyNode>) -> TopologyPlanningInput {
+        TopologyPlanningInput {
+            native_context_length: 65_536,
+            layer_count: 40,
+            model_weight_bytes: 40 * GIB,
+            layer_weight_bytes: Vec::new(),
+            kv_bytes_per_token: 64 * 1024,
+            minimum_nodes: 2,
+            nodes,
+            context_length_override: None,
+            parallel_lanes_override: None,
+            target_decode_tpot_ms: None,
+        }
+    }
+
+    fn stage(node_id: &str, layer_start: u32, layer_end: u32) -> LockedTopologyStage {
+        LockedTopologyStage {
+            node_id: node_id.to_string(),
+            layer_start,
+            layer_end,
+        }
+    }
+
+    #[test]
+    fn preserves_node_order_and_layer_ranges() {
+        let request = input(vec![node("large", 48), node("small", 24)]);
+        let locked = vec![stage("small", 0, 12), stage("large", 12, 40)];
+
+        let plan = plan_locked_topology(&request, &locked).unwrap();
+
+        assert_eq!(
+            plan.stages
+                .iter()
+                .map(|stage| (stage.node_id.as_str(), stage.layer_start, stage.layer_end))
+                .collect::<Vec<_>>(),
+            vec![("small", 0, 12), ("large", 12, 40)]
+        );
+    }
+
+    #[test]
+    fn rejects_too_few_stages() {
+        let request = input(vec![node("a", 80), node("b", 80)]);
+
+        assert_eq!(
+            plan_locked_topology(&request, &[stage("a", 0, 40)]),
+            Err(TopologyPlanError::LockedStageCount {
+                minimum: 2,
+                actual: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_node() {
+        let request = input(vec![node("a", 48), node("b", 48)]);
+        let locked = vec![stage("a", 0, 20), stage("missing", 20, 40)];
+
+        assert_eq!(
+            plan_locked_topology(&request, &locked),
+            Err(TopologyPlanError::LockedUnknownNode {
+                node_id: "missing".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_duplicate_node() {
+        let request = input(vec![node("a", 48), node("b", 48)]);
+        let locked = vec![stage("a", 0, 20), stage("a", 20, 40)];
+
+        assert_eq!(
+            plan_locked_topology(&request, &locked),
+            Err(TopologyPlanError::LockedDuplicateNode {
+                node_id: "a".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_range() {
+        let request = input(vec![node("a", 48), node("b", 48)]);
+        let locked = vec![stage("a", 0, 20), stage("b", 20, 20)];
+
+        assert_eq!(
+            plan_locked_topology(&request, &locked),
+            Err(TopologyPlanError::LockedInvalidRange {
+                stage_index: 1,
+                start: 20,
+                end: 20,
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_non_contiguous_ranges() {
+        let request = input(vec![node("a", 48), node("b", 48)]);
+        let locked = vec![stage("a", 0, 19), stage("b", 20, 40)];
+
+        assert_eq!(
+            plan_locked_topology(&request, &locked),
+            Err(TopologyPlanError::LockedNonContiguousRange {
+                stage_index: 1,
+                expected_start: 19,
+                actual_start: 20,
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_incomplete_coverage() {
+        let request = input(vec![node("a", 48), node("b", 48)]);
+        let locked = vec![stage("a", 0, 20), stage("b", 20, 39)];
+
+        assert_eq!(
+            plan_locked_topology(&request, &locked),
+            Err(TopologyPlanError::LockedIncompleteCoverage {
+                actual_end: 39,
+                layer_count: 40,
+            })
+        );
+    }
+
+    #[test]
+    fn fails_when_pinned_stage_exceeds_node_capacity() {
+        let request = input(vec![node("small", 12), node("large", 48)]);
+        let locked = vec![stage("small", 0, 30), stage("large", 30, 40)];
+
+        assert_eq!(
+            plan_locked_topology(&request, &locked),
+            Err(TopologyPlanError::LockedTopologyDoesNotFit {
+                minimum_context: 65_536,
+            })
+        );
+    }
+}

@@ -214,6 +214,15 @@ pub(super) fn plan_locked_runtime_slice_topology_with_resources(
     resources: SplitTopologyResourceInputs,
     locked_stages: &[LockedSplitStageAssignment],
 ) -> Result<PlannedRuntimeSliceTopology> {
+    tracing::info!(
+        topology_id,
+        model_ref,
+        participants = ?split_participant_labels(participants),
+        layer_count = package.layer_count,
+        native_context_length = resources.native_context_length,
+        "planning locked resource-aware split runtime topology"
+    );
+
     let participant_by_id = participant_index_by_id(participants);
     let locked_stages = locked_stages
         .iter()
@@ -234,6 +243,8 @@ pub(super) fn plan_locked_runtime_slice_topology_with_resources(
         model_ref,
         context_length = plan.context_length,
         slots = plan.parallel_lanes,
+        estimated_decode_network_ms_per_token = plan.estimated_decode_network_ms_per_token,
+        decode_tpot_target_met = plan.decode_tpot_target_met,
         stages = ?split_stage_plan_labels(&stages),
         "validated locked split runtime topology"
     );
