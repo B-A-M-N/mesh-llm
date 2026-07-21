@@ -327,6 +327,15 @@ fn poll_direct_or_downstream_reply(
             break Ok(reply);
         }
         if downstream_reply_available(downstream)? {
+            // `peek` only proves that the first byte has arrived. Tunnelled
+            // replies may be fragmented, so retaining the short poll timeout
+            // while decoding the complete frame turns an ordinary partial
+            // arrival into EWOULDBLOCK. Once downstream wins the race, give
+            // the frame the remainder of the bounded fallback deadline.
+            let remaining = DIRECT_RETURN_FALLBACK_TIMEOUT.saturating_sub(started.elapsed());
+            downstream
+                .set_read_timeout(Some(remaining.max(DIRECT_RETURN_FALLBACK_POLL)))
+                .map_err(openai_io_error)?;
             break receive_downstream_stage_reply_one_of(downstream, expected_replies);
         }
         if started.elapsed() >= DIRECT_RETURN_FALLBACK_TIMEOUT {
@@ -514,5 +523,46 @@ mod tests {
         }
 
         assert_eq!(stream.read_timeout().unwrap(), original);
+    }
+
+    #[test]
+    fn direct_return_fallback_accepts_fragmented_downstream_reply() {
+        use std::io::Write;
+
+        let request_id = 91;
+        let session_id = 92;
+        let hub = Arc::new(PredictionReturnHub::default());
+        let receiver = hub.register(request_id, session_id).unwrap();
+        let (mut downstream, mut downstream_peer) = connected_stream_pair();
+        let mut bytes = Vec::new();
+        skippy_protocol::binary::send_reply_message(
+            &mut bytes,
+            &StageReply {
+                kind: WireReplyKind::PredictedTokens,
+                predicted: 0,
+                predicted_tokens: vec![17, 23],
+                native_mtp_draft: None,
+                window: Default::default(),
+                stats: StageReplyStats::default(),
+            },
+        )
+        .unwrap();
+        let writer = std::thread::spawn(move || {
+            downstream_peer.write_all(&bytes[..1]).unwrap();
+            downstream_peer.flush().unwrap();
+            std::thread::sleep(DIRECT_RETURN_FALLBACK_POLL * 3);
+            downstream_peer.write_all(&bytes[1..]).unwrap();
+        });
+
+        let reply = receive_embedded_stage_reply_one_of(
+            &mut downstream,
+            Some(&receiver),
+            &[WireReplyKind::PredictedTokens],
+        )
+        .unwrap();
+
+        assert_eq!(reply.predicted_tokens, vec![17, 23]);
+        assert_eq!(downstream.read_timeout().unwrap(), None);
+        writer.join().unwrap();
     }
 }
