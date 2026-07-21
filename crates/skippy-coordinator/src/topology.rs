@@ -1,5 +1,9 @@
 use std::cmp::Ordering;
 
+mod locked;
+
+pub use locked::{LockedTopologyStage, plan_locked_topology};
+
 /// Default auto lane cap.  Matches llama-server's default of `--parallel 4`.
 /// Users can override via `gpu.parallel` in config.toml or the per-model
 /// `parallel` setting.
@@ -82,6 +86,30 @@ pub enum TopologyPlanError {
     ZeroParallelLanes,
     #[error("no topology can distribute all layers and keep context >= {minimum_context}")]
     NoValidTopology { minimum_context: u32 },
+    #[error("locked topology must contain at least {minimum} stages; found {actual}")]
+    LockedStageCount { minimum: usize, actual: usize },
+    #[error("locked topology references unknown node {node_id}")]
+    LockedUnknownNode { node_id: String },
+    #[error("locked topology assigns node {node_id} more than once")]
+    LockedDuplicateNode { node_id: String },
+    #[error(
+        "locked topology stage {stage_index} must start at layer {expected_start}; found {actual_start}"
+    )]
+    LockedNonContiguousRange {
+        stage_index: usize,
+        expected_start: u32,
+        actual_start: u32,
+    },
+    #[error("locked topology stage {stage_index} has empty or reversed range {start}..{end}")]
+    LockedInvalidRange {
+        stage_index: usize,
+        start: u32,
+        end: u32,
+    },
+    #[error("locked topology ends at layer {actual_end}; model has {layer_count} layers")]
+    LockedIncompleteCoverage { actual_end: u32, layer_count: u32 },
+    #[error("locked topology cannot fit context >= {minimum_context}")]
+    LockedTopologyDoesNotFit { minimum_context: u32 },
 }
 
 pub fn plan_topology(input: &TopologyPlanningInput) -> Result<TopologyPlan, TopologyPlanError> {
@@ -690,6 +718,86 @@ mod tests {
                 .map(|stage| (stage.layer_start, stage.layer_end))
                 .collect::<Vec<_>>(),
             vec![(0, 2), (2, 4)]
+        );
+    }
+
+    #[test]
+    fn locked_topology_preserves_node_order_and_layer_ranges() {
+        let mut request = input(vec![node("large", 48), node("small", 24)]);
+        request.minimum_nodes = 2;
+        let locked = vec![
+            LockedTopologyStage {
+                node_id: "small".to_string(),
+                layer_start: 0,
+                layer_end: 12,
+            },
+            LockedTopologyStage {
+                node_id: "large".to_string(),
+                layer_start: 12,
+                layer_end: 40,
+            },
+        ];
+
+        let plan = plan_locked_topology(&request, &locked).unwrap();
+
+        assert_eq!(
+            plan.stages
+                .iter()
+                .map(|stage| (stage.node_id.as_str(), stage.layer_start, stage.layer_end))
+                .collect::<Vec<_>>(),
+            vec![("small", 0, 12), ("large", 12, 40)]
+        );
+    }
+
+    #[test]
+    fn locked_topology_rejects_non_contiguous_ranges() {
+        let mut request = input(vec![node("a", 48), node("b", 48)]);
+        request.minimum_nodes = 2;
+        let locked = vec![
+            LockedTopologyStage {
+                node_id: "a".to_string(),
+                layer_start: 0,
+                layer_end: 19,
+            },
+            LockedTopologyStage {
+                node_id: "b".to_string(),
+                layer_start: 20,
+                layer_end: 40,
+            },
+        ];
+
+        assert_eq!(
+            plan_locked_topology(&request, &locked),
+            Err(TopologyPlanError::LockedNonContiguousRange {
+                stage_index: 1,
+                expected_start: 19,
+                actual_start: 20,
+            })
+        );
+    }
+
+    #[test]
+    fn locked_topology_fails_when_pinned_stage_exceeds_node_capacity() {
+        let mut request = input(vec![node("small", 12), node("large", 48)]);
+        request.minimum_nodes = 2;
+        let locked = vec![
+            LockedTopologyStage {
+                node_id: "small".to_string(),
+                layer_start: 0,
+                layer_end: 30,
+            },
+            LockedTopologyStage {
+                node_id: "large".to_string(),
+                layer_start: 30,
+                layer_end: 40,
+            },
+        ];
+
+        assert_eq!(
+            plan_locked_topology(&request, &locked),
+            Err(TopologyPlanError::LockedTopologyDoesNotFit {
+                minimum_context: 65_536,
+            })
         );
     }
 
