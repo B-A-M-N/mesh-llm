@@ -279,6 +279,55 @@ and `ngram-suffix` arms on the same split. The benchmark runner uses generic
 draft acceptance for standalone arms and N-gram tail acceptance for MTP hybrid
 arms; activation requires the configured proposer’s own hit/source telemetry.
 
+### Standalone GLM-4.7 split result (2026-07-21)
+
+We ran the first standalone matrix on
+`meshllm/GLM-4.7-Flash-MTP-GGUF:Q4_K_M` with a two-stage 47/1-layer split,
+eight lanes, and no injected inter-stage latency. Each arm received the same
+deterministic coding prompt: re-emit a source file with one function renamed,
+then generate 384 tokens. Results below are medians from five measured requests
+after two warmups. Prefix caching was explicitly disabled for every arm so a
+cross-request cache restore could not change the comparison.
+
+| Standalone arm | Server decode tok/s | End-to-end tok/s | Server uplift vs target | Acceptance | Proposed / accepted tokens per request |
+|---|---:|---:|---:|---:|---:|
+| Target only | 22.60 | 19.87 | — | — | 0 / 0 |
+| Simple | 107.22 | 64.38 | +374.5% | 53.2% | 694 / 369 |
+| Cache | 77.96 | 52.94 | +245.0% | 67.1% | 523 / 351 |
+| Suffix | **119.24** | **68.49** | **+427.6%** | **84.9%** | 425 / 361 |
+
+Suffix was the fastest arm: 11.2% higher server decode throughput and 6.4%
+higher end-to-end throughput than Simple. Its lookup cost was 63 microseconds
+across all five measured requests, about 12.6 microseconds per request, so
+hashing was not a material cost in this workload.
+
+The Simple-versus-Cache result is also important. Simple had lower acceptance
+(53.2% versus 67.1%) yet delivered 37.5% more server throughput because it
+proposed and accepted more tokens in absolute terms. Acceptance percentage is
+therefore not enough to judge a proposer: proposal width, accepted tokens per
+verification window, and resulting pipeline occupancy matter too.
+
+This is a mechanism microbenchmark, not yet a production or quality result:
+
+- It measured standalone N-gram strategies, not MTP plus N-gram composition.
+- Each arm was deterministic by itself, but output hashes differed at the one
+  novel edit line before reconverging on the copied body. Exact greedy-trajectory
+  equivalence remains unresolved, so the throughput numbers must not be read as
+  proof of equivalent code quality.
+- With prefix caching enabled, a second standalone Simple request returned 502
+  after a `chain_restore_hit`. Disabling the cache made sequential requests
+  reliable. This points to speculative checkpoint state interacting with
+  cross-request KV restore and must be fixed before a cache-enabled rerun.
+- The previous cache-enabled target-only baseline was 22.93 server tok/s and
+  19.68 end-to-end tok/s. The new target-only row differs by -1.5% and +1.0%
+  respectively, which suggests the underlying baseline was stable.
+
+Two small observability fixes were made while obtaining these results. An
+explicit `prefix_cache.enabled = false` now survives model-family defaults, and
+standalone response timings now report generic proposed, accepted, rejected,
+and acceptance totals. These fixes make the arms comparable and do not change
+the suffix lookup algorithm.
+
 ## Production Readiness
 
 This branch establishes runtime capability, not production certification. The
