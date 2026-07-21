@@ -36,6 +36,14 @@ pub(in crate::frontend) struct CompositeProposalPipeline {
     dispatched_native_mtp_token_count: usize,
     accepted_tokens: usize,
     next_draft: Option<NativeMtpDraft>,
+    /// Sealed-tail invariant (expert-reviewed): once a dispatched window had no
+    /// reserved free-target candidate (`expected_free_target == None`), the
+    /// pipeline's optimistic frontier is no longer represented by a buffered
+    /// bridge token, so appending more candidates behind it would splice onto a
+    /// stale `pipelined_current`. Once sealed, refill is refused and the pipeline
+    /// must retire/reseed. This is the flag the ledger-free continuous refill
+    /// relies on for correctness.
+    sealed: bool,
 }
 
 impl CompositeProposalPipeline {
@@ -52,6 +60,7 @@ impl CompositeProposalPipeline {
             dispatched_native_mtp_token_count: 0,
             accepted_tokens: 0,
             next_draft: None,
+            sealed: false,
         }
     }
 
@@ -72,11 +81,46 @@ impl CompositeProposalPipeline {
             .min(verify_width);
         let proposal_tokens = self.candidates.drain(..verify_width).collect();
         self.dispatched_native_mtp_token_count += native_mtp_token_count;
+        let expected_free_target = self.candidates.pop_front();
+        if expected_free_target.is_none() {
+            // No reserved bridge token: the optimistic frontier is no longer
+            // represented by a buffered candidate. Seal the tail so refill can
+            // never splice behind this window (sealed-tail invariant).
+            self.sealed = true;
+        }
         Some(PipelinedCandidateWindow {
             proposal_tokens,
-            expected_free_target: self.candidates.pop_front(),
+            expected_free_target,
             native_mtp_token_count,
         })
+    }
+
+    /// The uncommitted optimistic suffix (proposal tokens past what the target
+    /// has committed). Safe to use ONLY as read-only lookup context for the
+    /// n-gram cache; it must never be indexed into the cache as committed
+    /// history.
+    pub(in crate::frontend) fn optimistic_suffix(&self) -> &[i32] {
+        let tokens = self.proposal.tokens();
+        &tokens[self.accepted_tokens.min(tokens.len())..]
+    }
+
+    /// Whether the pipeline may still accept refilled candidates. False once the
+    /// tail is sealed (a window was dispatched without a reserved free target).
+    pub(in crate::frontend) fn can_refill(&self) -> bool {
+        !self.sealed
+    }
+
+    /// Append n-gram tail candidates for continuous refill. Extends both the
+    /// proposal (for accounting/telemetry) and the dispatchable candidate deque.
+    /// Refuses to append when the tail is sealed (returns 0), preserving the
+    /// sealed-tail invariant. Returns the number of candidates appended.
+    pub(in crate::frontend) fn append_ngram_candidates(&mut self, tokens: &[i32]) -> usize {
+        if self.sealed || tokens.is_empty() {
+            return 0;
+        }
+        self.proposal.append_ngram_tokens(tokens);
+        self.candidates.extend(tokens.iter().copied());
+        tokens.len()
     }
 
     pub(in crate::frontend) fn proposal(&self) -> &NativeMtpHybridProposal {
@@ -230,5 +274,71 @@ mod tests {
                 .proposal()
                 .ngram_tail_rejected(pipeline.accepted_tokens())
         );
+    }
+
+    #[test]
+    fn optimistic_suffix_tracks_accepted_tokens() {
+        let mut pipeline = CompositeProposalPipeline::new(
+            proposal(vec![9, 1, 2, 3], 1),
+            Some(NativeMtpDraftOrigin::InitialSerial),
+            2,
+        );
+        assert_eq!(pipeline.optimistic_suffix(), &[9, 1, 2, 3]);
+        pipeline.observe_accepted(2);
+        assert_eq!(pipeline.optimistic_suffix(), &[2, 3]);
+        // accepted beyond len saturates, no panic
+        pipeline.observe_accepted(10);
+        assert_eq!(pipeline.optimistic_suffix(), &[] as &[i32]);
+    }
+
+    #[test]
+    fn append_ngram_candidates_extends_proposal_and_deque() {
+        let mut pipeline = CompositeProposalPipeline::new(
+            proposal(vec![9, 1, 2, 3], 1),
+            Some(NativeMtpDraftOrigin::InitialSerial),
+            2,
+        );
+        // consume the first window (width 2), leaving candidates [2,3] then
+        // reserving 2 as free target -> candidates [3]
+        let first = pipeline.next_window(2).unwrap();
+        assert_eq!(first.proposal_tokens(), &[9, 1]);
+        assert_eq!(first.expected_free_target(), Some(2));
+        assert!(pipeline.can_refill());
+        assert_eq!(pipeline.append_ngram_candidates(&[4, 5]), 2);
+        assert_eq!(pipeline.proposal().tokens(), &[9, 1, 2, 3, 4, 5]);
+        assert_eq!(pipeline.proposal().ngram_token_count(), 5);
+        // next window can now draw the refilled candidates
+        let second = pipeline.next_window(2).unwrap();
+        assert_eq!(second.proposal_tokens(), &[3, 4]);
+        assert_eq!(second.expected_free_target(), Some(5));
+    }
+
+    #[test]
+    fn sealed_tail_refuses_refill_after_window_without_free_target() {
+        let mut pipeline = CompositeProposalPipeline::new(
+            proposal(vec![9, 1], 1),
+            Some(NativeMtpDraftOrigin::InitialSerial),
+            2,
+        );
+        // width-2 window drains both candidates, leaving none to reserve as the
+        // free target -> tail seals.
+        let first = pipeline.next_window(2).unwrap();
+        assert_eq!(first.proposal_tokens(), &[9, 1]);
+        assert_eq!(first.expected_free_target(), None);
+        assert!(!pipeline.can_refill());
+        // refill is refused once sealed (sealed-tail invariant)
+        assert_eq!(pipeline.append_ngram_candidates(&[4, 5]), 0);
+        assert_eq!(pipeline.proposal().tokens(), &[9, 1]);
+    }
+
+    #[test]
+    fn append_empty_is_noop() {
+        let mut pipeline = CompositeProposalPipeline::new(
+            proposal(vec![9, 1, 2], 1),
+            Some(NativeMtpDraftOrigin::InitialSerial),
+            2,
+        );
+        assert_eq!(pipeline.append_ngram_candidates(&[]), 0);
+        assert_eq!(pipeline.proposal().tokens(), &[9, 1, 2]);
     }
 }

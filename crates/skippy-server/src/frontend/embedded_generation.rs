@@ -45,7 +45,10 @@ use crate::frontend::wire_messages::embedded_prefill_message;
 use crate::frontend::wire_messages::embedded_verify_window_message;
 use crate::frontend::wire_messages::generation_config_message;
 use crate::telemetry::now_unix_nanos;
-use lifecycle::{EmbeddedDecodeSummary, PipelinedCompositeWindow, decode_uses_context_sideband};
+use lifecycle::{
+    EmbeddedDecodeSummary, PipelinedCompositeWindow, decode_uses_context_sideband,
+    refill_pipeline_ngram_candidates,
+};
 use openai_frontend::OpenAiError;
 use openai_frontend::OpenAiResult;
 use serde_json::json;
@@ -1161,6 +1164,28 @@ impl StageOpenAiBackend {
                                     .sum::<usize>()
                                 < request.max_tokens as usize
                         {
+                            // Continuous refill (Phase 1): before planning the
+                            // next window, top up n-gram candidates so depth stays
+                            // full across proposal boundaries instead of draining
+                            // and rebuilding. Reads the n-gram cache over committed
+                            // history + the optimistic suffix (read-only); the
+                            // sealed-tail guard prevents splicing behind an
+                            // unbridged window. No-op once sealed or on cache miss.
+                            let verify_width =
+                                adaptive_verify_window.width(pipeline.candidate_len());
+                            if pipeline.candidate_len() < verify_width.saturating_add(1) {
+                                let refill_budget =
+                                    native_mtp_options.ngram_max_proposal_tokens.min(
+                                        native_mtp_remaining
+                                            .saturating_sub(pipeline.optimistic_suffix().len()),
+                                    );
+                                refill_pipeline_ngram_candidates(
+                                    pipeline,
+                                    &context_tokens,
+                                    &mut cached_ngram_proposer,
+                                    refill_budget,
+                                )?;
+                            }
                             let Some(planned) = pipeline.next_window(
                                 adaptive_verify_window.width(pipeline.candidate_len()),
                             ) else {

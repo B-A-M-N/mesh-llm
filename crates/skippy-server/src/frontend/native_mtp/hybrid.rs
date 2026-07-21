@@ -160,6 +160,19 @@ impl NativeMtpHybridProposal {
         &self.tokens
     }
 
+    /// Extend the proposal with additional n-gram tail tokens (continuous
+    /// refill). These are n-gram-sourced by construction, so only the n-gram
+    /// count grows; the native-MTP prefix length is unchanged.
+    pub(in crate::frontend) fn append_ngram_tokens(&mut self, tokens: &[i32]) {
+        self.tokens.extend_from_slice(tokens);
+        self.ngram_token_count = self.ngram_token_count.saturating_add(tokens.len());
+        if tokens.is_empty() {
+            return;
+        }
+        // A refilled tail means an n-gram continuation was available.
+        self.ngram_span_available = true;
+    }
+
     pub(in crate::frontend) fn native_mtp_token_count(&self) -> usize {
         self.native_mtp_token_count
     }

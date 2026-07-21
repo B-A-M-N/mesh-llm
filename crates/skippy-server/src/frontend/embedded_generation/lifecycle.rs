@@ -246,3 +246,33 @@ pub(super) fn decode_uses_context_sideband(
     context_token_ids.len() <= sideband_capacity
         && context_token_ids.last().copied() == Some(current)
 }
+
+/// Continuous refill (Phase 1, Option A): top up the pipeline's dispatchable
+/// candidates with fresh n-gram tail tokens so pipeline depth stays full across
+/// what would otherwise be a proposal boundary, instead of draining and
+/// rebuilding.
+///
+/// The n-gram cache is synced to committed history ONLY; the pipeline's
+/// optimistic (unverified) suffix is passed purely as read-only lookup context.
+/// Any refilled candidate that turns out wrong is discarded by the existing
+/// FIFO stale-drain + KV rewind, so this can only waste target work, never
+/// corrupt committed state. `append_ngram_candidates` refuses to append once the
+/// tail is sealed, preserving the sealed-tail invariant.
+///
+/// Returns the number of candidates appended (0 if disabled, sealed, budget 0,
+/// or no n-gram match).
+pub(super) fn refill_pipeline_ngram_candidates(
+    pipeline: &mut crate::frontend::CompositeProposalPipeline,
+    committed_tokens: &[i32],
+    cached_ngram_proposer: &mut Option<crate::frontend::speculative::CachedNgramProposer>,
+    max_tokens: usize,
+) -> OpenAiResult<usize> {
+    if max_tokens == 0 || !pipeline.can_refill() {
+        return Ok(0);
+    }
+    let Some(cache) = cached_ngram_proposer.as_mut() else {
+        return Ok(0);
+    };
+    let tokens = cache.propose(committed_tokens, pipeline.optimistic_suffix(), max_tokens)?;
+    Ok(pipeline.append_ngram_candidates(&tokens))
+}
