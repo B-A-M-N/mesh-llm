@@ -668,7 +668,7 @@ fn speculative_settings(prefix: &str) -> Vec<ConfigSettingSchema> {
         basic_setting(&format!("{prefix}.ngram_max"), ConfigValueSchema::Integer),
         basic_setting(
             &format!("{prefix}.ngram_proposer"),
-            string_enum(["simple", "cache"]),
+            string_enum(["simple", "cache", "suffix"]),
         ),
         basic_setting(
             &format!("{prefix}.ngram_max_proposal_tokens"),

@@ -204,6 +204,7 @@ struct DecodeResolutionInput<'a> {
     package_generation: Option<&'a PackageGenerationInfo>,
 }
 
+#[allow(clippy::too_many_lines)]
 fn resolve_decode_config(input: DecodeResolutionInput<'_>) -> Result<SpeculativeDecodeConfig> {
     let mut config = package_decode_config(input.requested_strategy, input.package_generation)?
         .unwrap_or_else(SpeculativeDecodeConfig::default);
@@ -260,6 +261,7 @@ fn resolve_decode_config(input: DecodeResolutionInput<'_>) -> Result<Speculative
         let kind = match ngram_proposer.as_deref() {
             Some("cache") => NgramProposerKind::Cache,
             Some("simple") => NgramProposerKind::Simple,
+            Some("suffix") => NgramProposerKind::Suffix,
             None => existing.map_or_else(
                 || match input.requested_strategy {
                     "ngram-cache" => NgramProposerKind::Cache,
@@ -291,6 +293,7 @@ fn resolve_decode_config(input: DecodeResolutionInput<'_>) -> Result<Speculative
         config.effective_strategy = match ngram.kind {
             NgramProposerKind::Simple => "native-mtp+ngram-simple",
             NgramProposerKind::Cache => "native-mtp+ngram-cache",
+            NgramProposerKind::Suffix => "native-mtp+ngram-suffix",
         }
         .to_string();
         if config.extension.is_none() {
@@ -485,6 +488,7 @@ fn package_decode_config(
     let effective_strategy = match (native_mtp.is_some(), ngram.as_ref().map(|value| value.kind)) {
         (true, Some(NgramProposerKind::Simple)) => "native-mtp+ngram-simple",
         (true, Some(NgramProposerKind::Cache)) => "native-mtp+ngram-cache",
+        (true, Some(NgramProposerKind::Suffix)) => "native-mtp+ngram-suffix",
         (true, None) => "native-mtp",
         (false, Some(kind)) => ngram_effective_strategy(kind),
         (false, None) => "disabled",
@@ -586,6 +590,7 @@ fn ngram_effective_strategy(kind: NgramProposerKind) -> &'static str {
     match kind {
         NgramProposerKind::Simple => "ngram-simple",
         NgramProposerKind::Cache => "ngram-cache",
+        NgramProposerKind::Suffix => "ngram-suffix",
     }
 }
 

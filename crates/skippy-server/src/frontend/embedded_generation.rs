@@ -839,7 +839,7 @@ impl StageOpenAiBackend {
                     }
                 }
             }
-            let mut cached_ngram_proposer = CachedNgramProposer::from_config(request.speculative)?;
+            let mut cached_ngram_proposer = HistoryNgramProposer::from_config(request.speculative)?;
             let max_speculative_window = request.speculative_window.max(1);
             let mut adaptive_window = if request.adaptive_speculative_window {
                 max_speculative_window.min(4)

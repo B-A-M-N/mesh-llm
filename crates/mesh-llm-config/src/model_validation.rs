@@ -544,7 +544,7 @@ fn validate_speculative_proposer_controls(
 ) -> DiagnosticResult {
     validate_optional_enum(
         config.ngram_proposer.as_deref(),
-        &["simple", "cache"],
+        &["simple", "cache", "suffix"],
         &format!("{base_path}.ngram_proposer"),
     )?;
     validate_optional_u32_range(

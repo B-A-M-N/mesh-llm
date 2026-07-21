@@ -3,7 +3,7 @@ use std::collections::VecDeque;
 use openai_frontend::{OpenAiError, OpenAiResult};
 
 use super::NativeMtpDecodeOptions;
-use crate::frontend::speculative::{CachedNgramProposer, propose_ngram_tokens};
+use crate::frontend::speculative::{HistoryNgramProposer, propose_ngram_tokens};
 
 const MIN_NGRAM_EXTENSION_TOKENS: usize = 2;
 
@@ -51,7 +51,7 @@ impl CompositeProposalProvider {
         context_tokens: &[i32],
         max_proposal_tokens: usize,
         max_ngram_extension_tokens: usize,
-        cached_ngram_proposer: Option<&mut CachedNgramProposer>,
+        cached_ngram_proposer: Option<&mut HistoryNgramProposer>,
     ) -> OpenAiResult<NativeMtpHybridProposal> {
         let native_mtp_tokens =
             &native_mtp_tokens[..native_mtp_tokens.len().min(max_proposal_tokens)];
@@ -578,7 +578,7 @@ mod tests {
     #[test]
     fn cache_extends_native_mtp_without_requiring_a_matching_prefix() {
         let provider = CompositeProposalProvider::from_options(options());
-        let mut cache = CachedNgramProposer::new(2, 2).unwrap();
+        let mut cache = HistoryNgramProposer::new_cache(2, 2).unwrap();
         let context = [1, 9, 7, 1, 9, 7, 1];
 
         let proposal = provider

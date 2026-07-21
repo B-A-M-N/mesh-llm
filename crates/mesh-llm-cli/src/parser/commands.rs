@@ -399,6 +399,7 @@ impl MeshGuardrailCliMode {
 pub enum SpeculativeNgramProposerCli {
     Simple,
     Cache,
+    Suffix,
 }
 
 impl SpeculativeNgramProposerCli {
@@ -406,6 +407,7 @@ impl SpeculativeNgramProposerCli {
         match self {
             Self::Simple => "simple",
             Self::Cache => "cache",
+            Self::Suffix => "suffix",
         }
     }
 }
