@@ -6,7 +6,9 @@ use std::{
 
 use anyhow::{Result, bail};
 use openai_frontend::OpenAiHookPolicy;
-use skippy_protocol::{LoadMode, StageConfig, StageKvCacheConfig, StageKvCachePayload};
+use skippy_protocol::{
+    LoadMode, StageConfig, StageKvCacheConfig, StageKvCacheMode, StageKvCachePayload,
+};
 use skippy_server::{
     EmbeddedOpenAiArgs, EmbeddedOpenAiRequestDefaults, EmbeddedRuntimeOptions,
     NativeMtpProposalConfig, SpeculativeDecodeConfig, telemetry::Telemetry,
@@ -327,7 +329,15 @@ impl ResolvedSkippyConfig {
     ) -> Result<Option<StageKvCacheConfig>> {
         match &self.model_fit.prefix_cache {
             ResolvedStageKvCache::FamilyDefault => Ok(family_default),
-            ResolvedStageKvCache::Disabled => Ok(None),
+            ResolvedStageKvCache::Disabled => Ok(Some(StageKvCacheConfig {
+                mode: StageKvCacheMode::Disabled,
+                payload: StageKvCachePayload::Auto,
+                max_entries: 0,
+                max_bytes: 0,
+                min_tokens: 0,
+                shared_prefix_stride_tokens: 0,
+                shared_prefix_record_limit: 0,
+            })),
             ResolvedStageKvCache::Explicit(template) => {
                 let mut cache = family_default.unwrap_or(StageKvCacheConfig {
                     mode: template.mode.clone(),
