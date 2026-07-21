@@ -531,7 +531,9 @@ fn validate_speculative_proposer(
             layer_count,
             report,
         ),
-        "ngram-simple" | "ngram-cache" => validate_ngram_proposer(name, proposer, report),
+        "ngram-simple" | "ngram-cache" | "ngram-suffix" => {
+            validate_ngram_proposer(name, proposer, report);
+        }
         _ => report.error(
             "unsupported_speculative_proposer_type",
             format!(
@@ -539,7 +541,7 @@ fn validate_speculative_proposer(
                 proposer.proposer_type
             ),
             Some("model-package.json".to_string()),
-            "use native-mtp, ngram-simple, or ngram-cache",
+            "use native-mtp, ngram-simple, ngram-cache, or ngram-suffix",
         ),
     }
 }
@@ -581,7 +583,7 @@ fn validate_speculative_strategy(
     }
     if matches!(
         strategy.strategy_type.as_str(),
-        "ngram-simple" | "ngram-cache"
+        "ngram-simple" | "ngram-cache" | "ngram-suffix"
     ) {
         validate_ngram_strategy_proposer_type(name, strategy, proposers, report);
     }
@@ -634,7 +636,7 @@ fn validate_ngram_strategy_proposer_type(
             "missing_ngram_strategy_proposer",
             format!("N-gram speculative strategy {strategy_name} must declare a proposer"),
             Some("model-package.json".to_string()),
-            "set proposer to a declared ngram-simple or ngram-cache proposer",
+            "set proposer to a declared ngram-simple, ngram-cache, or ngram-suffix proposer",
         );
         return;
     };
@@ -691,7 +693,7 @@ fn validate_composite_strategy(
             "missing_composite_extender",
             format!("composite speculative strategy {name} must declare extender"),
             Some("model-package.json".to_string()),
-            "set extender to a declared ngram-simple or ngram-cache proposer",
+            "set extender to a declared ngram-simple, ngram-cache, or ngram-suffix proposer",
         );
         return;
     };
@@ -711,14 +713,14 @@ fn validate_composite_strategy(
     if proposers.get(extender).is_some_and(|proposer| {
         !matches!(
             proposer.proposer_type.as_str(),
-            "ngram-simple" | "ngram-cache"
+            "ngram-simple" | "ngram-cache" | "ngram-suffix"
         )
     }) {
         report.error(
             "invalid_composite_extender_type",
             format!("composite speculative strategy {name} extender {extender} must be an N-gram proposer"),
             Some("model-package.json".to_string()),
-            "set extender to an ngram-simple or ngram-cache proposer",
+            "set extender to an ngram-simple, ngram-cache, or ngram-suffix proposer",
         );
     }
 }
@@ -822,6 +824,24 @@ fn validate_ngram_proposer(
             format!("N-gram cache proposer {name} must set history_scope to request"),
             Some("model-package.json".to_string()),
             "set history_scope to request; shared cache history is not supported",
+        );
+    }
+    if proposer.proposer_type == "ngram-suffix" && (min < 3 || max > 64) {
+        report.error(
+            "unsupported_ngram_suffix_window",
+            format!("N-gram suffix proposer {name} must satisfy 3 <= ngram_min <= ngram_max <= 64"),
+            Some("model-package.json".to_string()),
+            "use at least the three-token exact seed and cap backward comparison at 64 tokens",
+        );
+    }
+    if proposer.proposer_type == "ngram-suffix"
+        && proposer.history_scope.as_deref() != Some("request")
+    {
+        report.error(
+            "invalid_ngram_suffix_history_scope",
+            format!("N-gram suffix proposer {name} must set history_scope to request"),
+            Some("model-package.json".to_string()),
+            "set history_scope to request; suffix indexes are request-local",
         );
     }
 }
@@ -1664,6 +1684,13 @@ mod tests {
                             "ngram_max": 4,
                             "max_proposal_tokens": 6,
                             "history_scope": "request"
+                        },
+                        "suffix": {
+                            "type": "ngram-suffix",
+                            "ngram_min": 5,
+                            "ngram_max": 32,
+                            "max_proposal_tokens": 48,
+                            "history_scope": "request"
                         }
                     },
                     "strategies": {
@@ -1678,6 +1705,10 @@ mod tests {
                         "ngram-cache": {
                             "type": "ngram-cache",
                             "proposer": "cache"
+                        },
+                        "ngram-suffix": {
+                            "type": "ngram-suffix",
+                            "proposer": "suffix"
                         },
                         "mtp-simple": {
                             "type": "composite",
@@ -1698,6 +1729,16 @@ mod tests {
                                 "max_tokens": 6,
                                 "tail_backoff_proposals": 2
                             }
+                        },
+                        "mtp-suffix": {
+                            "type": "composite",
+                            "primary": "mtp",
+                            "extender": "suffix",
+                            "extension_policy": {
+                                "initial_tokens": 2,
+                                "max_tokens": 48,
+                                "tail_backoff_proposals": 2
+                            }
                         }
                     }
                 }
@@ -1712,7 +1753,7 @@ mod tests {
             .and_then(|generation| generation.speculative_decoding)
             .expect("generation strategies should be reported")
             .strategies;
-        assert_eq!(strategies.len(), 5);
+        assert_eq!(strategies.len(), 7);
         assert!(
             strategies
                 .iter()
@@ -1723,6 +1764,49 @@ mod tests {
                 .iter()
                 .any(|strategy| strategy.name == "mtp-cache")
         );
+        assert!(
+            strategies
+                .iter()
+                .any(|strategy| strategy.name == "ngram-suffix")
+        );
+        assert!(
+            strategies
+                .iter()
+                .any(|strategy| strategy.name == "mtp-suffix")
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn preflight_rejects_invalid_request_local_suffix_proposer() {
+        let dir = unique_test_dir("ngram-suffix-invalid");
+        let package = write_package_fixture(&dir, true);
+        write_generation_to_manifest(
+            &package,
+            serde_json::json!({
+                "speculative_decoding": {
+                    "default": "suffix",
+                    "proposers": {
+                        "suffix": {
+                            "type": "ngram-suffix",
+                            "ngram_min": 2,
+                            "ngram_max": 65,
+                            "max_proposal_tokens": 48,
+                            "history_scope": "shared"
+                        }
+                    },
+                    "strategies": {
+                        "suffix": { "type": "ngram-suffix", "proposer": "suffix" }
+                    }
+                }
+            }),
+        );
+
+        let report = preflight_package(&package, &PackagePreflightOptions::default());
+
+        assert!(!report.valid);
+        assert_issue(&report, "unsupported_ngram_suffix_window");
+        assert_issue(&report, "invalid_ngram_suffix_history_scope");
         fs::remove_dir_all(dir).unwrap();
     }
 

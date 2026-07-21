@@ -17,7 +17,7 @@ OpenAI-compatible API retain their normal compatibility guarantees.
 |---|---|
 | Target | The full staged model, authoritative for every emitted token. |
 | Native MTP | Model-provided typed draft attached to a target reply. GLM 4.7 Flash currently supplies a narrow `N+1` candidate. |
-| N-gram sidecar | An upstream llama.cpp `ngram-simple` lookup or request-local `ngram-cache` proposer over target-committed tokens. |
+| N-gram sidecar | An upstream llama.cpp `ngram-simple` lookup, request-local `ngram-cache`, or request-local longest-suffix proposer over target-committed tokens. |
 | Composite proposal | Native-MTP prefix plus an optional N-gram suffix. |
 | VerifyWindow | Versioned target request that verifies a candidate span at one session position. |
 | Free target token | Target's next token after a fully verified span. |
@@ -249,6 +249,7 @@ native-MTP/N-gram menu:
 | `mtp` | Native MTP proposer | MTP |
 | `ngram-simple` | Pure prompt/history N-gram proposer | N-gram simple |
 | `ngram-cache` | Pure request-local cache N-gram proposer | N-gram cache |
+| `ngram-suffix` | Pure request-local longest exact-suffix proposer | N-gram suffix |
 | `mtp-simple` | Native MTP primary plus simple N-gram tail | MTP + N-gram simple |
 | `mtp-cache` | Native MTP primary plus request-local cache N-gram tail | MTP + N-gram cache |
 

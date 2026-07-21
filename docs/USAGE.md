@@ -728,8 +728,8 @@ defaults. The resolved plan is validated once before Skippy starts.
 Set `strategy = "auto"` to use a package recommendation, `"disabled"` for
 the no-speculation baseline, or `"mtp"` for native MTP. A package may also
 publish stable names such as `mtp-cache`; that name is valid only for the
-package that declares it. Direct GGUF serving can use `ngram-simple` or
-`ngram-cache` when it supplies valid N-gram bounds.
+package that declares it. Direct GGUF serving can use `ngram-simple`,
+`ngram-cache`, or `ngram-suffix` when it supplies valid N-gram bounds.
 
 ```toml
 [[models]]
@@ -782,8 +782,9 @@ verify_window_max_tokens = 32
 verify_window_pipeline_depth = 2
 ```
 
-The suffix proposer is currently selected by mesh configuration rather than a
-layer-package proposer declaration. See
+Suffix can also run without MTP by setting `strategy = "ngram-suffix"` and
+omitting the extension controls. Layer packages may declare `ngram-suffix` as
+a request-local proposer and standalone strategy. See
 [Suffix N-gram Proposer](skippy/SUFFIX_NGRAM_PROPOSER.md) for the lookup
 contract, telemetry, and benchmark requirements.
 

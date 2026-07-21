@@ -177,7 +177,7 @@ fn resolve_native_mtp_strategy(
             }
             true
         }
-        "ngram-simple" | "ngram-cache" => false,
+        "ngram-simple" | "ngram-cache" | "ngram-suffix" => false,
         "disabled" => false,
         package_strategy if package_strategy_exists(package_generation, package_strategy) => {
             let speculative = package_generation
@@ -186,7 +186,7 @@ fn resolve_native_mtp_strategy(
             strategy_uses_native_mtp(speculative, package_strategy)
         }
         _ => bail!(
-            "skippy speculative.strategy must be auto, disabled, mtp, or a strategy declared by model-package.json"
+            "skippy speculative.strategy must be auto, disabled, mtp, ngram-simple, ngram-cache, ngram-suffix, or a strategy declared by model-package.json"
         ),
     };
     Ok((strategy, native_mtp_enabled))
@@ -265,6 +265,7 @@ fn resolve_decode_config(input: DecodeResolutionInput<'_>) -> Result<Speculative
             None => existing.map_or_else(
                 || match input.requested_strategy {
                     "ngram-cache" => NgramProposerKind::Cache,
+                    "ngram-suffix" => NgramProposerKind::Suffix,
                     _ => NgramProposerKind::Simple,
                 },
                 |ngram| ngram.kind,
@@ -443,7 +444,7 @@ fn package_decode_config(
                 strategy,
             )?);
         }
-        "ngram-simple" | "ngram-cache" => {
+        "ngram-simple" | "ngram-cache" | "ngram-suffix" => {
             ngram = Some(ngram_proposer_config(
                 strategy
                     .proposer
@@ -550,6 +551,7 @@ fn ngram_proposer_config(
     let kind = match proposer.proposer_type.as_str() {
         "ngram-simple" => NgramProposerKind::Simple,
         "ngram-cache" => NgramProposerKind::Cache,
+        "ngram-suffix" => NgramProposerKind::Suffix,
         other => bail!("package N-gram proposer has unsupported type {other}"),
     };
     if expected_type != "composite" && expected_type != proposer.proposer_type {

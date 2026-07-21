@@ -542,7 +542,7 @@ pub struct Cli {
     pub auto_update: bool,
 
     // ── Advanced options (hidden from default --help) ─────────────
-    /// Override the package speculative decoding strategy for this invocation.
+    /// Override speculative decoding (`mtp`, `ngram-simple`, `ngram-cache`, `ngram-suffix`, or a package strategy id).
     #[arg(long, hide = true)]
     pub speculative_strategy: Option<String>,
 
@@ -1185,6 +1185,30 @@ mod tests {
         assert_eq!(cli.speculative_extension_max_tokens, Some(8));
         assert!(cli.speculative_native_mtp_allow_cooldown_drafts);
         assert_eq!(cli.speculative_verify_window_pipeline_depth, Some(3));
+    }
+
+    #[test]
+    fn serve_parses_standalone_suffix_strategy() {
+        let normalized = crate::parser::normalize_runtime_surface_args([
+            "mesh-llm",
+            "serve",
+            "--speculative-strategy",
+            "ngram-suffix",
+            "--speculative-ngram-proposer",
+            "suffix",
+            "--speculative-ngram-min",
+            "5",
+            "--speculative-ngram-max",
+            "32",
+        ]);
+        let cli = Cli::try_parse_from(normalized.normalized).expect("clap parse");
+        assert_eq!(cli.speculative_strategy.as_deref(), Some("ngram-suffix"));
+        assert_eq!(
+            cli.speculative_ngram_proposer,
+            Some(SpeculativeNgramProposerCli::Suffix)
+        );
+        assert_eq!(cli.speculative_ngram_min, Some(5));
+        assert_eq!(cli.speculative_ngram_max, Some(32));
     }
 
     #[test]

@@ -198,8 +198,14 @@ def summarize(samples: list[Sample], baseline_arm: str) -> dict[str, Any]:
 
     rows: list[dict[str, Any]] = []
     for (arm, workload), group in sorted(grouped.items()):
-        ngram_tokens = sum(sample.ngram_tokens for sample in group)
-        accepted = sum(sample.ngram_accepted_tokens for sample in group)
+        hybrid_tokens = sum(sample.ngram_tokens for sample in group)
+        standalone_tokens = sum(sample.draft_n for sample in group)
+        proposal_tokens = hybrid_tokens or standalone_tokens
+        accepted = (
+            sum(sample.ngram_accepted_tokens for sample in group)
+            if hybrid_tokens
+            else sum(sample.draft_accepted for sample in group)
+        )
         rows.append(
             {
                 "arm": arm,
@@ -212,9 +218,10 @@ def summarize(samples: list[Sample], baseline_arm: str) -> dict[str, Any]:
                 )
                 if len(group) > 1
                 else 0.0,
-                "ngram_tokens": ngram_tokens,
+                "proposal_mode": "mtp-hybrid" if hybrid_tokens else "standalone",
+                "ngram_tokens": proposal_tokens,
                 "ngram_accepted_tokens": accepted,
-                "ngram_acceptance": accepted / ngram_tokens if ngram_tokens else 0.0,
+                "ngram_acceptance": accepted / proposal_tokens if proposal_tokens else 0.0,
                 "proposer_match_length_max": max(
                     sample.proposer_match_length_max for sample in group
                 ),
@@ -381,9 +388,15 @@ def main() -> None:
         raise SystemExit(
             f"{args.require_drafts_arm} activation failed: proposer timing labels were {observed}"
         )
-    if required and sum(sample.ngram_tokens for sample in required) == 0:
+    activated = any(
+        sample.proposer_hits > 0
+        if sample.ngram_proposer in {"cache", "suffix"}
+        else sample.draft_n > 0
+        for sample in required
+    )
+    if required and not activated:
         raise SystemExit(
-            f"{args.require_drafts_arm} activation failed: no N-gram tail tokens were proposed"
+            f"{args.require_drafts_arm} activation failed: proposer reported no lookup hits"
         )
     print(f"artifacts={args.output_dir}")
 

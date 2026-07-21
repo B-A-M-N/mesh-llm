@@ -26,7 +26,7 @@ use crate::frontend::prefill::drain_one_embedded_prefill_reply;
 use crate::frontend::request::wire_sampling_config;
 use crate::frontend::speculative::OpenAiSpeculativeStats;
 use crate::frontend::speculative::classify_verify_window;
-use crate::frontend::speculative::propose_ngram_tokens;
+use crate::frontend::speculative::propose_configured_ngram_tokens;
 use crate::frontend::speculative::repaired_commit_tokens;
 use crate::frontend::speculative::verify_inputs_for_proposals;
 use crate::frontend::util::ms_to_us;
@@ -850,7 +850,9 @@ impl StageOpenAiBackend {
                 adaptive_window_start: adaptive_window,
                 adaptive_window_final: adaptive_window,
                 adaptive_window_max: max_speculative_window,
-                adaptive_window_min: if request.draft.is_some() || request.ngram_max > 0 {
+                adaptive_window_min: if request.draft.is_some()
+                    || request.speculative.ngram.is_some()
+                {
                     adaptive_window
                 } else {
                     0
@@ -1394,7 +1396,7 @@ impl StageOpenAiBackend {
                         }
                     }
                 }
-                if draft_guard.is_some() || request.ngram_max > 0 {
+                if draft_guard.is_some() || request.speculative.ngram.is_some() {
                     let remaining = (request.max_tokens as usize).saturating_sub(decoded_tokens);
                     if remaining == 0 {
                         break;
@@ -1414,27 +1416,16 @@ impl StageOpenAiBackend {
                             proposal_source = "draft-model";
                         }
                     }
-                    if let (true, Some(cache)) =
-                        (draft_tokens.is_empty(), cached_ngram_proposer.as_mut())
-                    {
-                        let source = cache.source_label();
-                        draft_tokens = cache.propose(
+                    if draft_tokens.is_empty() && request.speculative.ngram.is_some() {
+                        let proposal = propose_configured_ngram_tokens(
+                            request.speculative,
+                            &mut cached_ngram_proposer,
                             &context_tokens,
-                            &[],
                             proposal_limit.min(request.ngram_max),
                         )?;
+                        draft_tokens = proposal.tokens;
                         if !draft_tokens.is_empty() {
-                            proposal_source = source;
-                        }
-                    }
-                    if draft_tokens.is_empty() && request.ngram_max > 0 {
-                        draft_tokens = propose_ngram_tokens(
-                            &context_tokens,
-                            request.ngram_min,
-                            proposal_limit.min(request.ngram_max),
-                        )?;
-                        if !draft_tokens.is_empty() {
-                            proposal_source = "ngram";
+                            proposal_source = proposal.source;
                         }
                     }
                     let draft_propose_ms = propose_timer.elapsed_ms();

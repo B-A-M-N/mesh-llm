@@ -547,7 +547,9 @@ fn validate_speculative_proposer_controls(
         &["simple", "cache", "suffix"],
         &format!("{base_path}.ngram_proposer"),
     )?;
-    if config.ngram_proposer.as_deref() == Some("suffix") {
+    let suffix_selected = config.ngram_proposer.as_deref() == Some("suffix")
+        || config.strategy.as_deref() == Some("ngram-suffix");
+    if suffix_selected {
         if config.ngram_min.is_some_and(|min| min < 3) {
             return Err(validation_diagnostic(
                 &format!("{base_path}.ngram_min"),
@@ -1322,5 +1324,24 @@ ngram_max_proposal_tokens = 16
 
         let text = legacy_validation_error_text(&validate_config_diagnostics(&config));
         assert!(text.contains("ngram_max must not exceed 64"), "{text}");
+    }
+
+    #[test]
+    fn standalone_suffix_strategy_uses_suffix_validation_without_a_redundant_proposer_key() {
+        let config: MeshConfig = toml::from_str(
+            r#"
+version = 1
+
+[defaults.speculative]
+strategy = "ngram-suffix"
+ngram_min = 2
+ngram_max = 65
+ngram_max_proposal_tokens = 16
+"#,
+        )
+        .expect("config should parse before validation");
+
+        let text = legacy_validation_error_text(&validate_config_diagnostics(&config));
+        assert!(text.contains("ngram_min must be at least 3"), "{text}");
     }
 }

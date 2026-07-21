@@ -11,8 +11,10 @@ use std::time::Instant;
 use crate::config::load_json;
 use crate::frontend::util::openai_backend_error;
 
+mod standalone;
 mod suffix;
 
+pub(super) use standalone::{propose_configured_ngram_tokens, standalone_ngram_proposal_limit};
 use suffix::{SUFFIX_MIN_SEED_LEN, SuffixNgramProposer};
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -181,22 +183,6 @@ pub(super) fn load_standalone_speculative_config(
     };
     config.validate()?;
     Ok(config)
-}
-
-pub(super) fn standalone_simple_ngram_min(config: &SpeculativeDecodeConfig) -> usize {
-    config
-        .ngram
-        .as_ref()
-        .filter(|ngram| ngram.kind == NgramProposerKind::Simple)
-        .map_or(0, |ngram| ngram.min_ngram)
-}
-
-pub(super) fn standalone_simple_ngram_max(config: &SpeculativeDecodeConfig) -> usize {
-    config
-        .ngram
-        .as_ref()
-        .filter(|ngram| ngram.kind == NgramProposerKind::Simple)
-        .map_or(0, |ngram| ngram.max_proposal_tokens.min(ngram.max_ngram))
 }
 
 #[cfg(test)]
@@ -534,13 +520,6 @@ impl HistoryNgramProposer {
         self.stats.hits += usize::from(!tokens.is_empty());
         self.stats.proposed_tokens = self.stats.proposed_tokens.saturating_add(tokens.len());
         Ok(tokens)
-    }
-
-    pub(super) fn source_label(&self) -> &'static str {
-        match &self.proposer {
-            HistoryNgramProposerImpl::Cache(_) => NgramProposerKind::Cache.as_str(),
-            HistoryNgramProposerImpl::Suffix(_) => NgramProposerKind::Suffix.as_str(),
-        }
     }
 
     pub(super) fn stats(&self) -> HistoryNgramProposerStats {

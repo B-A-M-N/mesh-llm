@@ -151,6 +151,48 @@ fn ngram_cache_generation() -> PackageGenerationInfo {
     }
 }
 
+fn ngram_suffix_generation() -> PackageGenerationInfo {
+    let mut proposers = BTreeMap::new();
+    proposers.insert(
+        "suffix".to_string(),
+        PackageSpeculativeProposerInfo {
+            proposer_type: "ngram-suffix".to_string(),
+            prediction_depth: None,
+            layer_indices: Vec::new(),
+            ngram_min: Some(5),
+            ngram_max: Some(32),
+            max_proposal_tokens: Some(48),
+            history_scope: Some("request".to_string()),
+        },
+    );
+    let mut strategies = BTreeMap::new();
+    strategies.insert(
+        "ngram-suffix".to_string(),
+        PackageSpeculativeStrategyInfo {
+            strategy_type: "ngram-suffix".to_string(),
+            prediction_depth: None,
+            layer_indices: Vec::new(),
+            window_policy: Some(PackageWindowPolicyInfo {
+                default: "fixed".to_string(),
+                initial_window: 32,
+                min_window: 1,
+                max_window: 32,
+            }),
+            proposer: Some("suffix".to_string()),
+            primary: None,
+            extender: None,
+            extension_policy: None,
+        },
+    );
+    PackageGenerationInfo {
+        speculative_decoding: Some(PackageSpeculativeDecodingInfo {
+            default: "ngram-suffix".to_string(),
+            proposers,
+            strategies,
+        }),
+    }
+}
+
 #[test]
 fn speculative_strategy_auto_without_package_generation_disables_native_mtp() {
     let mesh_config = parse_config("");
@@ -417,6 +459,45 @@ strategy = "ngram-cache"
 }
 
 #[test]
+fn package_suffix_strategy_resolves_as_a_standalone_proposer() {
+    let mesh_config = parse_config(
+        r#"
+[defaults.speculative]
+strategy = "ngram-suffix"
+"#,
+    );
+    let model_file = temp_model_file();
+    let generation = ngram_suffix_generation();
+
+    let resolved = resolve_skippy_config(SkippyConfigResolveRequest {
+        mesh_config: &mesh_config,
+        model_id: "meshllm/coding-model",
+        model_path: model_file.path(),
+        model_bytes: 4 * 1024 * 1024 * 1024,
+        allocatable_memory_bytes: None,
+        request_defaults: None,
+        package_generation: Some(&generation),
+    })
+    .expect("package suffix strategy should resolve without native MTP");
+
+    assert!(!resolved.speculative.native_mtp_enabled);
+    assert_eq!(
+        resolved.speculative.decode.effective_strategy,
+        "ngram-suffix"
+    );
+    let openai = resolved
+        .to_embedded_openai_args(4096, true)
+        .expect("package suffix strategy should build OpenAI args");
+    assert_eq!(openai.speculative_window, 48);
+    assert_eq!(openai.ngram_min, 5);
+    assert_eq!(openai.ngram_max, 48);
+    assert_eq!(
+        openai.speculative.ngram.as_ref().map(|ngram| ngram.kind),
+        Some(skippy_server::NgramProposerKind::Suffix)
+    );
+}
+
+#[test]
 fn direct_native_mtp_can_use_a_request_local_cache_extension() {
     let mesh_config = parse_config(
         r#"
@@ -596,6 +677,89 @@ ngram_max_proposal_tokens = 6
     assert_eq!(ngram.min_ngram, 2);
     assert_eq!(ngram.max_ngram, 4);
     assert_eq!(ngram.max_proposal_tokens, 6);
+}
+
+#[test]
+fn direct_simple_strategy_resolves_without_native_mtp() {
+    let mesh_config = parse_config(
+        r#"
+[defaults.speculative]
+strategy = "ngram-simple"
+ngram_min = 2
+ngram_max = 6
+ngram_max_proposal_tokens = 8
+"#,
+    );
+    let model_file = temp_model_file();
+
+    let resolved = resolve_skippy_config(SkippyConfigResolveRequest {
+        mesh_config: &mesh_config,
+        model_id: "meshllm/coding-model",
+        model_path: model_file.path(),
+        model_bytes: 4 * 1024 * 1024 * 1024,
+        allocatable_memory_bytes: None,
+        request_defaults: None,
+        package_generation: None,
+    })
+    .expect("direct simple strategy should resolve without native MTP");
+
+    assert!(!resolved.speculative.native_mtp_enabled);
+    assert_eq!(
+        resolved.speculative.decode.effective_strategy,
+        "ngram-simple"
+    );
+    let openai = resolved
+        .to_embedded_openai_args(4096, true)
+        .expect("direct simple strategy should build OpenAI args");
+    assert_eq!(openai.speculative_window, 8);
+    assert_eq!(openai.ngram_min, 2);
+    assert_eq!(openai.ngram_max, 8);
+    assert_eq!(
+        openai.speculative.ngram.as_ref().map(|ngram| ngram.kind),
+        Some(skippy_server::NgramProposerKind::Simple)
+    );
+}
+
+#[test]
+fn direct_suffix_strategy_resolves_without_native_mtp() {
+    let mesh_config = parse_config(
+        r#"
+[defaults.speculative]
+strategy = "ngram-suffix"
+ngram_min = 5
+ngram_max = 32
+ngram_max_proposal_tokens = 48
+"#,
+    );
+    let model_file = temp_model_file();
+
+    let resolved = resolve_skippy_config(SkippyConfigResolveRequest {
+        mesh_config: &mesh_config,
+        model_id: "meshllm/coding-model",
+        model_path: model_file.path(),
+        model_bytes: 4 * 1024 * 1024 * 1024,
+        allocatable_memory_bytes: None,
+        request_defaults: None,
+        package_generation: None,
+    })
+    .expect("direct suffix strategy should resolve without native MTP");
+
+    assert!(!resolved.speculative.native_mtp_enabled);
+    assert_eq!(resolved.speculative.mode, "ngram");
+    assert_eq!(
+        resolved.speculative.decode.effective_strategy,
+        "ngram-suffix"
+    );
+    let openai = resolved
+        .to_embedded_openai_args(4096, true)
+        .expect("direct suffix strategy should build OpenAI args");
+    assert_eq!(openai.speculative_window, 48);
+    assert_eq!(openai.ngram_min, 5);
+    assert_eq!(openai.ngram_max, 48);
+    assert_eq!(
+        openai.speculative.ngram.as_ref().map(|ngram| ngram.kind),
+        Some(skippy_server::NgramProposerKind::Suffix)
+    );
 }
 
 #[test]
