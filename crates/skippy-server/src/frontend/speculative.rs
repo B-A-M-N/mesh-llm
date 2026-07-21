@@ -540,6 +540,27 @@ fn elapsed_us(started: Instant) -> u64 {
 
 impl OpenAiSpeculativeStats {
     pub(super) fn insert_response_timings(&self, timings: &mut BTreeMap<String, Value>) {
+        timings.insert("speculative_windows".to_string(), json!(self.windows));
+        timings.insert(
+            "speculative_proposed_n".to_string(),
+            json!(self.draft_tokens),
+        );
+        timings.insert(
+            "speculative_accepted_n".to_string(),
+            json!(self.accepted_tokens),
+        );
+        timings.insert(
+            "speculative_rejected_n".to_string(),
+            json!(self.rejected_tokens),
+        );
+        timings.insert(
+            "speculative_accept_rate".to_string(),
+            json!(if self.draft_tokens == 0 {
+                0.0
+            } else {
+                self.accepted_tokens as f64 / self.draft_tokens as f64
+            }),
+        );
         timings.insert(
             "verify_window_verify_elapsed_ms".to_string(),
             json!(self.primary_verify_elapsed_ms),

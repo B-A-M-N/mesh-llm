@@ -251,10 +251,20 @@ impl GeneratedText {
 
     pub(in crate::frontend) fn timings(&self) -> Option<BTreeMap<String, Value>> {
         let stats = self.native_mtp_stats;
-        let (drafted_tokens, accepted_tokens) = self
+        let native_totals = self
             .native_mtp_decode_telemetry
             .and_then(NativeMtpDecodeTelemetry::composite_proposal_totals)
             .unwrap_or((stats.drafted_tokens, stats.accepted_tokens));
+        let (drafted_tokens, accepted_tokens) = self
+            .speculative_stats
+            .as_ref()
+            .filter(|stats| stats.windows > 0)
+            .map_or(native_totals, |stats| {
+                (
+                    u64::try_from(stats.draft_tokens).unwrap_or(u64::MAX),
+                    u64::try_from(stats.accepted_tokens).unwrap_or(u64::MAX),
+                )
+            });
         let mut timings = BTreeMap::from([
             ("prompt_n".to_string(), json!(self.prompt_tokens)),
             ("prompt_ms".to_string(), json!(self.prompt_ms)),
