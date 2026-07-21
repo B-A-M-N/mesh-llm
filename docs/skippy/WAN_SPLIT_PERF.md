@@ -155,9 +155,10 @@ The smoking gun is `window_shrinks 0`: the adaptive policy never narrowed the
 window under a sustained reject storm, so it kept proposing deep, kept
 rejecting, and kept paying the 3× round-trip recovery.
 
-Stage-state v9 deletes that recovery path. Decode and verify messages carry an
-authoritative absolute position; a stage whose attention KV is ahead rewinds
-locally before executing the next useful message. No checkpoint, restore ACK,
+Stage-state v10 deletes that recovery path. Decode and verify messages carry an
+authoritative absolute position, while non-overlapping continuation chunks make
+the fully accepted path advance monotonically without rewinding. Only a real
+divergence trims an invalid target suffix locally. No checkpoint, restore ACK,
 trim ACK, or repair replay is sent. This makes accepted tokens per target verify
 the relevant throughput quantity; a lower acceptance rate can still win when a
 wider MTP+N-gram window amortizes WAN latency over more committed tokens.

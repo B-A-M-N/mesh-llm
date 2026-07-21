@@ -349,9 +349,7 @@ spec_default               = "auto"          # bool or "auto"
 # ngram_min                 = 2
 # ngram_max                 = 4
 # ngram_max_proposal_tokens = 6        # output budget, separate from ngram_max
-# extension_initial_tokens  = 2        # requires native MTP plus an N-gram proposer
-# extension_max_tokens      = 6
-# extension_tail_backoff_proposals = 2
+# extension_max_tokens      = 6        # fixed request-local continuation horizon
 
 # Target VerifyWindow and native-MTP recovery controls
 # verify_window_min_tokens                    = 1
@@ -737,9 +735,7 @@ strategy = "mtp"
 ngram_min = 2
 ngram_max = 4
 ngram_max_proposal_tokens = 6
-extension_initial_tokens = 2
 extension_max_tokens = 6
-extension_tail_backoff_proposals = 2
 verify_window_min_tokens = 1
 verify_window_max_tokens = 6
 verify_window_pipeline_depth = 2

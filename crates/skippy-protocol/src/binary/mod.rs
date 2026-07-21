@@ -178,11 +178,7 @@ mod tests {
         send_reply_predicted_tokens_with_window_and_stats(
             &mut bytes,
             &[1, 2, 3],
-            StageReplyWindow {
-                window_id: 42,
-                accepted_len: 2,
-                correction_token: 9,
-            },
+            StageReplyWindow { window_id: 42 },
             StageReplyStats::default(),
         )
         .unwrap();
@@ -191,8 +187,6 @@ mod tests {
         assert_eq!(reply.kind, WireReplyKind::PredictedTokens);
         assert_eq!(reply.predicted_tokens, vec![1, 2, 3]);
         assert_eq!(reply.window.window_id, 42);
-        assert_eq!(reply.window.accepted_len, 2);
-        assert_eq!(reply.window.correction_token, 9);
     }
 
     #[test]

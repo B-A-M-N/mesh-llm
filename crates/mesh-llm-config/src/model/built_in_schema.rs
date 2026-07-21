@@ -671,15 +671,7 @@ fn speculative_settings(prefix: &str) -> Vec<ConfigSettingSchema> {
             ConfigValueSchema::Integer,
         ),
         basic_setting(
-            &format!("{prefix}.extension_initial_tokens"),
-            ConfigValueSchema::Integer,
-        ),
-        basic_setting(
             &format!("{prefix}.extension_max_tokens"),
-            ConfigValueSchema::Integer,
-        ),
-        basic_setting(
-            &format!("{prefix}.extension_tail_backoff_proposals"),
             ConfigValueSchema::Integer,
         ),
         basic_setting(

@@ -258,21 +258,11 @@ fn resolve_decode_config(input: DecodeResolutionInput<'_>) -> Result<Speculative
         config.effective_strategy = "native-mtp+ngram-cache".to_string();
         if config.extension.is_none() {
             config.extension = Some(NgramExtensionConfig {
-                initial_tokens: ngram.max_proposal_tokens.clamp(1, 2),
                 max_tokens: ngram.max_proposal_tokens,
-                tail_backoff_proposals: 0,
             });
         }
     }
 
-    let extension_initial = pick_optional_u32(
-        input
-            .model_config
-            .and_then(|config| config.extension_initial_tokens),
-        input
-            .global_config
-            .and_then(|config| config.extension_initial_tokens),
-    );
     let extension_max = pick_optional_u32(
         input
             .model_config
@@ -281,28 +271,14 @@ fn resolve_decode_config(input: DecodeResolutionInput<'_>) -> Result<Speculative
             .global_config
             .and_then(|config| config.extension_max_tokens),
     );
-    let extension_backoff = pick_optional_u32(
-        input
-            .model_config
-            .and_then(|config| config.extension_tail_backoff_proposals),
-        input
-            .global_config
-            .and_then(|config| config.extension_tail_backoff_proposals),
-    );
-    if extension_initial.is_some() || extension_max.is_some() || extension_backoff.is_some() {
+    if extension_max.is_some() {
         let Some(extension) = config.extension.as_mut() else {
             bail!(
                 "skippy speculative extension controls require native MTP and an N-gram proposer"
             );
         };
-        if let Some(value) = extension_initial {
-            extension.initial_tokens = value as usize;
-        }
         if let Some(value) = extension_max {
             extension.max_tokens = value as usize;
-        }
-        if let Some(value) = extension_backoff {
-            extension.tail_backoff_proposals = value as usize;
         }
     }
     if config.extension.is_some() && (!config.native_mtp.enabled || config.ngram.is_none()) {
@@ -504,9 +480,7 @@ fn ngram_proposer_config(
 
 fn extension_config(policy: &PackageExtensionPolicyInfo) -> NgramExtensionConfig {
     NgramExtensionConfig {
-        initial_tokens: policy.initial_tokens as usize,
         max_tokens: policy.max_tokens as usize,
-        tail_backoff_proposals: policy.tail_backoff_proposals as usize,
     }
 }
 

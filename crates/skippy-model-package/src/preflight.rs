@@ -134,9 +134,7 @@ pub(crate) struct PreflightSpeculativeStrategy {
 
 #[derive(Debug, Serialize)]
 pub(crate) struct PreflightExtensionPolicy {
-    pub initial_tokens: u32,
     pub max_tokens: u32,
-    pub tail_backoff_proposals: u32,
 }
 
 #[derive(Debug, Serialize)]
@@ -233,9 +231,7 @@ struct PackageSpeculativeStrategy {
 
 #[derive(Debug, Deserialize)]
 struct PackageExtensionPolicy {
-    initial_tokens: u32,
     max_tokens: u32,
-    tail_backoff_proposals: u32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -803,15 +799,12 @@ fn validate_extension_policy(
     policy: &PackageExtensionPolicy,
     report: &mut PackagePreflightReport,
 ) {
-    if policy.initial_tokens == 0
-        || policy.max_tokens == 0
-        || policy.initial_tokens > policy.max_tokens
-    {
+    if policy.max_tokens == 0 {
         report.error(
             "invalid_extension_policy_tokens",
-            format!("speculative strategy {name} extension_policy must satisfy 1 <= initial_tokens <= max_tokens"),
+            format!("speculative strategy {name} extension_policy must set max_tokens > 0"),
             Some("model-package.json".to_string()),
-            "set positive initial_tokens and max_tokens with initial_tokens no larger than max_tokens",
+            "set max_tokens to a positive verification horizon",
         );
     }
 }
@@ -903,9 +896,7 @@ fn preflight_speculative_decoding(
                 extender: strategy.extender.clone(),
                 extension_policy: strategy.extension_policy.as_ref().map(|policy| {
                     PreflightExtensionPolicy {
-                        initial_tokens: policy.initial_tokens,
                         max_tokens: policy.max_tokens,
-                        tail_backoff_proposals: policy.tail_backoff_proposals,
                     }
                 }),
             })
@@ -1586,9 +1577,7 @@ mod tests {
                             "primary": "mtp",
                             "extender": "cache",
                             "extension_policy": {
-                                "initial_tokens": 2,
-                                "max_tokens": 4,
-                                "tail_backoff_proposals": 6
+                                "max_tokens": 4
                             }
                         }
                     }

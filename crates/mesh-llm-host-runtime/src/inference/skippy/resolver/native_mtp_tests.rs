@@ -93,11 +93,7 @@ fn native_mtp_cache_generation() -> PackageGenerationInfo {
             proposer: None,
             primary: Some("mtp".to_string()),
             extender: Some("cache".to_string()),
-            extension_policy: Some(PackageExtensionPolicyInfo {
-                initial_tokens: 2,
-                max_tokens: 8,
-                tail_backoff_proposals: 5,
-            }),
+            extension_policy: Some(PackageExtensionPolicyInfo { max_tokens: 8 }),
         },
     );
     PackageGenerationInfo {
@@ -330,9 +326,7 @@ verify_window_pipeline_depth = 2
         .extension
         .as_ref()
         .expect("extension policy should resolve");
-    assert_eq!(extension.initial_tokens, 2);
     assert_eq!(extension.max_tokens, 7);
-    assert_eq!(extension.tail_backoff_proposals, 5);
     assert_eq!(resolved.speculative.decode.verify_window.min_tokens, 1);
     assert_eq!(resolved.speculative.decode.verify_window.max_tokens, 6);
     assert_eq!(resolved.speculative.decode.verify_window.pipeline_depth, 2);
@@ -373,7 +367,6 @@ ngram_max_proposal_tokens = 6
         .extension
         .as_ref()
         .expect("direct cache strategy should synthesize an extension plan");
-    assert_eq!(extension.initial_tokens, 2);
     assert_eq!(extension.max_tokens, 6);
     let openai = resolved
         .to_embedded_openai_args(4096, true)

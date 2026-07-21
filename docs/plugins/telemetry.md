@@ -148,26 +148,8 @@ to an OTLP record.
 | `mesh_llm.guardrail.outcome` | guardrail outcome | Bounded enum: `pass_through`, `valid`, `rescued`, `retried`, `failed`, or `metrics_only_failure`. |
 | `mesh_llm.guardrail.parser_stage` | guardrail outcome | Bounded enum: `none`, `json_exact`, `json_fenced`, or `json_substring`. |
 | `mesh_llm.guardrail.attempt_bucket` | guardrail outcome | Bounded retry bucket: `1`, `2`, or `3_plus`. |
-| `llama_stage.verify_window.direct_return_upstream_opened` | Skippy decode summary | Boolean indicating that the preferred upstream-opened v9 prediction-return sink completed its handshake. |
-| `llama_stage.verify_window.direct_return_reverse_fallback` | Skippy decode summary | Boolean indicating that the final stage used the bounded reverse-open v9 prediction-return fallback after the preferred sink was unavailable. |
-| `llama_stage.verify_window.credit_limit` | Skippy decode summary | Configured global count of optional parallel verify-window credits. |
-| `llama_stage.verify_window.credit_effective_limit_min` | Skippy decode summary | Minimum optional-credit budget after subtracting the unmetered head window owned by every live generation. |
-| `llama_stage.verify_window.credit_unmetered_progress_windows` | Skippy decode summary | Count of per-request head windows that preserve forward progress without consuming optional credits. |
-| `llama_stage.verify_window.credit_checks` | Skippy decode summary | Count only. |
-| `llama_stage.verify_window.credit_grants` | Skippy decode summary | Count only. |
-| `llama_stage.verify_window.credit_serial_fallbacks` | Skippy decode summary | Count of optional parallel launches that fell back to serial retirement under backpressure. |
-| `llama_stage.verify_window.credit_pipeline_occupied_denials` | Skippy decode summary | Count of optional launches suppressed because live generations already occupied the configured pipeline capacity. |
-| `llama_stage.verify_window.credit_fair_share_denials` | Skippy decode summary | Count only; no request identity is exported. |
-| `llama_stage.verify_window.credit_global_limit_denials` | Skippy decode summary | Count only. |
-| `llama_stage.verify_window.credit_fair_queue_denials` | Skippy decode summary | Count only; the queue contains no exported request identity. |
-| `llama_stage.verify_window.credit_lock_poisoned_denials` | Skippy decode summary | Count only. |
-| `llama_stage.verify_window.credit_global_max_in_use` | Skippy decode summary | Bounded occupancy high-water mark. |
-| `llama_stage.verify_window.credit_active_requests_max` | Skippy decode summary | Bounded concurrent-request count; no request identity is exported. |
-| `llama_stage.verify_window.credit_request_max_held` | Skippy decode summary | Per-request credit-count high-water mark; no request identity is exported. |
-| `llama_stage.verify_window.credit_queue_max` | Skippy decode summary | Bounded queue-depth high-water mark; no queued identity is exported. |
-| `llama_stage.native_mtp.hybrid_ngram_admission_slow_start_accepted_token_count` | Skippy decode summary | Count of accepted active N-gram tokens accumulated while the request-local pipeline remained depth-capped. |
-| `llama_stage.native_mtp.hybrid_ngram_admission_slow_start_full_accept_proposal_count` | Skippy decode summary | Count of fully accepted active proposals used as profitability evidence before full-depth admission. |
-| `llama_stage.native_mtp.hybrid_ngram_admission_slow_start_refill_suppression_count` | Skippy decode summary | Count of optimistic horizon refills suppressed while first-miss waste remained depth-capped. |
+| `llama_stage.verify_window.direct_return_upstream_opened` | Skippy decode summary | Boolean indicating that the preferred upstream-opened v10 prediction-return sink completed its handshake. |
+| `llama_stage.verify_window.direct_return_reverse_fallback` | Skippy decode summary | Boolean indicating that the final stage used the bounded reverse-open v10 prediction-return fallback after the preferred sink was unavailable. |
 
 ## Review Checklist
 

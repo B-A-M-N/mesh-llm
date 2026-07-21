@@ -2,33 +2,60 @@ use std::collections::VecDeque;
 
 use super::{NativeMtpDraft, NativeMtpDraftOrigin, NativeMtpHybridProposal};
 
-/// One candidate predicted by one exact-shape positional target evaluation.
+/// One contiguous candidate span verified by one target traversal.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(in crate::frontend) struct PipelinedCandidateWindow {
-    proposal_token: i32,
+pub(in crate::frontend) struct PipelinedCandidateChunk {
+    proposal_tokens: Vec<i32>,
     native_mtp_token_count: usize,
+    starts_epoch: bool,
 }
 
-impl PipelinedCandidateWindow {
-    pub(in crate::frontend) fn proposal_token(&self) -> i32 {
-        self.proposal_token
+impl PipelinedCandidateChunk {
+    pub(in crate::frontend) fn proposal_tokens(&self) -> &[i32] {
+        &self.proposal_tokens
     }
 
     pub(in crate::frontend) fn native_mtp_token_count(&self) -> usize {
         self.native_mtp_token_count
     }
+
+    pub(in crate::frontend) fn starts_epoch(&self) -> bool {
+        self.starts_epoch
+    }
+
+    pub(in crate::frontend) fn advance_tokens(&self) -> usize {
+        self.proposal_tokens.len()
+    }
+}
+
+/// A full target traversal produces one prediction beyond its proposal span.
+/// Keep that free token at the boundary while any later chunk depends on the
+/// last proposal token as its input anchor.
+pub(in crate::frontend) fn pipelined_target_commit_count(
+    planned_advance_tokens: usize,
+    target_commit_count: usize,
+    fully_accepted: bool,
+    dependent_work_exists: bool,
+) -> usize {
+    if fully_accepted && dependent_work_exists {
+        planned_advance_tokens
+    } else {
+        target_commit_count
+    }
 }
 
 /// Owns a composite candidate while positional windows consume it.
 ///
-/// Every window evaluates exactly one input token and predicts exactly one
-/// candidate token, matching native target decode's batch shape. Pipeline depth
-/// comes only from consecutive positions in flight, never a wider target batch.
+/// The first chunk is anchored by the current target token. Later chunks are
+/// contiguous continuations: their first candidate is validated by the prior
+/// chunk's free boundary prediction, and the target consumes only new inputs.
+/// A fully accepted epoch therefore advances monotonically without trimming KV.
 #[derive(Debug)]
 pub(in crate::frontend) struct CompositeProposalPipeline {
     proposal: NativeMtpHybridProposal,
     origin: Option<NativeMtpDraftOrigin>,
     candidates: VecDeque<i32>,
+    dispatched_tokens: usize,
     dispatched_native_mtp_token_count: usize,
     accepted_tokens: usize,
     next_draft: Option<NativeMtpDraft>,
@@ -43,23 +70,34 @@ impl CompositeProposalPipeline {
             candidates: proposal.tokens().iter().copied().collect(),
             proposal,
             origin,
+            dispatched_tokens: 0,
             dispatched_native_mtp_token_count: 0,
             accepted_tokens: 0,
             next_draft: None,
         }
     }
 
-    pub(in crate::frontend) fn next_window(&mut self) -> Option<PipelinedCandidateWindow> {
-        let proposal_token = self.candidates.pop_front()?;
+    pub(in crate::frontend) fn next_chunk(
+        &mut self,
+        max_tokens: usize,
+    ) -> Option<PipelinedCandidateChunk> {
+        let chunk_len = max_tokens.max(1).min(self.candidates.len());
+        if chunk_len == 0 {
+            return None;
+        }
+        let starts_epoch = self.dispatched_tokens == 0;
+        let proposal_tokens = self.candidates.drain(..chunk_len).collect::<Vec<_>>();
         let native_mtp_token_count = self
             .proposal
             .native_mtp_token_count()
             .saturating_sub(self.dispatched_native_mtp_token_count)
-            .min(1);
+            .min(proposal_tokens.len());
         self.dispatched_native_mtp_token_count += native_mtp_token_count;
-        Some(PipelinedCandidateWindow {
-            proposal_token,
+        self.dispatched_tokens += proposal_tokens.len();
+        Some(PipelinedCandidateChunk {
+            proposal_tokens,
             native_mtp_token_count,
+            starts_epoch,
         })
     }
 
@@ -127,28 +165,54 @@ mod tests {
     }
 
     #[test]
-    fn plans_one_exact_target_position_per_window() {
+    fn marks_only_the_first_full_chunk_as_epoch_start() {
         let mut pipeline = CompositeProposalPipeline::new(
-            proposal(vec![9, 1, 2], 1),
+            proposal(vec![9, 1, 2, 3, 4], 1),
             Some(NativeMtpDraftOrigin::InitialSerial),
         );
 
-        let first = pipeline.next_window().unwrap();
-        assert_eq!(first.proposal_token(), 9);
+        let first = pipeline.next_chunk(3).unwrap();
+        assert_eq!(first.proposal_tokens(), [9, 1, 2]);
         assert_eq!(first.native_mtp_token_count(), 1);
+        assert_eq!(first.advance_tokens(), 3);
+        assert!(first.starts_epoch());
 
-        let second = pipeline.next_window().unwrap();
-        assert_eq!(second.proposal_token(), 1);
+        let second = pipeline.next_chunk(3).unwrap();
+        assert_eq!(second.proposal_tokens(), [3, 4]);
         assert_eq!(second.native_mtp_token_count(), 0);
+        assert!(!second.starts_epoch());
+    }
+
+    #[test]
+    fn dependent_chunk_keeps_the_free_target_at_the_boundary() {
+        let mut pipeline = CompositeProposalPipeline::new(proposal(vec![9, 1, 2, 3], 1), None);
+        let first = pipeline.next_chunk(2).unwrap();
+
+        assert_eq!(
+            pipelined_target_commit_count(first.advance_tokens(), 3, true, true),
+            2
+        );
+        assert_eq!(pipeline.next_chunk(2).unwrap().proposal_tokens(), [2, 3]);
+    }
+
+    #[test]
+    fn terminal_chunk_commits_the_free_target() {
+        let mut pipeline = CompositeProposalPipeline::new(proposal(vec![9, 1], 1), None);
+        let chunk = pipeline.next_chunk(2).unwrap();
+
+        assert_eq!(
+            pipelined_target_commit_count(chunk.advance_tokens(), 3, true, false),
+            3
+        );
     }
 
     #[test]
     fn supports_a_pure_ngram_candidate() {
         let mut pipeline = CompositeProposalPipeline::new(proposal(vec![1, 2, 3], 0), None);
 
-        let window = pipeline.next_window().unwrap();
-        assert_eq!(window.proposal_token(), 1);
-        assert_eq!(window.native_mtp_token_count(), 0);
+        let chunk = pipeline.next_chunk(2).unwrap();
+        assert_eq!(chunk.proposal_tokens(), [1, 2]);
+        assert_eq!(chunk.native_mtp_token_count(), 0);
         assert!(pipeline.has_remaining_candidates());
     }
 
@@ -174,7 +238,7 @@ mod tests {
             Some(NativeMtpDraftOrigin::InitialSerial),
         );
 
-        let _ = pipeline.next_window().unwrap();
+        let _ = pipeline.next_chunk(1).unwrap();
         pipeline.observe_accepted(1);
 
         assert_eq!(pipeline.accepted_tokens(), 1);
@@ -192,12 +256,12 @@ mod tests {
             Some(NativeMtpDraftOrigin::InitialSerial),
         );
 
-        let first = pipeline.next_window().unwrap();
-        assert_eq!(first.proposal_token(), 9);
+        let first = pipeline.next_chunk(1).unwrap();
+        assert_eq!(first.proposal_tokens(), [9]);
         pipeline.observe_accepted(1);
 
-        let second = pipeline.next_window().unwrap();
-        assert_eq!(second.proposal_token(), 1);
+        let second = pipeline.next_chunk(1).unwrap();
+        assert_eq!(second.proposal_tokens(), [1]);
         pipeline.observe_accepted(0);
 
         assert!(
@@ -219,8 +283,8 @@ mod tests {
             Some(NativeMtpDraftOrigin::InitialSerial),
         );
 
-        let first = pipeline.next_window().unwrap();
-        assert_eq!(first.proposal_token(), 9);
+        let first = pipeline.next_chunk(1).unwrap();
+        assert_eq!(first.proposal_tokens(), [9]);
         assert_eq!(pipeline.optimistic_suffix(), &[9, 1, 2, 3]);
 
         pipeline.observe_accepted(1);
@@ -230,7 +294,7 @@ mod tests {
         assert_eq!(pipeline.proposal().tokens(), &[9, 1, 2, 3, 4, 5]);
         assert_eq!(pipeline.proposal().ngram_token_count(), 5);
 
-        let second = pipeline.next_window().unwrap();
-        assert_eq!(second.proposal_token(), 1);
+        let second = pipeline.next_chunk(1).unwrap();
+        assert_eq!(second.proposal_tokens(), [1]);
     }
 }

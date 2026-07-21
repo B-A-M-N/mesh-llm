@@ -12,10 +12,9 @@ pub(super) use decode::{
 pub(super) use draft::{NativeMtpDraft, NativeMtpDraftOrigin, PendingNativeMtpDraft};
 pub(super) use hybrid::{
     BufferedCompositeProposal, CompositeProposalProvider, NativeMtpHybridProposal,
-    NgramAdmissionStats, NgramExtensionPolicy, NgramSidecarController,
-    classify_native_mtp_position, classify_native_mtp_verify_window,
+    NgramSidecarController, classify_native_mtp_verify_window,
 };
-pub(super) use pipeline::CompositeProposalPipeline;
+pub(super) use pipeline::{CompositeProposalPipeline, pipelined_target_commit_count};
 pub(super) use stats::{NativeMtpStats, NativeMtpVerification};
 pub(super) use verifier::NativeMtpVerifier;
 pub(super) use verify_window::NativeMtpVerifyWindowControl;

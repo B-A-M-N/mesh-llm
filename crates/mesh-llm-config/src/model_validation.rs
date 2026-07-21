@@ -555,32 +555,9 @@ fn validate_speculative_proposer_controls(
 
 fn validate_extension_controls(config: &SpeculativeConfig, base_path: &str) -> DiagnosticResult {
     validate_optional_u32_range(
-        config.extension_initial_tokens,
-        &format!("{base_path}.extension_initial_tokens"),
-        1,
-        10_000_000,
-    )?;
-    validate_optional_u32_range(
         config.extension_max_tokens,
         &format!("{base_path}.extension_max_tokens"),
         1,
-        10_000_000,
-    )?;
-    if let (Some(initial), Some(max)) =
-        (config.extension_initial_tokens, config.extension_max_tokens)
-        && initial > max
-    {
-        return Err(validation_diagnostic(
-            &format!("{base_path}.extension_initial_tokens"),
-            format!(
-                "{base_path}.extension_initial_tokens must be less than or equal to {base_path}.extension_max_tokens"
-            ),
-        ));
-    }
-    validate_optional_u32_range(
-        config.extension_tail_backoff_proposals,
-        &format!("{base_path}.extension_tail_backoff_proposals"),
-        0,
         10_000_000,
     )
 }

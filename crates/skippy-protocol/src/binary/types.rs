@@ -5,9 +5,9 @@ use super::{
     invalid_data,
 };
 
-// v9 makes decode positions authoritative for speculative KV rewind. Stage peers must be
-// upgraded together.
-pub const STAGE_STATE_VERSION: i32 = 9;
+// v10 makes the coordinator the sole owner of verify-window acceptance and removes the
+// redundant tail-stage acceptance/correction fields. Stage peers must be upgraded together.
+pub const STAGE_STATE_VERSION: i32 = 10;
 pub const MAX_STAGE_LOGIT_BIAS: usize = 256;
 pub const MAX_STAGE_PREDICTED_TOKENS: usize = 262_144;
 pub const MAX_STAGE_SIDEBAND_VALUES: usize = 1_048_576;
@@ -391,7 +391,7 @@ pub struct StageWireMessage {
 impl StageWireMessage {
     /// The committed session position that must exist before this message runs.
     ///
-    /// Stage-state v9 makes this absolute position authoritative: a worker whose
+    /// Stage-state v10 makes this absolute position authoritative: a worker whose
     /// speculative KV is ahead must rewind locally before executing the message.
     pub fn authoritative_session_position(&self) -> Option<u64> {
         if !matches!(
@@ -578,21 +578,9 @@ pub struct StageNativeMtpDraft {
     pub proposal_compute_us: i64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct StageReplyWindow {
     pub window_id: i32,
-    pub accepted_len: i32,
-    pub correction_token: i32,
-}
-
-impl Default for StageReplyWindow {
-    fn default() -> Self {
-        Self {
-            window_id: 0,
-            accepted_len: 0,
-            correction_token: LLAMA_TOKEN_NULL,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

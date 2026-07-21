@@ -532,11 +532,7 @@ mod tests {
                 token_ids: vec![43],
                 proposal_compute_us: 123,
             }),
-            window: skippy_protocol::binary::StageReplyWindow {
-                window_id: 7,
-                accepted_len: 2,
-                correction_token: 123,
-            },
+            window: skippy_protocol::binary::StageReplyWindow { window_id: 7 },
             stats: Default::default(),
         };
         send_direct_prediction_return(&mut server, reply).unwrap();
@@ -553,8 +549,6 @@ mod tests {
             })
         );
         assert_eq!(received.window.window_id, 7);
-        assert_eq!(received.window.accepted_len, 2);
-        assert_eq!(received.window.correction_token, 123);
     }
 
     #[test]

@@ -1,281 +1,159 @@
-# Pipelined VerifyWindow Decode
+# Pipelined MTP + N-gram Verification
 
 ## Purpose
 
-This document describes Skippy's internal speculative-decode subsystem for
-native multi-token prediction (MTP) and the optional MTP-anchored N-gram
-extender. It covers the wire protocol, target-verification invariant,
-asynchronous scheduling, operating modes, and diagnostic telemetry.
+This document describes Skippy's split-decode path that combines native
+multi-token prediction (MTP) with a request-local N-gram continuation. There is
+no separate model in this path. Native MTP supplies the anchor candidate, the
+N-gram cache extends it, and the full staged model remains authoritative for
+every emitted token.
 
-The staged-runtime protocol deliberately has no compatibility path for the
-retired synchronous `VerifySpan` message. Public mesh gossip and the
-OpenAI-compatible API retain their normal compatibility guarantees.
+The design follows a fixed-depth pipeline:
+
+1. form full multi-token candidate chunks;
+2. send them through the stages asynchronously and in FIFO order;
+3. return predictions directly from the final stage to the coordinator;
+4. keep the configured number of windows in flight while candidates remain;
+5. discard later results after the first divergence and refill immediately.
+
+Public mesh gossip and the OpenAI-compatible API are unchanged. The internal
+stage protocol is intentionally incompatible with the previous reply shape.
 
 ## Terms
 
 | Term | Meaning |
 |---|---|
-| Target | The full staged model, authoritative for every emitted token. |
-| Native MTP | Model-provided typed draft attached to a target reply. GLM 4.7 Flash currently supplies a narrow `N+1` candidate. |
-| N-gram sidecar | A request-local llama.cpp `ngram-cache` proposer over target-committed tokens. |
-| Composite proposal | Native-MTP prefix plus an optional N-gram suffix. |
-| VerifyWindow | Versioned target request at an authoritative session position. Native MTP may use a batch; admitted N-gram pipelining sends one input token per window. |
-| Stale window | Optimistic in-flight window invalidated by an earlier divergence. |
+| Target | The full staged model and sole token authority. |
+| Native MTP | Model-provided candidate tokens attached to a target reply. |
+| N-gram continuation | Exact request-local cache continuation after the MTP prefix. |
+| Composite proposal | Native-MTP prefix followed by zero or more N-gram tokens. |
+| Verification chunk | A bounded contiguous part of the composite proposal. |
+| Epoch | One optimistic candidate branch, possibly containing several chunks. |
+| Stale window | In-flight work invalidated by an earlier mismatch or stop. |
 
-## Safety Invariant
+## Correctness Invariant
 
-MTP and N-gram are candidate sources, never authorities. The target verifies
-each candidate sequence, and Skippy commits only the longest target-matching
-prefix. A target correction is committed after a rejection.
+Candidates are never committed directly. For each epoch the coordinator emits
+only the longest prefix reproduced by the target. At the first mismatch it
+emits the target correction and marks all later windows from that epoch stale.
 
-```mermaid
-flowchart LR
-  MTP["Native MTP draft"] --> C["Composite candidate"]
-  NGRAM["N-gram continuation"] --> C
-  C --> W["VerifyWindow to target"]
-  W --> R{"Target result"}
-  R -->|"match"| A["Commit target token\nand retain optimistic branch"]
-  R -->|"mismatch"| P["Commit target correction\nand retire later windows"]
-  R -->|"no proposal"| T["Ordinary target decode"]
-```
+The request-local N-gram index contains committed target history only.
+Optimistic suffixes may be queried to extend the current branch, but they are
+never inserted into the index before target acceptance.
 
-This invariant also applies when multiple windows are in flight.
+## Stage Protocol v10
 
-## Wire Protocol
+`STAGE_STATE_VERSION` is `10`, and `VerifyWindow` is message kind `21`.
+Every verification request carries:
 
-`STAGE_STATE_VERSION` is `9`. `VerifyWindow` is wire message kind `21`; the
-legacy kind `10` is rejected. An old/new staged-runtime pairing therefore fails
-clearly instead of silently interpreting requests with different semantics.
+- a FIFO window ID;
+- an authoritative absolute start position;
+- a contiguous token input;
+- the target sampling configuration.
 
-```mermaid
-sequenceDiagram
-  participant S0 as "Stage 0 / OpenAI frontend"
-  participant ST as "Downstream stages + target"
-  Note over S0,ST: "Typed native MTP draft travels in target-reply sideband"
-  S0->>ST: "VerifyWindow(id, position, one input token)"
-  ST-->>S0: "PredictedTokens(window id, one target token, next MTP draft)"
-  S0->>S0: "Compare target token with one candidate"
-  S0->>S0: "Commit the target token"
-```
+Every reply carries the same window ID, the target predictions, stage timing,
+and an optional typed native-MTP candidate. The removed `accepted_len` and
+`correction_token` fields duplicated policy at the final stage and could not
+describe continuation chunks correctly. Acceptance now has one owner: the
+coordinator, which has both the prior boundary prediction and the current
+reply.
 
-Serial native-MTP verification may still send `current + MTP prefix` and
-receive one additional target prediction. That last prediction is both the
-ordinary target continuation and a zero-cost admission probe when a one-token
-probationary N-gram tail is present. Pipelined decode requires direct prediction
-return. The preferred v9 sink is opened from stage zero toward the final stage.
-If that bounded handshake fails transiently, the final stage opens the existing
-reverse direct-return path back to the registered stage-zero receiver. A
-missing receiver still fails closed before any verify window is launched.
-Every steady-state persistent-lane read and write, including prefill replies,
-direct-return/downstream reply races, and graceful stop, has a 30-second
-terminal deadline. This is far above a normal WAN traversal but prevents a
-dead tunnel that emits neither EOF nor a reply from holding a generation
-permit and speculative credits indefinitely. Failed generations skip the
-graceful stop handshake, discard the suspect lane, and attempt replacement
-with a separate three-second connection/ready budget.
+The final stage returns verification replies directly to stage zero. Stage zero
+first opens a bounded return sink toward the tail; if that handshake is not
+available, the tail opens the reverse direct-return connection. A request does
+not start pipelined verification without a registered receiver.
 
-## Composite Proposals
+## Non-overlapping Verification Chunks
 
-The sidecar exists only inside the native-MTP composite strategy. Skippy uses
-llama.cpp's request-local `ngram-cache` for candidate generation and a bounded
-Rust history scan for probationary support. It reads after the provisional MTP
-prefix and may provide the entire candidate on a step where the model returns
-no MTP token.
+Let `c` be the current unprocessed target token and let the composite candidate
+be `[d1, d2, d3, d4]`. With chunk width two, stage zero sends:
 
-```mermaid
-flowchart TD
-  D["Receive typed MTP draft"] --> Q{"MTP tokens?"}
-  Q -->|"no"| P["Cache candidate\nfrom accepted context"]
-  Q -->|"yes"| H["Read cache after\nprovisional MTP prefix"]
-  H --> X["Append useful suffix only"]
-  P --> C["Composite proposal"]
-  X --> C
-  C --> V["Native prefix batch, then one positional window per admitted N-gram token"]
-```
-
-For MTP `[a, b]`, a valid historical continuation must start `[a, b, ...]`.
-The composite proposal becomes `[a, b, c, d]`, not two independent requests.
-Active tails shorter than the normal minimum are discarded. Probation is the
-exception: it deliberately retains one token so the native batch's existing
-next-target prediction can test it without another target request. A rejected
-tail does not count as an MTP prefix rejection; it only backs off the sidecar.
-
-The cache is never shared between requests and is updated only after target
-tokens commit. Drafting with `[a, b]` is read-only, so a rejected VerifyWindow
-cannot affect a later lookup. This permits a cache tail to follow MTP even when
-the cache would not independently predict `[a, b]`.
-
-## Adaptive Sidecar Policy
-
-The sidecar begins in probation with a one-token tail attached to native MTP.
-The native-MTP prefix keeps its ordinary batched VerifyWindow. If the prefix is
-accepted, the target prediction already produced immediately after it is
-compared with the probation token. A match accepts the probe and a mismatch
-discards it, with no extra target request in either case. Two fully accepted
-anchored probes promote the sidecar to active admission. Probation has a
-bounded budget of three rejected probes, separated by the configured sidecar
-cooldown; exhausting that budget fails closed to native MTP for the rest of the
-request. Only active admission may issue pure N-gram proposals or refill an
-optimistic horizon. Active N-gram positions are verified one position at a
-time so greedy target sampling retains native decode's one-input batch shape.
-Promotion raises the number of consecutive positions in flight; it never
-widens a target batch or narrows the native-MTP prefix batch.
-Promotion uses a slow start before full-depth admission. Until 16 active
-N-gram tokens have completed in fully accepted proposal spans, the request is
-capped at two positions in flight (one progress window plus one speculative
-credit) and optimistic horizon refill is disabled. A mismatch resets that
-evidence. This bounds first-miss rollback when a repeated local prefix later
-diverges, while sustained exact continuations can still fill the configured
-pipeline.
-Probation also requires an earlier occurrence in target-committed output—not
-the prompt—of an 8-to-32-token suffix with the same four-token continuation,
-while exposing only the first token as the target-verified probe. The native
-cache applies its sample threshold by the actual configured N-gram size, so a
-3-to-4-token cache range does not accidentally inherit the stricter 1-to-2
-token threshold.
-Low-support, short-context, prompt-only, or contradictory matches are
-skipped without spending a target verification probe.
-A fully accepted active tail widens the next tail by one token, up to the
-configured maximum. Any N-gram rejection revokes active admission, resets the
-width, and enters sidecar cooldown. A native-prefix rejection is not N-gram
-evidence and does not change admission state.
-
-```mermaid
-stateDiagram-v2
-  [*] --> Probation
-  Probation --> Probation: "first anchored tail accepted"
-  Probation --> Active: "second consecutive anchored tail accepted"
-  Probation --> Probation: "rejected probe; budget remains"
-  Probation --> NativeMTP: "third rejected probe"
-  Active --> Active: "N-gram proposal accepted"
-  Active --> Cooldown: "N-gram proposal rejected"
-  Cooldown --> Probation: "cooldown expires"
-```
-
-## Serial Native-MTP Mode
-
-Native MTP alone uses serial VerifyWindow processing. A window is opened,
-verified, classified, and committed before the next window begins.
-
-```mermaid
-sequenceDiagram
-  participant F as "Frontend"
-  participant T as "Target"
-  F->>T: "Window 41: current + MTP candidate"
-  T-->>F: "Window 41 reply"
-  F->>F: "Commit verified prefix"
-  F->>T: "Window 42: next candidate"
-  T-->>F: "Window 42 reply"
-```
-
-This is the native-MTP parity path. It is not decode parallelism by itself.
-Native MTP currently bypasses target prefix restoration because the target KV
-snapshot does not contain llama.cpp's model-specific MTP sidecar state. The
-frontend still records the prefix for later non-MTP requests, but an MTP
-request prefills all stages so it cannot silently trade prompt-cache savings
-for collapsed draft acceptance. State import also clears and boundedly
-re-primes MTP state before proposals resume.
-
-## Pipelined Composite Mode
-
-`verify_window_pipeline_depth > 1` is a maximum rather than a command to keep
-that many windows in flight. After request-local N-gram admission, the scheduler
-bootstraps at bounded depth and measures candidate agreement, stage-zero
-compute, downstream wait, and stale work. It keeps depth above one only while
-expected downstream overlap exceeds the expected cost of an invalidated
-position, including a safety margin.
-
-Every admitted window has width one. For candidate sequence `[m1, n1, n2]`,
-window 100 evaluates the committed current token and predicts `m1`; window 101
-optimistically evaluates `m1` at the next absolute position and predicts `n1`;
-window 102 evaluates `n1` and predicts `n2`. These evaluations may be in flight
-together, but each target batch has the same shape as ordinary decode.
-
-The configured depth is not multiplied by request concurrency. Every live
-generation may launch one head window to preserve forward progress, and those
-head windows consume pipeline capacity even when the request has not earned
-N-gram admission. The backend therefore subtracts the live-generation count
-from total configured depth, then divides the effective credits fairly among
-admitted speculative requests with FIFO handoff under contention. When
-ordinary requests leave fewer optional credits than two dependent positions
-per live generation, hybrid requests fall back to native MTP; a smaller
-rotating budget serializes N-gram tail verification and competes with useful
-head work. A
-credit remains owned until its reply is retired, including stale and
-cancellation drains, or until a failed lane is abandoned. RAII release covers
-early errors, so optimistic work cannot escape the global bound. Request
-concurrency remains an independent capacity setting—the scheduler derives the
-budget from live occupancy rather than hard-coding concurrency two.
-
-N-gram cache state, the asynchronous window writer, and global-credit
-registration are lazy. Until committed target output contains a repeated
-N-gram anchor that passes probation, the request stays on the native-MTP path
-without allocating the native cache, spawning a pipeline writer, or reducing
-another request's fair credit share.
-
-```mermaid
-sequenceDiagram
-  participant F as "Stage-zero frontend"
-  participant T as "Target"
-  Note over F: "Composite proposal: [m1, n1, n2, n3]"
-  F->>T: "Window 100: input current, expect m1"
-  F->>T: "Window 101: input m1, expect n1"
-  F->>T: "Window 102: input n1, expect n2"
-  T-->>F: "Window 100 reply"
-  F->>F: "Commit target token if m1 matches"
-  T-->>F: "Window 101 reply"
-  F->>F: "Commit only while prefix remains valid"
-```
-
-Replies complete in FIFO window-id order. An earlier divergence invalidates
-later optimistic windows. Skippy drains and records them as stale. The next
-decode or verify message carries the corrected absolute position, and every
-stage rewinds its local attention KV to that position before executing it.
-There is no rollback control message or repair replay.
-
-Attention-KV position is not the whole state of a native-MTP model. The local
-llama.cpp sidecar also carries a recurrent hidden prefix and pending hidden
-vector. Each session therefore keeps at most 64 small, position-keyed MTP
-checkpoints. A speculative trim restores the matching local checkpoint and
-removes only the MTP KV suffix; if the checkpoint has aged out, the sidecar
-fails closed by clearing and re-priming. This is process-local state repair,
-not a checkpoint/restore wire round trip, and it is required to prevent a
-rejected speculative suffix from poisoning subsequent MTP drafts.
-
-```mermaid
-flowchart LR
-  W0["Earlier window\npartial accept"] --> C["Commit matching prefix\n+ correction"]
-  W0 --> D["Discard later windows\nas stale"]
-  D --> R["Next message names corrected position"]
-  R --> N["Each stage rewinds locally and continues"]
-```
-
-## Verification Outcomes
-
-| Target result | Committed output | Next action |
+| Chunk | Absolute inputs | Target predictions used by coordinator |
 |---|---|---|
-| Full accept | One target token equal to the candidate | Continue; profitable depth may grow. |
-| Tail rejection | MTP prefix and matching tail prefix, then correction | Back off sidecar only. |
-| Prefix rejection | Matching prefix, then correction | Handle native MTP rejection and discard stale windows. |
-| EOG | Verified prefix through EOG | Stop. |
-| No candidate | Ordinary target token | Continue decode. |
+| 1, epoch start | `[c, d1, d2]` | `[p(d1), p(d2), boundary]` |
+| 2, continuation | `[d3, d4]` | `[p(d4), free]` plus chunk 1 `boundary` |
 
-## Running On The Two-Host Lab
+Chunk 1 validates `d1` and `d2`. Its final free prediction is the target's
+prediction for `d3`. Chunk 2 begins at the next absolute position, consumes
+only `d3` and `d4`, and predicts `d4` plus one new free token. The coordinator
+reconstructs chunk 2's target vector as:
 
-Use the package-qualified model reference. The normal mesh runtime owns split
-planning; do not replace it with a direct `gguf://` reference for this flow.
+```text
+[chunk_1_boundary, chunk_2_prediction_0, chunk_2_prediction_1]
+```
 
-The package owns a tested declarative default. `mesh-llm` resolves that package
-plan once at launch, applies model-level settings before global defaults, and
-passes the resulting typed configuration to `skippy-server`. The server does
-not read `SKIPPY_NATIVE_MTP_*`, `SKIPPY_NGRAM_CACHE_*`, or
-`SKIPPY_VERIFY_WINDOW_*` from its request hot path. Those variables are retired
-from supported operation.
+This validates both candidates and retains a new boundary prediction without
+reprocessing the last token of chunk 1.
 
-### Package Strategy Shape
+```mermaid
+sequenceDiagram
+  participant C as "Stage-zero coordinator"
+  participant P as "Asynchronous stage pipeline"
+  participant T as "Final target stage"
+  C->>P: "W1 @ N: [c, d1, d2]"
+  C->>P: "W2 @ N+3: [d3, d4]"
+  P->>T: "W1"
+  P->>T: "W2"
+  T-->>C: "W1: [d1, d2, boundary]"
+  T-->>C: "W2: [d4, free]"
+  C->>C: "validate W2 with [boundary, d4, free]"
+```
 
-`model-package.json` names reusable proposers and strategies. A GLM 4.7 Flash
-package can expose native MTP plus a request-local cache sidecar as follows:
+The end position of one traversal is exactly the start position of the next.
+On a fully accepted epoch, target KV and native-MTP state advance monotonically:
+there is no accepted-path trim, checkpoint restore, or repair replay.
+
+## Divergence And Refill
+
+Replies retire in FIFO order. When a window diverges:
+
+1. the coordinator commits its matching prefix and target correction;
+2. all later windows in the same epoch become stale;
+3. completed stale work is drained and measured but never emitted;
+4. a new epoch may be queued behind the stale work as soon as capacity exists;
+5. its authoritative start position trims only the invalid target suffix.
+
+The removed native-MTP checkpoint ring existed to repair the old accepted-path
+one-token rewind between overlapping chunks. It is unnecessary with contiguous
+continuations. A real divergence uses the native runtime's conservative local
+trim and bounded MTP re-prime; no repair message or replay protocol exists.
+
+## Fixed-depth Scheduling
+
+`verify_window_pipeline_depth` is the per-request FIFO capacity. It is not an
+adaptive profitability target and is not divided by generation concurrency.
+While an epoch has candidates, the coordinator fills every available slot up
+to that depth. When a reply retires, it immediately attempts to refill the
+vacated slot from the request-local N-gram continuation.
+
+The remaining bounds are:
+
+- the normal generation admission semaphore and lane pool;
+- `verify_window_pipeline_depth` per request;
+- `verify_window_max_tokens` per traversal;
+- `extension_max_tokens` for each cache continuation lookup;
+- `ngram_max_proposal_tokens` for cache output.
+
+Depth one preserves serial verification. A depth greater than one activates
+the asynchronous path only when a composite MTP + N-gram candidate is long
+enough to create dependent work. Native-MTP-only verification remains the
+control path.
+
+## Request-local Candidate Formation
+
+The N-gram cache uses exact matches in committed request history. A match is
+eligible immediately; there is no probation, promotion, slow start, cooldown,
+global speculative-credit pool, or concurrency-two special case. A rejected
+N-gram suffix does not count as rejection of an already accepted native-MTP
+prefix.
+
+If the current candidate queue falls below one chunk, the coordinator queries
+the cache after the full optimistic suffix. Successful continuation appends new
+tokens to the epoch and keeps the configured pipeline depth occupied.
+
+## Configuration
+
+A package may declare native MTP plus a request-local cache proposer:
 
 ```json
 {
@@ -292,7 +170,7 @@ package can expose native MTP plus a request-local cache sidecar as follows:
           "type": "ngram-cache",
           "ngram_min": 2,
           "ngram_max": 4,
-          "max_proposal_tokens": 10,
+          "max_proposal_tokens": 16,
           "history_scope": "request"
         }
       },
@@ -302,9 +180,7 @@ package can expose native MTP plus a request-local cache sidecar as follows:
           "primary": "mtp",
           "extender": "cache",
           "extension_policy": {
-            "initial_tokens": 2,
-            "max_tokens": 8,
-            "tail_backoff_proposals": 5
+            "max_tokens": 16
           }
         }
       }
@@ -313,160 +189,61 @@ package can expose native MTP plus a request-local cache sidecar as follows:
 }
 ```
 
-Use the following stable strategy names:
-
-| Strategy | Composition | Benchmark condition |
-|---|---|---|
-| `mtp` | Native MTP proposer | MTP |
-| `mtp-cache` | Native MTP primary plus request-local cache N-gram tail | MTP + N-gram cache |
-
-`disabled` is an operator control rather than a package strategy; it supplies
-the no-MTP baseline. Every listed strategy is still target-verified.
-
-### Operator Configuration
-
-Choose a package strategy with `speculative.strategy`. `auto` uses the package
-default; `disabled` turns speculation off; `mtp` preserves the direct native
-MTP path. A named strategy such as `mtp-cache` is valid only when the selected
-package declares it. Packages provide the recommended bounds and topology for
-a model, while an explicit direct-GGUF configuration enables the request-local
-cache by combining native MTP with valid N-gram bounds.
+Equivalent model configuration is:
 
 ```toml
-[defaults.speculative]
-strategy = "auto"
-
 [[models]]
 model = "meshllm/GLM-4.7-Flash-MTP-GGUF:Q4_K_M"
 
 [models.speculative]
 strategy = "mtp-cache"
-ngram_max_proposal_tokens = 10
-extension_initial_tokens = 2
-extension_max_tokens = 8
-extension_tail_backoff_proposals = 5
+ngram_min = 2
+ngram_max = 4
+ngram_max_proposal_tokens = 16
+extension_max_tokens = 16
 verify_window_min_tokens = 1
-verify_window_max_tokens = 6
+verify_window_max_tokens = 4
 verify_window_pipeline_depth = 2
 ```
 
-### No MTP Baseline
+For comparisons, use `strategy = "mtp"` as the native-MTP control and
+`strategy = "disabled"` as the no-speculation control. The MTP + N-gram path
+does not require a standalone model or service.
 
-```bash
-mesh-llm serve meshllm/GLM-4.7-Flash-MTP-GGUF:Q4_K_M --split --no-draft
-```
+## Measurement Contract
 
-Use `[models.speculative] strategy = "disabled"` to make this an explicit
-baseline instead of relying on environment variables.
+Throughput alone is insufficient. A pipeline result must report:
 
-### Native MTP Only
-
-```bash
-mesh-llm serve meshllm/GLM-4.7-Flash-MTP-GGUF:Q4_K_M --split --no-draft
-```
-
-Use `[models.speculative] strategy = "mtp"` to force this control.
-
-### MTP With Cache-backed N-gram Extension
-
-```bash
-mesh-llm serve meshllm/GLM-4.7-Flash-MTP-GGUF:Q4_K_M --split --no-draft
-```
-
-Use `[models.speculative] strategy = "mtp-cache"` with the bounded settings
-above when the package declares that recommendation. For a direct GGUF, use
-the built-in request-local cache proposer explicitly:
-
-```toml
-[models.speculative]
-strategy = "mtp"
-ngram_min = 2
-ngram_max = 4
-ngram_max_proposal_tokens = 6
-extension_max_tokens = 6
-```
-
-With native MTP and an N-gram proposer present, mesh-llm creates the bounded
-composite plan. The package remains the preferred way to publish tested values.
-
-### Invocation Overrides
-
-`mesh-llm serve` may temporarily override a package-selected strategy without
-editing `config.toml`. CLI settings have highest precedence, then the selected
-model entry, then `[defaults.speculative]`; unspecified CLI fields retain the
-lower-layer value. Named package strategies remain package-declared. For a
-direct GGUF, the CLI may enable only the request-local cache extension, and
-only when it supplies valid N-gram bounds alongside native MTP.
-
-```bash
-mesh-llm serve meshllm/GLM-4.7-Flash-MTP-GGUF:Q4_K_M --split --no-draft \
-  --speculative-strategy mtp \
-  --speculative-ngram-min 2 \
-  --speculative-ngram-max 4 \
-  --speculative-extension-max-tokens 8 \
-  --speculative-verify-window-pipeline-depth 2
-```
-
-The supported tuning flags are `--speculative-ngram-{min,max}`,
-`--speculative-ngram-max-proposal-tokens`,
-`--speculative-extension-{initial,max}-tokens`,
-`--speculative-extension-tail-backoff-proposals`,
-`--speculative-native-mtp-{reject-cooldown-tokens,suppress-cooldown-drafts,suppress-cooldown-draft-limit}`,
-and `--speculative-verify-window-{min,max}-tokens` / `--speculative-verify-window-pipeline-depth`.
-Use `--speculative-native-mtp-allow-cooldown-drafts` to explicitly override a
-configured suppression policy to `false`.
-
-### Standalone Skippy Server
-
-`skippy-server` does not resolve layer-package recommendations. For isolated
-stage-server operation it accepts a complete, already resolved JSON
-`SpeculativeDecodeConfig` via `serve-binary --openai-speculative-config` or
-`serve-openai --speculative-config`. The file is validated as one typed plan
-before serving starts. This is intentionally not a second policy-merging path;
-normal mesh serving always resolves the package and policy in `mesh-llm`.
-
-```mermaid
-flowchart LR
-  C["SPEED-Bench client\non micstudio"] --> S0["micstudio :9337\nOpenAI frontend / stage 0"]
-  S0 --> L["Persistent direct-LAN\nbinary stage lanes"]
-  L --> S1["studio54\nstage 1"]
-  S1 --> S0
-  S0 --> C
-```
-
-The normal planner currently selected `micstudio 0..47` and `studio54 47..48`.
-Record layer ranges, direct RTT, lane count, context size, and binary commit
-with every benchmark. That shape proves normal split serving but is not directly
-comparable to historic 22/26 benchmark rows.
-
-## Telemetry And Interpretation
-
-The OpenAI response `timings` object provides aggregate evidence; debug
-telemetry supplies per-window and per-stage detail.
-
-| Question | Counters |
+| Question | Evidence |
 |---|---|
-| Is decode faster? | `predicted_per_second`, `predicted_n`, `predicted_ms` |
-| Which plan actually ran? | `llama_stage.spec.requested_strategy`, `llama_stage.spec.effective_strategy` |
-| Are proposals accepted? | `draft_n`, `draft_n_accepted` |
-| Did the sidecar widen MTP? | `native_mtp_hybrid_native_tokens`, `native_mtp_hybrid_ngram_tokens`, `native_mtp_hybrid_proposed_tokens` |
-| Were tails useful? | `native_mtp_hybrid_accepted_tail_tokens`, `native_mtp_hybrid_ngram_tail_rejections`, `native_mtp_hybrid_ngram_sidecar_backoffs` |
-| Did confidence admit or suppress N-gram? | `native_mtp_hybrid_ngram_admission_probe_attempts`, `native_mtp_hybrid_ngram_admission_promotions`, `native_mtp_hybrid_ngram_admission_revocations`, `native_mtp_hybrid_ngram_admission_probation_rejections`, `native_mtp_hybrid_ngram_admission_probation_fallbacks`, `native_mtp_hybrid_ngram_admission_suppressed_after_fallback`, `native_mtp_hybrid_ngram_admission_suppressed_unanchored`, `native_mtp_hybrid_ngram_admission_suppressed_refills`, `native_mtp_hybrid_ngram_admission_suppressed_pipeline_starts`, `native_mtp_hybrid_ngram_admission_serial_probation_verify_windows`, `native_mtp_hybrid_ngram_admission_low_support_suppressions`, `native_mtp_hybrid_ngram_admission_slow_start_accepted_tokens`, `native_mtp_hybrid_ngram_admission_slow_start_full_accept_proposals`, `native_mtp_hybrid_ngram_admission_slow_start_refill_suppressions`, `native_mtp_hybrid_ngram_admission_active`, `native_mtp_hybrid_ngram_admission_probation_failed` |
-| Was it pipelined? | `verify_window_depth`, `verify_window_opened`, `verify_window_max_in_flight`, `verify_window_stale_discarded` |
-| Did the proposer keep supplying horizon? | `verify_window_horizon_refill_attempts`, `verify_window_horizon_refill_successes`, `verify_window_horizon_refill_tokens`, `verify_window_horizon_refill_misses` |
-| Why was depth used or suppressed? | `verify_window_policy_observed_windows`, `verify_window_policy_continuation_windows`, `verify_window_policy_profitable_widths`, `verify_window_policy_permit_checks`, `verify_window_policy_permits`, `verify_window_policy_suppressed` |
-| Was concurrent speculation bounded or backpressured? | `verify_window_credit_limit`, `verify_window_credit_effective_limit_min`, `verify_window_credit_checks`, `verify_window_credit_grants`, `verify_window_credit_serial_fallbacks`, `verify_window_credit_pipeline_occupied_denials`, `verify_window_credit_fair_share_denials`, `verify_window_credit_global_limit_denials`, `verify_window_credit_fair_queue_denials`, `verify_window_credit_global_max_in_use`, `verify_window_credit_active_requests_max`, `verify_window_credit_request_max_held`, `verify_window_credit_queue_max` |
-| Which direct-return path was used? | `verify_window_direct_prediction_return_upstream_opened`, `verify_window_direct_prediction_return_reverse_fallback` |
-| Where was time spent? | `verify_window_downstream_wait_ms`, `verify_window_forward_write_ms`, `verify_window_stage0_compute_ms`, `verify_window_verify_elapsed_ms` |
+| Did it improve output rate? | wall completion TPS and `predicted_per_second` |
+| Did it reduce exposed latency? | TTFT and inter-token latency percentiles |
+| Was the queue actually full? | `verify_window_occupancy_ms_by_depth`, average in-flight, parallel/full fractions |
+| Were stages busy simultaneously? | per-window `compute_start_unix_nanos` / `compute_end_unix_nanos`, grouped by stage and window ID |
+| Was network delay hidden? | stage compute intervals versus forward-write and downstream-wait intervals |
+| What was wasted? | stale marked/discarded counts and stale compute/write/wait/elapsed time |
+| Did candidates remain useful? | proposed tokens, accepted tokens, full-accept windows, first-reject position |
+| Did the horizon remain supplied? | refill attempts, successes, tokens, and misses |
+| Was output correct? | token-for-token control comparison and finish reason |
 
-A useful hybrid run needs more than an increased `draft_n`: it needs accepted
-tail tokens, high anchor agreement, bounded stale-window work, and completion
-throughput higher than the native-MTP control.
+For the GLM-4.7 two-host lab, sweep depths `1, 2, 4, 8, 16` with matched
+prompt/output corpora, verification width, topology, lane count, sampling, and
+request concurrency. Repeat under injected inter-stage latency. The useful
+frontier is the shallowest depth where throughput approaches the bottleneck
+stage service rate and added depth mostly increases stale work.
 
-Pipeline-policy telemetry contains only bounded numeric counts and stage timing;
-it does not include prompts, completions, token IDs, paths, endpoints, or node
-identifiers. Debug OTLP export remains explicitly configured by the operator.
-Horizon refills query speculative suffixes only in request-local memory; the
-telemetry exports counts, never those suffixes or their token IDs.
-Admission telemetry is likewise limited to bounded counts and one final-state
-boolean. It does not export the matched context, speculative suffix, or tokens.
+Compare three controls in the same run family:
+
+1. native MTP;
+2. the previous PR #1026 implementation;
+3. fixed-depth non-overlapping MTP + N-gram.
+
+Report PR #938 and issue #1025 separately when their topology, model, or
+measurement method is not directly comparable.
+
+## Telemetry Privacy
+
+Pipeline telemetry contains bounded numeric counts, durations, booleans, and
+stage/window identifiers needed to join timing spans. It does not export
+prompts, completions, token IDs, speculative suffixes, paths, endpoints, or raw
+node identities. Debug OTLP export remains operator-configured.

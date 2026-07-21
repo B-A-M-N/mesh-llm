@@ -541,17 +541,9 @@ pub struct Cli {
     #[arg(long, hide = true)]
     pub speculative_ngram_max_proposal_tokens: Option<u32>,
 
-    /// Initial N-gram extension length for a composite MTP strategy.
-    #[arg(long, hide = true)]
-    pub speculative_extension_initial_tokens: Option<u32>,
-
     /// Maximum N-gram extension length for a composite MTP strategy.
     #[arg(long, hide = true)]
     pub speculative_extension_max_tokens: Option<u32>,
-
-    /// Consecutive weak extensions before the composite strategy backs off.
-    #[arg(long, hide = true)]
-    pub speculative_extension_tail_backoff_proposals: Option<u32>,
 
     /// Native MTP rejection cooldown in generated tokens.
     #[arg(long, hide = true)]

@@ -150,7 +150,7 @@ pub(super) fn handle_binary_connection(
         let session_key = session_id.to_string();
         if message.kind == WireMessageKind::VerifyWindow && !positional_speculation_supported {
             bail!(
-                "stage-state v9 positional speculation requires an attention-only stage; {} contains recurrent state",
+                "stage-state v10 positional speculation requires an attention-only stage; {} contains recurrent state",
                 config.stage_id
             );
         }
@@ -1051,7 +1051,7 @@ pub(super) fn handle_binary_connection(
             let reply_start_unix_nanos = now_unix_nanos() as u64;
             upstream_reply_start_unix_nanos.get_or_insert(reply_start_unix_nanos);
             let reply_started = Instant::now();
-            let reply_window = reply_window_for_message(&message, &predicted_tokens);
+            let reply_window = reply_window_for_message(&message);
             let reply = StageReply {
                 kind: reply_kind,
                 predicted: predicted_token,

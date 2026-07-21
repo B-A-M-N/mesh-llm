@@ -560,9 +560,7 @@ pub struct SpeculativeConfig {
     pub ngram_min: Option<u32>,
     pub ngram_max: Option<u32>,
     pub ngram_max_proposal_tokens: Option<u32>,
-    pub extension_initial_tokens: Option<u32>,
     pub extension_max_tokens: Option<u32>,
-    pub extension_tail_backoff_proposals: Option<u32>,
     pub native_mtp_reject_cooldown_tokens: Option<u32>,
     pub native_mtp_suppress_cooldown_drafts: Option<bool>,
     pub native_mtp_suppress_cooldown_draft_limit: Option<u32>,
@@ -610,9 +608,7 @@ impl SpeculativeConfig {
             ngram_min: pick!(ngram_min),
             ngram_max: pick!(ngram_max),
             ngram_max_proposal_tokens: pick!(ngram_max_proposal_tokens),
-            extension_initial_tokens: pick!(extension_initial_tokens),
             extension_max_tokens: pick!(extension_max_tokens),
-            extension_tail_backoff_proposals: pick!(extension_tail_backoff_proposals),
             native_mtp_reject_cooldown_tokens: pick!(native_mtp_reject_cooldown_tokens),
             native_mtp_suppress_cooldown_drafts: pick!(native_mtp_suppress_cooldown_drafts),
             native_mtp_suppress_cooldown_draft_limit: pick!(
@@ -678,11 +674,7 @@ struct SpeculativeConfigRaw {
     #[serde(default)]
     ngram_max_proposal_tokens: Option<u32>,
     #[serde(default)]
-    extension_initial_tokens: Option<u32>,
-    #[serde(default)]
     extension_max_tokens: Option<u32>,
-    #[serde(default)]
-    extension_tail_backoff_proposals: Option<u32>,
     #[serde(default)]
     native_mtp_reject_cooldown_tokens: Option<u32>,
     #[serde(default)]
@@ -732,9 +724,7 @@ impl<'de> Deserialize<'de> for SpeculativeConfig {
             ngram_min: raw.ngram_min,
             ngram_max: raw.ngram_max,
             ngram_max_proposal_tokens: raw.ngram_max_proposal_tokens,
-            extension_initial_tokens: raw.extension_initial_tokens,
             extension_max_tokens: raw.extension_max_tokens,
-            extension_tail_backoff_proposals: raw.extension_tail_backoff_proposals,
             native_mtp_reject_cooldown_tokens: raw.native_mtp_reject_cooldown_tokens,
             native_mtp_suppress_cooldown_drafts: raw.native_mtp_suppress_cooldown_drafts,
             native_mtp_suppress_cooldown_draft_limit: raw.native_mtp_suppress_cooldown_draft_limit,
@@ -783,12 +773,7 @@ impl Serialize for SpeculativeConfig {
         map.serialize_entry("ngram_min", &self.ngram_min)?;
         map.serialize_entry("ngram_max", &self.ngram_max)?;
         map.serialize_entry("ngram_max_proposal_tokens", &self.ngram_max_proposal_tokens)?;
-        map.serialize_entry("extension_initial_tokens", &self.extension_initial_tokens)?;
         map.serialize_entry("extension_max_tokens", &self.extension_max_tokens)?;
-        map.serialize_entry(
-            "extension_tail_backoff_proposals",
-            &self.extension_tail_backoff_proposals,
-        )?;
         map.serialize_entry(
             "native_mtp_reject_cooldown_tokens",
             &self.native_mtp_reject_cooldown_tokens,

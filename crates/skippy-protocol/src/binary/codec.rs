@@ -588,16 +588,12 @@ fn read_reply_stats(mut reader: impl Read) -> io::Result<StageReplyStats> {
 }
 
 fn write_reply_window(mut writer: impl Write, window: StageReplyWindow) -> io::Result<()> {
-    write_i32(&mut writer, window.window_id)?;
-    write_i32(&mut writer, window.accepted_len)?;
-    write_i32(&mut writer, window.correction_token)
+    write_i32(&mut writer, window.window_id)
 }
 
 fn read_reply_window(mut reader: impl Read) -> io::Result<StageReplyWindow> {
     Ok(StageReplyWindow {
         window_id: read_i32(&mut reader)?,
-        accepted_len: read_i32(&mut reader)?,
-        correction_token: read_i32(&mut reader)?,
     })
 }
 

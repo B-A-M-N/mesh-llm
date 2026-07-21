@@ -67,9 +67,7 @@ pub(super) fn apply_speculative_behavior(
             push_range_constraint(setting, Some(format!("{prefix}.ngram_min")), None);
         }
         "ngram_max_proposal_tokens"
-        | "extension_initial_tokens"
         | "extension_max_tokens"
-        | "extension_tail_backoff_proposals"
         | "native_mtp_reject_cooldown_tokens"
         | "native_mtp_suppress_cooldown_drafts"
         | "native_mtp_suppress_cooldown_draft_limit"

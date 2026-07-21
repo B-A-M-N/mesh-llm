@@ -27,38 +27,6 @@ pub mod attr {
         "llama_stage.verify_window.direct_return_upstream_opened";
     pub const VERIFY_WINDOW_DIRECT_RETURN_REVERSE_FALLBACK: &str =
         "llama_stage.verify_window.direct_return_reverse_fallback";
-    pub const VERIFY_WINDOW_CREDIT_LIMIT: &str = "llama_stage.verify_window.credit_limit";
-    pub const VERIFY_WINDOW_CREDIT_EFFECTIVE_LIMIT_MIN: &str =
-        "llama_stage.verify_window.credit_effective_limit_min";
-    pub const VERIFY_WINDOW_CREDIT_UNMETERED_PROGRESS_WINDOWS: &str =
-        "llama_stage.verify_window.credit_unmetered_progress_windows";
-    pub const VERIFY_WINDOW_CREDIT_CHECKS: &str = "llama_stage.verify_window.credit_checks";
-    pub const VERIFY_WINDOW_CREDIT_GRANTS: &str = "llama_stage.verify_window.credit_grants";
-    pub const VERIFY_WINDOW_CREDIT_SERIAL_FALLBACKS: &str =
-        "llama_stage.verify_window.credit_serial_fallbacks";
-    pub const VERIFY_WINDOW_CREDIT_PIPELINE_OCCUPIED_DENIALS: &str =
-        "llama_stage.verify_window.credit_pipeline_occupied_denials";
-    pub const VERIFY_WINDOW_CREDIT_FAIR_SHARE_DENIALS: &str =
-        "llama_stage.verify_window.credit_fair_share_denials";
-    pub const VERIFY_WINDOW_CREDIT_GLOBAL_LIMIT_DENIALS: &str =
-        "llama_stage.verify_window.credit_global_limit_denials";
-    pub const VERIFY_WINDOW_CREDIT_FAIR_QUEUE_DENIALS: &str =
-        "llama_stage.verify_window.credit_fair_queue_denials";
-    pub const VERIFY_WINDOW_CREDIT_LOCK_POISONED_DENIALS: &str =
-        "llama_stage.verify_window.credit_lock_poisoned_denials";
-    pub const VERIFY_WINDOW_CREDIT_GLOBAL_MAX_IN_USE: &str =
-        "llama_stage.verify_window.credit_global_max_in_use";
-    pub const VERIFY_WINDOW_CREDIT_ACTIVE_REQUESTS_MAX: &str =
-        "llama_stage.verify_window.credit_active_requests_max";
-    pub const VERIFY_WINDOW_CREDIT_REQUEST_MAX_HELD: &str =
-        "llama_stage.verify_window.credit_request_max_held";
-    pub const VERIFY_WINDOW_CREDIT_QUEUE_MAX: &str = "llama_stage.verify_window.credit_queue_max";
-    pub const NGRAM_SLOW_START_ACCEPTED_TOKENS: &str =
-        "llama_stage.native_mtp.hybrid_ngram_admission_slow_start_accepted_token_count";
-    pub const NGRAM_SLOW_START_FULL_ACCEPT_PROPOSALS: &str =
-        "llama_stage.native_mtp.hybrid_ngram_admission_slow_start_full_accept_proposal_count";
-    pub const NGRAM_SLOW_START_REFILL_SUPPRESSIONS: &str =
-        "llama_stage.native_mtp.hybrid_ngram_admission_slow_start_refill_suppression_count";
 }
 
 pub mod metric {

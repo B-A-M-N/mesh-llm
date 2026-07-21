@@ -211,9 +211,7 @@ fn speculative_overrides_from_cli(
     overrides.ngram_min = cli.speculative_ngram_min;
     overrides.ngram_max = cli.speculative_ngram_max;
     overrides.ngram_max_proposal_tokens = cli.speculative_ngram_max_proposal_tokens;
-    overrides.extension_initial_tokens = cli.speculative_extension_initial_tokens;
     overrides.extension_max_tokens = cli.speculative_extension_max_tokens;
-    overrides.extension_tail_backoff_proposals = cli.speculative_extension_tail_backoff_proposals;
     overrides.native_mtp_reject_cooldown_tokens = cli.speculative_native_mtp_reject_cooldown_tokens;
     overrides.native_mtp_suppress_cooldown_drafts = suppress_cooldown_drafts;
     overrides.native_mtp_suppress_cooldown_draft_limit =

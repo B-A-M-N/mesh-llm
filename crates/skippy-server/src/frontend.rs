@@ -16,7 +16,6 @@ mod prefix_cache;
 mod prompting;
 mod request;
 mod speculative;
-mod speculative_credits;
 mod tool_emulation;
 mod util;
 

@@ -14,19 +14,86 @@ use crate::frontend::{
         PersistentStageLanePool, PhaseTimer, StageOpenAiBackend, TokenControl,
     },
     speculative::OpenAiSpeculativeStats,
-    speculative_credits::SpeculativeCredit,
     util::openai_io_error,
 };
 
 pub(super) struct PipelinedCompositeWindow {
     pub(super) epoch: u64,
     pub(super) stale: bool,
+    pub(super) starts_epoch: bool,
     pub(super) window: VerifyWindow,
     pub(super) input_tokens: Vec<i32>,
-    pub(super) proposal_token: i32,
+    pub(super) proposal_tokens: Vec<i32>,
     pub(super) native_mtp_token_count: usize,
-    pub(super) _speculative_credit: Option<SpeculativeCredit>,
+    pub(super) planned_advance_tokens: usize,
     pub(super) dispatched: DispatchedEmbeddedStage,
+}
+
+pub(super) struct PipelinedWindowLayout {
+    pub(super) pos_start: usize,
+    pub(super) decode_step: usize,
+    pub(super) input_tokens: Vec<i32>,
+}
+
+/// Places an epoch-start chunk and its non-overlapping continuations on one
+/// monotonically increasing absolute token axis.
+pub(super) fn pipelined_window_layout(
+    prefill_token_count: usize,
+    decoded_tokens: usize,
+    queued_advance_tokens: usize,
+    starts_epoch: bool,
+    current: i32,
+    proposal_tokens: &[i32],
+) -> PipelinedWindowLayout {
+    let continuation_offset = usize::from(!starts_epoch);
+    let decode_step = decoded_tokens + queued_advance_tokens + continuation_offset;
+    let mut input_tokens = Vec::with_capacity(proposal_tokens.len() + usize::from(starts_epoch));
+    if starts_epoch {
+        input_tokens.push(current);
+    }
+    input_tokens.extend_from_slice(proposal_tokens);
+    PipelinedWindowLayout {
+        pos_start: prefill_token_count + decode_step,
+        decode_step,
+        input_tokens,
+    }
+}
+
+/// Reconstructs the target predictions for one proposal span.
+///
+/// The epoch-start traversal predicts every proposal plus one free token. A
+/// continuation predicts proposal 2..K plus the free token; proposal 1 is the
+/// preceding traversal's boundary prediction.
+pub(super) fn compose_target_predictions(
+    starts_epoch: bool,
+    proposal_count: usize,
+    prior_boundary_prediction: Option<i32>,
+    traversal_predictions: &[i32],
+) -> OpenAiResult<Vec<i32>> {
+    let required = proposal_count.saturating_add(1);
+    if starts_epoch {
+        if traversal_predictions.len() < required {
+            return Err(OpenAiError::backend(format!(
+                "epoch-start verify window returned {} predictions; expected {required}",
+                traversal_predictions.len()
+            )));
+        }
+        return Ok(traversal_predictions[..required].to_vec());
+    }
+
+    let boundary = prior_boundary_prediction.ok_or_else(|| {
+        OpenAiError::backend("continuation verify window has no prior boundary prediction")
+    })?;
+    if traversal_predictions.len() < proposal_count {
+        return Err(OpenAiError::backend(format!(
+            "continuation verify window returned {} predictions; expected {proposal_count}",
+            traversal_predictions.len()
+        )));
+    }
+    let mut predictions = Vec::with_capacity(required);
+    predictions.push(boundary);
+    predictions.extend_from_slice(&traversal_predictions[..proposal_count]);
+    Ok(predictions)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -59,7 +126,7 @@ pub(super) fn queued_active_tokens(windows: &VecDeque<PipelinedCompositeWindow>)
     windows
         .iter()
         .filter(|window| !window.stale)
-        .map(|window| window.input_tokens.len())
+        .map(|window| window.planned_advance_tokens)
         .sum()
 }
 
@@ -79,6 +146,37 @@ pub(super) fn mark_epoch_stale(
         }
     }
     marked
+}
+
+#[cfg(test)]
+mod prediction_tests {
+    use super::*;
+
+    #[test]
+    fn epoch_start_uses_its_own_boundary_prediction() {
+        let predictions = compose_target_predictions(true, 2, None, &[11, 12, 13]).unwrap();
+
+        assert_eq!(predictions, [11, 12, 13]);
+    }
+
+    #[test]
+    fn continuation_prepends_the_prior_boundary_prediction() {
+        let predictions = compose_target_predictions(false, 2, Some(11), &[12, 13]).unwrap();
+
+        assert_eq!(predictions, [11, 12, 13]);
+    }
+
+    #[test]
+    fn continuation_starts_after_the_epoch_start_traversal_without_overlap() {
+        let first = pipelined_window_layout(100, 4, 0, true, 10, &[11, 12]);
+        let second = pipelined_window_layout(100, 4, 2, false, 12, &[13, 14]);
+
+        assert_eq!(first.pos_start, 104);
+        assert_eq!(first.input_tokens, [10, 11, 12]);
+        assert_eq!(second.pos_start, 107);
+        assert_eq!(second.input_tokens, [13, 14]);
+        assert_eq!(first.pos_start + first.input_tokens.len(), second.pos_start);
+    }
 }
 
 /// Extends the optimistic branch without adding speculative tokens to the
@@ -217,7 +315,7 @@ impl StageOpenAiBackend {
             .insert_summary_attrs(&mut attrs, summary.native_mtp_options);
         summary
             .verify_window_scheduler
-            .insert_policy_telemetry_attrs(&mut attrs);
+            .insert_pipeline_telemetry_attrs(&mut attrs);
 
         cache_stats.native_mtp_stats = summary.native_mtp_stats;
         cache_stats.native_mtp_decode_telemetry = Some(NativeMtpDecodeTelemetry::new(

@@ -7,10 +7,10 @@ use super::super::{
     AdaptiveVerifyWindow, BufferedCompositeProposal, CachedNgramProposer,
     CompositeProposalProvider, EmbeddedStageZeroGeneration, NativeMtpDecodeCounters,
     NativeMtpDecodeOptions, NativeMtpDraft, NativeMtpDraftOrigin, NativeMtpVerifier,
-    NgramExtensionPolicy, NgramSidecarController, PendingNativeMtpDraft, PhaseTimer,
-    StageOpenAiBackend, TokenControl, VerifyWindowMessageArgs, VerifyWindowScheduler,
-    WireSamplingConfig, classify_native_mtp_position, classify_native_mtp_verify_window,
-    embedded_verify_window_message, ms_to_us, token_is_eog_with_runtime,
+    NgramSidecarController, PendingNativeMtpDraft, PhaseTimer, StageOpenAiBackend, TokenControl,
+    VerifyWindowMessageArgs, VerifyWindowScheduler, WireSamplingConfig,
+    classify_native_mtp_verify_window, embedded_verify_window_message, ms_to_us,
+    token_is_eog_with_runtime,
 };
 
 /// Control signal returned after processing a batched native MTP verify step.
@@ -93,13 +93,9 @@ impl StageOpenAiBackend {
                     native_mtp_tokens,
                     context_tokens,
                     native_mtp_remaining.saturating_sub(1),
-                    NgramExtensionPolicy::new(
-                        ngram_sidecar_controller.extension_limit(
-                            native_mtp_tokens,
-                            native_mtp_remaining.saturating_sub(native_mtp_tokens.len() + 1),
-                        ),
-                        ngram_sidecar_controller.minimum_support(),
-                        request.prompt_token_ids.len(),
+                    ngram_sidecar_controller.extension_limit(
+                        native_mtp_tokens,
+                        native_mtp_remaining.saturating_sub(native_mtp_tokens.len() + 1),
                     ),
                     cached_ngram_proposer.as_mut(),
                 )?;
@@ -116,8 +112,7 @@ impl StageOpenAiBackend {
             .as_ref()
             .map(BufferedCompositeProposal::remaining_native_mtp_tokens)
             .unwrap_or_default();
-        let verify_width = ngram_sidecar_controller
-            .verify_width(requested_verify_width, remaining_native_mtp_tokens);
+        let verify_width = ngram_sidecar_controller.verify_width(requested_verify_width);
         let proposal_tokens = {
             let buffer = proposal_buffer
                 .as_ref()
@@ -127,13 +122,7 @@ impl StageOpenAiBackend {
         if proposal_tokens.is_empty() {
             return Ok(NativeMtpVerifyWindowControl::NoProposal);
         }
-        let exact_positional_verify =
-            ngram_sidecar_controller.exact_positional_verify() && remaining_native_mtp_tokens == 0;
-        let verify_inputs = if exact_positional_verify {
-            vec![*current]
-        } else {
-            native_mtp_verify_window_inputs(*current, &proposal_tokens)
-        };
+        let verify_inputs = native_mtp_verify_window_inputs(*current, &proposal_tokens);
         let window =
             verify_window_scheduler.open(prefill_token_count + *decoded_tokens, *decoded_tokens)?;
         let message = embedded_verify_window_message(
@@ -163,17 +152,13 @@ impl StageOpenAiBackend {
                 "verify window scheduler lost FIFO state",
             ));
         }
-        let native_mtp_verify_decision = if exact_positional_verify {
-            classify_native_mtp_position(proposal_tokens[0], &verify.reply.predicted_tokens)?
-        } else {
-            classify_native_mtp_verify_window(
-                &proposal_tokens,
-                &verify.reply.predicted_tokens,
-                *decoded_tokens,
-                request.max_tokens as usize,
-                |token| token_is_eog_with_runtime(&self.runtime, token),
-            )?
-        };
+        let native_mtp_verify_decision = classify_native_mtp_verify_window(
+            &proposal_tokens,
+            &verify.reply.predicted_tokens,
+            *decoded_tokens,
+            request.max_tokens as usize,
+            |token| token_is_eog_with_runtime(&self.runtime, token),
+        )?;
         let target_token = verify.reply.predicted_tokens[0];
         let verify_next_mtp_draft = next_native_mtp_draft(
             request.native_mtp_enabled,
@@ -233,15 +218,11 @@ impl StageOpenAiBackend {
             let dependent_target_rejected = if fully_accepted_window {
                 buffer.accept_window(
                     &proposal_tokens,
-                    (!exact_positional_verify)
-                        .then(|| {
-                            verify
-                                .reply
-                                .predicted_tokens
-                                .get(proposal_tokens.len())
-                                .copied()
-                        })
-                        .flatten(),
+                    verify
+                        .reply
+                        .predicted_tokens
+                        .get(proposal_tokens.len())
+                        .copied(),
                 )
             } else {
                 buffer.reject_window(native_mtp_verify_decision.accepted_proposal_tokens);
@@ -290,11 +271,9 @@ impl StageOpenAiBackend {
             let buffer = proposal_buffer
                 .take()
                 .expect("empty proposal buffer retained");
-            if ngram_sidecar_controller.observe_tail_outcome(
-                buffer.proposal(),
-                accepted_proposal_tokens,
-                native_mtp_options.ngram_tail_backoff_proposals,
-            ) {
+            if ngram_sidecar_controller
+                .observe_tail_outcome(buffer.proposal(), accepted_proposal_tokens)
+            {
                 native_mtp_counters.observe_ngram_tail_rejection();
             }
             native_mtp_counters

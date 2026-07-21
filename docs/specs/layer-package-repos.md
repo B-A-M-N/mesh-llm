@@ -321,9 +321,7 @@ without changing the MTP source:
       "primary": "mtp",
       "extender": "cache",
       "extension_policy": {
-        "initial_tokens": 2,
-        "max_tokens": 8,
-        "tail_backoff_proposals": 5
+        "max_tokens": 8
       }
     }
   }
@@ -335,8 +333,8 @@ Supported proposer types are `native-mtp` and `ngram-cache`. An
 and `ngram_max` no greater than `4`, llama.cpp's current cache match-window
 limit. It contains only target-committed history for one request and is never shared
 between users or sessions. A `composite` strategy MUST use a `native-mtp`
-primary and an N-gram extender. Its `extension_policy` bounds the adaptive
-tail; every combined candidate is still verified by one target VerifyWindow.
+primary and an N-gram extender. Its `extension_policy` bounds the fixed
+request-local continuation horizon; every combined candidate is target-verified.
 
 The package schema separates a proposer match length from its output budget:
 
@@ -347,8 +345,7 @@ The package schema separates a proposer match length from its output budget:
 | `ngram_min` / `ngram_max` | N-gram proposers | Define the historical token match range. Both are required and `ngram_min <= ngram_max`. |
 | `max_proposal_tokens` | N-gram proposers | Caps how many continuation tokens the proposer may return. It is independent of `ngram_max`. |
 | `history_scope` | `ngram-cache` | Must be `"request"`; a cache proposer never observes another request's tokens. |
-| `initial_tokens` / `max_tokens` | composite extension policy | Bound the adaptive N-gram tail after an MTP prefix. |
-| `tail_backoff_proposals` | composite extension policy | Sets how many proposals to back off after an unhelpful tail. |
+| `max_tokens` | composite extension policy | Bounds the N-gram continuation horizon after an MTP prefix. |
 
 `ngram-cache` is a request-local incremental lookup that starts after a
 provisional MTP prefix; its

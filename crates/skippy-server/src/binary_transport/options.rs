@@ -204,11 +204,7 @@ mod tests {
                 max_ngram: 4,
                 max_proposal_tokens: 6,
             }),
-            extension: Some(NgramExtensionConfig {
-                initial_tokens: 2,
-                max_tokens: 6,
-                tail_backoff_proposals: 2,
-            }),
+            extension: Some(NgramExtensionConfig { max_tokens: 6 }),
             verify_window: VerifyWindowConfig {
                 min_tokens: 1,
                 max_tokens: 6,
