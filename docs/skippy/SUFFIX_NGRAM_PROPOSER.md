@@ -328,6 +328,54 @@ standalone response timings now report generic proposed, accepted, rejected,
 and acceptance totals. These fixes make the arms comparable and do not change
 the suffix lookup algorithm.
 
+### MTP extension GLM-4.7 split result (2026-07-21)
+
+We then repeated the same workload as an MTP extension matrix: MTP-only,
+MTP+Simple, MTP+Cache, and MTP+Suffix. The model, 47/1-layer split, eight lanes,
+zero injected delay, disabled prefix cache, prompt, 384-token output limit,
+sampling, warmups, and five measured requests were unchanged. Arms ran
+sequentially on the shared lab hardware, and response telemetry confirmed that
+each configured extension contributed N-gram tokens. Every metrics run
+completed with seven requests, no dropped events, and no export errors.
+
+| MTP arm | Server decode tok/s | End-to-end tok/s | Server / end-to-end uplift vs MTP | Relevant acceptance | N-gram proposed / accepted per request |
+|---|---:|---:|---:|---:|---:|
+| MTP only | 30.53 | 25.84 | — | 53.9% native | — |
+| MTP + Simple | 56.56 | 42.16 | +85.2% / +63.2% | 12.6% N-gram tail | 2,059 / 259 |
+| MTP + Cache | 64.62 | 46.40 | +111.6% / +79.5% | 37.6% N-gram tail | 712 / 268 |
+| MTP + Suffix | **78.05** | **53.24** | **+155.6% / +106.0%** | **35.9% N-gram tail** | **806 / 289** |
+
+This is the clearest evidence for evaluating useful speculative width rather
+than acceptance percentage alone. Suffix has lower N-gram-tail acceptance than
+Cache (35.9% versus 37.6%) but accepts more tail tokens per request (289 versus
+268). It is consequently 20.8% faster in server decode throughput and 14.7%
+faster end to end than Cache.
+
+The comparison against MTP-only is stronger still. Overall composite
+acceptance falls from 53.9% for MTP-only to 37.0% for MTP+Suffix, while accepted
+speculative tokens rise from 103 to 315 per request. Server throughput improves
+by 155.6% and end-to-end throughput by 106.0%. A wider proposal can therefore
+produce much more accepted work per verification sequence even when its
+acceptance ratio is lower.
+
+The hybrid matrix does not supersede the standalone result. On this
+exact-copy-heavy prompt, standalone Suffix remains faster at 119.24 server
+tok/s and 68.49 end-to-end tok/s. The hybrid result answers the narrower
+question: extending an already active MTP proposer materially beats MTP-only,
+and Suffix was the fastest MTP extension tested.
+
+The same correctness limitation applies. MTP-only reproduced the target-only
+output hash, while every extension arm diverged at the novel edit line before
+returning to copied source. All arms were deterministic within-arm, but this
+microbenchmark proves a throughput mechanism rather than equivalent code
+quality or an exact greedy trajectory.
+
+Finally, legacy `draft_n` response fields are inconsistent on some fragmented
+direct-return hybrid replies; the Cache arm can report more accepted than
+proposed tokens there. The table uses the explicit, internally consistent
+`native_mtp_hybrid_*` counters. The known direct-return aggregation fix must be
+present before legacy draft fields are used in a public report.
+
 ## Production Readiness
 
 This branch establishes runtime capability, not production certification. The
@@ -363,8 +411,9 @@ following work should be completed before making suffix a package default:
 
 ### Runtime and performance certification
 
-- Run release builds on the GLM 4.7 split with long coding/edit traffic and a
-  low-overlap control, comparing both standalone and MTP-composite matrices.
+- Expand the measured GLM 4.7 mechanism matrix beyond one repeated coding
+  prompt: add longer multi-file edits, tool-loop traffic, a low-overlap control,
+  and quality scoring while retaining both standalone and MTP-composite arms.
 - Repeat at 0, 20, and 100 ms injected inter-stage RTT and report stage overlap,
   downstream wait, stale work, acceptance, wall TPS, and server TPS.
 - Set memory and lookup-cost guardrails for adversarial repetitive contexts;
