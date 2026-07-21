@@ -377,47 +377,58 @@ fn resolve_decode_config(input: DecodeResolutionInput<'_>) -> Result<Speculative
     .map_or(config.native_mtp.suppress_cooldown_draft_limit, |value| {
         value as usize
     });
-    config.verify_window.min_tokens = pick_optional_u32(
-        input
-            .model_config
-            .and_then(|config| config.verify_window_min_tokens),
-        input
-            .global_config
-            .and_then(|config| config.verify_window_min_tokens),
-    )
-    .map_or(config.verify_window.min_tokens, |value| value as usize);
-    config.verify_window.max_tokens = pick_optional_u32(
-        input
-            .model_config
-            .and_then(|config| config.verify_window_max_tokens),
-        input
-            .global_config
-            .and_then(|config| config.verify_window_max_tokens),
-    )
-    .map_or(config.verify_window.max_tokens, |value| value as usize);
-    config.verify_window.pipeline_depth = pick_optional_u32(
-        input
-            .model_config
-            .and_then(|config| config.verify_window_pipeline_depth),
-        input
-            .global_config
-            .and_then(|config| config.verify_window_pipeline_depth),
-    )
-    .map_or(config.verify_window.pipeline_depth, |value| value as usize);
-    config.verify_window.pipeline_force = pick_owned(
-        input
-            .model_config
-            .and_then(|config| config.verify_window_pipeline_force),
-        input
-            .global_config
-            .and_then(|config| config.verify_window_pipeline_force),
-    )
-    .unwrap_or(config.verify_window.pipeline_force);
+    resolve_verify_window_config(&mut config.verify_window, &input);
     if config.verify_window.min_tokens > config.verify_window.max_tokens {
         bail!("skippy speculative verify window requires min_tokens <= max_tokens");
     }
     config.validate()?;
     Ok(config)
+}
+
+/// Apply model/global config overrides onto the resolved verify-window config.
+/// Extracted from `resolve_decode_config` to keep that function within the
+/// clippy line limit; each field prefers model config, then global, then the
+/// already-resolved default.
+fn resolve_verify_window_config(
+    verify_window: &mut VerifyWindowConfig,
+    input: &DecodeResolutionInput<'_>,
+) {
+    verify_window.min_tokens = pick_optional_u32(
+        input
+            .model_config
+            .and_then(|config| config.verify_window_min_tokens),
+        input
+            .global_config
+            .and_then(|config| config.verify_window_min_tokens),
+    )
+    .map_or(verify_window.min_tokens, |value| value as usize);
+    verify_window.max_tokens = pick_optional_u32(
+        input
+            .model_config
+            .and_then(|config| config.verify_window_max_tokens),
+        input
+            .global_config
+            .and_then(|config| config.verify_window_max_tokens),
+    )
+    .map_or(verify_window.max_tokens, |value| value as usize);
+    verify_window.pipeline_depth = pick_optional_u32(
+        input
+            .model_config
+            .and_then(|config| config.verify_window_pipeline_depth),
+        input
+            .global_config
+            .and_then(|config| config.verify_window_pipeline_depth),
+    )
+    .map_or(verify_window.pipeline_depth, |value| value as usize);
+    verify_window.pipeline_force = pick_owned(
+        input
+            .model_config
+            .and_then(|config| config.verify_window_pipeline_force),
+        input
+            .global_config
+            .and_then(|config| config.verify_window_pipeline_force),
+    )
+    .unwrap_or(verify_window.pipeline_force);
 }
 
 fn package_decode_config(
