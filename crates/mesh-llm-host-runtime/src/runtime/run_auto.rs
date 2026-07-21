@@ -598,9 +598,10 @@ pub(super) async fn start_run_auto_node_and_plugins(
     .await?;
     node.set_swarm_capture_recorder(swarm_capture);
     attach_local_release_attestation(&node).await?;
-    node.set_stage_control_sender(skippy::spawn_stage_control_loop(Some(Arc::new(
-        node.clone(),
-    ))))
+    node.set_stage_control_sender(skippy::spawn_stage_control_loop(
+        Some(Arc::new(node.clone())),
+        skippy_telemetry_options(options),
+    ))
     .await;
     node.start_accepting();
     node.set_display_name(node_display_name(options, &node))

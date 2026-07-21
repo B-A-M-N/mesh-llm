@@ -193,6 +193,12 @@ pub(crate) struct SkippyTelemetryOptions {
     pub(crate) level: TelemetryLevel,
 }
 
+impl Default for SkippyTelemetryOptions {
+    fn default() -> Self {
+        Self::off()
+    }
+}
+
 impl SkippyTelemetryOptions {
     pub(crate) fn off() -> Self {
         Self {

@@ -246,4 +246,7 @@ measurement method is not directly comparable.
 Pipeline telemetry contains bounded numeric counts, durations, booleans, and
 stage/window identifiers needed to join timing spans. It does not export
 prompts, completions, token IDs, speculative suffixes, paths, endpoints, or raw
-node identities. Debug OTLP export remains operator-configured.
+node identities. Debug OTLP export remains operator-configured. Every worker
+applies its own node-local telemetry policy and endpoint when a stage is loaded;
+telemetry destinations are not copied from the coordinator or sent over the
+stage-control protocol.

@@ -15,6 +15,7 @@ use crate::frontend::generation::StageOpenAiBackend;
 use crate::frontend::util::ms_to_us;
 use crate::frontend::util::openai_backend_error;
 use crate::frontend::util::openai_io_error;
+use crate::telemetry::now_unix_nanos;
 use openai_frontend::OpenAiError;
 use openai_frontend::OpenAiResult;
 use serde_json::json;
@@ -132,6 +133,26 @@ impl StageOpenAiBackend {
             }
         };
         let stage0_compute_ms = stage0_timer.elapsed_ms();
+        if self.telemetry.is_debug_enabled() {
+            let mut attrs = self.openai_attrs(request.ids);
+            attrs.insert(
+                "llama_stage.message_kind".to_string(),
+                json!(format!("{:?}", message.kind)),
+            );
+            attrs.insert(
+                "llama_stage.token_count".to_string(),
+                json!(message.token_count),
+            );
+            if let Some(window_id) = message.verify_window_id() {
+                attrs.insert("llama_stage.verify_window_id".to_string(), json!(window_id));
+            }
+            self.telemetry.emit_debug_span(
+                "stage.openai_stage0_llama_decode",
+                attrs,
+                stage0_timer.start_unix_nanos,
+                now_unix_nanos() as u64,
+            );
+        }
         let forwarded = forwarded_stage_message_timed(
             request.config,
             message,
