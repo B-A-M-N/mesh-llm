@@ -141,7 +141,21 @@ pub(in crate::frontend) struct NativeMtpDecodeCounters {
     adaptive_verify_window_width_max: usize,
     adaptive_verify_window_grow_count: usize,
     adaptive_verify_window_shrink_count: usize,
+    // Phase 0 survival curve: per logical composite proposal, how far the draft
+    // stayed correct, split by source. `eligible_ge[k]` counts proposals that
+    // actually offered depth k+1 (index 0 = depth 1); `survived_ge[k]` counts
+    // those accepted through depth k+1. P(A>=k) = survived_ge[k-1]/eligible_ge[k-1].
+    // Lets us measure acceptance depth `g` per source x workload (benchmark-side)
+    // to decide whether pipelining depth pays. Stale-drained proposals excluded.
+    logical_proposal_count: usize,
+    native_eligible_ge: [usize; SURVIVAL_DEPTHS],
+    native_survived_ge: [usize; SURVIVAL_DEPTHS],
+    ngram_eligible_ge: [usize; SURVIVAL_DEPTHS],
+    ngram_survived_ge: [usize; SURVIVAL_DEPTHS],
 }
+
+/// Survival curve tracks depths 1..=8 (native MTP max draft depth is 8).
+pub(in crate::frontend) const SURVIVAL_DEPTHS: usize = 8;
 
 impl NativeMtpDecodeCounters {
     pub(in crate::frontend) fn verify_window_verification_count(&self) -> usize {
@@ -215,6 +229,50 @@ impl NativeMtpDecodeCounters {
         self.hybrid_native_mtp_token_count += proposal.native_mtp_token_count();
         self.hybrid_ngram_token_count += proposal.ngram_token_count();
         self.hybrid_pure_ngram_proposal_count += usize::from(proposal.is_pure_ngram());
+        self.observe_survival(
+            proposal.native_mtp_token_count(),
+            proposal.ngram_token_count(),
+            accepted_token_count,
+        );
+    }
+
+    /// Feed the per-source survival curve for one retired logical proposal.
+    ///
+    /// The proposal is a single linear candidate stream: `native` MTP tokens
+    /// first, then `ngram` tail tokens. `accepted` is how many led tokens the
+    /// target actually confirmed (including the free-target token when it
+    /// matched the next buffered candidate — the caller already folds that in).
+    ///
+    /// Decomposition (expert-reviewed): native survival is `min(accepted, N)`;
+    /// ngram survival only counts once the native prefix fully survived, so a
+    /// native failure never contaminates ngram quality. `eligible_ge[k]` is
+    /// only incremented when the source actually offered depth `k+1`.
+    fn observe_survival(&mut self, native: usize, ngram: usize, accepted: usize) {
+        self.logical_proposal_count += 1;
+        let native_survived = accepted.min(native);
+        // Tail is only eligible/measured after the whole native prefix survived.
+        let ngram_survived = if accepted >= native {
+            (accepted - native).min(ngram)
+        } else {
+            0
+        };
+        for depth in 1..=SURVIVAL_DEPTHS {
+            let idx = depth - 1;
+            if native >= depth {
+                self.native_eligible_ge[idx] += 1;
+                if native_survived >= depth {
+                    self.native_survived_ge[idx] += 1;
+                }
+            }
+            // Ngram tail depth is only meaningful when the native prefix fully
+            // survived (else the tail was never actually reached/verified).
+            if ngram >= depth && accepted >= native {
+                self.ngram_eligible_ge[idx] += 1;
+                if ngram_survived >= depth {
+                    self.ngram_survived_ge[idx] += 1;
+                }
+            }
+        }
     }
 
     pub(in crate::frontend) fn observe_ngram_tail_rejection(&mut self) {
@@ -492,6 +550,28 @@ impl NativeMtpDecodeCounters {
             "native_mtp_adaptive_verify_window_shrinks".to_string(),
             json!(self.adaptive_verify_window_shrink_count),
         );
+        // Phase 0 survival curve (arrays indexed by depth-1, i.e. [0]=depth 1).
+        // P(A>=k) per source = survived_ge[k-1] / eligible_ge[k-1].
+        timings.insert(
+            "native_mtp_survival_logical_proposals".to_string(),
+            json!(self.logical_proposal_count),
+        );
+        timings.insert(
+            "native_mtp_survival_native_eligible_ge".to_string(),
+            json!(self.native_eligible_ge),
+        );
+        timings.insert(
+            "native_mtp_survival_native_survived_ge".to_string(),
+            json!(self.native_survived_ge),
+        );
+        timings.insert(
+            "native_mtp_survival_ngram_eligible_ge".to_string(),
+            json!(self.ngram_eligible_ge),
+        );
+        timings.insert(
+            "native_mtp_survival_ngram_survived_ge".to_string(),
+            json!(self.ngram_survived_ge),
+        );
     }
 }
 
@@ -556,6 +636,55 @@ impl NativeMtpDecodeTelemetry {
 mod tests {
     use super::super::CompositeProposalProvider;
     use super::*;
+
+    // Survival decomposition: native=3, ngram=4, all 7 accepted (+ free target
+    // folded in by caller => accepted can exceed proposal len; min() caps it).
+    #[test]
+    fn survival_full_accept_counts_both_sources_to_their_depth() {
+        let mut c = NativeMtpDecodeCounters::default();
+        c.observe_survival(3, 4, 7);
+        assert_eq!(c.logical_proposal_count, 1);
+        // native eligible+survived at depths 1..=3
+        assert_eq!(&c.native_eligible_ge[0..3], &[1, 1, 1]);
+        assert_eq!(&c.native_survived_ge[0..3], &[1, 1, 1]);
+        assert_eq!(c.native_eligible_ge[3], 0);
+        // ngram eligible+survived at depths 1..=4
+        assert_eq!(&c.ngram_eligible_ge[0..4], &[1, 1, 1, 1]);
+        assert_eq!(&c.ngram_survived_ge[0..4], &[1, 1, 1, 1]);
+    }
+
+    // Native fails partway: ngram tail must NOT be counted eligible (it was
+    // never reached), so native failure can't contaminate ngram quality.
+    #[test]
+    fn survival_native_partial_reject_excludes_ngram_tail() {
+        let mut c = NativeMtpDecodeCounters::default();
+        c.observe_survival(3, 4, 2); // only 2 of 3 native accepted
+        assert_eq!(&c.native_eligible_ge[0..3], &[1, 1, 1]);
+        assert_eq!(&c.native_survived_ge[0..3], &[1, 1, 0]); // survived depth 1,2 not 3
+        // ngram never reached -> not eligible at any depth
+        assert_eq!(c.ngram_eligible_ge.iter().sum::<usize>(), 0);
+        assert_eq!(c.ngram_survived_ge.iter().sum::<usize>(), 0);
+    }
+
+    // Ngram partial: native fully survived, ngram accepted 2 of 4.
+    #[test]
+    fn survival_ngram_partial_accept() {
+        let mut c = NativeMtpDecodeCounters::default();
+        c.observe_survival(3, 4, 5); // 3 native + 2 ngram
+        assert_eq!(&c.native_survived_ge[0..3], &[1, 1, 1]);
+        assert_eq!(&c.ngram_eligible_ge[0..4], &[1, 1, 1, 1]);
+        assert_eq!(&c.ngram_survived_ge[0..4], &[1, 1, 0, 0]);
+    }
+
+    // Pure-ngram proposal (native=0): everything is tail from depth 1.
+    #[test]
+    fn survival_pure_ngram_proposal() {
+        let mut c = NativeMtpDecodeCounters::default();
+        c.observe_survival(0, 5, 3); // 0 native, 3 of 5 ngram accepted
+        assert_eq!(c.native_eligible_ge.iter().sum::<usize>(), 0);
+        assert_eq!(&c.ngram_eligible_ge[0..5], &[1, 1, 1, 1, 1]);
+        assert_eq!(&c.ngram_survived_ge[0..5], &[1, 1, 1, 0, 0]);
+    }
 
     fn options() -> NativeMtpDecodeOptions {
         NativeMtpDecodeOptions {
