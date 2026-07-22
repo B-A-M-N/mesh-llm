@@ -200,6 +200,7 @@ fn local_openai_backend(config: StageConfig) -> Result<StageOpenAiBackend> {
         draft: None,
         speculative_window: 0,
         adaptive_speculative_window: false,
+        ngram_max: 0,
         speculative: SpeculativeDecodeConfig::default(),
         generation_limit: Arc::new(Semaphore::new(1)),
         generation_queue_depth: Arc::new(AtomicUsize::new(0)),
@@ -390,6 +391,7 @@ async fn real_multimodal_split_smoke_when_fixture_is_set() -> Result<()> {
         draft: None,
         speculative_window: 0,
         adaptive_speculative_window: false,
+        ngram_max: 0,
         speculative: SpeculativeDecodeConfig {
             native_mtp: NativeMtpProposalConfig {
                 enabled: true,

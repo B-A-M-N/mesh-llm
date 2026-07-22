@@ -5,7 +5,7 @@ use serde_json::json;
 use skippy_protocol::binary::{StageWireMessage, WireReplyKind, recv_reply, write_stage_message};
 
 use crate::frontend::{
-    CachedNgramProposer, CompositeProposalPipeline, NativeMtpDecodeCounters,
+    CompositeProposalPipeline, HistoryNgramProposer, NativeMtpDecodeCounters,
     NativeMtpDecodeOptions, NativeMtpDecodeTelemetry, NativeMtpStats,
     decode_scheduler::{VerifyWindow, VerifyWindowScheduler},
     embedded_execution::DispatchedEmbeddedStage,
@@ -185,7 +185,7 @@ mod prediction_tests {
 pub(super) fn refill_pipeline_ngram_candidates(
     pipeline: &mut CompositeProposalPipeline,
     committed_tokens: &[i32],
-    cached_ngram_proposer: &mut Option<CachedNgramProposer>,
+    cached_ngram_proposer: &mut Option<HistoryNgramProposer>,
     max_tokens: usize,
 ) -> OpenAiResult<usize> {
     if max_tokens == 0 {
@@ -451,7 +451,7 @@ mod tests {
     #[test]
     fn refills_from_an_optimistic_suffix_without_indexing_it() {
         let committed = vec![1, 2, 3, 1, 2, 3, 1, 2];
-        let mut cache = Some(CachedNgramProposer::new(2, 2).unwrap());
+        let mut cache = Some(HistoryNgramProposer::new_cache(2, 2).unwrap());
         let initial = cache.as_mut().unwrap().propose(&committed, &[], 2).unwrap();
         assert_eq!(initial, vec![3, 1]);
         let proposal = NativeMtpHybridProposal::from_parts(initial, 0, true);

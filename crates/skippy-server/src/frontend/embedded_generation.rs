@@ -9,7 +9,8 @@ use crate::binary_transport::{
 };
 use crate::frontend::request::wire_sampling_config;
 use crate::frontend::speculative::{
-    OpenAiSpeculativeStats, classify_verify_window, verify_inputs_for_proposals,
+    OpenAiSpeculativeStats, classify_verify_window, propose_configured_ngram_tokens,
+    verify_inputs_for_proposals,
 };
 use crate::frontend::util::{
     ms_to_us, openai_backend_error, openai_io_error, saturating_u32, token_is_eog_with_runtime,
@@ -858,7 +859,7 @@ impl StageOpenAiBackend {
                     }
                 }
             }
-            let mut cached_ngram_proposer = CachedNgramProposer::from_config(request.speculative)?;
+            let mut cached_ngram_proposer = HistoryNgramProposer::from_config(request.speculative)?;
             let max_speculative_window = request.speculative_window.max(1);
             let mut adaptive_window = if request.adaptive_speculative_window {
                 max_speculative_window.min(4)
@@ -869,7 +870,9 @@ impl StageOpenAiBackend {
                 adaptive_window_start: adaptive_window,
                 adaptive_window_final: adaptive_window,
                 adaptive_window_max: max_speculative_window,
-                adaptive_window_min: if request.draft.is_some() {
+                adaptive_window_min: if request.draft.is_some()
+                    || request.speculative.ngram.is_some()
+                {
                     adaptive_window
                 } else {
                     0
@@ -1439,7 +1442,7 @@ impl StageOpenAiBackend {
                         continue;
                     }
                 }
-                if draft_guard.is_some() {
+                if draft_guard.is_some() || request.speculative.ngram.is_some() {
                     let remaining = (request.max_tokens as usize).saturating_sub(decoded_tokens);
                     if remaining == 0 {
                         break;
@@ -1457,6 +1460,18 @@ impl StageOpenAiBackend {
                             .map_err(openai_backend_error)?;
                         if !draft_tokens.is_empty() {
                             proposal_source = "draft-model";
+                        }
+                    }
+                    if draft_tokens.is_empty() && request.speculative.ngram.is_some() {
+                        let proposal = propose_configured_ngram_tokens(
+                            request.speculative,
+                            &mut cached_ngram_proposer,
+                            &context_tokens,
+                            proposal_limit.min(request.ngram_max),
+                        )?;
+                        draft_tokens = proposal.tokens;
+                        if !draft_tokens.is_empty() {
+                            proposal_source = proposal.source;
                         }
                     }
                     let draft_propose_ms = propose_timer.elapsed_ms();
@@ -1902,6 +1917,9 @@ impl StageOpenAiBackend {
                 native_mtp_counters
                     .observe_hybrid_proposal(pipeline.proposal(), pipeline.accepted_tokens());
                 native_mtp.clear_pending_draft();
+            }
+            if let Some(proposer) = cached_ngram_proposer.as_ref() {
+                native_mtp_counters.observe_history_ngram_proposer(proposer.stats());
             }
             let native_mtp_stats = native_mtp.stats();
             self.record_embedded_decode_summary(

@@ -4,8 +4,8 @@ use openai_frontend::{OpenAiError, OpenAiResult};
 use skippy_protocol::binary::{StageNativeMtpDraft, WireReplyKind};
 
 use super::super::{
-    AdaptiveVerifyWindow, BufferedCompositeProposal, CachedNgramProposer,
-    CompositeProposalProvider, EmbeddedStageZeroGeneration, NativeMtpDecodeCounters,
+    AdaptiveVerifyWindow, BufferedCompositeProposal, CompositeProposalProvider,
+    EmbeddedStageZeroGeneration, HistoryNgramProposer, NativeMtpDecodeCounters,
     NativeMtpDecodeOptions, NativeMtpDraft, NativeMtpDraftOrigin, NativeMtpVerifier,
     NgramSidecarController, PendingNativeMtpDraft, PhaseTimer, StageOpenAiBackend, TokenControl,
     VerifyWindowMessageArgs, VerifyWindowScheduler, WireSamplingConfig,
@@ -38,7 +38,7 @@ impl StageOpenAiBackend {
         verify_window_scheduler: &mut VerifyWindowScheduler,
         pending_native_mtp_draft: Option<PendingNativeMtpDraft>,
         proposal_buffer: &mut Option<BufferedCompositeProposal>,
-        cached_ngram_proposer: &mut Option<CachedNgramProposer>,
+        cached_ngram_proposer: &mut Option<HistoryNgramProposer>,
         adaptive_verify_window: &mut AdaptiveVerifyWindow,
         current: &mut i32,
         decode_step: u32,

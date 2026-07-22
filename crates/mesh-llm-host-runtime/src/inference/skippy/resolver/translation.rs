@@ -6,7 +6,9 @@ use std::{
 
 use anyhow::{Result, bail};
 use openai_frontend::OpenAiHookPolicy;
-use skippy_protocol::{LoadMode, StageConfig, StageKvCacheConfig, StageKvCachePayload};
+use skippy_protocol::{
+    LoadMode, StageConfig, StageKvCacheConfig, StageKvCacheMode, StageKvCachePayload,
+};
 use skippy_server::{
     EmbeddedOpenAiArgs, EmbeddedOpenAiRequestDefaults, EmbeddedRuntimeOptions,
     NativeMtpProposalConfig, SpeculativeDecodeConfig, telemetry::Telemetry,
@@ -278,13 +280,30 @@ impl ResolvedSkippyConfig {
             if self.skippy.prefill_controls_explicit {
                 bail!("skippy prefill chunk controls require staged serving");
             }
+            // A stage with no downstream delegates to generate_local_tokens, which
+            // has no N-gram verification path. Reject a standalone N-gram plan here
+            // rather than silently running target-only while reporting a proposer.
+            if self.speculative.decode.ngram.is_some()
+                && !self.speculative.decode.native_mtp.enabled
+            {
+                bail!(
+                    "standalone N-gram speculation ({}) requires multi-stage split serving; \
+                     single-stage and direct GGUF requests have no N-gram verification path",
+                    self.speculative.decode.effective_strategy
+                );
+            }
         }
         Ok(())
     }
 
-    fn speculative_mode_for_embedded(&self, _staged: bool) -> &'static str {
+    fn speculative_mode_for_embedded(&self, staged: bool) -> &'static str {
         if self.speculative.mode == "draft" && self.speculative.draft_model_path.is_some() {
             "draft"
+        } else if staged
+            && self.speculative.decode.ngram.is_some()
+            && !self.speculative.decode.native_mtp.enabled
+        {
+            "ngram"
         } else {
             "disabled"
         }
@@ -293,6 +312,12 @@ impl ResolvedSkippyConfig {
     fn speculative_window_for_embedded(&self, mode: &str) -> usize {
         match mode {
             "draft" => self.speculative.draft_max_tokens as usize,
+            "ngram" => self
+                .speculative
+                .decode
+                .ngram
+                .as_ref()
+                .map_or(0, |ngram| ngram.max_proposal_tokens),
             _ => 0,
         }
     }
@@ -303,7 +328,15 @@ impl ResolvedSkippyConfig {
     ) -> Result<Option<StageKvCacheConfig>> {
         match &self.model_fit.prefix_cache {
             ResolvedStageKvCache::FamilyDefault => Ok(family_default),
-            ResolvedStageKvCache::Disabled => Ok(None),
+            ResolvedStageKvCache::Disabled => Ok(Some(StageKvCacheConfig {
+                mode: StageKvCacheMode::Disabled,
+                payload: StageKvCachePayload::Auto,
+                max_entries: 0,
+                max_bytes: 0,
+                min_tokens: 0,
+                shared_prefix_stride_tokens: 0,
+                shared_prefix_record_limit: 0,
+            })),
             ResolvedStageKvCache::Explicit(template) => {
                 let mut cache = family_default.unwrap_or(StageKvCacheConfig {
                     mode: template.mode.clone(),

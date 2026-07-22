@@ -171,6 +171,7 @@ impl StageOpenAiBackend {
                     speculative_window: self.speculative_window,
                     adaptive_speculative_window: self.adaptive_speculative_window,
                     speculative: &self.speculative,
+                    ngram_max: self.ngram_max,
                     native_mtp_enabled: config.native_mtp_enabled
                         && self.speculative.native_mtp.enabled,
                     prompt_token_ids: &prompt_token_ids,

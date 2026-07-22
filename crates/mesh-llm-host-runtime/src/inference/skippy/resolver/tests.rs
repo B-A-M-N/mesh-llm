@@ -742,6 +742,36 @@ fn family_policy_wires_prefix_cache_by_default_for_supported_models() {
 }
 
 #[test]
+fn explicit_prefix_cache_disable_overrides_supported_family_default() {
+    let model_file = temp_model_file();
+    let config = parse_config(
+        r#"
+[defaults.model_fit.prefix_cache]
+enabled = false
+"#,
+    );
+    let resolved = resolve_skippy_config(SkippyConfigResolveRequest {
+        mesh_config: &config,
+        model_id: "Qwen/Qwen3-0.6B:Q4_K_M",
+        model_path: model_file.path(),
+        model_bytes: 4 * 1024 * 1024 * 1024,
+        allocatable_memory_bytes: None,
+        request_defaults: None,
+        package_generation: None,
+    })
+    .expect("config should resolve");
+
+    let stage_config = resolved
+        .to_stage_config(Some(fake_package_identity(24)), LoadMode::RuntimeSlice)
+        .expect("stage config should build");
+    let kv_cache = stage_config
+        .kv_cache
+        .expect("explicit disable must survive family-default materialization");
+
+    assert_eq!(kv_cache.mode, StageKvCacheMode::Disabled);
+}
+
+#[test]
 fn staged_controls_propagate_into_stage_config_and_embedded_openai_args() {
     let mesh_config = parse_config(
         r#"

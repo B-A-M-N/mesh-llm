@@ -52,6 +52,7 @@ pub(in crate::frontend) struct StageOpenAiBackend {
     pub(in crate::frontend) draft: Option<Arc<Mutex<DraftRunner>>>,
     pub(in crate::frontend) speculative_window: usize,
     pub(in crate::frontend) adaptive_speculative_window: bool,
+    pub(in crate::frontend) ngram_max: usize,
     pub(in crate::frontend) speculative: SpeculativeDecodeConfig,
     pub(in crate::frontend) generation_limit: Arc<Semaphore>,
     pub(in crate::frontend) generation_queue_depth: Arc<AtomicUsize>,
@@ -146,6 +147,7 @@ pub(in crate::frontend) struct EmbeddedStageZeroGeneration<'a> {
     pub(in crate::frontend) draft: Option<Arc<Mutex<DraftRunner>>>,
     pub(in crate::frontend) speculative_window: usize,
     pub(in crate::frontend) adaptive_speculative_window: bool,
+    pub(in crate::frontend) ngram_max: usize,
     pub(in crate::frontend) speculative: &'a SpeculativeDecodeConfig,
     pub(in crate::frontend) native_mtp_enabled: bool,
     pub(in crate::frontend) prompt_token_ids: &'a [i32],
@@ -238,10 +240,20 @@ impl GeneratedText {
 
     pub(in crate::frontend) fn timings(&self) -> Option<BTreeMap<String, Value>> {
         let stats = self.native_mtp_stats;
-        let (drafted_tokens, accepted_tokens) = self
+        let native_totals = self
             .native_mtp_decode_telemetry
             .and_then(NativeMtpDecodeTelemetry::composite_proposal_totals)
             .unwrap_or((stats.drafted_tokens, stats.accepted_tokens));
+        let (drafted_tokens, accepted_tokens) = self
+            .speculative_stats
+            .as_ref()
+            .filter(|stats| stats.windows > 0)
+            .map_or(native_totals, |stats| {
+                (
+                    u64::try_from(stats.draft_tokens).unwrap_or(u64::MAX),
+                    u64::try_from(stats.accepted_tokens).unwrap_or(u64::MAX),
+                )
+            });
         let mut timings = BTreeMap::from([
             ("prompt_n".to_string(), json!(self.prompt_tokens)),
             ("prompt_ms".to_string(), json!(self.prompt_ms)),

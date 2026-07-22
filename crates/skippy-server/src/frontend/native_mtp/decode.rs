@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 
 use super::{NativeMtpDraftOrigin, NativeMtpHybridProposal};
 use crate::frontend::SpeculativeDecodeConfig;
+use crate::frontend::speculative::HistoryNgramProposerStats;
 use serde_json::{Value, json};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -12,6 +13,7 @@ pub(in crate::frontend) struct NativeMtpDecodeOptions {
     pub(in crate::frontend) suppress_cooldown_drafts: bool,
     pub(in crate::frontend) suppress_cooldown_draft_limit: usize,
     pub(in crate::frontend) ngram_hybrid: bool,
+    pub(in crate::frontend) ngram_proposer: &'static str,
     pub(in crate::frontend) ngram_size: usize,
     pub(in crate::frontend) ngram_max_proposal_tokens: usize,
     pub(in crate::frontend) verify_window_min_tokens: usize,
@@ -30,6 +32,10 @@ impl NativeMtpDecodeOptions {
             suppress_cooldown_drafts: config.native_mtp.suppress_cooldown_drafts,
             suppress_cooldown_draft_limit: config.native_mtp.suppress_cooldown_draft_limit,
             ngram_hybrid: config.extension.is_some() && config.ngram.is_some(),
+            ngram_proposer: config
+                .ngram
+                .as_ref()
+                .map_or("none", |ngram| ngram.kind.as_str()),
             ngram_size: config.ngram.as_ref().map_or(0, |ngram| ngram.min_ngram),
             ngram_max_proposal_tokens: config
                 .extension
@@ -104,6 +110,17 @@ pub(in crate::frontend) struct NativeMtpDecodeCounters {
     hybrid_pure_ngram_proposal_count: usize,
     hybrid_accepted_native_mtp_token_count: usize,
     hybrid_ngram_tail_rejection_count: usize,
+    hybrid_ngram_sidecar_backoff_count: usize,
+    ngram_proposer_attempt_count: usize,
+    ngram_proposer_hit_count: usize,
+    ngram_proposer_proposed_token_count: usize,
+    ngram_proposer_match_length_sum: usize,
+    ngram_proposer_match_length_max: usize,
+    ngram_proposer_candidates_examined: usize,
+    ngram_proposer_appended_tokens: usize,
+    ngram_proposer_rebuild_count: usize,
+    ngram_proposer_sync_us: u64,
+    ngram_proposer_lookup_us: u64,
     adaptive_verify_window_count: usize,
     adaptive_verify_window_width_sum: usize,
     adaptive_verify_window_width_min: usize,
@@ -190,6 +207,22 @@ impl NativeMtpDecodeCounters {
         self.hybrid_ngram_tail_rejection_count += 1;
     }
 
+    pub(in crate::frontend) fn observe_history_ngram_proposer(
+        &mut self,
+        stats: HistoryNgramProposerStats,
+    ) {
+        self.ngram_proposer_attempt_count = stats.attempts;
+        self.ngram_proposer_hit_count = stats.hits;
+        self.ngram_proposer_proposed_token_count = stats.proposed_tokens;
+        self.ngram_proposer_match_length_sum = stats.match_length_sum;
+        self.ngram_proposer_match_length_max = stats.match_length_max;
+        self.ngram_proposer_candidates_examined = stats.candidates_examined;
+        self.ngram_proposer_appended_tokens = stats.appended_tokens;
+        self.ngram_proposer_rebuild_count = stats.rebuilds;
+        self.ngram_proposer_sync_us = stats.sync_us;
+        self.ngram_proposer_lookup_us = stats.lookup_us;
+    }
+
     pub(in crate::frontend) fn observe_adaptive_verify_window(
         &mut self,
         width: usize,
@@ -236,6 +269,10 @@ impl NativeMtpDecodeCounters {
         attrs.insert(
             "llama_stage.native_mtp.ngram_hybrid".to_string(),
             json!(options.ngram_hybrid),
+        );
+        attrs.insert(
+            "llama_stage.native_mtp.ngram_proposer".to_string(),
+            json!(options.ngram_proposer),
         );
         attrs.insert(
             "llama_stage.native_mtp.ngram_size".to_string(),
@@ -330,6 +367,50 @@ impl NativeMtpDecodeCounters {
             json!(self.hybrid_ngram_tail_rejection_count),
         );
         attrs.insert(
+            "llama_stage.native_mtp.hybrid_ngram_sidecar_backoff_count".to_string(),
+            json!(self.hybrid_ngram_sidecar_backoff_count),
+        );
+        attrs.insert(
+            "llama_stage.native_mtp.ngram_proposer_attempt_count".to_string(),
+            json!(self.ngram_proposer_attempt_count),
+        );
+        attrs.insert(
+            "llama_stage.native_mtp.ngram_proposer_hit_count".to_string(),
+            json!(self.ngram_proposer_hit_count),
+        );
+        attrs.insert(
+            "llama_stage.native_mtp.ngram_proposer_proposed_token_count".to_string(),
+            json!(self.ngram_proposer_proposed_token_count),
+        );
+        attrs.insert(
+            "llama_stage.native_mtp.ngram_proposer_match_length_sum".to_string(),
+            json!(self.ngram_proposer_match_length_sum),
+        );
+        attrs.insert(
+            "llama_stage.native_mtp.ngram_proposer_match_length_max".to_string(),
+            json!(self.ngram_proposer_match_length_max),
+        );
+        attrs.insert(
+            "llama_stage.native_mtp.ngram_proposer_candidates_examined".to_string(),
+            json!(self.ngram_proposer_candidates_examined),
+        );
+        attrs.insert(
+            "llama_stage.native_mtp.ngram_proposer_appended_tokens".to_string(),
+            json!(self.ngram_proposer_appended_tokens),
+        );
+        attrs.insert(
+            "llama_stage.native_mtp.ngram_proposer_rebuild_count".to_string(),
+            json!(self.ngram_proposer_rebuild_count),
+        );
+        attrs.insert(
+            "llama_stage.native_mtp.ngram_proposer_sync_us".to_string(),
+            json!(self.ngram_proposer_sync_us),
+        );
+        attrs.insert(
+            "llama_stage.native_mtp.ngram_proposer_lookup_us".to_string(),
+            json!(self.ngram_proposer_lookup_us),
+        );
+        attrs.insert(
             "llama_stage.native_mtp.hybrid_pure_ngram_proposal_count".to_string(),
             json!(self.hybrid_pure_ngram_proposal_count),
         );
@@ -401,6 +482,50 @@ impl NativeMtpDecodeCounters {
             json!(self.hybrid_ngram_tail_rejection_count),
         );
         timings.insert(
+            "native_mtp_hybrid_ngram_sidecar_backoffs".to_string(),
+            json!(self.hybrid_ngram_sidecar_backoff_count),
+        );
+        timings.insert(
+            "native_mtp_ngram_proposer_attempts".to_string(),
+            json!(self.ngram_proposer_attempt_count),
+        );
+        timings.insert(
+            "native_mtp_ngram_proposer_hits".to_string(),
+            json!(self.ngram_proposer_hit_count),
+        );
+        timings.insert(
+            "native_mtp_ngram_proposer_proposed_tokens".to_string(),
+            json!(self.ngram_proposer_proposed_token_count),
+        );
+        timings.insert(
+            "native_mtp_ngram_proposer_match_length_sum".to_string(),
+            json!(self.ngram_proposer_match_length_sum),
+        );
+        timings.insert(
+            "native_mtp_ngram_proposer_match_length_max".to_string(),
+            json!(self.ngram_proposer_match_length_max),
+        );
+        timings.insert(
+            "native_mtp_ngram_proposer_candidates_examined".to_string(),
+            json!(self.ngram_proposer_candidates_examined),
+        );
+        timings.insert(
+            "native_mtp_ngram_proposer_appended_tokens".to_string(),
+            json!(self.ngram_proposer_appended_tokens),
+        );
+        timings.insert(
+            "native_mtp_ngram_proposer_rebuilds".to_string(),
+            json!(self.ngram_proposer_rebuild_count),
+        );
+        timings.insert(
+            "native_mtp_ngram_proposer_sync_us".to_string(),
+            json!(self.ngram_proposer_sync_us),
+        );
+        timings.insert(
+            "native_mtp_ngram_proposer_lookup_us".to_string(),
+            json!(self.ngram_proposer_lookup_us),
+        );
+        timings.insert(
             "native_mtp_hybrid_pure_ngram_proposals".to_string(),
             json!(self.hybrid_pure_ngram_proposal_count),
         );
@@ -461,6 +586,10 @@ impl NativeMtpDecodeTelemetry {
             json!(self.options.ngram_hybrid),
         );
         timings.insert(
+            "native_mtp_ngram_proposer".to_string(),
+            json!(self.options.ngram_proposer),
+        );
+        timings.insert(
             "native_mtp_ngram_size".to_string(),
             json!(self.options.ngram_size),
         );
@@ -484,7 +613,7 @@ impl NativeMtpDecodeTelemetry {
 mod tests {
     use super::super::CompositeProposalProvider;
     use super::*;
-    use crate::frontend::CachedNgramProposer;
+    use crate::frontend::HistoryNgramProposer;
 
     fn options() -> NativeMtpDecodeOptions {
         NativeMtpDecodeOptions {
@@ -494,6 +623,7 @@ mod tests {
             suppress_cooldown_drafts: false,
             suppress_cooldown_draft_limit: 0,
             ngram_hybrid: true,
+            ngram_proposer: "cache",
             ngram_size: 2,
             ngram_max_proposal_tokens: 4,
             verify_window_min_tokens: 1,
@@ -503,7 +633,7 @@ mod tests {
 
     fn composite_proposal() -> NativeMtpHybridProposal {
         let context = [1, 2, 3, 1, 2, 3, 1, 2];
-        let mut cache = CachedNgramProposer::new(2, 2).unwrap();
+        let mut cache = HistoryNgramProposer::new_cache(2, 2).unwrap();
         CompositeProposalProvider::from_options(options())
             .propose_with_ngram_extension(&[3], &context, 4, 4, Some(&mut cache))
             .unwrap()
@@ -514,6 +644,7 @@ mod tests {
         let config = SpeculativeDecodeConfig {
             extension: Some(crate::frontend::NgramExtensionConfig { max_tokens: 7 }),
             ngram: Some(crate::frontend::NgramProposalConfig {
+                kind: crate::frontend::NgramProposerKind::Cache,
                 min_ngram: 2,
                 max_ngram: 4,
                 max_proposal_tokens: 7,
@@ -523,6 +654,7 @@ mod tests {
 
         let options = NativeMtpDecodeOptions::from_config(&config);
 
+        assert_eq!(options.ngram_proposer, "cache");
         assert_eq!(options.ngram_max_proposal_tokens, 7);
     }
 
@@ -549,6 +681,7 @@ mod tests {
                 suppress_cooldown_drafts: false,
                 suppress_cooldown_draft_limit: 2,
                 ngram_hybrid: true,
+                ngram_proposer: "cache",
                 ngram_size: 8,
                 ngram_max_proposal_tokens: 4,
                 verify_window_min_tokens: 1,
@@ -647,6 +780,18 @@ mod tests {
         counters.observe_verify_window_verification(NativeMtpDraftOrigin::InitialSerial, true);
         counters.observe_hybrid_proposal(&composite_proposal(), 3);
         counters.observe_adaptive_verify_window(2, 2, 3);
+        counters.observe_history_ngram_proposer(HistoryNgramProposerStats {
+            attempts: 7,
+            hits: 4,
+            proposed_tokens: 12,
+            match_length_sum: 27,
+            match_length_max: 9,
+            candidates_examined: 18,
+            appended_tokens: 15,
+            rebuilds: 1,
+            sync_us: 21,
+            lookup_us: 34,
+        });
         let telemetry = NativeMtpDecodeTelemetry::new(
             NativeMtpDecodeOptions {
                 max_draft_tokens: 1,
@@ -655,6 +800,7 @@ mod tests {
                 suppress_cooldown_drafts: false,
                 suppress_cooldown_draft_limit: 0,
                 ngram_hybrid: true,
+                ngram_proposer: "cache",
                 ngram_size: 8,
                 ngram_max_proposal_tokens: 4,
                 verify_window_min_tokens: 1,
@@ -669,6 +815,26 @@ mod tests {
         assert_eq!(
             timings.get("native_mtp_ngram_hybrid_enabled"),
             Some(&json!(true))
+        );
+        assert_eq!(
+            timings.get("native_mtp_ngram_proposer"),
+            Some(&json!("cache"))
+        );
+        assert_eq!(
+            timings.get("native_mtp_ngram_proposer_attempts"),
+            Some(&json!(7))
+        );
+        assert_eq!(
+            timings.get("native_mtp_ngram_proposer_match_length_max"),
+            Some(&json!(9))
+        );
+        assert_eq!(
+            timings.get("native_mtp_ngram_proposer_appended_tokens"),
+            Some(&json!(15))
+        );
+        assert_eq!(
+            timings.get("native_mtp_ngram_proposer_lookup_us"),
+            Some(&json!(34))
         );
         assert_eq!(
             timings.get("native_mtp_hybrid_native_tokens"),
@@ -707,7 +873,7 @@ mod tests {
     fn composite_proposal_totals_include_pure_ngram_candidates() {
         let mut counters = NativeMtpDecodeCounters::default();
         let context = [1, 2, 3, 1, 2, 3, 1, 2];
-        let mut cache = CachedNgramProposer::new(2, 2).unwrap();
+        let mut cache = HistoryNgramProposer::new_cache(2, 2).unwrap();
         let proposal = CompositeProposalProvider::from_options(options())
             .propose_with_ngram_extension(&[], &context, 4, 4, Some(&mut cache))
             .unwrap();

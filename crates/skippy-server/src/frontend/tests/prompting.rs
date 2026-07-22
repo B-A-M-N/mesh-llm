@@ -205,10 +205,46 @@ fn generated_text_timings_are_present_without_native_mtp() {
 }
 
 #[test]
+fn generated_text_timings_report_standalone_speculative_totals() {
+    let output = GeneratedText {
+        prompt_tokens: 4,
+        completion_tokens: 8,
+        cache_status: "disabled",
+        cached_prompt_tokens: 0,
+        matched_prefix_tokens: 0,
+        suffix_prefill_tokens: 0,
+        cache_hit_kind: None,
+        native_mtp_stats: NativeMtpStats::default(),
+        native_mtp_decode_telemetry: None,
+        verify_window_pipeline_stats: None,
+        speculative_stats: Some(OpenAiSpeculativeStats {
+            windows: 3,
+            draft_tokens: 12,
+            accepted_tokens: 9,
+            rejected_tokens: 3,
+            ..OpenAiSpeculativeStats::default()
+        }),
+        prompt_ms: 20.0,
+        predicted_ms: 100.0,
+        text: "Paris".to_string(),
+        finish_reason: FinishReason::Stop,
+        detokenize_ms: 0.0,
+        text_emit_ms: 0.0,
+        eog_check_ms: 0.0,
+    };
+
+    let timings = output.timings().expect("standalone speculative timings");
+    assert_eq!(timings.get("draft_n"), Some(&json!(12)));
+    assert_eq!(timings.get("draft_n_accepted"), Some(&json!(9)));
+    assert_eq!(timings.get("speculative_windows"), Some(&json!(3)));
+    assert_eq!(timings.get("speculative_accept_rate"), Some(&json!(0.75)));
+}
+
+#[test]
 fn generated_text_timings_prefer_composite_proposal_totals() {
     let mut counters = NativeMtpDecodeCounters::default();
     let context = [1, 2, 3, 1, 2, 3, 1, 2];
-    let mut cache = CachedNgramProposer::new(2, 2).unwrap();
+    let mut cache = HistoryNgramProposer::new_cache(2, 2).unwrap();
     let options = NativeMtpDecodeOptions {
         max_draft_tokens: 1,
         min_draft_tokens: 0,
@@ -216,6 +252,7 @@ fn generated_text_timings_prefer_composite_proposal_totals() {
         suppress_cooldown_drafts: false,
         suppress_cooldown_draft_limit: 0,
         ngram_hybrid: true,
+        ngram_proposer: "cache",
         ngram_size: 2,
         ngram_max_proposal_tokens: 4,
         verify_window_min_tokens: 1,

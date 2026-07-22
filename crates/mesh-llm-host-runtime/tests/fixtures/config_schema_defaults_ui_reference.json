@@ -876,6 +876,13 @@
       }
     },
     {
+      "canonical_path": "defaults.speculative.ngram_proposer",
+      "support": "supported",
+      "source": {
+        "kind": "built_in"
+      }
+    },
+    {
       "canonical_path": "defaults.speculative.pairing_fault",
       "support": "supported",
       "source": {

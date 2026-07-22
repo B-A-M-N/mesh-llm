@@ -560,6 +560,7 @@ pub struct SpeculativeConfig {
     pub ngram_min: Option<u32>,
     pub ngram_max: Option<u32>,
     pub ngram_max_proposal_tokens: Option<u32>,
+    pub ngram_proposer: Option<String>,
     pub extension_max_tokens: Option<u32>,
     pub native_mtp_reject_cooldown_tokens: Option<u32>,
     pub native_mtp_suppress_cooldown_drafts: Option<bool>,
@@ -608,6 +609,7 @@ impl SpeculativeConfig {
             ngram_min: pick!(ngram_min),
             ngram_max: pick!(ngram_max),
             ngram_max_proposal_tokens: pick!(ngram_max_proposal_tokens),
+            ngram_proposer: pick!(ngram_proposer),
             extension_max_tokens: pick!(extension_max_tokens),
             native_mtp_reject_cooldown_tokens: pick!(native_mtp_reject_cooldown_tokens),
             native_mtp_suppress_cooldown_drafts: pick!(native_mtp_suppress_cooldown_drafts),
@@ -674,6 +676,8 @@ struct SpeculativeConfigRaw {
     #[serde(default)]
     ngram_max_proposal_tokens: Option<u32>,
     #[serde(default)]
+    ngram_proposer: Option<String>,
+    #[serde(default)]
     extension_max_tokens: Option<u32>,
     #[serde(default)]
     native_mtp_reject_cooldown_tokens: Option<u32>,
@@ -724,6 +728,7 @@ impl<'de> Deserialize<'de> for SpeculativeConfig {
             ngram_min: raw.ngram_min,
             ngram_max: raw.ngram_max,
             ngram_max_proposal_tokens: raw.ngram_max_proposal_tokens,
+            ngram_proposer: raw.ngram_proposer,
             extension_max_tokens: raw.extension_max_tokens,
             native_mtp_reject_cooldown_tokens: raw.native_mtp_reject_cooldown_tokens,
             native_mtp_suppress_cooldown_drafts: raw.native_mtp_suppress_cooldown_drafts,
@@ -773,6 +778,7 @@ impl Serialize for SpeculativeConfig {
         map.serialize_entry("ngram_min", &self.ngram_min)?;
         map.serialize_entry("ngram_max", &self.ngram_max)?;
         map.serialize_entry("ngram_max_proposal_tokens", &self.ngram_max_proposal_tokens)?;
+        map.serialize_entry("ngram_proposer", &self.ngram_proposer)?;
         map.serialize_entry("extension_max_tokens", &self.extension_max_tokens)?;
         map.serialize_entry(
             "native_mtp_reject_cooldown_tokens",

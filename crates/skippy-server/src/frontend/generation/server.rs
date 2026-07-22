@@ -18,7 +18,9 @@ use crate::frontend::generation::open_draft_runner;
 use crate::frontend::generation::prewarm_generation_sessions;
 use crate::frontend::prefill::PrefillChunkPolicy;
 use crate::frontend::prefill::PrefillChunkPolicyArgs;
-use crate::frontend::speculative::{SpeculativeDecodeConfig, load_standalone_speculative_config};
+use crate::frontend::speculative::{
+    SpeculativeDecodeConfig, load_standalone_speculative_config, standalone_ngram_proposal_limit,
+};
 use crate::kv_integration::{KvStageIntegration, model_requires_recurrent_state};
 use crate::runtime_state::RuntimeState;
 use crate::runtime_state::load_runtime;
@@ -129,6 +131,7 @@ pub async fn serve_openai(args: ServeOpenAiArgs) -> Result<()> {
         draft: None,
         speculative_window: 0,
         adaptive_speculative_window: false,
+        ngram_max: standalone_ngram_proposal_limit(&speculative),
         speculative,
         generation_limit: Arc::new(Semaphore::new(args.generation_concurrency)),
         generation_queue_depth: Arc::new(AtomicUsize::new(0)),
@@ -377,6 +380,7 @@ pub fn embedded_openai_backend(args: EmbeddedOpenAiArgs) -> Result<EmbeddedOpenA
         draft,
         speculative_window: args.speculative_window,
         adaptive_speculative_window: args.adaptive_speculative_window,
+        ngram_max: standalone_ngram_proposal_limit(&args.speculative),
         speculative: args.speculative,
         generation_limit: Arc::new(Semaphore::new(args.generation_concurrency)),
         generation_queue_depth: Arc::new(AtomicUsize::new(0)),

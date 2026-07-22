@@ -6,10 +6,18 @@ use serde_json::Value;
 use serde_json::json;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::time::Instant;
 
 use crate::config::load_json;
 use crate::frontend::util::openai_backend_error;
 
+mod standalone;
+mod suffix;
+
+pub(super) use standalone::{propose_configured_ngram_tokens, standalone_ngram_proposal_limit};
+use suffix::{SUFFIX_MIN_SEED_LEN, SuffixNgramProposer};
+
+/// Resolved speculative decoding plan for a served model.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SpeculativeDecodeConfig {
@@ -21,6 +29,7 @@ pub struct SpeculativeDecodeConfig {
     pub verify_window: VerifyWindowConfig,
 }
 
+/// Native multi-token-prediction draft settings.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct NativeMtpProposalConfig {
@@ -32,20 +41,50 @@ pub struct NativeMtpProposalConfig {
     pub suppress_cooldown_draft_limit: usize,
 }
 
+/// Which N-gram draft proposer to run: llama.cpp request-local `cache`, or the
+/// pure-Rust longest-suffix `suffix`.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum NgramProposerKind {
+    #[default]
+    Cache,
+    Suffix,
+}
+
+impl NgramProposerKind {
+    /// Stable string name used in config and telemetry.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Cache => "cache",
+            Self::Suffix => "suffix",
+        }
+    }
+}
+
+/// Longest suffix match window, and upper bound for a suffix proposer's `max_ngram`.
+pub const SUFFIX_NGRAM_MAX_WINDOW: usize = 64;
+
+/// N-gram proposer kind and its match-length and draft-length bounds.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct NgramProposalConfig {
+    /// Defaults to `cache` so speculative plans written before the kind field
+    /// existed still deserialize.
+    #[serde(default)]
+    pub kind: NgramProposerKind,
     pub min_ngram: usize,
     pub max_ngram: usize,
     pub max_proposal_tokens: usize,
 }
 
+/// Bounds for extending an MTP prefix with an N-gram tail.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct NgramExtensionConfig {
     pub max_tokens: usize,
 }
 
+/// Pipelined verify-window sizing.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct VerifyWindowConfig {
@@ -79,6 +118,8 @@ impl Default for SpeculativeDecodeConfig {
 }
 
 impl SpeculativeDecodeConfig {
+    /// Checks the plan's internal invariants (bounds, proposer limits, extension
+    /// and verify-window constraints).
     pub fn validate(&self) -> Result<()> {
         if self.requested_strategy.trim().is_empty() || self.effective_strategy.trim().is_empty() {
             bail!("speculative decode strategies must not be empty");
@@ -89,13 +130,14 @@ impl SpeculativeDecodeConfig {
         if let Some(ngram) = &self.ngram
             && (ngram.min_ngram == 0
                 || ngram.min_ngram > ngram.max_ngram
-                || ngram.max_proposal_tokens < ngram.min_ngram)
+                || ngram.max_proposal_tokens == 0)
         {
             bail!(
-                "N-gram proposer requires 0 < min_ngram <= max_ngram and max_proposal_tokens >= min_ngram"
+                "N-gram proposer requires 0 < min_ngram <= max_ngram and max_proposal_tokens > 0"
             );
         }
         if let Some(ngram) = &self.ngram
+            && ngram.kind == NgramProposerKind::Cache
             && ngram.max_ngram > skippy_runtime::NGRAM_CACHE_MAX_NGRAM
         {
             bail!(
@@ -103,10 +145,18 @@ impl SpeculativeDecodeConfig {
                 skippy_runtime::NGRAM_CACHE_MAX_NGRAM
             );
         }
-        if self.ngram.is_some() != self.extension.is_some()
-            || (self.ngram.is_some() && !self.native_mtp.enabled)
+        if let Some(ngram) = &self.ngram
+            && ngram.kind == NgramProposerKind::Suffix
+            && (ngram.min_ngram < SUFFIX_MIN_SEED_LEN || ngram.max_ngram > SUFFIX_NGRAM_MAX_WINDOW)
         {
-            bail!("N-gram speculation requires native MTP and an extension policy");
+            bail!(
+                "suffix N-gram proposer requires {SUFFIX_MIN_SEED_LEN} <= min_ngram <= max_ngram <= {SUFFIX_NGRAM_MAX_WINDOW}"
+            );
+        }
+        if self.extension.is_some() && (!self.native_mtp.enabled || self.ngram.is_none()) {
+            bail!(
+                "composite speculation requires native MTP and an extension policy backed by an N-gram proposer"
+            );
         }
         if let Some(extension) = &self.extension
             && extension.max_tokens == 0
@@ -122,6 +172,7 @@ impl SpeculativeDecodeConfig {
         Ok(())
     }
 
+    /// Adds the requested and effective strategy names to a telemetry attr map.
     pub(super) fn insert_telemetry_attrs(&self, attrs: &mut BTreeMap<String, Value>) {
         attrs.insert(
             "llama_stage.spec.requested_strategy".to_string(),
@@ -134,6 +185,7 @@ impl SpeculativeDecodeConfig {
     }
 }
 
+/// Loads a speculative decode plan from JSON (or the default), then validates it.
 pub(super) fn load_standalone_speculative_config(
     path: Option<&PathBuf>,
 ) -> Result<SpeculativeDecodeConfig> {
@@ -177,6 +229,7 @@ mod standalone_speculative_config_tests {
                 ..SpeculativeDecodeConfig::default().native_mtp
             },
             ngram: Some(NgramProposalConfig {
+                kind: NgramProposerKind::Cache,
                 min_ngram: 2,
                 max_ngram: 4,
                 max_proposal_tokens: 6,
@@ -196,6 +249,7 @@ mod standalone_speculative_config_tests {
     fn standalone_speculative_config_rejects_cache_windows_above_llama_limit() {
         let config = SpeculativeDecodeConfig {
             ngram: Some(NgramProposalConfig {
+                kind: NgramProposerKind::Cache,
                 min_ngram: 2,
                 max_ngram: skippy_runtime::NGRAM_CACHE_MAX_NGRAM + 1,
                 max_proposal_tokens: 6,
@@ -210,6 +264,73 @@ mod standalone_speculative_config_tests {
                 .to_string()
                 .contains("must not exceed llama.cpp limit 4")
         );
+    }
+
+    #[test]
+    fn standalone_speculative_config_round_trips_suffix() {
+        let config = SpeculativeDecodeConfig {
+            requested_strategy: "ngram".to_string(),
+            effective_strategy: "ngram-suffix".to_string(),
+            ngram: Some(NgramProposalConfig {
+                kind: NgramProposerKind::Suffix,
+                min_ngram: 5,
+                max_ngram: 32,
+                max_proposal_tokens: 48,
+            }),
+            ..SpeculativeDecodeConfig::default()
+        };
+
+        let json = serde_json::to_string(&config).expect("serialize plan");
+        let decoded: SpeculativeDecodeConfig = serde_json::from_str(&json).expect("parse plan");
+
+        assert_eq!(decoded, config);
+        decoded.validate().expect("valid suffix plan");
+    }
+
+    #[test]
+    fn ngram_proposal_config_without_kind_defaults_to_cache() {
+        // Speculative plans written before the kind field existed omit it; they
+        // must still deserialize (for --openai-speculative-config) as cache.
+        let json = r#"{"min_ngram":2,"max_ngram":4,"max_proposal_tokens":6}"#;
+        let config: NgramProposalConfig =
+            serde_json::from_str(json).expect("legacy plan without kind should deserialize");
+        assert_eq!(config.kind, NgramProposerKind::Cache);
+    }
+
+    #[test]
+    fn standalone_speculative_config_rejects_suffix_windows_above_limit() {
+        let config = SpeculativeDecodeConfig {
+            ngram: Some(NgramProposalConfig {
+                kind: NgramProposerKind::Suffix,
+                min_ngram: 3,
+                max_ngram: SUFFIX_NGRAM_MAX_WINDOW + 1,
+                max_proposal_tokens: 6,
+            }),
+            ..SpeculativeDecodeConfig::default()
+        };
+
+        let error = config.validate().expect_err("suffix max must be bounded");
+
+        assert!(error.to_string().contains("min_ngram <= max_ngram <= 64"));
+    }
+
+    #[test]
+    fn standalone_speculative_config_rejects_suffix_matches_below_seed_length() {
+        let config = SpeculativeDecodeConfig {
+            ngram: Some(NgramProposalConfig {
+                kind: NgramProposerKind::Suffix,
+                min_ngram: 2,
+                max_ngram: 16,
+                max_proposal_tokens: 4,
+            }),
+            ..SpeculativeDecodeConfig::default()
+        };
+
+        let error = config
+            .validate()
+            .expect_err("suffix minimum must cover the exact seed");
+
+        assert!(error.to_string().contains("3 <= min_ngram"));
     }
 }
 
@@ -260,13 +381,7 @@ pub(super) struct CachedNgramProposer {
 }
 
 impl CachedNgramProposer {
-    pub(super) fn from_config(config: &SpeculativeDecodeConfig) -> OpenAiResult<Option<Self>> {
-        let Some(ngram) = config.ngram.as_ref() else {
-            return Ok(None);
-        };
-        Self::new(ngram.min_ngram, ngram.max_ngram).map(Some)
-    }
-
+    /// Creates a cache-backed proposer with the given match bounds.
     pub(super) fn new(ngram_min: usize, ngram_max: usize) -> OpenAiResult<Self> {
         if ngram_min == 0
             || ngram_min > ngram_max
@@ -285,6 +400,7 @@ impl CachedNgramProposer {
         })
     }
 
+    /// Syncs committed history, then drafts after the continuation prefix.
     pub(super) fn propose(
         &mut self,
         committed_history: &[i32],
@@ -299,6 +415,7 @@ impl CachedNgramProposer {
             .map_err(openai_backend_error)
     }
 
+    /// Mirrors committed history into native cache state (append or reset).
     fn sync(&mut self, committed_history: &[i32]) -> OpenAiResult<()> {
         if self.cache.is_none() {
             self.cache = Some(
@@ -325,8 +442,153 @@ impl CachedNgramProposer {
     }
 }
 
+/// The concrete history-backed proposer behind [`HistoryNgramProposer`].
+enum HistoryNgramProposerImpl {
+    Cache(CachedNgramProposer),
+    Suffix(SuffixNgramProposer),
+}
+
+/// Aggregate proposer counters surfaced through response timings.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) struct HistoryNgramProposerStats {
+    pub(super) attempts: usize,
+    pub(super) hits: usize,
+    pub(super) proposed_tokens: usize,
+    pub(super) match_length_sum: usize,
+    pub(super) match_length_max: usize,
+    pub(super) candidates_examined: usize,
+    pub(super) appended_tokens: usize,
+    pub(super) rebuilds: usize,
+    pub(super) sync_us: u64,
+    pub(super) lookup_us: u64,
+}
+
+/// Config-selected history N-gram proposer (cache or suffix) with running stats.
+pub(super) struct HistoryNgramProposer {
+    proposer: HistoryNgramProposerImpl,
+    stats: HistoryNgramProposerStats,
+}
+
+impl HistoryNgramProposer {
+    /// Builds the configured history proposer, or `None` for simple/no proposer.
+    pub(super) fn from_config(config: &SpeculativeDecodeConfig) -> OpenAiResult<Option<Self>> {
+        let Some(ngram) = config.ngram.as_ref() else {
+            return Ok(None);
+        };
+        match ngram.kind {
+            NgramProposerKind::Cache => CachedNgramProposer::new(ngram.min_ngram, ngram.max_ngram)
+                .map(HistoryNgramProposerImpl::Cache)
+                .map(Self::new)
+                .map(Some),
+            NgramProposerKind::Suffix => SuffixNgramProposer::new(
+                ngram.min_ngram,
+                ngram.max_ngram,
+                ngram.max_proposal_tokens,
+            )
+            .map_err(OpenAiError::backend)
+            .map(HistoryNgramProposerImpl::Suffix)
+            .map(Self::new)
+            .map(Some),
+        }
+    }
+
+    /// Wraps a concrete proposer with zeroed stats.
+    fn new(proposer: HistoryNgramProposerImpl) -> Self {
+        Self {
+            proposer,
+            stats: HistoryNgramProposerStats::default(),
+        }
+    }
+
+    /// Runs the proposer and accumulates per-request stats.
+    pub(super) fn propose(
+        &mut self,
+        committed_history: &[i32],
+        continuation_prefix: &[i32],
+        max_proposed_tokens: usize,
+    ) -> OpenAiResult<Vec<i32>> {
+        self.stats.attempts += 1;
+        let tokens = match &mut self.proposer {
+            HistoryNgramProposerImpl::Cache(cache) => {
+                let started = Instant::now();
+                let tokens =
+                    cache.propose(committed_history, continuation_prefix, max_proposed_tokens)?;
+                self.stats.lookup_us = self.stats.lookup_us.saturating_add(elapsed_us(started));
+                tokens
+            }
+            HistoryNgramProposerImpl::Suffix(suffix) => {
+                let proposal =
+                    suffix.propose(committed_history, continuation_prefix, max_proposed_tokens);
+                self.stats.match_length_sum = self
+                    .stats
+                    .match_length_sum
+                    .saturating_add(proposal.stats.match_length);
+                self.stats.match_length_max =
+                    self.stats.match_length_max.max(proposal.stats.match_length);
+                self.stats.candidates_examined = self
+                    .stats
+                    .candidates_examined
+                    .saturating_add(proposal.stats.candidates_examined);
+                self.stats.appended_tokens = self
+                    .stats
+                    .appended_tokens
+                    .saturating_add(proposal.stats.appended_tokens);
+                self.stats.rebuilds += usize::from(proposal.stats.rebuilt);
+                self.stats.sync_us = self.stats.sync_us.saturating_add(proposal.stats.sync_us);
+                self.stats.lookup_us = self
+                    .stats
+                    .lookup_us
+                    .saturating_add(proposal.stats.lookup_us);
+                proposal.tokens
+            }
+        };
+        self.stats.hits += usize::from(!tokens.is_empty());
+        self.stats.proposed_tokens = self.stats.proposed_tokens.saturating_add(tokens.len());
+        Ok(tokens)
+    }
+
+    /// Returns the accumulated proposer stats.
+    pub(super) fn stats(&self) -> HistoryNgramProposerStats {
+        self.stats
+    }
+
+    /// Test-only constructor for the cache variant.
+    #[cfg(test)]
+    pub(super) fn new_cache(ngram_min: usize, ngram_max: usize) -> OpenAiResult<Self> {
+        CachedNgramProposer::new(ngram_min, ngram_max)
+            .map(HistoryNgramProposerImpl::Cache)
+            .map(Self::new)
+    }
+}
+
+/// Microseconds elapsed since `started`, saturating into a `u64`.
+fn elapsed_us(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX)
+}
+
 impl OpenAiSpeculativeStats {
     pub(super) fn insert_response_timings(&self, timings: &mut BTreeMap<String, Value>) {
+        timings.insert("speculative_windows".to_string(), json!(self.windows));
+        timings.insert(
+            "speculative_proposed_n".to_string(),
+            json!(self.draft_tokens),
+        );
+        timings.insert(
+            "speculative_accepted_n".to_string(),
+            json!(self.accepted_tokens),
+        );
+        timings.insert(
+            "speculative_rejected_n".to_string(),
+            json!(self.rejected_tokens),
+        );
+        timings.insert(
+            "speculative_accept_rate".to_string(),
+            json!(if self.draft_tokens == 0 {
+                0.0
+            } else {
+                self.accepted_tokens as f64 / self.draft_tokens as f64
+            }),
+        );
         timings.insert(
             "verify_window_verify_elapsed_ms".to_string(),
             json!(self.primary_verify_elapsed_ms),

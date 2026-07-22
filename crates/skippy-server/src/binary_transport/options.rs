@@ -144,7 +144,8 @@ mod tests {
     use crate::{
         cli::{Cli, Command},
         frontend::{
-            NativeMtpProposalConfig, NgramExtensionConfig, NgramProposalConfig, VerifyWindowConfig,
+            NativeMtpProposalConfig, NgramExtensionConfig, NgramProposalConfig, NgramProposerKind,
+            VerifyWindowConfig,
         },
     };
 
@@ -200,6 +201,7 @@ mod tests {
                 suppress_cooldown_draft_limit: 0,
             },
             ngram: Some(NgramProposalConfig {
+                kind: NgramProposerKind::Cache,
                 min_ngram: 2,
                 max_ngram: 4,
                 max_proposal_tokens: 6,

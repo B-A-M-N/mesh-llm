@@ -345,7 +345,10 @@ spec_default               = "auto"          # bool or "auto"
 # draft_cache_type_k = "q8_0"
 # draft_cache_type_v = "q8_0"
 
-# Request-local N-gram cache and MTP extension (ngram_max <= 4).
+# N-gram proposer and MTP extension.
+# `cache` is request-local and requires ngram_max <= 4; `suffix` is a pure-Rust
+# longest-suffix (prompt-lookup) matcher allowing ngram_max <= 64.
+# ngram_proposer            = "cache"  # cache | suffix
 # ngram_min                 = 2
 # ngram_max                 = 4
 # ngram_max_proposal_tokens = 6        # output budget, separate from ngram_max
@@ -723,8 +726,8 @@ defaults. The resolved plan is validated once before Skippy starts.
 Set `strategy = "auto"` to use a package recommendation, `"disabled"` for
 the no-speculation baseline, or `"mtp"` for native MTP. A package may also
 publish stable names such as `mtp-cache`; that name is valid only for the
-package that declares it. Direct GGUF serving creates the same composite by
-combining `strategy = "mtp"` with valid N-gram bounds.
+package that declares it. Direct GGUF serving can use `ngram-cache` or
+`ngram-suffix` when it supplies valid N-gram bounds.
 
 ```toml
 [[models]]
@@ -743,10 +746,40 @@ verify_window_pipeline_depth = 2
 
 `ngram_min` and `ngram_max` determine the history match length.
 `ngram_max_proposal_tokens` is separately the maximum continuation length.
-The request-local cache is limited to `ngram_max <= 4`. N-gram settings require
-native MTP and create one composite proposal; standalone N-gram speculation is
-not supported. All combinations are verified together by the target, so tuning
-these values changes speculative work, not output correctness.
+The request-local cache is limited to `ngram_max <= 4`. N-gram settings may run
+standalone or, with native MTP, form one composite proposal. All combinations
+are verified together by the target, so tuning these values changes speculative
+work, not output correctness.
+
+The `suffix` proposer is a pure-Rust longest-suffix matcher
+("prompt-lookup decoding"). Unlike `cache` it is not bound by
+llama.cpp's 4-token match window, so it can match long verbatim repeats in the
+context (up to `ngram_max <= 64`) and copy long, high-confidence drafts. It is
+designed for input-grounded, repetitive workloads — re-emitting a file with a
+small edit, echoed tool output, repeated identifiers — and stays silent when no
+sufficiently long match exists. Benchmark the target workload before assuming
+an uplift or neutrality on freeform prose. `ngram_min` is the minimum verbatim
+match length before it drafts; draft length scales with match length up to
+`ngram_max_proposal_tokens`.
+
+```toml
+[models.speculative]
+strategy = "mtp"
+ngram_proposer = "suffix"
+ngram_min = 5
+ngram_max = 32
+ngram_max_proposal_tokens = 48
+extension_max_tokens = 48
+verify_window_min_tokens = 1
+verify_window_max_tokens = 32
+verify_window_pipeline_depth = 2
+```
+
+Suffix can also run without MTP by setting `strategy = "ngram-suffix"` and
+omitting the extension controls. Layer packages may declare `ngram-suffix` as
+a request-local proposer and standalone strategy. See
+[Suffix N-gram Proposer](skippy/SUFFIX_NGRAM_PROPOSER.md) for the lookup
+contract, telemetry, and benchmark requirements.
 
 For package-authoring rules, see
 [Layer Package Repositories](specs/layer-package-repos.md#generation-defaults).

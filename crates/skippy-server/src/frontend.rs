@@ -39,8 +39,8 @@ pub use self::guardrails::{
     OpenAiGuardrailsConfig, OpenAiGuardrailsStatus, OpenAiGuardrailsTarget,
 };
 pub use self::speculative::{
-    NativeMtpProposalConfig, NgramExtensionConfig, NgramProposalConfig, SpeculativeDecodeConfig,
-    VerifyWindowConfig,
+    NativeMtpProposalConfig, NgramExtensionConfig, NgramProposalConfig, NgramProposerKind,
+    SpeculativeDecodeConfig, VerifyWindowConfig,
 };
 
 #[cfg(test)]
