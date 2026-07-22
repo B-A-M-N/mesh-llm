@@ -16,7 +16,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     container:
-      image: ghcr.io/mesh-llm/mesh-llm-cuda-runner@sha256:b00684f3837ee1671dee57d8b5fe2a98c91d6684e451132a5361dfd0585bd115
+      image: ghcr.io/mesh-llm/mesh-llm-cuda-runner@sha256:c89705117adc31064d656225b5b8659e133e1bec2ad0e9e574e870d6e54e3850
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
@@ -24,7 +24,7 @@ jobs:
       CARGO_INCREMENTAL: "0"
       CARGO_NET_RETRY: "10"
       CARGO_HTTP_MULTIPLEXING: "false"
-      RUNNER_IMAGE: ghcr.io/mesh-llm/mesh-llm-cuda-runner@sha256:b00684f3837ee1671dee57d8b5fe2a98c91d6684e451132a5361dfd0585bd115
+      RUNNER_IMAGE: ghcr.io/mesh-llm/mesh-llm-cuda-runner@sha256:c89705117adc31064d656225b5b8659e133e1bec2ad0e9e574e870d6e54e3850
       CONTROLLED_SOURCE: 6bd55216f7c8425ac760bc22225a64d3093598a8
     steps:
       - name: Record runner start
@@ -80,7 +80,7 @@ jobs:
       CARGO_INCREMENTAL: "0"
       CARGO_NET_RETRY: "10"
       CARGO_HTTP_MULTIPLEXING: "false"
-      RUNNER_IMAGE: ghcr.io/mesh-llm/mesh-llm-cuda-runner@sha256:fa1e07fdb4c71719783d3b6cde22ccb48e8c980c37db26b067343e1da3769f0c
+      RUNNER_IMAGE: ghcr.io/mesh-llm/mesh-llm-cuda-runner@sha256:2541c069393955e8aa767aba78432a7db104a6d2e93c65ea3e011c29860801fd
       CONTROLLED_SOURCE: 6bd55216f7c8425ac760bc22225a64d3093598a8
     steps:
       - name: Record runner start
@@ -136,7 +136,7 @@ jobs:
       CARGO_INCREMENTAL: "0"
       CARGO_NET_RETRY: "10"
       CARGO_HTTP_MULTIPLEXING: "false"
-      RUNNER_IMAGE: ghcr.io/mesh-llm/mesh-llm-cuda-runner@sha256:fa1e07fdb4c71719783d3b6cde22ccb48e8c980c37db26b067343e1da3769f0c
+      RUNNER_IMAGE: ghcr.io/mesh-llm/mesh-llm-cuda-runner@sha256:2541c069393955e8aa767aba78432a7db104a6d2e93c65ea3e011c29860801fd
       CONTROLLED_SOURCE: 6bd55216f7c8425ac760bc22225a64d3093598a8
     steps:
       - name: Record runner start
