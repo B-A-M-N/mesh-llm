@@ -462,9 +462,10 @@ mod tests {
         doctor::preflight_eval_run,
         registry::{definition, selected_evals},
         run::{
-            fill_client_rates, resolved_harness_commit, speed_bench_metrics,
-            speed_bench_output_path, swe_bench_pro_metrics, swe_bench_pro_output_path,
-            telemetry_or_unavailable, terminal_bench_metrics, terminal_bench_output_path,
+            fill_client_rates, resolved_harness_commit, run_artifacts, speed_bench_metrics,
+            speed_bench_output_path, speed_bench_response_timings_path, swe_bench_pro_metrics,
+            swe_bench_pro_output_path, telemetry_or_unavailable, terminal_bench_metrics,
+            terminal_bench_output_path,
         },
         sync::existing_repo_sync_steps,
     };
@@ -502,6 +503,7 @@ mod tests {
             run_id: None,
             metrics_http: "http://127.0.0.1:18080".to_string(),
             metrics_run_id: None,
+            metrics_finalize_only: false,
             dry_run: true,
         };
         let root = PathBuf::from("/tmp/skippy-cache");
@@ -538,6 +540,14 @@ mod tests {
                 .envs
                 .contains(&("SKIPPY_BENCH_BASE_URL".to_string(), args.base_url.clone()))
         );
+        assert!(
+            command.envs.contains(&(
+                "SKIPPY_BENCH_RESPONSE_TIMINGS_PATH".to_string(),
+                speed_bench_response_timings_path(&run_dir)
+                    .display()
+                    .to_string(),
+            ))
+        );
         assert!(!command.display().contains("test"));
         assert!(
             command
@@ -547,6 +557,24 @@ mod tests {
         let launcher = fs::read_to_string(run_dir.join("raw/speed-bench-auth.py")).unwrap();
         assert!(launcher.contains("request_origin(url) == benchmark_origin"));
         assert!(launcher.contains("headers.setdefault(\"Authorization\""));
+        assert!(launcher.contains("capture_response_timings"));
+        assert!(launcher.contains("response.get(\"timings\")"));
+        assert!(launcher.contains("safe_timings"));
+        let _ = fs::remove_dir_all(run_dir);
+    }
+
+    #[test]
+    fn speed_bench_reports_the_response_timing_artifact() {
+        let run_dir = temp_run_dir("speed-artifacts");
+        let artifacts = run_artifacts(definition(EvalId::SpeedBench), &run_dir);
+
+        assert!(artifacts.iter().any(|artifact| {
+            artifact.kind == "speed-bench-response-timings"
+                && artifact.path
+                    == speed_bench_response_timings_path(&run_dir)
+                        .display()
+                        .to_string()
+        }));
         let _ = fs::remove_dir_all(run_dir);
     }
 
@@ -565,6 +593,7 @@ mod tests {
             run_id: None,
             metrics_http: "http://127.0.0.1:18080".to_string(),
             metrics_run_id: None,
+            metrics_finalize_only: false,
             dry_run: true,
         };
         let command = terminal_bench_command(&args, Path::new("/tmp/skippy-run"));
@@ -937,6 +966,7 @@ mod tests {
             run_id: None,
             metrics_http: "http://127.0.0.1:18080".to_string(),
             metrics_run_id: None,
+            metrics_finalize_only: false,
             dry_run: true,
         }
     }

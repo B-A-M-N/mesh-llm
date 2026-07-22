@@ -8,6 +8,7 @@ use std::{
 use anyhow::{Context, Result};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
+use skippy_ffi::TensorRole;
 use skippy_runtime::package::PackageGenerationInfo;
 
 use super::hash_cache::{self, SidecarDigestCache};
@@ -87,6 +88,13 @@ pub fn synthetic_direct_gguf_package(
         source_model_path.display()
     );
     let source_model_bytes = source_files.iter().map(|file| file.bytes).sum();
+    let layer_weight_bytes = direct_gguf_layer_weight_bytes(&source_files, compact.layer_count)
+        .with_context(|| {
+            format!(
+                "inspect GGUF tensor weights {}",
+                source_model_path.display()
+            )
+        })?;
 
     let source_model_sha256 = aggregate_source_sha256(&source_files);
 
@@ -113,7 +121,7 @@ pub fn synthetic_direct_gguf_package(
         source_model_sha256,
         source_model_bytes,
         source_files,
-        layer_weight_bytes: Vec::new(),
+        layer_weight_bytes,
         layer_count: compact.layer_count,
         activation_width: compact.embedding_size,
         tensor_count,
@@ -311,6 +319,88 @@ fn gguf_tensor_count(path: &Path) -> Result<u64> {
     read_gguf_count(&mut reader, version)
 }
 
+fn direct_gguf_layer_weight_bytes(
+    source_files: &[SkippyPackageSourceFile],
+    layer_count: u32,
+) -> Result<Vec<u64>> {
+    let mut tensors = Vec::new();
+    for source_file in source_files {
+        let info = match skippy_runtime::ModelInfo::open(&source_file.path) {
+            Ok(info) => info,
+            Err(error) => {
+                tracing::debug!(
+                    path = %source_file.path.display(),
+                    error = %error,
+                    "GGUF tensor layout unavailable; using capacity-based split planning"
+                );
+                return Ok(Vec::new());
+            }
+        };
+        tensors.extend(
+            info.tensors()
+                .with_context(|| format!("read GGUF tensors {}", source_file.path.display()))?,
+        );
+    }
+    Ok(layer_weight_bytes_from_tensors(&tensors, layer_count))
+}
+
+fn layer_weight_bytes_from_tensors(
+    tensors: &[skippy_runtime::TensorInfo],
+    layer_count: u32,
+) -> Vec<u64> {
+    let Ok(layer_count) = usize::try_from(layer_count) else {
+        return Vec::new();
+    };
+    if layer_count == 0 {
+        return Vec::new();
+    }
+
+    let mut weights = vec![0_u64; layer_count];
+    let mut shared_bytes = 0_u64;
+    let mut seen = std::collections::BTreeSet::new();
+
+    for tensor in tensors {
+        if !seen.insert(tensor.name.as_str()) {
+            continue;
+        }
+        let bytes = tensor.byte_size;
+        match tensor.layer_index {
+            Some(layer) if (layer as usize) < layer_count => {
+                weights[layer as usize] = weights[layer as usize].saturating_add(bytes);
+            }
+            // Native MTP blocks are appended after the trunk's declared layer
+            // count and must stay with the final stage that owns logits.
+            Some(_) => {
+                let last = weights.len() - 1;
+                weights[last] = weights[last].saturating_add(bytes);
+            }
+            None => match tensor.role {
+                TensorRole::Embedding => {
+                    weights[0] = weights[0].saturating_add(bytes);
+                }
+                TensorRole::FinalNorm | TensorRole::Output => {
+                    let last = weights.len() - 1;
+                    weights[last] = weights[last].saturating_add(bytes);
+                }
+                TensorRole::Unknown
+                | TensorRole::Metadata
+                | TensorRole::Tokenizer
+                | TensorRole::Layer => {
+                    shared_bytes = shared_bytes.saturating_add(bytes);
+                }
+            },
+        }
+    }
+
+    // Metadata is loaded at every stage but is normally tiny. Split it between
+    // endpoints so total model weight stays conserved without biasing a middle
+    // stage in multi-node plans.
+    weights[0] = weights[0].saturating_add(shared_bytes.div_ceil(2));
+    let last = weights.len() - 1;
+    weights[last] = weights[last].saturating_add(shared_bytes / 2);
+    weights
+}
+
 fn read_u32_le(reader: &mut impl Read) -> Result<u32> {
     let mut bytes = [0u8; 4];
     reader.read_exact(&mut bytes).context("read u32")?;
@@ -463,6 +553,7 @@ fn required_layer_package_activation_width(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use skippy_runtime::TensorInfo;
 
     #[test]
     fn synthetic_manifest_identity_is_stable_and_metadata_sensitive() {
@@ -763,5 +854,36 @@ mod tests {
         assert!(layer_weight_bytes_from_info(&info).is_empty());
         info.layers[1].layer_index = 1;
         assert_eq!(layer_weight_bytes_from_info(&info), vec![30, 40]);
+    }
+
+    #[test]
+    fn direct_gguf_weights_charge_native_mtp_block_to_final_stage() {
+        let tensors = vec![
+            tensor("token_embd.weight", None, TensorRole::Embedding, 5),
+            tensor("blk.0.attn_norm.weight", Some(0), TensorRole::Layer, 10),
+            tensor("blk.1.attn_norm.weight", Some(1), TensorRole::Layer, 10),
+            tensor("blk.2.nextn.eh_proj.weight", Some(2), TensorRole::Layer, 7),
+            tensor("output_norm.weight", None, TensorRole::FinalNorm, 1),
+            tensor("output.weight", None, TensorRole::Output, 9),
+            tensor("general.alignment", None, TensorRole::Metadata, 3),
+        ];
+
+        assert_eq!(layer_weight_bytes_from_tensors(&tensors, 2), vec![17, 28]);
+    }
+
+    fn tensor(
+        name: &str,
+        layer_index: Option<u32>,
+        role: TensorRole,
+        byte_size: u64,
+    ) -> TensorInfo {
+        TensorInfo {
+            name: name.to_string(),
+            layer_index,
+            role,
+            ggml_type: 0,
+            byte_size,
+            element_count: byte_size,
+        }
     }
 }

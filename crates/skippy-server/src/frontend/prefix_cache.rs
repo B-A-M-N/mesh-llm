@@ -1,4 +1,50 @@
-use super::*;
+use crate::binary_transport::BinaryStageExecutionOptions;
+use crate::binary_transport::forwarded_stage_message_timed;
+use crate::binary_transport::run_binary_stage_message;
+use crate::binary_transport::stage_output_activation_capacity;
+use crate::binary_transport::write_stage_message_conditioned;
+use crate::frontend::NativeMtpDraft;
+use crate::frontend::generation::ChainPrefixRestore;
+use crate::frontend::generation::EmbeddedExecutionStats;
+use crate::frontend::generation::EmbeddedFusedFirstDecode;
+use crate::frontend::generation::EmbeddedStageZeroGeneration;
+use crate::frontend::generation::MAX_EXACT_REPLAY_TOKENS;
+use crate::frontend::generation::OpenAiGenerationIds;
+use crate::frontend::generation::PhaseTimer;
+use crate::frontend::generation::StageOpenAiBackend;
+use crate::frontend::util::openai_backend_error;
+use crate::frontend::util::openai_io_error;
+use crate::frontend::wire_messages::DecodeMessageArgs;
+use crate::frontend::wire_messages::RestorePrefillDecodeMessageArgs;
+use crate::frontend::wire_messages::embedded_decode_message;
+use crate::frontend::wire_messages::embedded_prefix_cache_message;
+use crate::frontend::wire_messages::embedded_restore_prefill_decode_message;
+use crate::frontend::wire_messages::openai_stage_mask;
+use crate::kv_integration::KvStageIntegration;
+use crate::kv_integration::proactive_eviction_attrs;
+use crate::kv_integration::proactive_eviction_error_kind;
+use anyhow::Context;
+use anyhow::anyhow;
+use openai_frontend::OpenAiError;
+use openai_frontend::OpenAiResult;
+use serde_json::Value;
+use serde_json::json;
+use sha2::Digest;
+use sha2::Sha256;
+use skippy_protocol::MessageBase;
+use skippy_protocol::SCHEMA_VERSION;
+use skippy_protocol::StageConfig;
+use skippy_protocol::binary::StageReplyStats;
+use skippy_protocol::binary::StageSamplingConfig as WireSamplingConfig;
+use skippy_protocol::binary::StageWireMessage;
+use skippy_protocol::binary::WireActivationDType;
+use skippy_protocol::binary::WireMessageKind;
+use skippy_protocol::binary::WireReplyKind;
+use skippy_protocol::binary::recv_reply;
+use skippy_runtime::ActivationFrame;
+use skippy_runtime::SamplingConfig;
+use std::collections::BTreeMap;
+use std::net::TcpStream;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(super) struct ChainPrefixCacheSavings {
@@ -152,6 +198,69 @@ impl StageOpenAiBackend {
             chat_template_id: ids.cache.namespace(),
             seq: Some(ids.session_id),
         }
+    }
+
+    pub(super) fn evict_embedded_stage0_resident_prefix(
+        &self,
+        session_id: &str,
+        ids: &OpenAiGenerationIds,
+        target_tokens: Option<u64>,
+    ) -> OpenAiResult<()> {
+        let Some(kv) = self.kv.as_ref() else {
+            return Ok(());
+        };
+        let eviction = (|| {
+            let mut runtime = self
+                .runtime
+                .lock()
+                .map_err(|_| anyhow!("runtime lock poisoned"))?;
+            runtime
+                .ensure_session_active(session_id)
+                .context("activate embedded stage-0 session before resident-prefix eviction")?;
+            if let Some(target_tokens) = target_tokens {
+                kv.evict_resident_prefix_for_tokens(&mut runtime, session_id, target_tokens)
+            } else {
+                kv.evict_resident_prefix_for_decode_batch(&mut runtime, session_id)
+            }
+        })();
+        let (status, error_kind, target_tokens, evicted_entries, evicted_tokens) = match &eviction {
+            Ok(eviction) => (
+                if eviction.evicted_entries > 0 {
+                    "evicted"
+                } else {
+                    "noop"
+                },
+                None,
+                eviction.target_tokens,
+                eviction.evicted_entries,
+                eviction.evicted_tokens,
+            ),
+            Err(error) => (
+                "error",
+                Some(proactive_eviction_error_kind(error)),
+                target_tokens.unwrap_or_default(),
+                0,
+                0,
+            ),
+        };
+        let mut attrs = self.openai_attrs(ids);
+        attrs.extend(proactive_eviction_attrs(
+            status,
+            error_kind,
+            target_tokens,
+            evicted_entries,
+            evicted_tokens,
+        ));
+        if error_kind.is_some() || evicted_entries > 0 || evicted_tokens > 0 {
+            self.telemetry
+                .emit("stage.openai_kv_record_decision", attrs);
+        } else {
+            self.telemetry
+                .emit_debug("stage.openai_kv_record_decision", attrs);
+        }
+        eviction
+            .map(|_| ())
+            .map_err(|error| openai_backend_error(error.context("evict embedded stage-0 KV")))
     }
 
     pub(super) fn restore_embedded_stage0_prefill(
@@ -943,7 +1052,7 @@ impl StageOpenAiBackend {
                     .map_err(openai_backend_error)?,
                     request.native_mtp_enabled,
                 )
-                .with_native_mtp_max_tokens(request.native_mtp_max_tokens),
+                .with_native_mtp_max_tokens(request.speculative.native_mtp.max_draft_tokens),
             )
             .map_err(openai_backend_error)?
             .2;
@@ -984,7 +1093,11 @@ impl StageOpenAiBackend {
         .map_err(openai_io_error)?;
         let forward_write_ms = write_timer.elapsed_ms();
         let wait_timer = PhaseTimer::start();
-        let downstream_reply = recv_reply(&mut *downstream).map_err(openai_io_error)?;
+        let downstream_reply = super::embedded_execution::receive_embedded_stage_reply_one_of(
+            downstream,
+            request.prediction_return.as_ref(),
+            &[WireReplyKind::PredictedToken, WireReplyKind::Ack],
+        )?;
         let downstream_wait_ms = wait_timer.elapsed_ms();
         let downstream_missed = downstream_reply.kind != WireReplyKind::PredictedToken
             || downstream_reply.stats.kv_lookup_errors > 0
@@ -1032,9 +1145,10 @@ impl StageOpenAiBackend {
         Ok(Some(EmbeddedFusedFirstDecode {
             predicted: downstream_reply.predicted,
             predicted_tokens: vec![downstream_reply.predicted],
-            native_mtp_draft: NativeMtpDraft::from_prediction_tokens(
-                &downstream_reply.predicted_tokens,
-            ),
+            native_mtp_draft: downstream_reply
+                .native_mtp_draft
+                .clone()
+                .map(NativeMtpDraft::from_stage_draft),
             reply_stats,
             execution: EmbeddedExecutionStats {
                 stage0_compute_ms,

@@ -140,6 +140,8 @@ pub struct CompletionResponse {
     pub model: String,
     pub choices: Vec<CompletionChoice>,
     pub usage: Usage,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timings: Option<BTreeMap<String, Value>>,
 }
 
 impl CompletionResponse {
@@ -165,7 +167,28 @@ impl CompletionResponse {
                 finish_reason: Some(finish_reason),
             }],
             usage,
+            timings: None,
         }
+    }
+
+    pub fn with_timings(mut self, timings: Option<BTreeMap<String, Value>>) -> Self {
+        self.timings = timings;
+        self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn completion_response_serializes_optional_timings() {
+        let response = CompletionResponse::new("model", "text", Usage::new(1, 1))
+            .with_timings(Some(BTreeMap::from([("draft_n".to_string(), json!(2))])));
+
+        let value = serde_json::to_value(response).unwrap();
+        assert_eq!(value["timings"]["draft_n"], json!(2));
     }
 }
 

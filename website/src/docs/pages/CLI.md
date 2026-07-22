@@ -208,6 +208,85 @@ Switches:
 - `--trust-policy <TRUST_POLICY>`: override peer ownership trust policy.
 - `--trust-owner <TRUST_OWNER>`: add trusted owner IDs on top of the local trust store.
 
+### Locked split topology
+
+Automatic split planning chooses nodes and layer boundaries from the capacity
+currently advertised by the mesh. For controlled lab benchmarks, use a
+topology lock so every host runs the same node order and layer ranges across
+repeated runs, branches, and binaries.
+
+Copy the same versioned JSON file to every serving host:
+
+```json
+{
+  "version": 1,
+  "model": "hf://meshllm/example-layers@immutable-revision",
+  "manifest_sha256": "<sha256 of model-package.json>",
+  "stages": [
+    {
+      "node": "micstudio.local",
+      "layer_start": 0,
+      "layer_end": 31
+    },
+    {
+      "node": "studio54-3.local",
+      "layer_start": 31,
+      "layer_end": 47
+    }
+  ]
+}
+```
+
+Then pass the lock with `--split` on every host:
+
+```bash
+mesh-llm serve \
+  --model hf://meshllm/example-layers@immutable-revision \
+  --split \
+  --split-topology-lock /path/to/topology-lock.json
+```
+
+The runtime verifies the resolved package and manifest digest, resolves each
+node selector uniquely, requires contiguous ranges covering the full model,
+and applies the normal context, KV-cache, headroom, and VRAM checks to those
+exact assignments. A node selector may be a full iroh endpoint ID or an
+advertised hostname. Ranges are half-open: `layer_start` is inclusive and
+`layer_end` is exclusive.
+
+The lock is fail-closed, not a placement hint. If the requested topology cannot
+be reproduced, startup fails. If an assigned stage is later lost, mesh-llm
+withdraws the route after the normal grace period instead of replanning or
+falling back to a local model. This prevents benchmark results from silently
+mixing different execution topologies.
+
+### Speculative decoding overrides
+
+Advanced `serve` invocations can temporarily override a package or config-file
+speculative decoding plan. CLI values have highest precedence; fields you omit
+continue to come from the selected model, defaults, or model package.
+
+```bash
+mesh-llm serve meshllm/GLM-4.7-Flash-MTP-GGUF:Q4_K_M --split --no-draft \
+  --speculative-strategy mtp \
+  --speculative-ngram-min 2 \
+  --speculative-ngram-max 4 \
+  --speculative-ngram-max-proposal-tokens 32 \
+  --speculative-extension-initial-tokens 4 \
+  --speculative-extension-max-tokens 32 \
+  --speculative-verify-window-pipeline-depth 8
+```
+
+- `--speculative-strategy <STRATEGY>`: select `auto`, `disabled`, `mtp`, or a strategy declared by the model package. N-gram is a request-local extension of native MTP, not a standalone strategy.
+- `--speculative-ngram-min <N>` / `--speculative-ngram-max <N>`: set the request-local cache history match bounds used to extend native MTP.
+- `--speculative-ngram-max-proposal-tokens <N>`: cap the N-gram continuation proposed at once.
+- `--speculative-extension-initial-tokens <N>` / `--speculative-extension-max-tokens <N>`: set the adaptive N-gram tail bounds when extending native MTP.
+- `--speculative-extension-tail-backoff-proposals <N>`: pause extension attempts after a rejected N-gram tail.
+- `--speculative-native-mtp-reject-cooldown-tokens <N>`: set the generated-token cooldown after native MTP rejection.
+- `--speculative-native-mtp-suppress-cooldown-drafts`: suppress native drafts during cooldown; `--speculative-native-mtp-allow-cooldown-drafts` explicitly disables a configured suppression policy.
+- `--speculative-native-mtp-suppress-cooldown-draft-limit <N>`: cap the native drafts suppressed by one cooldown.
+- `--speculative-verify-window-min-tokens <N>` / `--speculative-verify-window-max-tokens <N>`: set adaptive verification window bounds.
+- `--speculative-verify-window-pipeline-depth <N>`: set the global maximum in-flight verification windows. Live request heads consume this capacity; optional N-gram windows are admitted with bounded, fair credits and fall back to native MTP when requests already fill the pipeline.
+
 ## Commands
 
 ### `models`
@@ -412,7 +491,8 @@ Switches:
 
 ### `runtime`
 
-Inspect and manage installed native runtimes:
+Inspect and manage installed native runtimes, or run supported owner-control
+operations against an explicitly targeted node:
 
 ```bash
 mesh-llm runtime list
@@ -420,10 +500,53 @@ mesh-llm runtime install
 mesh-llm runtime install cuda13
 mesh-llm runtime remove <RUNTIME_ID>
 mesh-llm runtime prune --active-only
+mesh-llm runtime scan-refresh --endpoint '<control-endpoint>'
+mesh-llm runtime scan-refresh --endpoint '<control-endpoint>' --json
 ```
 
 Use `--json` for machine-readable output. Runtime selection is constrained by
 the running Mesh version, platform, backend, and Skippy ABI.
+
+#### `runtime scan-refresh`
+
+Use this to ask exactly one remote, owner-attested node to rescan its managed
+model inventory. It uses the private `mesh-llm-control/1` lane; it does not
+change public mesh join, gossip, routing, or inference behavior.
+
+The target node must expose owner-control and the requester must use an owner
+key for the same owner. On the target node, read the endpoint token locally:
+
+```bash
+mesh-llm runtime bootstrap --port 3131 --json
+```
+
+Transfer that token to the controlling node out of band, then run:
+
+```bash
+mesh-llm runtime scan-refresh \
+  --port 3131 \
+  --endpoint '<control-endpoint>'
+```
+
+Switches:
+
+- `--endpoint <TOKEN>`: required token that identifies and pins one target
+  node. Mesh does not infer it from a peer ID, public gossip, discovery, or
+  status output.
+- `--port <PORT>`: management API port on the controlling node (default
+  `3131`). The CLI sends the request through this local, loopback-only API.
+- `--json`: print the API response unchanged.
+
+Human output includes the execution disposition, target node, model count,
+total bytes, and sorted canonical model references. JSON output includes
+`target_node_id`, `disposition`, and `inventory`. A disposition of `executed`
+means this request ran the scan; `coalesced` means it joined an in-progress
+scan and received the same result.
+
+The older hidden `runtime refresh-inventory` spelling remains available for
+compatibility and returns its legacy snapshot-only shape. New clients also
+accept snapshot-only responses from older owner-control servers without
+claiming that detailed inventory metadata was returned.
 
 
 ### `gpus`
@@ -555,13 +678,13 @@ Core tuning switches:
 
 Speculative decoding tuning switches:
 
-- `--speculative-types <TYPES>`: speculative decoding types to sweep (`auto`, `disabled`, `mtp`, `draft`, `ngram`; comma-separated). Conflicts with `--no-speculative-tune`.
+- `--speculative-types <TYPES>`: speculative decoding types to sweep (`auto`, `disabled`, `mtp`, `draft`, `mtp-ngram`; comma-separated). Conflicts with `--no-speculative-tune`.
 - `--no-speculative-tune`: disable speculative decoding sweeps and only benchmark the disabled baseline.
 - `--spec-draft-models <PATHS>`: candidate draft GGUF paths for speculative draft mode (comma-separated).
 - `--spec-draft-max-tokens <N>`: candidate maximum draft-token windows for MTP and draft speculation (comma-separated).
 - `--spec-draft-min-tokens <N>`: candidate minimum draft-token windows for MTP and draft speculation (comma-separated).
-- `--spec-ngram-min <N>`: candidate minimum ngram draft-token counts (comma-separated).
-- `--spec-ngram-max <N>`: candidate maximum ngram draft-token counts (comma-separated).
+- `--spec-ngram-min <N>`: candidate minimum cache match lengths for `mtp-ngram` (comma-separated).
+- `--spec-ngram-max <N>`: candidate maximum cache match lengths for `mtp-ngram` (comma-separated).
 
 Additional switches:
 
@@ -684,6 +807,20 @@ Subcommands:
 
 - `auth init`: generate/save owner keypair.
 - `auth status`: show identity/keystore status.
+- `auth sign-node`: sign the current node identity with the owner key.
+- `auth renew-node`: renew the local node ownership certificate.
+- `auth verify-node`: verify a node ownership certificate and trust policy.
+- `auth rotate-node`: rotate the local node identity key and optionally revoke
+  the previous certificate.
+- `auth revoke-owner`: revoke an owner in the local trust store.
+- `auth revoke-node`: revoke a node certificate or node ID in the local trust
+  store.
+- `auth rotate-owner`: rotate the owner keystore identity.
+- `auth trust add <OWNER_ID> [--label <LABEL>] [--trust-store <PATH>]`: add an
+  owner to the local trust allowlist.
+- `auth trust remove <OWNER_ID> [--trust-store <PATH>]`: remove an owner from
+  the local trust allowlist.
+- `auth trust list [--trust-store <PATH>]`: show the current trust store.
 
 `auth init` switches:
 
@@ -704,6 +841,12 @@ Subcommands:
 `auth rotate-owner` switches:
 
 - `--owner-key <OWNER_KEY>`: keystore path.
+
+`auth trust` switches:
+
+- `--trust-store <PATH>`: use a specific trust store instead of the default.
+- `auth trust add <OWNER_ID> --label <LABEL>`: attach a human-readable label to
+  a trusted owner.
 
 ## Model reference formats
 

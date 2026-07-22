@@ -1,9 +1,12 @@
 mod authoring;
 mod diagnostic;
+mod hardware_validation;
 mod model;
+mod model_validation;
 mod plugin_validation;
 mod store;
 mod validate;
+mod validation_support;
 
 #[cfg(test)]
 mod validate_schema_contract;
@@ -38,8 +41,8 @@ pub use validate::{
 mod tests {
     use super::{
         ConfigStore, GpuAssignment, LocalServingNodeConfig, MeshConfig, ModelRuntimeKind,
-        built_in_config_schema, canonicalize_built_in_config_identifier, parse_config_toml,
-        validate_config,
+        SpeculativeConfig, built_in_config_schema, canonicalize_built_in_config_identifier,
+        parse_config_toml, validate_config,
     };
     use std::collections::{BTreeMap, BTreeSet};
     use std::fs;
@@ -53,6 +56,31 @@ mod tests {
         let config = store.load().unwrap();
 
         assert!(config.models.is_empty());
+    }
+
+    #[test]
+    fn speculative_config_precedence_keeps_lower_layer_fields() {
+        let defaults = SpeculativeConfig {
+            strategy: Some("mtp-cache".to_string()),
+            verify_window_pipeline_depth: Some(2),
+            ..Default::default()
+        };
+        let model = SpeculativeConfig {
+            ngram_max_proposal_tokens: Some(6),
+            ..Default::default()
+        };
+        let overrides = SpeculativeConfig {
+            strategy: Some("mtp".to_string()),
+            verify_window_pipeline_depth: Some(3),
+            ..Default::default()
+        };
+
+        let resolved =
+            SpeculativeConfig::with_precedence(Some(&overrides), Some(&model), Some(&defaults));
+
+        assert_eq!(resolved.strategy.as_deref(), Some("mtp"));
+        assert_eq!(resolved.ngram_max_proposal_tokens, Some(6));
+        assert_eq!(resolved.verify_window_pipeline_depth, Some(3));
     }
 
     #[test]
@@ -731,7 +759,6 @@ gpu_id = "pci:0000:65:00.0"
             "models",
             "plugins",
             "settings",
-            "strategy",
         ];
 
         let mut total = 0usize;

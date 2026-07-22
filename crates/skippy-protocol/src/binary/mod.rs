@@ -9,9 +9,10 @@ pub use activation::{
 };
 pub use codec::{
     read_stage_message, recv_ready, recv_reply, send_ready, send_reply_ack,
-    send_reply_ack_with_stats, send_reply_predicted, send_reply_predicted_tokens_with_stats,
+    send_reply_ack_with_stats, send_reply_message, send_reply_predicted,
+    send_reply_predicted_tokens_with_stats, send_reply_predicted_tokens_with_window_and_stats,
     send_reply_predicted_with_stats, send_reply_predicted_with_tokens_and_stats,
-    write_stage_message,
+    send_reply_predicted_with_tokens_window_and_stats, write_stage_message,
 };
 pub use types::{
     ACTIVATION_FLAG_GEMMA3N_ALTUP, ACTIVATION_FLAG_INKLING_MTP_EMBD, ACTIVATION_FLAG_RWKV7_V_FIRST,
@@ -19,10 +20,11 @@ pub use types::{
     MAX_STAGE_DECODED_ACTIVATION_BYTES, MAX_STAGE_LOGIT_BIAS, MAX_STAGE_PREDICTED_TOKENS,
     MAX_STAGE_SIDEBAND_VALUES, MAX_STAGE_STATE_IMPORT_BYTES, READY_MAGIC,
     STAGE_LOGIT_BIAS_WIRE_BYTES, STAGE_SAMPLING_CONFIG_BASE_BYTES, STAGE_STATE_HEADER_BYTES,
-    STAGE_STATE_VERSION, STAGE_WIRE_FIXED_HEADER_BYTES, StageLogitBias, StageReply,
-    StageReplyStats, StageRequestEpoch, StageSamplingConfig, StageStateHeader, StageWireMessage,
-    WireActivationDType, WireMessageKind, WireReplyKind, WireStagePhase,
-    activation_frame_flags_from_state_flags, activation_state_flags_from_frame_flags, state_flags,
+    STAGE_STATE_VERSION, STAGE_WIRE_FIXED_HEADER_BYTES, StageLogitBias, StageNativeMtpDraft,
+    StageReply, StageReplyStats, StageReplyWindow, StageRequestEpoch, StageSamplingConfig,
+    StageStateHeader, StageWireMessage, WireActivationDType, WireMessageKind, WireReplyKind,
+    WireStagePhase, activation_frame_flags_from_state_flags,
+    activation_state_flags_from_frame_flags, state_flags,
 };
 
 pub(crate) fn invalid_data(message: &'static str) -> std::io::Error {
@@ -103,6 +105,26 @@ mod tests {
         assert_eq!(reply.kind, WireReplyKind::PredictedToken);
         assert_eq!(reply.predicted, 42);
         assert_eq!(reply.predicted_tokens, vec![42]);
+        assert_eq!(reply.native_mtp_draft, None);
+    }
+
+    #[test]
+    fn reply_round_trips_typed_native_mtp_draft() {
+        let reply = StageReply {
+            kind: WireReplyKind::PredictedToken,
+            predicted: 42,
+            predicted_tokens: vec![42],
+            native_mtp_draft: Some(StageNativeMtpDraft {
+                token_ids: vec![43, 44],
+                proposal_compute_us: 12_345,
+            }),
+            window: StageReplyWindow::default(),
+            stats: StageReplyStats::default(),
+        };
+        let mut bytes = Vec::new();
+        send_reply_message(&mut bytes, &reply).unwrap();
+
+        assert_eq!(recv_reply(Cursor::new(bytes)).unwrap(), reply);
     }
 
     #[test]
@@ -148,6 +170,23 @@ mod tests {
         assert_eq!(reply.kind, WireReplyKind::PredictedTokens);
         assert_eq!(reply.predicted, 1);
         assert_eq!(reply.predicted_tokens, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn reply_window_metadata_round_trips() {
+        let mut bytes = Vec::new();
+        send_reply_predicted_tokens_with_window_and_stats(
+            &mut bytes,
+            &[1, 2, 3],
+            StageReplyWindow { window_id: 42 },
+            StageReplyStats::default(),
+        )
+        .unwrap();
+        let reply = recv_reply(Cursor::new(bytes)).unwrap();
+
+        assert_eq!(reply.kind, WireReplyKind::PredictedTokens);
+        assert_eq!(reply.predicted_tokens, vec![1, 2, 3]);
+        assert_eq!(reply.window.window_id, 42);
     }
 
     #[test]
@@ -229,6 +268,95 @@ mod tests {
         assert_eq!(sampling.logit_bias.len(), 1);
         assert_eq!(sampling.logit_bias[0].token_id, 123);
         assert_eq!(sampling.logit_bias[0].bias, -50.0);
+    }
+
+    #[test]
+    fn verify_window_message_round_trips_window_metadata() {
+        let mut state =
+            StageStateHeader::new(WireMessageKind::VerifyWindow, WireActivationDType::F32);
+        state.seq_id = 42;
+        state.prompt_token_count = 128;
+        state.decode_step = 7;
+        state.current_token = 1001;
+        let message = StageWireMessage {
+            kind: WireMessageKind::VerifyWindow,
+            pos_start: 135,
+            token_count: 4,
+            state,
+            request_id: 7,
+            session_id: 11,
+            sampling: None,
+            chat_sampling_metadata: None,
+            tokens: vec![1001, 1002, 1003, 1004],
+            positions: Vec::new(),
+            activation: Vec::new(),
+            raw_bytes: Vec::new(),
+        };
+
+        let mut bytes = Vec::new();
+        write_stage_message(&mut bytes, &message, WireActivationDType::F32).unwrap();
+        let decoded = read_stage_message(Cursor::new(bytes), 2).unwrap();
+
+        assert_eq!(decoded.kind, WireMessageKind::VerifyWindow);
+        assert_eq!(decoded.verify_window_id(), Some(42));
+        assert_eq!(decoded.verify_window_base_position(), Some(135));
+        assert_eq!(decoded.verify_window_token_count(), Some(4));
+        assert_eq!(decoded.authoritative_session_position(), Some(135));
+        assert_eq!(decoded.tokens, vec![1001, 1002, 1003, 1004]);
+        assert_eq!(decoded.state.decode_step, 7);
+    }
+
+    #[test]
+    fn only_decode_messages_carry_authoritative_session_positions() {
+        let mut decode = StageWireMessage {
+            kind: WireMessageKind::DecodeEmbd,
+            pos_start: 17,
+            token_count: 1,
+            state: StageStateHeader::new(WireMessageKind::DecodeEmbd, WireActivationDType::F32),
+            request_id: 1,
+            session_id: 2,
+            sampling: None,
+            chat_sampling_metadata: None,
+            tokens: vec![3],
+            positions: Vec::new(),
+            activation: Vec::new(),
+            raw_bytes: Vec::new(),
+        };
+        assert_eq!(decode.authoritative_session_position(), Some(17));
+
+        decode.pos_start = -1;
+        assert_eq!(decode.authoritative_session_position(), None);
+
+        decode.kind = WireMessageKind::PrefillEmbd;
+        assert_eq!(decode.authoritative_session_position(), None);
+    }
+
+    #[test]
+    fn stage_message_rejects_old_state_version() {
+        let mut state =
+            StageStateHeader::new(WireMessageKind::DecodeEmbd, WireActivationDType::F32);
+        state.version = STAGE_STATE_VERSION - 1;
+        let bytes = stage_frame_prefix(WireMessageKind::DecodeEmbd, 1, 0, 0, state);
+
+        assert_invalid_data(
+            read_stage_message(Cursor::new(bytes), 2),
+            "unsupported stage state version",
+        );
+    }
+
+    #[test]
+    fn stage_message_rejects_legacy_kind_10() {
+        let mut bytes = Vec::new();
+        push_i32(&mut bytes, 10);
+        push_i32(&mut bytes, 0);
+        push_i32(&mut bytes, 1);
+        push_i32(&mut bytes, 0);
+        push_i32(&mut bytes, 0);
+
+        assert_invalid_data(
+            read_stage_message(Cursor::new(bytes), 2),
+            "unknown stage message kind",
+        );
     }
 
     #[test]
@@ -500,35 +628,30 @@ mod tests {
 
     #[test]
     fn session_control_messages_are_fixed_header_only() {
-        for kind in [
-            WireMessageKind::CheckpointSession,
-            WireMessageKind::RestoreSession,
-            WireMessageKind::TrimSession,
-        ] {
-            let message = StageWireMessage {
-                kind,
-                pos_start: 0,
-                token_count: 0,
-                state: StageStateHeader::new(kind, WireActivationDType::F32),
-                request_id: 23,
-                session_id: 29,
-                sampling: None,
-                chat_sampling_metadata: None,
-                tokens: Vec::new(),
-                positions: Vec::new(),
-                activation: Vec::new(),
-                raw_bytes: Vec::new(),
-            };
-            let mut bytes = Vec::new();
-            write_stage_message(&mut bytes, &message, WireActivationDType::F32).unwrap();
-            assert_eq!(bytes.len(), STAGE_WIRE_FIXED_HEADER_BYTES);
-            let decoded = read_stage_message(Cursor::new(bytes), 2048).unwrap();
-            assert_eq!(decoded.kind, kind);
-            assert_eq!(decoded.request_id, 23);
-            assert_eq!(decoded.session_id, 29);
-            assert!(decoded.tokens.is_empty());
-            assert!(decoded.activation.is_empty());
-        }
+        let kind = WireMessageKind::TrimSession;
+        let message = StageWireMessage {
+            kind,
+            pos_start: 0,
+            token_count: 0,
+            state: StageStateHeader::new(kind, WireActivationDType::F32),
+            request_id: 23,
+            session_id: 29,
+            sampling: None,
+            chat_sampling_metadata: None,
+            tokens: Vec::new(),
+            positions: Vec::new(),
+            activation: Vec::new(),
+            raw_bytes: Vec::new(),
+        };
+        let mut bytes = Vec::new();
+        write_stage_message(&mut bytes, &message, WireActivationDType::F32).unwrap();
+        assert_eq!(bytes.len(), STAGE_WIRE_FIXED_HEADER_BYTES);
+        let decoded = read_stage_message(Cursor::new(bytes), 2048).unwrap();
+        assert_eq!(decoded.kind, kind);
+        assert_eq!(decoded.request_id, 23);
+        assert_eq!(decoded.session_id, 29);
+        assert!(decoded.tokens.is_empty());
+        assert!(decoded.activation.is_empty());
     }
 
     #[test]

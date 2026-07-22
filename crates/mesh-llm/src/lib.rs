@@ -131,6 +131,7 @@ fn runtime_help_text() -> Option<String> {
 }
 
 fn runtime_options_from_cli(cli: mesh_llm_cli::Cli) -> mesh_llm_host_runtime::RuntimeOptions {
+    let speculative_overrides = speculative_overrides_from_cli(&cli);
     mesh_llm_host_runtime::RuntimeOptions {
         log_format: cli.log_format,
         debug: cli.debug,
@@ -166,7 +167,9 @@ fn runtime_options_from_cli(cli: mesh_llm_cli::Cli) -> mesh_llm_host_runtime::Ru
         draft: cli.draft,
         draft_max: cli.draft_max,
         no_draft: cli.no_draft,
+        speculative_overrides,
         split: cli.split,
+        split_topology_lock: cli.split_topology_lock,
         ctx_size: cli.ctx_size,
         max_vram: cli.max_vram,
         no_enumerate_host: cli.no_enumerate_host,
@@ -193,6 +196,31 @@ fn runtime_options_from_cli(cli: mesh_llm_cli::Cli) -> mesh_llm_host_runtime::Ru
         trust_owner: cli.trust_owner,
         nostr_discovery: cli.nostr_discovery,
     }
+}
+
+fn speculative_overrides_from_cli(
+    cli: &mesh_llm_cli::Cli,
+) -> Option<mesh_llm_host_runtime::plugin::SpeculativeConfig> {
+    let suppress_cooldown_drafts = if cli.speculative_native_mtp_allow_cooldown_drafts {
+        Some(false)
+    } else {
+        cli.speculative_native_mtp_suppress_cooldown_drafts
+            .then_some(true)
+    };
+    let mut overrides = mesh_llm_host_runtime::plugin::SpeculativeConfig::default();
+    overrides.strategy = cli.speculative_strategy.clone();
+    overrides.ngram_min = cli.speculative_ngram_min;
+    overrides.ngram_max = cli.speculative_ngram_max;
+    overrides.ngram_max_proposal_tokens = cli.speculative_ngram_max_proposal_tokens;
+    overrides.extension_max_tokens = cli.speculative_extension_max_tokens;
+    overrides.native_mtp_reject_cooldown_tokens = cli.speculative_native_mtp_reject_cooldown_tokens;
+    overrides.native_mtp_suppress_cooldown_drafts = suppress_cooldown_drafts;
+    overrides.native_mtp_suppress_cooldown_draft_limit =
+        cli.speculative_native_mtp_suppress_cooldown_draft_limit;
+    overrides.verify_window_min_tokens = cli.speculative_verify_window_min_tokens;
+    overrides.verify_window_max_tokens = cli.speculative_verify_window_max_tokens;
+    overrides.verify_window_pipeline_depth = cli.speculative_verify_window_pipeline_depth;
+    (overrides != Default::default()).then_some(overrides)
 }
 
 fn command_uses_machine_output(command: Option<&mesh_llm_cli::Command>) -> bool {
@@ -279,6 +307,7 @@ fn map_trust_policy(
 
 #[cfg(test)]
 mod cli_entrypoint_tests {
+    use clap::Parser;
     use std::ffi::OsString;
 
     #[test]
@@ -331,5 +360,30 @@ mod cli_entrypoint_tests {
             OsString::from("help"),
             OsString::from("--help"),
         ]));
+    }
+
+    #[test]
+    fn cli_ngram_override_reaches_runtime_config() {
+        let normalized = mesh_llm_cli::normalize_runtime_surface_args([
+            "mesh-llm",
+            "serve",
+            "--speculative-strategy",
+            "mtp",
+            "--speculative-ngram-min",
+            "2",
+            "--speculative-ngram-max",
+            "6",
+            "--speculative-ngram-max-proposal-tokens",
+            "5",
+        ]);
+        let cli = mesh_llm_cli::Cli::try_parse_from(normalized.normalized).expect("CLI parses");
+
+        let config = super::speculative_overrides_from_cli(&cli)
+            .expect("speculative flags produce an override");
+
+        assert_eq!(config.strategy.as_deref(), Some("mtp"));
+        assert_eq!(config.ngram_min, Some(2));
+        assert_eq!(config.ngram_max, Some(6));
+        assert_eq!(config.ngram_max_proposal_tokens, Some(5));
     }
 }

@@ -46,7 +46,15 @@ class BuildReleaseScriptTests(unittest.TestCase):
         self.assertIn("--features gpu-bench-hip", cargo_log)
         self.assertIn("--features dynamic-native-runtime", cargo_log)
 
-    def run_build_release_with_backend(self, backend: str) -> str:
+    def test_static_release_build_handles_an_empty_feature_list(self) -> None:
+        cargo_log = self.run_build_release_with_backend("metal", dynamic_native_runtime=False)
+
+        self.assertIn("build --release --locked -p mesh-llm", cargo_log)
+        self.assertNotIn("--features", cargo_log)
+
+    def run_build_release_with_backend(
+        self, backend: str, *, dynamic_native_runtime: bool = True
+    ) -> str:
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
             scripts_dir = tmp / "scripts"
@@ -64,6 +72,22 @@ class BuildReleaseScriptTests(unittest.TestCase):
                 #!/usr/bin/env bash
                 set -euo pipefail
                 echo "stub build-ui $*"
+                """,
+            )
+            self.write_executable(
+                scripts_dir / "prepare-llama.sh",
+                """
+                #!/usr/bin/env bash
+                set -euo pipefail
+                echo "stub prepare-llama $*"
+                """,
+            )
+            self.write_executable(
+                scripts_dir / "build-llama.sh",
+                """
+                #!/usr/bin/env bash
+                set -euo pipefail
+                echo "stub build-llama $*"
                 """,
             )
             self.write_executable(
@@ -114,7 +138,9 @@ class BuildReleaseScriptTests(unittest.TestCase):
                 {
                     "CARGO_LOG": str(cargo_log),
                     "LLAMA_STAGE_BACKEND": backend,
-                    "MESH_LLM_DYNAMIC_NATIVE_RUNTIME": "1",
+                    "MESH_LLM_DYNAMIC_NATIVE_RUNTIME": "1"
+                    if dynamic_native_runtime
+                    else "0",
                     "PATH": f"{bin_dir}{os.pathsep}{env['PATH']}",
                 }
             )

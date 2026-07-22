@@ -1,12 +1,12 @@
 use std::{
     collections::HashMap,
     io,
-    net::{SocketAddr, TcpListener, TcpStream},
+    net::{IpAddr, SocketAddr, TcpListener, TcpStream},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
         mpsc,
-        mpsc::TryRecvError,
+        mpsc::{RecvTimeoutError, TryRecvError},
     },
     thread::{self, JoinHandle},
     time::Duration,
@@ -17,14 +17,15 @@ use skippy_protocol::{
     StageConfig, StageTopology,
     binary::{
         StageReply, StageStateHeader, StageWireMessage, WireActivationDType, WireMessageKind,
-        WireReplyKind, read_stage_message, recv_ready, recv_reply, send_ready,
-        send_reply_ack_with_stats, send_reply_predicted_tokens_with_stats,
-        send_reply_predicted_with_tokens_and_stats, write_stage_message,
+        WireReplyKind, read_stage_message, recv_ready, recv_reply, send_ready, send_reply_message,
+        write_stage_message,
     },
 };
 
 use super::socket::{connect_downstream_socket, downstream_source_ip, resolve_downstream_endpoint};
-use super::{consume_optional_client_ready_hello, send_client_ready_hello_if_enabled};
+use super::stage_execution::{
+    consume_optional_client_ready_hello, send_client_ready_hello_if_enabled,
+};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct PredictionReturnKey {
@@ -214,17 +215,27 @@ impl PredictionReturnReceiver {
         });
     }
 
-    pub(crate) fn try_recv_expected(&self, expected: WireReplyKind) -> Result<Option<StageReply>> {
+    pub(crate) fn recv_expected_timeout(
+        &self,
+        expected: WireReplyKind,
+        timeout: Duration,
+    ) -> Result<Option<StageReply>> {
+        let reply = match self.receiver.recv_timeout(timeout) {
+            Ok(Ok(reply)) => reply,
+            Ok(Err(error)) => return Err(anyhow!(error)),
+            Err(RecvTimeoutError::Timeout) => return Ok(None),
+            Err(RecvTimeoutError::Disconnected) => {
+                return Err(anyhow!("prediction return channel disconnected"));
+            }
+        };
+        validate_expected_reply(reply, std::slice::from_ref(&expected)).map(Some)
+    }
+
+    pub(crate) fn try_recv_one_of(&self, expected: &[WireReplyKind]) -> Result<Option<StageReply>> {
         let Some(reply) = self.try_recv()? else {
             return Ok(None);
         };
-        if reply.kind != expected {
-            bail!(
-                "expected {expected:?} direct prediction return, got {:?}",
-                reply.kind
-            );
-        }
-        Ok(Some(reply))
+        validate_expected_reply(reply, expected).map(Some)
     }
 
     fn try_recv(&self) -> Result<Option<StageReply>> {
@@ -237,6 +248,16 @@ impl PredictionReturnReceiver {
             }
         }
     }
+}
+
+fn validate_expected_reply(reply: StageReply, expected: &[WireReplyKind]) -> Result<StageReply> {
+    if !expected.contains(&reply.kind) {
+        bail!(
+            "expected one of {expected:?} from direct prediction return, got {:?}",
+            reply.kind
+        );
+    }
+    Ok(reply)
 }
 
 impl Drop for PredictionReturnReceiver {
@@ -285,6 +306,75 @@ impl PredictionReturnSinks {
             thread::sleep(Duration::from_millis(2));
         }
     }
+
+    pub(crate) fn remove(&self, request_id: u64, session_id: u64) {
+        let key = PredictionReturnKey::new(request_id, session_id);
+        if let Ok(mut streams) = self.streams.lock() {
+            streams.remove(&key);
+        }
+    }
+}
+
+/// Read timeout for the return-sink ready handshake. `recv_ready` is a blocking
+/// `read_exact`; without this a stalled downstream connection hangs the open
+/// forever, which mid-generation blocks the request from ever falling back to
+/// the upstream reply. Cleared afterwards so the sink's normal reads stay
+/// blocking.
+///
+/// Budget sizing (20s): over a WAN mesh the return sink connects to a LOCAL
+/// bridge alias, but the remote `ready` byte only arrives after the bridge
+/// COLD-establishes a fresh stage QUIC connection (up to ~10s) and the remote
+/// inbound handler then dials its local binary server. A 5s budget timed out
+/// during that cold setup (observed EAGAIN on a healthy ~26ms WAN split), even
+/// though the pooled forward lanes — which get a 20s initial connect budget and
+/// are then reused — succeeded on the same bridge. Matching the forward-lane
+/// budget lets the cold return path complete instead of failing to the slower
+/// upstream-reply fallback.
+///
+/// This is a *single bounded deadline*, not a retry budget: the sink is opened
+/// on the generation hot path, and `connect_downstream_socket` already bounds
+/// the connect itself, so wrapping this in an outer retry only compounds the
+/// worst-case stall (see PR #1011 review).
+const RETURN_SINK_READY_READ_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Connect to `return_addr`, complete the ready handshake, and send the
+/// prediction-return open message. Single bounded attempt — on failure the
+/// caller falls back to the upstream reply path.
+fn open_return_sink_once(
+    return_addr: SocketAddr,
+    source_ip: Option<IpAddr>,
+    request_id: u64,
+    session_id: u64,
+    wire_dtype: WireActivationDType,
+    not_ready_context: &'static str,
+) -> Result<TcpStream> {
+    let mut stream = connect_downstream_socket(return_addr, source_ip, Duration::from_secs(2))
+        .map_err(|error| anyhow!(error))?;
+    stream.set_nodelay(true).ok();
+    send_client_ready_hello_if_enabled(&mut stream)
+        .context("send prediction return client ready hello")?;
+    // Bound the ready handshake read. `recv_ready` is a blocking `read_exact`;
+    // without a timeout a stalled downstream connection hangs the return-sink
+    // open forever, blocking generation from falling back to the upstream reply.
+    // A single short deadline (no outer retry) fails fast to that fallback.
+    // Both the set and the clear are propagated: if the set fails, `recv_ready`
+    // would be unbounded (defeating the fix); if the clear fails, the handshake
+    // timeout would leak into the sink's later reads.
+    stream
+        .set_read_timeout(Some(RETURN_SINK_READY_READ_TIMEOUT))
+        .context("set prediction return ready read timeout")?;
+    let ready = recv_ready(&mut stream).context(not_ready_context);
+    stream
+        .set_read_timeout(None)
+        .context("clear prediction return ready read timeout")?;
+    ready?;
+    write_stage_message(
+        &mut stream,
+        &prediction_return_open_message(request_id, session_id),
+        wire_dtype,
+    )
+    .context("open prediction return stream")?;
+    Ok(stream)
 }
 
 pub(crate) fn open_prediction_return_stream(
@@ -298,34 +388,15 @@ pub(crate) fn open_prediction_return_stream(
     let endpoint = driver_stage_endpoint(config, topology)?;
     let return_addr = resolve_downstream_endpoint(endpoint)?;
     let source_ip = downstream_source_ip(config)?;
-    let attempts = 1;
-    let mut last_error = None;
-    for _ in 0..attempts {
-        match connect_downstream_socket(return_addr, source_ip, Duration::from_secs(2)) {
-            Ok(mut stream) => {
-                stream.set_nodelay(true).ok();
-                send_client_ready_hello_if_enabled(&mut stream)
-                    .context("send prediction return client ready hello")?;
-                recv_ready(&mut stream).context("prediction return sink did not become ready")?;
-                write_stage_message(
-                    &mut stream,
-                    &prediction_return_open_message(request_id, session_id),
-                    wire_dtype,
-                )
-                .context("open direct prediction return stream")?;
-                return Ok(stream);
-            }
-            Err(error) => {
-                last_error = Some(anyhow!(error));
-                std::thread::sleep(Duration::from_millis(500));
-            }
-        }
-    }
-    Err(last_error
-        .unwrap_or_else(|| anyhow!("timed out"))
-        .context(format!(
-            "connect direct prediction return sink at {endpoint}"
-        )))
+    open_return_sink_once(
+        return_addr,
+        source_ip,
+        request_id,
+        session_id,
+        wire_dtype,
+        "prediction return sink did not become ready",
+    )
+    .with_context(|| format!("connect direct prediction return sink at {endpoint}"))
 }
 
 pub(crate) fn open_downstream_prediction_return_stream(
@@ -341,41 +412,22 @@ pub(crate) fn open_downstream_prediction_return_stream(
     let endpoint = strip_tcp_prefix(&downstream.endpoint);
     let return_addr = resolve_downstream_endpoint(endpoint)?;
     let source_ip = downstream_source_ip(config)?;
-    let mut stream = connect_downstream_socket(return_addr, source_ip, Duration::from_secs(2))
-        .with_context(|| format!("connect downstream prediction return sink at {endpoint}"))?;
-    stream.set_nodelay(true).ok();
-    send_client_ready_hello_if_enabled(&mut stream)
-        .context("send downstream prediction return client ready hello")?;
-    recv_ready(&mut stream).context("downstream prediction return sink did not become ready")?;
-    write_stage_message(
-        &mut stream,
-        &prediction_return_open_message(request_id, session_id),
+    open_return_sink_once(
+        return_addr,
+        source_ip,
+        request_id,
+        session_id,
         wire_dtype,
+        "downstream prediction return sink did not become ready",
     )
-    .context("open downstream prediction return stream")?;
-    Ok(stream)
+    .with_context(|| format!("connect downstream prediction return sink at {endpoint}"))
 }
 
 pub(crate) fn send_direct_prediction_return(
     stream: &mut TcpStream,
     reply: StageReply,
 ) -> Result<()> {
-    match reply.kind {
-        WireReplyKind::PredictedToken => send_reply_predicted_with_tokens_and_stats(
-            stream,
-            reply.predicted,
-            &reply.predicted_tokens,
-            reply.stats,
-        )
-        .context("send direct predicted-token return"),
-        WireReplyKind::PredictedTokens => {
-            send_reply_predicted_tokens_with_stats(stream, &reply.predicted_tokens, reply.stats)
-                .context("send direct predicted-tokens return")
-        }
-        WireReplyKind::Ack => {
-            send_reply_ack_with_stats(stream, reply.stats).context("send direct ACK return")
-        }
-    }
+    send_reply_message(stream, &reply).context("send direct prediction return")
 }
 
 fn driver_stage_endpoint<'a>(
@@ -451,14 +503,32 @@ mod tests {
 
         send_reply_predicted_with_stats(&mut client, 42, Default::default()).unwrap();
 
-        let reply = poll_test_reply(&receiver, WireReplyKind::PredictedToken);
+        let reply = receiver
+            .recv_expected_timeout(WireReplyKind::PredictedToken, Duration::from_secs(1))
+            .unwrap()
+            .expect("prediction return reply");
         assert_eq!(reply.predicted, 42);
         drop(client);
         handle.join().unwrap().unwrap();
     }
 
     #[test]
-    fn direct_prediction_return_preserves_predicted_token_sideband() {
+    fn blocking_prediction_return_receive_times_out_without_polling() {
+        let hub = Arc::new(PredictionReturnHub::default());
+        let receiver = hub.register(53, 59).unwrap();
+        let started = std::time::Instant::now();
+
+        assert!(
+            receiver
+                .recv_expected_timeout(WireReplyKind::PredictedTokens, Duration::from_millis(10),)
+                .unwrap()
+                .is_none()
+        );
+        assert!(started.elapsed() >= Duration::from_millis(8));
+    }
+
+    #[test]
+    fn direct_prediction_return_preserves_typed_native_mtp_draft() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let mut client = TcpStream::connect(addr).unwrap();
@@ -467,7 +537,12 @@ mod tests {
         let reply = StageReply {
             kind: WireReplyKind::PredictedToken,
             predicted: 42,
-            predicted_tokens: vec![42, 43, 123],
+            predicted_tokens: vec![42],
+            native_mtp_draft: Some(skippy_protocol::binary::StageNativeMtpDraft {
+                token_ids: vec![43],
+                proposal_compute_us: 123,
+            }),
+            window: skippy_protocol::binary::StageReplyWindow { window_id: 7 },
             stats: Default::default(),
         };
         send_direct_prediction_return(&mut server, reply).unwrap();
@@ -475,7 +550,15 @@ mod tests {
         let received = recv_reply(&mut client).unwrap();
         assert_eq!(received.kind, WireReplyKind::PredictedToken);
         assert_eq!(received.predicted, 42);
-        assert_eq!(received.predicted_tokens, vec![42, 43, 123]);
+        assert_eq!(received.predicted_tokens, vec![42]);
+        assert_eq!(
+            received.native_mtp_draft,
+            Some(skippy_protocol::binary::StageNativeMtpDraft {
+                token_ids: vec![43],
+                proposal_compute_us: 123,
+            })
+        );
+        assert_eq!(received.window.window_id, 7);
     }
 
     #[test]
@@ -502,17 +585,29 @@ mod tests {
         assert_eq!(stream.peer_addr().unwrap(), client.local_addr().unwrap());
     }
 
-    fn poll_test_reply(receiver: &PredictionReturnReceiver, expected: WireReplyKind) -> StageReply {
-        let started = std::time::Instant::now();
-        loop {
-            if let Some(reply) = receiver.try_recv_expected(expected).unwrap() {
-                return reply;
-            }
-            assert!(
-                started.elapsed() < Duration::from_secs(1),
-                "timed out waiting for prediction return reply"
-            );
-            thread::sleep(Duration::from_millis(1));
-        }
+    #[test]
+    fn prediction_return_sinks_remove_abandoned_streams() {
+        let request_id = 41;
+        let session_id = 43;
+        let sinks = PredictionReturnSinks::default();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (server, _) = listener.accept().unwrap();
+
+        sinks
+            .insert_opened_sink(
+                prediction_return_open_message(request_id, session_id),
+                server,
+            )
+            .unwrap();
+        sinks.remove(request_id, session_id);
+
+        assert!(
+            sinks
+                .take_wait(request_id, session_id, Duration::from_millis(1))
+                .unwrap()
+                .is_none()
+        );
+        drop(client);
     }
 }

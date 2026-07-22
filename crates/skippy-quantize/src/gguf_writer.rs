@@ -6,7 +6,7 @@ use std::path::Path;
 use anyhow::{Context, Result, ensure};
 use serde::Serialize;
 
-use crate::float_convert::{FloatDType, target_dtype_for_tensor};
+use crate::float_convert::{FloatDType, convert_float_chunk, target_dtype_for_tensor};
 pub(crate) use crate::gguf_metadata::GgufKv;
 use crate::gguf_metadata::write_kv;
 #[cfg(test)]
@@ -19,8 +19,14 @@ use crate::tensor_map::{
     TensorNameMap, hf_layer_id, inkling_mtp_depth, is_inkling_fused_w13, is_mtp_source_tensor,
     is_shared_mtp_context_tensor,
 };
-use crate::tensor_stream::{TensorSegment, TensorTransform, stream_tensor_segment};
 use crate::types::ConvertOutputType;
+
+mod glm_dsa;
+
+use glm_dsa::{
+    GlmDsaKvBSplitMode, TensorTransform, enrich_glm_dsa_indexshare_metadata, glm_dsa_kv_b_layer,
+    glm_dsa_kv_b_split_mode, stream_transformed_segment,
+};
 
 const GGUF_MAGIC: &[u8; 4] = b"GGUF";
 const GGUF_VERSION: u32 = 3;
@@ -28,7 +34,6 @@ const GGUF_ALIGNMENT: u64 = 32;
 const GGML_TYPE_F32: u32 = 0;
 const GGML_TYPE_F16: u32 = 1;
 const GGML_TYPE_BF16: u32 = 30;
-
 #[derive(Debug, Clone)]
 pub(crate) struct RawGgufWriteOptions {
     pub(crate) buffer_size: usize,
@@ -120,11 +125,14 @@ fn prepare_raw_safetensors_gguf(
         "no safetensors files found under {}",
         source.display()
     );
+    let metadata_seed = options.metadata.clone();
+    let glm_dsa_kv_b_split = glm_dsa_kv_b_split_mode(metadata_seed.as_deref())?;
     let tensors = collect_tensor_sources(
         &files,
         options.tensor_name_map,
         options.output_type,
         options.tensor_selection,
+        glm_dsa_kv_b_split,
     )?;
     ensure!(
         !tensors.is_empty(),
@@ -132,12 +140,10 @@ fn prepare_raw_safetensors_gguf(
         source.display()
     );
     let total_tensor_count = tensors.len();
+    let mut metadata = metadata_seed.unwrap_or_else(|| raw_metadata(source, total_tensor_count));
+    enrich_glm_dsa_indexshare_metadata(&mut metadata, &tensors)?;
     let mut tensors = select_split_tensors(tensors, options.split)?;
     assign_gguf_offsets(&mut tensors)?;
-    let metadata = options
-        .metadata
-        .clone()
-        .unwrap_or_else(|| raw_metadata(source, total_tensor_count));
     let metadata = split_metadata(metadata, options.split, total_tensor_count)?;
     Ok(PreparedGgufWrite {
         files,
@@ -290,6 +296,7 @@ fn collect_tensor_sources(
     tensor_name_map: TensorNameMap,
     output_type: Option<ConvertOutputType>,
     tensor_selection: TensorSelection,
+    glm_dsa_kv_b_split: GlmDsaKvBSplitMode,
 ) -> Result<Vec<TensorSource>> {
     let mut tensors = Vec::new();
     let mut expert_groups = BTreeMap::<ExpertGroupKey, ExpertGroup>::new();
@@ -323,6 +330,27 @@ fn collect_tensor_sources(
                     }
                 }
                 continue;
+            }
+            if let Some(layer) = glm_dsa_kv_b_layer(tensor.name())? {
+                match glm_dsa_kv_b_split {
+                    GlmDsaKvBSplitMode::Config(split) => {
+                        tensors.extend(TensorSource::from_glm_dsa_kv_b_split(
+                            file_index,
+                            tensor,
+                            layer,
+                            split,
+                            output_type,
+                        )?);
+                        continue;
+                    }
+                    GlmDsaKvBSplitMode::MissingMetadata => {
+                        anyhow::bail!(
+                            "GLM-DSA tensor {} requires attention head/value/rope/kv_lora metadata for kv_b split",
+                            tensor.name()
+                        );
+                    }
+                    GlmDsaKvBSplitMode::Disabled => {}
+                }
             }
             tensors.push(TensorSource::from_safetensor(
                 file_index,
@@ -389,7 +417,7 @@ impl TensorSource {
                 element_count,
                 source_byte_len: tensor.byte_len(),
                 target_byte_len: tensor_byte_len(element_count, target_dtype)?,
-                transform: TensorTransform::Direct,
+                transform: TensorTransform::Identity,
             }],
             name,
             dims,
@@ -480,6 +508,17 @@ fn inkling_w13_tensor_sources(
             gguf_offset: 0,
         })
         .collect())
+}
+
+struct TensorSegment {
+    file_index: usize,
+    source_name: String,
+    source_dtype: FloatDType,
+    target_dtype: FloatDType,
+    element_count: u64,
+    source_byte_len: u64,
+    target_byte_len: u64,
+    transform: TensorTransform,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -623,7 +662,7 @@ impl ExpertGroup {
                 element_count,
                 source_byte_len: tensor.byte_len(),
                 target_byte_len: tensor_byte_len(element_count, self.target_dtype)?,
-                transform: TensorTransform::Direct,
+                transform: TensorTransform::Identity,
             },
         );
         ensure!(
@@ -745,7 +784,7 @@ fn stream_tensor_data(
         let mut copied = 0_u64;
         for segment in &tensor.segments {
             let segment_copied =
-                stream_tensor_segment(writer, &files[segment.file_index], segment, buffer_size)?;
+                stream_segment(writer, &files[segment.file_index], segment, buffer_size)?;
             ensure!(
                 segment_copied == segment.target_byte_len,
                 "copied {} bytes for {}, expected {}",
@@ -764,6 +803,124 @@ fn stream_tensor_data(
         );
     }
     Ok(())
+}
+
+fn stream_segment(
+    writer: &mut File,
+    file: &SafetensorFile,
+    segment: &TensorSegment,
+    buffer_size: usize,
+) -> Result<u64> {
+    if let TensorTransform::AlternatingRows {
+        parity,
+        row_elements,
+    } = segment.transform
+    {
+        return stream_alternating_rows(writer, file, segment, buffer_size, parity, row_elements);
+    }
+    if let Some(written) = stream_transformed_segment(writer, file, segment, buffer_size)? {
+        return Ok(written);
+    }
+
+    if segment.source_dtype == segment.target_dtype {
+        let copied = file.stream_tensor(&segment.source_name, writer, buffer_size)?;
+        ensure!(
+            copied == segment.source_byte_len,
+            "read {} bytes for {}, expected {}",
+            copied,
+            segment.source_name,
+            segment.source_byte_len
+        );
+        return Ok(copied);
+    }
+
+    let source_element_size = usize::try_from(segment.source_dtype.byte_size())
+        .context("source dtype byte size does not fit usize")?;
+    let chunk_size = aligned_chunk_size(buffer_size, source_element_size);
+    let mut output_bytes = 0_u64;
+    let mut source_bytes = 0_u64;
+    file.stream_tensor_chunks(&segment.source_name, chunk_size, |chunk| {
+        ensure!(
+            chunk.len() % source_element_size == 0,
+            "chunk for {} split an element boundary",
+            segment.source_name
+        );
+        source_bytes += chunk.len() as u64;
+        output_bytes +=
+            convert_float_chunk(chunk, segment.source_dtype, segment.target_dtype, writer)?;
+        Ok(())
+    })?;
+    ensure!(
+        source_bytes == segment.source_byte_len,
+        "read {} bytes for {}, expected {}",
+        source_bytes,
+        segment.source_name,
+        segment.source_byte_len
+    );
+    ensure!(
+        source_bytes / segment.source_dtype.byte_size() == segment.element_count,
+        "read element count mismatch for {}",
+        segment.source_name
+    );
+    Ok(output_bytes)
+}
+
+/// Deinterleave alternating rows of a fused SwiGLU tensor (Inkling MTP fused
+/// w13): parity 0 keeps even rows (gate), parity 1 keeps odd rows (up).
+fn stream_alternating_rows(
+    writer: &mut File,
+    file: &SafetensorFile,
+    segment: &TensorSegment,
+    buffer_size: usize,
+    parity: u64,
+    row_elements: u64,
+) -> Result<u64> {
+    ensure!(parity < 2, "alternating-row parity must be zero or one");
+    ensure!(row_elements > 0, "alternating-row width must be non-zero");
+    let row_bytes = row_elements
+        .checked_mul(segment.source_dtype.byte_size())
+        .context("alternating-row byte length overflow")?;
+    let row_bytes = usize::try_from(row_bytes).context("row byte length does not fit usize")?;
+    let chunk_size = aligned_chunk_size(buffer_size, row_bytes);
+    let mut source_bytes = 0_u64;
+    let mut output_bytes = 0_u64;
+    let mut row_index = 0_u64;
+    file.stream_tensor_chunks(&segment.source_name, chunk_size, |chunk| {
+        ensure!(
+            chunk.len() % row_bytes == 0,
+            "chunk for {} split a fused SwiGLU row",
+            segment.source_name
+        );
+        source_bytes += chunk.len() as u64;
+        for row in chunk.chunks_exact(row_bytes) {
+            if row_index % 2 == parity {
+                output_bytes +=
+                    convert_float_chunk(row, segment.source_dtype, segment.target_dtype, writer)?;
+            }
+            row_index += 1;
+        }
+        Ok(())
+    })?;
+    ensure!(
+        source_bytes == segment.source_byte_len,
+        "read {} bytes for {}, expected {}",
+        source_bytes,
+        segment.source_name,
+        segment.source_byte_len
+    );
+    ensure!(
+        output_bytes == segment.target_byte_len,
+        "deinterleaved {} bytes for {}, expected {}",
+        output_bytes,
+        segment.source_name,
+        segment.target_byte_len
+    );
+    Ok(output_bytes)
+}
+
+fn aligned_chunk_size(buffer_size: usize, element_size: usize) -> usize {
+    let aligned = buffer_size - (buffer_size % element_size);
+    aligned.max(element_size)
 }
 
 fn pad_writer_to_alignment(writer: &mut File, alignment: u64) -> Result<()> {

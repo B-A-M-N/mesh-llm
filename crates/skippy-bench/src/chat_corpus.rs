@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     fs,
     io::{BufRead, BufReader},
     path::{Path, PathBuf},
@@ -78,6 +79,7 @@ struct ChatCorpusResult {
     total_tokens: Option<u64>,
     finish_reason: Option<String>,
     output_chars: usize,
+    timings: Option<BTreeMap<String, Value>>,
     error: Option<String>,
     api_error_code: Option<String>,
 }
@@ -99,6 +101,9 @@ struct ChatCorpusSummary {
     total_wall_ms: f64,
     completion_tok_s: Option<f64>,
     total_tok_s: Option<f64>,
+    drafted_tokens: u64,
+    accepted_draft_tokens: u64,
+    draft_acceptance: Option<f64>,
 }
 
 pub fn chat_corpus(args: ChatCorpusArgs) -> Result<()> {
@@ -330,6 +335,7 @@ fn parse_json_response(
                     .map(str::chars)
                     .map(Iterator::count)
                     .unwrap_or_default(),
+                timings: response_timings(&value),
                 error: None,
                 api_error_code: None,
             }
@@ -370,6 +376,7 @@ fn parse_stream_response(
     let mut prompt_tokens = None;
     let mut total_tokens = None;
     let mut finish_reason = None;
+    let mut timings = None;
     let mut error = None;
     let mut api_error_code_value = None;
 
@@ -419,6 +426,9 @@ fn parse_stream_response(
                 .and_then(Value::as_str)
                 .map(ToOwned::to_owned);
         }
+        if let Some(response_timings) = response_timings(&value) {
+            timings = Some(response_timings);
+        }
         if let Some(usage) = value.get("usage").filter(|usage| !usage.is_null()) {
             completion_tokens = usage_u64(usage, "completion_tokens");
             prompt_tokens = usage_u64(usage, "prompt_tokens");
@@ -440,6 +450,7 @@ fn parse_stream_response(
         total_tokens,
         finish_reason,
         output_chars,
+        timings,
         error,
         api_error_code: api_error_code_value,
     }
@@ -466,6 +477,7 @@ fn error_result(
         total_tokens: None,
         finish_reason: None,
         output_chars: 0,
+        timings: None,
         error: Some(error),
         api_error_code,
     }
@@ -622,6 +634,14 @@ fn summarize(results: &[ChatCorpusResult], total_wall_ms: f64) -> ChatCorpusSumm
         .iter()
         .filter_map(|result| result.total_tokens)
         .sum::<u64>();
+    let drafted_tokens = results
+        .iter()
+        .filter_map(|result| timing_u64(result, "draft_n"))
+        .sum::<u64>();
+    let accepted_draft_tokens = results
+        .iter()
+        .filter_map(|result| timing_u64(result, "draft_n_accepted"))
+        .sum::<u64>();
     elapsed.sort_by(f64::total_cmp);
     ttft.sort_by(f64::total_cmp);
     ChatCorpusSummary {
@@ -640,7 +660,19 @@ fn summarize(results: &[ChatCorpusResult], total_wall_ms: f64) -> ChatCorpusSumm
         total_wall_ms,
         completion_tok_s: rate(completion_tokens, total_wall_ms),
         total_tok_s: rate(total_tokens, total_wall_ms),
+        drafted_tokens,
+        accepted_draft_tokens,
+        draft_acceptance: (drafted_tokens > 0)
+            .then(|| accepted_draft_tokens as f64 / drafted_tokens as f64),
     }
+}
+
+fn response_timings(value: &Value) -> Option<BTreeMap<String, Value>> {
+    serde_json::from_value(value.get("timings")?.clone()).ok()
+}
+
+fn timing_u64(result: &ChatCorpusResult, key: &str) -> Option<u64> {
+    result.timings.as_ref()?.get(key)?.as_u64()
 }
 
 fn mean(values: &[f64]) -> Option<f64> {
@@ -811,5 +843,44 @@ mod tests {
         );
 
         assert_eq!(body["user"], "repo:turns");
+    }
+
+    #[test]
+    fn summary_aggregates_canonical_draft_counters() {
+        let results = vec![
+            result_with_timings(20, 12),
+            result_with_timings(5, 4),
+            result_with_timings(0, 0),
+        ];
+
+        let summary = summarize(&results, 1_000.0);
+
+        assert_eq!(summary.drafted_tokens, 25);
+        assert_eq!(summary.accepted_draft_tokens, 16);
+        assert_eq!(summary.draft_acceptance, Some(0.64));
+    }
+
+    fn result_with_timings(drafted: u64, accepted: u64) -> ChatCorpusResult {
+        ChatCorpusResult {
+            sequence: 0,
+            prompt_id: None,
+            category: None,
+            length_bucket: None,
+            session_id: "session".to_string(),
+            prompt_chars: 1,
+            elapsed_ms: 1.0,
+            ttft_ms: None,
+            completion_tokens: Some(1),
+            prompt_tokens: Some(1),
+            total_tokens: Some(2),
+            finish_reason: Some("stop".to_string()),
+            output_chars: 1,
+            timings: Some(BTreeMap::from([
+                ("draft_n".to_string(), json!(drafted)),
+                ("draft_n_accepted".to_string(), json!(accepted)),
+            ])),
+            error: None,
+            api_error_code: None,
+        }
     }
 }

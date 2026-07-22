@@ -11,7 +11,7 @@ pub(super) fn apply_speculative_behavior(
     suffix: &str,
 ) {
     match suffix {
-        "mode" | "draft_selection_policy" | "pairing_fault" | "spec_default" => {
+        "strategy" | "mode" | "draft_selection_policy" | "pairing_fault" | "spec_default" => {
             set_static_options(setting);
         }
         "draft_model" => {
@@ -61,13 +61,19 @@ pub(super) fn apply_speculative_behavior(
         }
         "ngram_min" => {
             set_numeric(setting, Some(1.0), None, Some(1.0), None);
-            push_mode_dependency(setting, prefix, "ngram", suffix);
         }
         "ngram_max" => {
             set_numeric(setting, Some(1.0), None, Some(1.0), None);
             push_range_constraint(setting, Some(format!("{prefix}.ngram_min")), None);
-            push_mode_dependency(setting, prefix, "ngram", suffix);
         }
+        "ngram_max_proposal_tokens"
+        | "extension_max_tokens"
+        | "native_mtp_reject_cooldown_tokens"
+        | "native_mtp_suppress_cooldown_drafts"
+        | "native_mtp_suppress_cooldown_draft_limit"
+        | "verify_window_min_tokens"
+        | "verify_window_max_tokens"
+        | "verify_window_pipeline_depth" => {}
         _ => {}
     }
 }

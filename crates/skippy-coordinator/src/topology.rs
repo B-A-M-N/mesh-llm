@@ -1,11 +1,28 @@
 use std::cmp::Ordering;
 
+mod locked;
+
+pub use locked::{LockedTopologyStage, plan_locked_topology};
+
 /// Default auto lane cap.  Matches llama-server's default of `--parallel 4`.
 /// Users can override via `gpu.parallel` in config.toml or the per-model
 /// `parallel` setting.
 const MAX_AUTO_PARALLEL_LANES: usize = 4;
 const MINIMUM_AUTO_CONTEXT_LENGTH: u32 = 65_536;
 const CONTEXT_STEPS: &[u32] = &[512, 1024, 2048, 4096, 8192, 16_384, 32_768, 65_536, 131_072];
+
+/// Compute-buffer reserve applied to the KV term of each layer's placement
+/// cost. Charging KV at 100/85 holds back 15% of a node's post-weight space for
+/// llama.cpp compute-graph buffers and scratch — algebraically identical to the
+/// single-node context planner's `usable_kv_cache_budget`, which grants KV 85%
+/// of post-weight space (`context_planning.rs`). Without this, placement packed
+/// a node with `weights + KV` alone and left the decode's transient buffers
+/// nowhere to go, OOM-ing the stage or swapping the host. Because the reserve
+/// rides on the KV term it scales with context length, matching how compute
+/// buffers grow with `n_ctx`. A fixed per-node floor (see the coordinator's
+/// node headroom) covers the context-independent minimum on top of this.
+const KV_COMPUTE_RESERVE_NUMERATOR: u128 = 100;
+const KV_COMPUTE_RESERVE_DENOMINATOR: u128 = 85;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TopologyPlanningInput {
@@ -69,6 +86,30 @@ pub enum TopologyPlanError {
     ZeroParallelLanes,
     #[error("no topology can distribute all layers and keep context >= {minimum_context}")]
     NoValidTopology { minimum_context: u32 },
+    #[error("locked topology must contain at least {minimum} stages; found {actual}")]
+    LockedStageCount { minimum: usize, actual: usize },
+    #[error("locked topology references unknown node {node_id}")]
+    LockedUnknownNode { node_id: String },
+    #[error("locked topology assigns node {node_id} more than once")]
+    LockedDuplicateNode { node_id: String },
+    #[error(
+        "locked topology stage {stage_index} must start at layer {expected_start}; found {actual_start}"
+    )]
+    LockedNonContiguousRange {
+        stage_index: usize,
+        expected_start: u32,
+        actual_start: u32,
+    },
+    #[error("locked topology stage {stage_index} has empty or reversed range {start}..{end}")]
+    LockedInvalidRange {
+        stage_index: usize,
+        start: u32,
+        end: u32,
+    },
+    #[error("locked topology ends at layer {actual_end}; model has {layer_count} layers")]
+    LockedIncompleteCoverage { actual_end: u32, layer_count: u32 },
+    #[error("locked topology cannot fit context >= {minimum_context}")]
+    LockedTopologyDoesNotFit { minimum_context: u32 },
 }
 
 pub fn plan_topology(input: &TopologyPlanningInput) -> Result<TopologyPlan, TopologyPlanError> {
@@ -461,7 +502,14 @@ fn candidate_bytes_per_layer(
     // share one unified cache via sequence IDs (kv_unified=true in
     // llama.cpp when lane_count > 1).  Do not multiply by lanes.
     let kv_bytes = u128::from(kv_per_layer).checked_mul(u128::from(context_length))?;
-    let total = u128::from(weight_per_layer).checked_add(kv_bytes)?;
+    // Charge KV at 100/85 so 15% of the node's post-weight space is held back
+    // for llama.cpp compute-graph buffers/scratch (mirrors the single-node
+    // context planner's `usable_kv_cache_budget`). This scales the reserve with
+    // context length, matching how compute buffers grow with `n_ctx`.
+    let kv_with_compute_reserve = kv_bytes
+        .checked_mul(KV_COMPUTE_RESERVE_NUMERATOR)?
+        .div_ceil(KV_COMPUTE_RESERVE_DENOMINATOR);
+    let total = u128::from(weight_per_layer).checked_add(kv_with_compute_reserve)?;
     total.try_into().ok()
 }
 
@@ -807,12 +855,20 @@ mod tests {
         //   part of the fixture, but the planner must use Metal working set
         //   size, not total RAM.
         //
-        // Expected topology: possible, 262_144 context, 4 lanes.
+        // Expected topology: possible, 131_072 context, 4 lanes.
         //
         // Why: this is a fixture-driven simulation. The model package metadata
         // and each machine's Metal working-set budget are passed into the same
         // planner used by runtime orchestration, and the planner reports
         // whether a topology can be formed plus its context and lane count.
+        //
+        // Context is 131_072 rather than the model's 262_144 native maximum
+        // because the planner reserves compute-buffer headroom (KV billed at
+        // 100/85). The ~316 GB of weights plus full-native KV would pack the
+        // combined ~354.6 GB working-set budget to within a few GB, leaving no
+        // room for llama.cpp compute graphs; halving the context restores ~18 GB
+        // of headroom across the two stages. This is the fix for stages that
+        // previously loaded at native context and then OOM'd on the first token.
         assert_eq!(STUDIO_RAM_BYTES, 274_877_906_944);
 
         let planned = plan_topology(&qwen_coder_480b_input(vec![
@@ -825,7 +881,7 @@ mod tests {
         };
 
         assert!(split_possible, "{planned:?}");
-        assert_eq!(context_length, Some(QWEN_CODER_480B_NATIVE_CONTEXT));
+        assert_eq!(context_length, Some(131_072));
         assert_eq!(parallel_lanes, Some(4));
 
         let plan = planned.expect("studio-james and studio-mic should form a split topology");

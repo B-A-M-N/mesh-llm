@@ -131,10 +131,11 @@ pub struct ServeBinaryArgs {
         help = "Override n_gpu_layers for the embedded OpenAI draft model. Defaults to the stage config n_gpu_layers."
     )]
     pub openai_draft_n_gpu_layers: Option<i32>,
-    #[arg(long, default_value_t = 0)]
-    pub openai_ngram_min: usize,
-    #[arg(long, default_value_t = 0)]
-    pub openai_ngram_max: usize,
+    #[arg(
+        long,
+        help = "JSON file containing the complete resolved speculative decode plan."
+    )]
+    pub openai_speculative_config: Option<PathBuf>,
 }
 
 #[derive(Parser)]
@@ -150,6 +151,11 @@ pub struct ServeOpenAiArgs {
         help = "Served model id to advertise and accept, for example org/repo:Q4_K_M. Defaults to config model_id."
     )]
     pub model_id: Option<String>,
+    #[arg(
+        long,
+        help = "JSON file containing a complete resolved speculative decode plan."
+    )]
+    pub speculative_config: Option<PathBuf>,
     #[arg(long, default_value_t = 16)]
     pub default_max_tokens: u32,
     #[arg(
@@ -261,5 +267,44 @@ mod tests {
             panic!("expected serve-openai command");
         };
         assert_eq!(args.openai_guardrails, OpenAiGuardrailsCliMode::Enforce);
+    }
+
+    #[test]
+    fn standalone_commands_accept_resolved_speculative_config_files() {
+        let cli = Cli::try_parse_from([
+            "skippy-server",
+            "serve-binary",
+            "--config",
+            "stage.json",
+            "--activation-width",
+            "2048",
+            "--openai-speculative-config",
+            "decode-plan.json",
+        ])
+        .unwrap();
+        let Command::ServeBinary(args) = cli.command else {
+            panic!("expected serve-binary command");
+        };
+        assert_eq!(
+            args.openai_speculative_config,
+            Some(PathBuf::from("decode-plan.json"))
+        );
+
+        let cli = Cli::try_parse_from([
+            "skippy-server",
+            "serve-openai",
+            "--config",
+            "stage.json",
+            "--speculative-config",
+            "decode-plan.json",
+        ])
+        .unwrap();
+        let Command::ServeOpenAi(args) = cli.command else {
+            panic!("expected serve-openai command");
+        };
+        assert_eq!(
+            args.speculative_config,
+            Some(PathBuf::from("decode-plan.json"))
+        );
     }
 }

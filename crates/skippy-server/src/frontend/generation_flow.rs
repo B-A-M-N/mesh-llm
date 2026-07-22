@@ -1,4 +1,42 @@
-use super::*;
+use crate::binary_transport::forwarded_stage_message_timed;
+use crate::binary_transport::write_stage_message_conditioned;
+use crate::frontend::admission::GenerationTokenBudgetRequest;
+use crate::frontend::generation::EmbeddedStageZeroGeneration;
+use crate::frontend::generation::GENERATION_ADMISSION_TIMEOUT;
+use crate::frontend::generation::GeneratedText;
+use crate::frontend::generation::GenerationCacheStats;
+use crate::frontend::generation::GenerationTokenLimit;
+use crate::frontend::generation::LocalGeneration;
+use crate::frontend::generation::OpenAiBackendMode;
+use crate::frontend::generation::OpenAiGenerationIds;
+use crate::frontend::generation::PhaseTimer;
+use crate::frontend::generation::PreparedGenerationPrompt;
+use crate::frontend::generation::SplitMultimodalGeneration;
+use crate::frontend::generation::StageOpenAiBackend;
+use crate::frontend::generation::TextGenerationCollector;
+use crate::frontend::generation::TokenControl;
+use crate::frontend::generation::emulation_generation_active;
+use crate::frontend::request::wire_sampling_config;
+use crate::frontend::util::generation_stop_values;
+use crate::frontend::util::openai_backend_error;
+use crate::frontend::util::openai_io_error;
+use crate::frontend::wire_messages::MultimodalPrefillArgs;
+use crate::frontend::wire_messages::ReusableDecodeMessage;
+use crate::frontend::wire_messages::ReusableDecodeMessageArgs;
+use crate::frontend::wire_messages::generation_config_message;
+use crate::frontend::wire_messages::multimodal_prefill_message;
+use crate::kv_integration::proactive_eviction_attrs;
+use crate::kv_integration::proactive_eviction_error_kind;
+use anyhow::anyhow;
+use openai_frontend::ChatCompletionRequest;
+use openai_frontend::OpenAiError;
+use openai_frontend::OpenAiResult;
+use serde_json::json;
+use skippy_protocol::binary::StageWireMessage;
+use skippy_protocol::binary::WireReplyKind;
+use skippy_protocol::binary::recv_reply;
+use skippy_protocol::binary::write_stage_message;
+use skippy_runtime::SamplingConfig;
 
 impl StageOpenAiBackend {
     #[allow(clippy::too_many_arguments)]
@@ -55,39 +93,34 @@ impl StageOpenAiBackend {
             return Err(OpenAiError::invalid_request("prompt produced no tokens"));
         }
         let max_tokens = max_tokens.resolve(prompt_token_ids.len(), self.ctx_size)?;
-        let _token_budget_reservation = if self.mode.reserves_local_kv_tokens() {
-            let token_admit_timer = PhaseTimer::start();
-            let reservation = self.generation_token_budget.reserve(
-                GenerationTokenBudgetRequest::new(prompt_token_ids.len(), max_tokens),
-                GENERATION_ADMISSION_TIMEOUT,
-            )?;
-            let mut token_admit_attrs = self.openai_attrs(&ids);
-            token_admit_attrs.insert(
-                "llama_stage.prompt_token_count".to_string(),
-                json!(prompt_token_ids.len()),
-            );
-            token_admit_attrs.insert("llama_stage.max_tokens".to_string(), json!(max_tokens));
-            token_admit_attrs.insert(
-                "llama_stage.kv_reserved_tokens".to_string(),
-                json!(reservation.tokens()),
-            );
-            token_admit_attrs.insert(
-                "llama_stage.kv_active_reserved_tokens".to_string(),
-                json!(reservation.active_tokens_after_reservation()),
-            );
-            token_admit_attrs.insert(
-                "llama_stage.kv_capacity_tokens".to_string(),
-                json!(self.generation_token_budget.capacity_tokens()),
-            );
-            self.emit_openai_phase(
-                "stage.openai_generation_token_admit",
-                token_admit_timer,
-                token_admit_attrs,
-            );
-            Some(reservation)
-        } else {
-            None
-        };
+        let token_admit_timer = PhaseTimer::start();
+        let token_budget_reservation = self.generation_token_budget.reserve(
+            GenerationTokenBudgetRequest::new(prompt_token_ids.len(), max_tokens),
+            GENERATION_ADMISSION_TIMEOUT,
+        )?;
+        let mut token_admit_attrs = self.openai_attrs(&ids);
+        token_admit_attrs.insert(
+            "llama_stage.prompt_token_count".to_string(),
+            json!(prompt_token_ids.len()),
+        );
+        token_admit_attrs.insert("llama_stage.max_tokens".to_string(), json!(max_tokens));
+        token_admit_attrs.insert(
+            "llama_stage.kv_reserved_tokens".to_string(),
+            json!(token_budget_reservation.tokens()),
+        );
+        token_admit_attrs.insert(
+            "llama_stage.kv_active_reserved_tokens".to_string(),
+            json!(token_budget_reservation.active_tokens_after_reservation()),
+        );
+        token_admit_attrs.insert(
+            "llama_stage.kv_capacity_tokens".to_string(),
+            json!(self.generation_token_budget.capacity_tokens()),
+        );
+        self.emit_openai_phase(
+            "stage.openai_generation_token_admit",
+            token_admit_timer,
+            token_admit_attrs,
+        );
         let chat_sampling_metadata = prompt.chat_parse_metadata.as_deref();
 
         let emulation_active = emulation_generation_active(hook_request.as_ref(), &prompt);
@@ -101,9 +134,9 @@ impl StageOpenAiBackend {
                     max_tokens,
                     sampling: &sampling,
                     chat_sampling_metadata,
-                    native_mtp_enabled: self.native_mtp_enabled,
-                    native_mtp_max_tokens: self.native_mtp_max_tokens,
-                    native_mtp_min_tokens: self.native_mtp_min_tokens,
+                    speculative: &self.speculative,
+                    native_mtp_enabled: self.config.native_mtp_enabled
+                        && self.speculative.native_mtp.enabled,
                     hook_request: hook_request.clone(),
                     hook_runtime: hook_runtime.clone(),
                     cancellation,
@@ -120,9 +153,6 @@ impl StageOpenAiBackend {
                 prefill_reply_credit_limit,
                 lane_pool,
                 prediction_returns,
-                native_mtp_enabled,
-                native_mtp_max_tokens,
-                native_mtp_min_tokens,
             } => self.generate_embedded_stage_zero_tokens(
                 EmbeddedStageZeroGeneration {
                     config: &config,
@@ -140,11 +170,9 @@ impl StageOpenAiBackend {
                     draft: self.draft.clone(),
                     speculative_window: self.speculative_window,
                     adaptive_speculative_window: self.adaptive_speculative_window,
-                    ngram_min: self.ngram_min,
-                    ngram_max: self.ngram_max,
-                    native_mtp_enabled,
-                    native_mtp_max_tokens,
-                    native_mtp_min_tokens,
+                    speculative: &self.speculative,
+                    native_mtp_enabled: config.native_mtp_enabled
+                        && self.speculative.native_mtp.enabled,
                     prompt_token_ids: &prompt_token_ids,
                     max_tokens,
                     sampling: &sampling,
@@ -824,8 +852,29 @@ impl StageOpenAiBackend {
                 let stage0_timer = PhaseTimer::start();
                 let batch_outcome = self
                     .decode_frame_batcher
-                    .decode(&session_key, current, Some(&request.sampling), None)
+                    .decode(
+                        &session_key,
+                        u64::try_from(message.pos_start).map_err(|_| {
+                            OpenAiError::backend("negative authoritative decode position")
+                        })?,
+                        current,
+                        request.sampling.enabled.then_some(&request.sampling),
+                        None,
+                    )
                     .map_err(openai_backend_error)?;
+                if let Some(alignment) = batch_outcome.session_alignment {
+                    let mut attrs = self.openai_attrs(&request.ids);
+                    attrs.insert(
+                        "llama_stage.session_auto_align_before_tokens".to_string(),
+                        json!(alignment.before_token_count),
+                    );
+                    attrs.insert(
+                        "llama_stage.session_auto_align_after_tokens".to_string(),
+                        json!(alignment.after_token_count),
+                    );
+                    self.telemetry
+                        .emit_debug("stage.openai_session_auto_align", attrs);
+                }
                 decode_runtime_lock_wait_ms += batch_outcome.runtime_lock_wait_ms;
                 decode_runtime_lock_hold_ms += batch_outcome.runtime_lock_hold_ms;
                 decode_runtime_lock_acquires += 1;

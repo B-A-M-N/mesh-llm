@@ -25,6 +25,15 @@ impl NativeMtpVerifier {
         })
     }
 
+    pub(in crate::frontend) fn restore_pending_draft(&mut self, pending: PendingNativeMtpDraft) {
+        debug_assert!(self.pending.is_none());
+        debug_assert!(self.pending_tokens.is_empty());
+        self.pending_tokens = pending.tokens;
+        self.pending = Some(PendingDraft {
+            origin: pending.origin,
+        });
+    }
+
     pub(in crate::frontend) fn clear_pending_draft(&mut self) {
         self.pending = None;
         self.pending_tokens.clear();
@@ -217,6 +226,20 @@ mod tests {
                 ..NativeMtpStats::default()
             }
         );
+    }
+
+    #[test]
+    fn restoring_a_taken_draft_preserves_its_origin_without_counting_it_twice() {
+        let mut verifier = NativeMtpVerifier::default();
+        verifier.observe_next_draft(Some(draft(12)), NativeMtpDraftOrigin::VerifyNext);
+
+        let pending = verifier.take_pending_draft().unwrap();
+        verifier.restore_pending_draft(pending);
+        let restored = verifier.take_pending_draft().unwrap();
+
+        assert_eq!(restored.tokens, vec![12]);
+        assert_eq!(restored.origin, NativeMtpDraftOrigin::VerifyNext);
+        assert_eq!(verifier.stats().drafted_tokens, 1);
     }
 
     #[test]

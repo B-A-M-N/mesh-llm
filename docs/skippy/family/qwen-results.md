@@ -663,7 +663,7 @@ Per-window timing:
 | draft adaptive max `8` | `365.43/812.61ms` | `153.54/524.55ms` | `188.98/197.73ms` |
 
 Interpretation: speculation is doing the thing we wanted: it replaces roughly
-`195` single-token staged decode turns with tens of `VerifySpan` requests, and
+`195` single-token staged decode turns with tens of `VerifyWindow` requests, and
 the draft is usually right. The limiting cost is now local draft decode time on
 stage0, not target verification acceptance. Larger windows reduce target
 verify count but increase draft cost and rejection cost. The next useful step

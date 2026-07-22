@@ -218,7 +218,7 @@ fn main() {
 
 fn default_build_dir(workspace_root: &std::path::Path, target: &str) -> std::path::PathBuf {
     let suffix = default_backend(target);
-    workspace_root.join(format!(".deps/llama-build/build-stage-abi-{suffix}"))
+    workspace_root.join(format!(".deps/llama-build/build-stage-abi-static-{suffix}"))
 }
 
 fn default_backend(target: &str) -> &'static str {

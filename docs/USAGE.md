@@ -88,7 +88,7 @@ mesh-llm benchmark tune --model /models/qwen3-8b.gguf --mmap-values auto,true,fa
 mesh-llm benchmark tune --model /models/qwen3-8b.gguf --flash-attention on,off
 mesh-llm benchmark tune --model /models/qwen3-mtp.gguf --speculative-types auto
 mesh-llm benchmark tune --model /models/qwen3-mtp.gguf --speculative-types mtp --debug-telemetry --json
-mesh-llm benchmark tune --model /models/qwen3-8b.gguf --speculative-types draft,ngram,disabled --spec-draft-models /models/qwen3-draft.gguf --spec-draft-max-tokens 4,8,16
+mesh-llm benchmark tune --model /models/qwen3-mtp.gguf --speculative-types mtp,mtp-ngram,disabled --spec-draft-max-tokens 4,8,16
 mesh-llm benchmark tune --model /models/qwen3-8b.gguf --throughput-tolerance-pct 2.5
 mesh-llm benchmark tune --model /models/qwen3-8b.gguf --apply
 mesh-llm benchmark tune --model /models/qwen3-8b.gguf --apply --replace-existing
@@ -96,7 +96,7 @@ mesh-llm benchmark tune --model /models/qwen3-8b.gguf --launch-args
 ```
 
 If `--mmap-values` is omitted, benchmark tune tries `auto`, `true`, and `false`. If `--mlock-values` is omitted, it tries `false` and only tries `true` when the current mlock limit can cover the evaluated budget. If `--flash-attention` is omitted, flash attention is not varied during the sweep; when supplied (e.g. `--flash-attention on,off`), trial count doubles and the recommendation applies the best flash attention setting.
-If `--speculative-types` is omitted, benchmark tune uses `auto`: native MTP is tried first for MTP-looking targets, locally discoverable draft models are tried when available, ngram candidates are tried as a model-free fallback, and a disabled baseline is included for comparison. Use `--speculative-types mtp,draft,ngram,disabled` to force an explicit speculative sweep, or `--no-speculative-tune` to reproduce the old disabled-baseline-only sweep.
+If `--speculative-types` is omitted, benchmark tune uses `auto`: native MTP and the bounded MTP + request-local N-gram cache composite are tried for MTP-looking targets, locally discoverable draft models are tried when available, and a disabled baseline is included for comparison. Use `--speculative-types mtp,mtp-ngram,draft,disabled` to force an explicit speculative sweep, or `--no-speculative-tune` to run only the disabled baseline.
 Use `--apply` to write the recommended settings into `~/.mesh-llm/config.toml`, and combine with `--replace-existing` to overwrite existing writable recommendation fields. `--launch-args` prints generated `mesh-llm serve` arguments for local launch without writing config.
 Use `--debug-telemetry` when proving speculative decoding behavior: each trial log includes Skippy debug telemetry, including `llama_stage.native_mtp.*` summary attributes for MTP drafted, accepted, rejected, and accept-rate counts.
 
@@ -320,8 +320,8 @@ lifecycle_health_interval_ms    = 5000      # health-check interval (ms)
 
 # --- Speculative decoding ------------------------------------------------
 [defaults.speculative]
-strategy                   = "auto"          # auto disabled mtp
-mode                       = "auto"          # auto off draft ngram lookahead
+strategy                   = "auto"          # auto disabled mtp or a package strategy id
+mode                       = "auto"          # external draft-model mode: auto disabled draft
 draft_selection_policy     = "auto"          # auto manual heuristic
 pairing_fault              = "warn_disable"  # warn_disable fail_open fail_closed
 draft_acceptance_threshold = 0.0             # 0.0 = use runtime default
@@ -345,9 +345,19 @@ spec_default               = "auto"          # bool or "auto"
 # draft_cache_type_k = "q8_0"
 # draft_cache_type_v = "q8_0"
 
-# N-gram speculative (when mode = "ngram")
-# ngram_min = 1
-# ngram_max = 5
+# Request-local N-gram cache and MTP extension (ngram_max <= 4).
+# ngram_min                 = 2
+# ngram_max                 = 4
+# ngram_max_proposal_tokens = 6        # output budget, separate from ngram_max
+# extension_max_tokens      = 6        # fixed request-local continuation horizon
+
+# Target VerifyWindow and native-MTP recovery controls
+# verify_window_min_tokens                    = 1
+# verify_window_max_tokens                    = 6
+# verify_window_pipeline_depth                = 2
+# native_mtp_reject_cooldown_tokens           = 4
+# native_mtp_suppress_cooldown_drafts         = true
+# native_mtp_suppress_cooldown_draft_limit    = 1
 
 # --- Request defaults (merged at OpenAI frontend only) -------------------
 [defaults.request_defaults]
@@ -702,6 +712,48 @@ Config precedence:
   process launch until direct plugin use. This is useful for very slow legacy
   hosts or emulator-assisted startup paths.
 
+## Speculative decode configuration
+
+Configure speculative decoding under `[defaults.speculative]` for all staged
+models, or under `[models.speculative]` to override one configured model. CLI
+flags have the highest precedence, followed by the selected model, then
+`[defaults.speculative]`; package strategies supply the remaining declared
+defaults. The resolved plan is validated once before Skippy starts.
+
+Set `strategy = "auto"` to use a package recommendation, `"disabled"` for
+the no-speculation baseline, or `"mtp"` for native MTP. A package may also
+publish stable names such as `mtp-cache`; that name is valid only for the
+package that declares it. Direct GGUF serving creates the same composite by
+combining `strategy = "mtp"` with valid N-gram bounds.
+
+```toml
+[[models]]
+model = "meshllm/GLM-4.7-Flash-MTP-GGUF:Q4_K_M"
+
+[models.speculative]
+strategy = "mtp"
+ngram_min = 2
+ngram_max = 4
+ngram_max_proposal_tokens = 6
+extension_max_tokens = 6
+verify_window_min_tokens = 1
+verify_window_max_tokens = 6
+verify_window_pipeline_depth = 2
+```
+
+`ngram_min` and `ngram_max` determine the history match length.
+`ngram_max_proposal_tokens` is separately the maximum continuation length.
+The request-local cache is limited to `ngram_max <= 4`. N-gram settings require
+native MTP and create one composite proposal; standalone N-gram speculation is
+not supported. All combinations are verified together by the target, so tuning
+these values changes speculative work, not output correctness.
+
+For package-authoring rules, see
+[Layer Package Repositories](specs/layer-package-repos.md#generation-defaults).
+For strategy diagrams, CLI overrides, and the VerifyWindow telemetry used to
+evaluate a configuration, see
+[Pipelined VerifyWindow Decode](skippy/PIPELINED_VERIFY_WINDOW.md).
+
 ## Lemonade integration
 
 Use the `openai-endpoint` plugin to route requests to a local [Lemonade Server](https://lemonade-server.ai) through the same `http://localhost:9337/v1` API that mesh-llm exposes.
@@ -850,12 +902,30 @@ Mesh-wide rebalancing and distributed load/unload come later.
 
 ## Owner-control plane
 
-Owner-control is the operator lane for config and inventory actions. It does **not** replace the public mesh plane used for join, gossip, routing, or inference. Config and inventory mutation are exclusive to `mesh-llm-control/1`; the old mesh-plane config stream IDs are reserved but no longer carry protobuf request/response handling.
+Owner-control is the private operator lane for commands directed at exactly one
+owner-attested node. It does **not** replace the public mesh plane used for
+join, gossip, routing, or inference. Config and inventory mutation are
+exclusive to `mesh-llm-control/1`; the old mesh-plane config stream IDs are
+reserved but no longer carry protobuf request/response handling.
+
+`scan-refresh` is the first public owned-node command. It asks the explicitly
+targeted remote node to rescan its managed model inventory, republishes the
+model names from that exact scan, and returns the refreshed inventory to the
+requester. The compatible protobuf operation remains named
+`refresh_inventory` on the wire.
 
 ### Bootstrap contract
 
-- New control clients need an explicit owner-control endpoint token.
-- Read the local bootstrap policy from `GET /api/runtime/control-bootstrap` or `mesh-llm runtime bootstrap --json`.
+- New control clients need an explicit owner-control endpoint token. The token
+  identifies and cryptographically pins one target; it is not inferred from a
+  peer ID, public gossip, Nostr, routing state, or `/api/status`.
+- Read a target node's local bootstrap policy from
+  `GET /api/runtime/control-bootstrap` or
+  `mesh-llm runtime bootstrap --json` on that node, then transfer the endpoint
+  token to the controlling node out of band.
+- The controlling node must have a valid owner key for the same owner. The
+  target verifies requester ownership against the actual QUIC connection
+  identity before dispatching a command.
 - If no explicit endpoint is supplied, the current client contract returns `ControlEndpointRequired`.
 - If an explicit endpoint is configured and fails, the client stays on owner-control and reports a structured failure. It does **not** silently fall back to mesh-plane config streams.
 
@@ -883,7 +953,8 @@ Run owner-control requests through the local management API using an explicit en
 
 ```bash
 mesh-llm runtime get-config --port 3131 --endpoint '<control-endpoint>' --json
-mesh-llm runtime refresh-inventory --port 3131 --endpoint '<control-endpoint>' --json
+mesh-llm runtime scan-refresh --port 3131 --endpoint '<control-endpoint>'
+mesh-llm runtime scan-refresh --port 3131 --endpoint '<control-endpoint>' --json
 mesh-llm runtime apply-config \
   --port 3131 \
   --endpoint '<control-endpoint>' \
@@ -899,6 +970,11 @@ curl -s -X POST localhost:3131/api/runtime/control/get-config \
   -H 'Content-Type: application/json' \
   -d '{"endpoint":"<control-endpoint>"}' | jq .
 
+curl -s -X POST localhost:3131/api/runtime/control/scan-refresh \
+  -H 'Content-Type: application/json' \
+  -d '{"endpoint":"<control-endpoint>"}' | jq .
+
+# Compatibility alias: retains the legacy snapshot-only response shape.
 curl -s -X POST localhost:3131/api/runtime/control/refresh-inventory \
   -H 'Content-Type: application/json' \
   -d '{"endpoint":"<control-endpoint>"}' | jq .
@@ -911,6 +987,53 @@ curl -s -X POST localhost:3131/api/runtime/control/apply-config \
     "config":{"version":1}
   }' | jq .
 ```
+
+The local REST facade is loopback-only. The public CLI spelling is
+`runtime scan-refresh`; the old `runtime refresh-inventory` spelling remains a
+hidden compatibility alias and continues to return the legacy config snapshot.
+Neither facade discovers a target implicitly: both require `--endpoint` (or
+the REST `endpoint` field).
+
+### Scan-refresh result
+
+The JSON response contains `target_node_id`, `disposition`, and `inventory`.
+Inventory entries are sorted by `canonical_model_ref` and contain an optional
+`display_name`, `total_size_bytes`, and optional compact model metadata. The
+metadata includes the canonical model key plus GGUF-derived architecture,
+quantization, tokenizer, dimensions, RoPE, special-token, and MoE fields when
+known. `--json` prints this response unchanged; human output summarizes the
+disposition, target, model count, total bytes, and sorted model references.
+
+`disposition` is `executed` when this request performed the scan and
+`coalesced` when it joined an already-running scan. Joined callers receive the
+same successful inventory payload. A new client talking to an older
+owner-control server may receive only the legacy wire snapshot; the command
+still succeeds, but the REST fields `disposition` and `inventory` are `null`
+and human output labels the result `compatibility-limited`. This does not mean
+released nodes support the richer response fields.
+
+Scan failures are returned to all joined callers and preserve the last good
+inventory and model advertisements. Rich inventory results stay on the private
+owner-control response path: they are not copied wholesale into peer state,
+public gossip, runtime status, or `/api/status`. Endpoint tokens and raw command
+results must not be logged or advertised. The node continues to publish only
+its existing availability projection from a successful scan.
+
+### Owner-control limits
+
+- Inbound and outbound protobuf frames are limited to 8 MiB. An oversized
+  generated response becomes `ControlUnavailable` before any oversized body is
+  written.
+- Client connect, stream-open, handshake, and request-write waits are bounded
+  at 8 seconds, 2 seconds, 2 seconds, and 2 seconds respectively.
+- Get/apply unary responses have a 5-second bound; inventory scans have a
+  30-second bound. Watch acceptance has a 5-second bound, after which an
+  accepted watch remains streaming without a unary deadline.
+- The server bounds handshake and request reads at 2 and 5 seconds and admits
+  at most 32 concurrent owner-control stream workers per connection.
+- Request IDs are non-zero. Authentication, requester binding, target binding,
+  request validation, deadline selection, and response-size enforcement occur
+  in the common dispatcher path.
 
 ### Failure modes
 

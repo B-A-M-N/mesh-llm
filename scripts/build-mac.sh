@@ -477,7 +477,16 @@ EOF
     echo "  security find-identity -v -p codesigning" >&2
 }
 
-export LLAMA_STAGE_BUILD_DIR="${LLAMA_STAGE_BUILD_DIR:-${SKIPPY_LLAMA_BUILD_DIR:-$LLAMA_BUILD_ROOT/build-stage-abi-metal}}"
+if [[ -z "${LLAMA_STAGE_BUILD_DIR:-}" && -n "${SKIPPY_LLAMA_BUILD_DIR:-}" ]]; then
+    export LLAMA_STAGE_BUILD_DIR="$SKIPPY_LLAMA_BUILD_DIR"
+fi
+if [[ -z "${LLAMA_STAGE_BUILD_DIR:-}" ]]; then
+    export LLAMA_STAGE_BUILD_DIR="$(
+        LLAMA_STAGE_BACKEND="${LLAMA_STAGE_BACKEND:-metal}" \
+            LLAMA_STAGE_LINK_MODE=static \
+            "$SCRIPT_DIR/build-llama.sh" --print-build-dir
+    )"
+fi
 
 configure_lld_linker
 

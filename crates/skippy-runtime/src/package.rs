@@ -66,7 +66,19 @@ pub struct PackageGenerationInfo {
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct PackageSpeculativeDecodingInfo {
     pub default: String,
+    pub proposers: BTreeMap<String, PackageSpeculativeProposerInfo>,
     pub strategies: BTreeMap<String, PackageSpeculativeStrategyInfo>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct PackageSpeculativeProposerInfo {
+    pub proposer_type: String,
+    pub prediction_depth: Option<u32>,
+    pub layer_indices: Vec<u32>,
+    pub ngram_min: Option<u32>,
+    pub ngram_max: Option<u32>,
+    pub max_proposal_tokens: Option<u32>,
+    pub history_scope: Option<String>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -75,6 +87,15 @@ pub struct PackageSpeculativeStrategyInfo {
     pub prediction_depth: Option<u32>,
     pub layer_indices: Vec<u32>,
     pub window_policy: Option<PackageWindowPolicyInfo>,
+    pub proposer: Option<String>,
+    pub primary: Option<String>,
+    pub extender: Option<String>,
+    pub extension_policy: Option<PackageExtensionPolicyInfo>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct PackageExtensionPolicyInfo {
+    pub max_tokens: u32,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -213,7 +234,27 @@ struct PackageGeneration {
 struct PackageSpeculativeDecoding {
     default: String,
     #[serde(default)]
+    proposers: BTreeMap<String, PackageSpeculativeProposer>,
+    #[serde(default)]
     strategies: BTreeMap<String, PackageSpeculativeStrategy>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PackageSpeculativeProposer {
+    #[serde(rename = "type")]
+    proposer_type: String,
+    #[serde(default)]
+    prediction_depth: Option<u32>,
+    #[serde(default)]
+    layer_indices: Vec<u32>,
+    #[serde(default)]
+    ngram_min: Option<u32>,
+    #[serde(default)]
+    ngram_max: Option<u32>,
+    #[serde(default)]
+    max_proposal_tokens: Option<u32>,
+    #[serde(default)]
+    history_scope: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -226,6 +267,19 @@ struct PackageSpeculativeStrategy {
     layer_indices: Vec<u32>,
     #[serde(default)]
     window_policy: Option<PackageWindowPolicy>,
+    #[serde(default)]
+    proposer: Option<String>,
+    #[serde(default)]
+    primary: Option<String>,
+    #[serde(default)]
+    extender: Option<String>,
+    #[serde(default)]
+    extension_policy: Option<PackageExtensionPolicy>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PackageExtensionPolicy {
+    max_tokens: u32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -556,11 +610,30 @@ fn package_speculative_decoding_info(
 ) -> PackageSpeculativeDecodingInfo {
     PackageSpeculativeDecodingInfo {
         default: speculative.default,
+        proposers: speculative
+            .proposers
+            .into_iter()
+            .map(|(name, proposer)| (name, package_speculative_proposer_info(proposer)))
+            .collect(),
         strategies: speculative
             .strategies
             .into_iter()
             .map(|(name, strategy)| (name, package_speculative_strategy_info(strategy)))
             .collect(),
+    }
+}
+
+fn package_speculative_proposer_info(
+    proposer: PackageSpeculativeProposer,
+) -> PackageSpeculativeProposerInfo {
+    PackageSpeculativeProposerInfo {
+        proposer_type: proposer.proposer_type,
+        prediction_depth: proposer.prediction_depth,
+        layer_indices: proposer.layer_indices,
+        ngram_min: proposer.ngram_min,
+        ngram_max: proposer.ngram_max,
+        max_proposal_tokens: proposer.max_proposal_tokens,
+        history_scope: proposer.history_scope,
     }
 }
 
@@ -578,6 +651,14 @@ fn package_speculative_strategy_info(
                 initial_window: window.initial_window,
                 min_window: window.min_window,
                 max_window: window.max_window,
+            }),
+        proposer: strategy.proposer,
+        primary: strategy.primary,
+        extender: strategy.extender,
+        extension_policy: strategy
+            .extension_policy
+            .map(|policy| PackageExtensionPolicyInfo {
+                max_tokens: policy.max_tokens,
             }),
     }
 }

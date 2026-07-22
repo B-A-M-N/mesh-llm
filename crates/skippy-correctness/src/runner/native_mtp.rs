@@ -6,12 +6,46 @@ use serde::Serialize;
 use skippy_protocol::binary::StageReply;
 use skippy_runtime::ModelInfo;
 
+#[derive(Clone, Copy)]
+pub(crate) struct NativeMtpRequirement {
+    pub(crate) require_draft: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct NativeMtpArtifactSummary {
+    pub(crate) nextn_predict_layers: u32,
+    pub(crate) has_eh_proj: bool,
+    pub(crate) has_enorm: bool,
+    pub(crate) has_hnorm: bool,
+}
+
+impl NativeMtpArtifactSummary {
+    pub(crate) fn supports_native_mtp(&self) -> bool {
+        self.nextn_predict_layers > 0 && self.has_eh_proj && self.has_enorm && self.has_hnorm
+    }
+
+    pub(crate) fn missing_reasons(&self) -> Vec<&'static str> {
+        let mut missing = Vec::new();
+        if self.nextn_predict_layers == 0 {
+            missing.push("*.nextn_predict_layers > 0");
+        }
+        if !self.has_eh_proj {
+            missing.push("*.nextn.eh_proj tensor");
+        }
+        if !self.has_enorm {
+            missing.push("*.nextn.enorm tensor");
+        }
+        if !self.has_hnorm {
+            missing.push("*.nextn.hnorm tensor");
+        }
+        missing
+    }
+}
+
 use crate::{
     cli::{NativeMtpArgs, RuntimeArgs},
     report::{NativeMtpSidebandReport, NativeMtpVerificationReport},
 };
-
-use super::{NativeMtpArtifactSummary, NativeMtpRequirement};
 
 pub(crate) fn native_mtp_verification_report(
     requested: bool,
@@ -70,33 +104,21 @@ pub(crate) fn native_mtp_verification_satisfies_requirement(
 
 pub(crate) fn native_mtp_sideband_report(reply: &StageReply) -> NativeMtpSidebandReport {
     let authoritative_token = reply.predicted_tokens.first().copied();
-    let advertised_count = reply
-        .predicted_tokens
-        .get(1)
-        .copied()
-        .and_then(|value| usize::try_from(value).ok())
-        .unwrap_or(0);
-    let available_draft_count = reply.predicted_tokens.len().saturating_sub(3);
-    let draft_token_count = advertised_count.min(available_draft_count);
-    let draft_start = 2;
-    let draft_end = draft_start + draft_token_count;
     let draft_tokens = reply
-        .predicted_tokens
-        .get(draft_start..draft_end)
-        .unwrap_or(&[])
-        .to_vec();
+        .native_mtp_draft
+        .as_ref()
+        .map_or_else(Vec::new, |draft| draft.token_ids.clone());
     let proposal_compute_us = reply
-        .predicted_tokens
-        .get(draft_end)
-        .copied()
-        .map(|value| i64::from(value.max(0)));
+        .native_mtp_draft
+        .as_ref()
+        .map(|draft| draft.proposal_compute_us.max(0));
     NativeMtpSidebandReport {
-        sideband_present: !draft_tokens.is_empty(),
+        sideband_present: reply.native_mtp_draft.is_some(),
         predicted_token_count: reply.predicted_tokens.len(),
         authoritative_matches_reply: authoritative_token
             .is_none_or(|token| token == reply.predicted),
         authoritative_token,
-        draft_token_count,
+        draft_token_count: draft_tokens.len(),
         draft_tokens,
         proposal_compute_us,
     }
@@ -203,20 +225,26 @@ pub(crate) fn emit_report<T: Serialize>(report: &T, report_out: Option<&Path>) -
 #[cfg(test)]
 mod tests {
     use super::*;
-    use skippy_protocol::binary::{StageReplyStats, WireReplyKind};
+    use skippy_protocol::binary::{StageNativeMtpDraft, StageReplyStats, WireReplyKind};
 
-    fn predicted_reply(predicted: i32, predicted_tokens: Vec<i32>) -> StageReply {
+    fn predicted_reply(
+        predicted: i32,
+        predicted_tokens: Vec<i32>,
+        native_mtp_draft: Option<StageNativeMtpDraft>,
+    ) -> StageReply {
         StageReply {
             kind: WireReplyKind::PredictedToken,
             predicted,
             predicted_tokens,
+            native_mtp_draft,
+            window: Default::default(),
             stats: StageReplyStats::default(),
         }
     }
 
     #[test]
     fn native_mtp_report_treats_plain_authoritative_token_as_no_draft() {
-        let report = native_mtp_sideband_report(&predicted_reply(11, vec![11]));
+        let report = native_mtp_sideband_report(&predicted_reply(11, vec![11], None));
 
         assert!(!report.sideband_present);
         assert_eq!(report.predicted_token_count, 1);
@@ -228,11 +256,18 @@ mod tests {
     }
 
     #[test]
-    fn native_mtp_report_extracts_draft_sideband() {
-        let report = native_mtp_sideband_report(&predicted_reply(11, vec![11, 2, 12, 13, 34]));
+    fn native_mtp_report_extracts_typed_draft() {
+        let report = native_mtp_sideband_report(&predicted_reply(
+            11,
+            vec![11],
+            Some(StageNativeMtpDraft {
+                token_ids: vec![12, 13],
+                proposal_compute_us: 34,
+            }),
+        ));
 
         assert!(report.sideband_present);
-        assert_eq!(report.predicted_token_count, 5);
+        assert_eq!(report.predicted_token_count, 1);
         assert!(report.authoritative_matches_reply);
         assert_eq!(report.authoritative_token, Some(11));
         assert_eq!(report.draft_token_count, 2);
@@ -241,8 +276,15 @@ mod tests {
     }
 
     #[test]
-    fn native_mtp_report_flags_authoritative_sideband_mismatch() {
-        let report = native_mtp_sideband_report(&predicted_reply(11, vec![10, 1, 12, 34]));
+    fn native_mtp_report_flags_authoritative_prediction_mismatch() {
+        let report = native_mtp_sideband_report(&predicted_reply(
+            11,
+            vec![10],
+            Some(StageNativeMtpDraft {
+                token_ids: vec![12],
+                proposal_compute_us: 34,
+            }),
+        ));
 
         assert!(report.sideband_present);
         assert!(!report.authoritative_matches_reply);
@@ -252,15 +294,29 @@ mod tests {
 
     #[test]
     fn native_mtp_report_clamps_negative_proposal_time() {
-        let report = native_mtp_sideband_report(&predicted_reply(11, vec![11, 1, 12, -34]));
+        let report = native_mtp_sideband_report(&predicted_reply(
+            11,
+            vec![11],
+            Some(StageNativeMtpDraft {
+                token_ids: vec![12],
+                proposal_compute_us: -34,
+            }),
+        ));
 
         assert_eq!(report.proposal_compute_us, Some(0));
     }
 
     #[test]
     fn native_mtp_requirement_can_require_draft_presence() {
-        let no_draft = native_mtp_sideband_report(&predicted_reply(11, vec![11]));
-        let draft = native_mtp_sideband_report(&predicted_reply(11, vec![11, 1, 12, 34]));
+        let no_draft = native_mtp_sideband_report(&predicted_reply(11, vec![11], None));
+        let draft = native_mtp_sideband_report(&predicted_reply(
+            11,
+            vec![11],
+            Some(StageNativeMtpDraft {
+                token_ids: vec![12],
+                proposal_compute_us: 34,
+            }),
+        ));
         let optional = NativeMtpRequirement {
             require_draft: false,
         };
@@ -275,7 +331,14 @@ mod tests {
 
     #[test]
     fn native_mtp_verification_report_accepts_matching_second_target() {
-        let first = native_mtp_sideband_report(&predicted_reply(11, vec![11, 2, 12, 13, 34]));
+        let first = native_mtp_sideband_report(&predicted_reply(
+            11,
+            vec![11],
+            Some(StageNativeMtpDraft {
+                token_ids: vec![12, 13],
+                proposal_compute_us: 34,
+            }),
+        ));
         let report = native_mtp_verification_report(true, &first, Some(12), Some(12), Some(9))
             .expect("verification report");
 
@@ -299,7 +362,14 @@ mod tests {
 
     #[test]
     fn native_mtp_verification_report_rejects_mismatched_draft_without_failing_byte_identity() {
-        let first = native_mtp_sideband_report(&predicted_reply(11, vec![11, 1, 12, 34]));
+        let first = native_mtp_sideband_report(&predicted_reply(
+            11,
+            vec![11],
+            Some(StageNativeMtpDraft {
+                token_ids: vec![12],
+                proposal_compute_us: 34,
+            }),
+        ));
         let report = native_mtp_verification_report(true, &first, Some(13), Some(13), Some(9))
             .expect("verification report");
 
@@ -320,7 +390,7 @@ mod tests {
 
     #[test]
     fn native_mtp_verification_requirement_fails_when_required_draft_is_missing() {
-        let first = native_mtp_sideband_report(&predicted_reply(11, vec![11]));
+        let first = native_mtp_sideband_report(&predicted_reply(11, vec![11], None));
         let report = native_mtp_verification_report(true, &first, Some(13), Some(13), Some(9))
             .expect("required verification report");
 

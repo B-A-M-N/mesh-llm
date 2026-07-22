@@ -20,8 +20,8 @@ pub enum CommandKind {
     LocalSplitBinary(LocalSplitBinaryArgs),
     LocalSplitCompare(LocalSplitCompareArgs),
     LocalSplitChainBinary(LocalSplitChainBinaryArgs),
-    #[command(name = "verify-span-local")]
-    VerifySpanLocal(VerifySpanLocalArgs),
+    #[command(name = "verify-window-local")]
+    VerifyWindowLocal(VerifyWindowLocalArgs),
     #[command(name = "chat-corpus")]
     ChatCorpus(ChatCorpusArgs),
     #[command(name = "token-lengths")]
@@ -144,6 +144,11 @@ pub struct EvalRunArgs {
     pub metrics_http: String,
     #[arg(long)]
     pub metrics_run_id: Option<String>,
+    #[arg(
+        long,
+        help = "Finalize metrics-server telemetry without downloading its full raw-span report"
+    )]
+    pub metrics_finalize_only: bool,
     #[arg(long)]
     pub dry_run: bool,
 }
@@ -208,7 +213,7 @@ pub struct TokenLengthsArgs {
 }
 
 #[derive(Parser)]
-pub struct VerifySpanLocalArgs {
+pub struct VerifyWindowLocalArgs {
     #[arg(long)]
     pub model_path: PathBuf,
     #[arg(long, default_value_t = 48)]
@@ -579,7 +584,27 @@ mod tests {
 
     use clap::Parser;
 
-    use super::{Cli, CommandKind, FocusedRuntimeScenario};
+    use super::{Cli, CommandKind, EvalCommandKind, FocusedRuntimeScenario};
+
+    #[test]
+    fn parses_eval_run_metrics_finalize_only() {
+        let cli = Cli::try_parse_from([
+            "skippy-bench",
+            "eval",
+            "run",
+            "speed-bench",
+            "--metrics-finalize-only",
+        ])
+        .unwrap();
+
+        let CommandKind::Eval(eval) = cli.command else {
+            panic!("expected eval subcommand");
+        };
+        let EvalCommandKind::Run(args) = eval.command else {
+            panic!("expected eval run subcommand");
+        };
+        assert!(args.metrics_finalize_only);
+    }
 
     #[test]
     fn parses_focused_runtime_schema_smoke_command() {
@@ -635,10 +660,10 @@ mod tests {
     }
 
     #[test]
-    fn parses_verify_span_local_command() {
+    fn parses_verify_window_local_command() {
         let cli = Cli::try_parse_from([
             "skippy-bench",
-            "verify-span-local",
+            "verify-window-local",
             "--model-path",
             "/tmp/model.gguf",
             "--layer-end",
@@ -652,8 +677,8 @@ mod tests {
         ])
         .unwrap();
 
-        let CommandKind::VerifySpanLocal(args) = cli.command else {
-            panic!("expected verify-span-local subcommand");
+        let CommandKind::VerifyWindowLocal(args) = cli.command else {
+            panic!("expected verify-window-local subcommand");
         };
 
         assert_eq!(args.model_path, PathBuf::from("/tmp/model.gguf"));
@@ -665,10 +690,10 @@ mod tests {
     }
 
     #[test]
-    fn parses_verify_span_local_split_layer() {
+    fn parses_verify_window_local_split_layer() {
         let cli = Cli::try_parse_from([
             "skippy-bench",
-            "verify-span-local",
+            "verify-window-local",
             "--model-path",
             "/tmp/model.gguf",
             "--split-layer",
@@ -676,8 +701,8 @@ mod tests {
         ])
         .unwrap();
 
-        let CommandKind::VerifySpanLocal(args) = cli.command else {
-            panic!("expected verify-span-local subcommand");
+        let CommandKind::VerifyWindowLocal(args) = cli.command else {
+            panic!("expected verify-window-local subcommand");
         };
 
         assert_eq!(args.split_layer, Some(24));

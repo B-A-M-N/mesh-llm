@@ -138,11 +138,11 @@ if [[ -z "${LLAMA_STAGE_BUILD_DIR:-}" && -n "${SKIPPY_LLAMA_BUILD_DIR:-}" ]]; th
     export LLAMA_STAGE_BUILD_DIR="$SKIPPY_LLAMA_BUILD_DIR"
 fi
 if [[ -z "${LLAMA_STAGE_BUILD_DIR:-}" ]]; then
-    if [[ "$BACKEND" == "cpu" ]]; then
-        export LLAMA_STAGE_BUILD_DIR="$LLAMA_BUILD_ROOT/build-stage-abi-static"
-    else
-        export LLAMA_STAGE_BUILD_DIR="$LLAMA_BUILD_ROOT/build-stage-abi-$BACKEND"
-    fi
+    export LLAMA_STAGE_BUILD_DIR="$(
+        LLAMA_STAGE_BACKEND="$BACKEND" \
+            LLAMA_STAGE_LINK_MODE=static \
+            "$SCRIPT_DIR/build-llama.sh" --print-build-dir
+    )"
 fi
 
 configure_lld_linker
@@ -174,4 +174,8 @@ case "$BACKEND" in
     rocm) cargo_features+=(--features gpu-bench-hip) ;;
 esac
 stamp_build_version
-(cd "$REPO_ROOT" && cargo build --release --locked -p mesh-llm "${cargo_features[@]}")
+if ((${#cargo_features[@]})); then
+    (cd "$REPO_ROOT" && cargo build --release --locked -p mesh-llm "${cargo_features[@]}")
+else
+    (cd "$REPO_ROOT" && cargo build --release --locked -p mesh-llm)
+fi

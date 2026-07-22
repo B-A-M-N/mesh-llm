@@ -5,6 +5,7 @@ use mesh_llm_events::LogFormat;
 
 use crate::crypto::TrustPolicy;
 use crate::discovery::MeshDiscoveryMode;
+use crate::plugin::SpeculativeConfig;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RuntimeSurface {
@@ -56,7 +57,9 @@ pub struct RuntimeOptions {
     pub draft: Option<PathBuf>,
     pub draft_max: u16,
     pub no_draft: bool,
+    pub speculative_overrides: Option<SpeculativeConfig>,
     pub split: bool,
+    pub split_topology_lock: Option<PathBuf>,
     pub ctx_size: Option<u32>,
     pub max_vram: Option<f64>,
     pub no_enumerate_host: bool,
@@ -121,7 +124,9 @@ impl Default for RuntimeOptions {
             draft: None,
             draft_max: 8,
             no_draft: false,
+            speculative_overrides: None,
             split: false,
+            split_topology_lock: None,
             ctx_size: None,
             max_vram: None,
             no_enumerate_host: false,

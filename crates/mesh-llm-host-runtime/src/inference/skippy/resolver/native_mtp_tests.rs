@@ -3,31 +3,103 @@ use super::*;
 use crate::inference::skippy::SkippyTelemetryOptions;
 use skippy_protocol::LoadMode;
 use skippy_runtime::package::{
-    PackageGenerationInfo, PackageSpeculativeDecodingInfo, PackageSpeculativeStrategyInfo,
-    PackageWindowPolicyInfo,
+    PackageExtensionPolicyInfo, PackageGenerationInfo, PackageSpeculativeDecodingInfo,
+    PackageSpeculativeProposerInfo, PackageSpeculativeStrategyInfo, PackageWindowPolicyInfo,
 };
 use std::collections::BTreeMap;
 
 fn native_mtp_generation() -> PackageGenerationInfo {
+    let mut proposers = BTreeMap::new();
+    proposers.insert(
+        "mtp".to_string(),
+        PackageSpeculativeProposerInfo {
+            proposer_type: "native-mtp".to_string(),
+            prediction_depth: Some(1),
+            layer_indices: vec![46],
+            ngram_min: None,
+            ngram_max: None,
+            max_proposal_tokens: None,
+            history_scope: None,
+        },
+    );
     let mut strategies = BTreeMap::new();
     strategies.insert(
         "mtp".to_string(),
         PackageSpeculativeStrategyInfo {
             strategy_type: "native-mtp".to_string(),
-            prediction_depth: Some(1),
-            layer_indices: vec![46],
+            prediction_depth: None,
+            layer_indices: Vec::new(),
             window_policy: Some(PackageWindowPolicyInfo {
                 default: "fixed".to_string(),
                 initial_window: 1,
                 min_window: 1,
                 max_window: 1,
             }),
+            proposer: Some("mtp".to_string()),
+            primary: None,
+            extender: None,
+            extension_policy: None,
         },
     );
 
     PackageGenerationInfo {
         speculative_decoding: Some(PackageSpeculativeDecodingInfo {
             default: "mtp".to_string(),
+            proposers,
+            strategies,
+        }),
+    }
+}
+
+fn native_mtp_cache_generation() -> PackageGenerationInfo {
+    let mut proposers = BTreeMap::new();
+    proposers.insert(
+        "mtp".to_string(),
+        PackageSpeculativeProposerInfo {
+            proposer_type: "native-mtp".to_string(),
+            prediction_depth: Some(1),
+            layer_indices: vec![46],
+            ngram_min: None,
+            ngram_max: None,
+            max_proposal_tokens: None,
+            history_scope: None,
+        },
+    );
+    proposers.insert(
+        "cache".to_string(),
+        PackageSpeculativeProposerInfo {
+            proposer_type: "ngram-cache".to_string(),
+            prediction_depth: None,
+            layer_indices: Vec::new(),
+            ngram_min: Some(2),
+            ngram_max: Some(4),
+            max_proposal_tokens: Some(10),
+            history_scope: Some("request".to_string()),
+        },
+    );
+    let mut strategies = BTreeMap::new();
+    strategies.insert(
+        "mtp-cache".to_string(),
+        PackageSpeculativeStrategyInfo {
+            strategy_type: "composite".to_string(),
+            prediction_depth: None,
+            layer_indices: Vec::new(),
+            window_policy: Some(PackageWindowPolicyInfo {
+                default: "adaptive".to_string(),
+                initial_window: 2,
+                min_window: 1,
+                max_window: 6,
+            }),
+            proposer: None,
+            primary: Some("mtp".to_string()),
+            extender: Some("cache".to_string()),
+            extension_policy: Some(PackageExtensionPolicyInfo { max_tokens: 8 }),
+        },
+    );
+    PackageGenerationInfo {
+        speculative_decoding: Some(PackageSpeculativeDecodingInfo {
+            default: "mtp-cache".to_string(),
+            proposers,
             strategies,
         }),
     }
@@ -183,6 +255,123 @@ fn speculative_strategy_auto_uses_package_native_mtp_default() {
     assert!(openai.native_mtp_enabled);
     assert_eq!(openai.native_mtp_max_tokens, 3);
     assert_eq!(openai.native_mtp_min_tokens, 0);
+}
+
+#[test]
+fn package_composite_strategy_resolves_native_mtp_with_cache_extension() {
+    let mesh_config = parse_config(
+        r#"
+[defaults.speculative]
+strategy = "mtp-cache"
+ngram_max_proposal_tokens = 4
+extension_max_tokens = 8
+verify_window_pipeline_depth = 1
+
+[[models]]
+model = "meshllm/GLM-4.7-Flash-MTP-GGUF"
+
+[models.speculative]
+ngram_max_proposal_tokens = 9
+extension_max_tokens = 7
+verify_window_pipeline_depth = 2
+"#,
+    );
+    assert_eq!(
+        mesh_config
+            .defaults
+            .as_ref()
+            .and_then(|defaults| defaults.speculative.as_ref())
+            .and_then(|speculative| speculative.ngram_max_proposal_tokens),
+        Some(4)
+    );
+    assert_eq!(
+        mesh_config
+            .models
+            .first()
+            .and_then(|model| model.speculative.as_ref())
+            .and_then(|speculative| speculative.ngram_max_proposal_tokens),
+        Some(9)
+    );
+    let model_file = temp_model_file();
+    let generation = native_mtp_cache_generation();
+
+    let resolved = resolve_skippy_config(SkippyConfigResolveRequest {
+        mesh_config: &mesh_config,
+        model_id: "meshllm/GLM-4.7-Flash-MTP-GGUF",
+        model_path: model_file.path(),
+        model_bytes: 4 * 1024 * 1024 * 1024,
+        allocatable_memory_bytes: None,
+        request_defaults: None,
+        package_generation: Some(&generation),
+    })
+    .expect("package composite strategy should resolve");
+
+    assert!(resolved.speculative.native_mtp_enabled);
+    assert_eq!(
+        resolved.speculative.decode.effective_strategy,
+        "native-mtp+ngram-cache"
+    );
+    let ngram = resolved
+        .speculative
+        .decode
+        .ngram
+        .as_ref()
+        .expect("cache proposer should resolve");
+    assert_eq!(ngram.min_ngram, 2);
+    assert_eq!(ngram.max_ngram, 4);
+    assert_eq!(ngram.max_proposal_tokens, 9);
+    let extension = resolved
+        .speculative
+        .decode
+        .extension
+        .as_ref()
+        .expect("extension policy should resolve");
+    assert_eq!(extension.max_tokens, 7);
+    assert_eq!(resolved.speculative.decode.verify_window.min_tokens, 1);
+    assert_eq!(resolved.speculative.decode.verify_window.max_tokens, 6);
+    assert_eq!(resolved.speculative.decode.verify_window.pipeline_depth, 2);
+}
+
+#[test]
+fn direct_native_mtp_can_use_a_request_local_cache_extension() {
+    let mesh_config = parse_config(
+        r#"
+[defaults.speculative]
+strategy = "mtp"
+ngram_min = 2
+ngram_max = 4
+ngram_max_proposal_tokens = 6
+"#,
+    );
+    let model_file = temp_model_file_with_tensor_names(&["blk.23.nextn.eh_proj.weight"], None);
+
+    let resolved = resolve_skippy_config(SkippyConfigResolveRequest {
+        mesh_config: &mesh_config,
+        model_id: "meshllm/GLM-4.7-Flash-MTP-GGUF",
+        model_path: model_file.path(),
+        model_bytes: 4 * 1024 * 1024 * 1024,
+        allocatable_memory_bytes: None,
+        request_defaults: None,
+        package_generation: None,
+    })
+    .expect("direct native MTP with cache extension should resolve");
+
+    assert!(resolved.speculative.native_mtp_enabled);
+    assert_eq!(
+        resolved.speculative.decode.effective_strategy,
+        "native-mtp+ngram-cache"
+    );
+    let extension = resolved
+        .speculative
+        .decode
+        .extension
+        .as_ref()
+        .expect("direct cache strategy should synthesize an extension plan");
+    assert_eq!(extension.max_tokens, 6);
+    let openai = resolved
+        .to_embedded_openai_args(4096, true)
+        .expect("direct cache strategy should build OpenAI args");
+    assert!(openai.native_mtp_enabled);
 }
 
 #[test]

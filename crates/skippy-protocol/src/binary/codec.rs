@@ -4,8 +4,9 @@ use super::{
     MAX_STAGE_ACTIVATION_BYTES, MAX_STAGE_CHAT_SAMPLING_METADATA_BYTES,
     MAX_STAGE_DECODED_ACTIVATION_BYTES, MAX_STAGE_LOGIT_BIAS, MAX_STAGE_PREDICTED_TOKENS,
     MAX_STAGE_SIDEBAND_VALUES, MAX_STAGE_STATE_IMPORT_BYTES, READY_MAGIC, STAGE_STATE_VERSION,
-    StageLogitBias, StageReply, StageReplyStats, StageSamplingConfig, StageStateHeader,
-    StageWireMessage, WireActivationDType, WireMessageKind, WireReplyKind,
+    StageLogitBias, StageNativeMtpDraft, StageReply, StageReplyStats, StageReplyWindow,
+    StageSamplingConfig, StageStateHeader, StageWireMessage, WireActivationDType, WireMessageKind,
+    WireReplyKind,
     activation::{
         activation_decoded_f32_bytes_with_state_flags, activation_wire_bytes_with_state_flags,
     },
@@ -29,10 +30,17 @@ pub fn send_reply_ack(mut writer: impl Write) -> io::Result<()> {
 }
 
 pub fn send_reply_ack_with_stats(mut writer: impl Write, stats: StageReplyStats) -> io::Result<()> {
-    write_i32(&mut writer, WireReplyKind::Ack as i32)?;
-    write_i32(&mut writer, 0)?;
-    write_i32(&mut writer, 0)?;
-    write_reply_stats(&mut writer, stats)
+    send_reply_message(
+        &mut writer,
+        &StageReply {
+            kind: WireReplyKind::Ack,
+            predicted: 0,
+            predicted_tokens: Vec::new(),
+            native_mtp_draft: None,
+            window: StageReplyWindow::default(),
+            stats,
+        },
+    )
 }
 
 pub fn send_reply_predicted(mut writer: impl Write, predicted: i32) -> io::Result<()> {
@@ -44,7 +52,13 @@ pub fn send_reply_predicted_with_stats(
     predicted: i32,
     stats: StageReplyStats,
 ) -> io::Result<()> {
-    send_reply_predicted_with_tokens_and_stats(&mut writer, predicted, &[predicted], stats)
+    send_reply_predicted_with_tokens_window_and_stats(
+        &mut writer,
+        predicted,
+        &[predicted],
+        StageReplyWindow::default(),
+        stats,
+    )
 }
 
 pub fn send_reply_predicted_with_tokens_and_stats(
@@ -53,19 +67,33 @@ pub fn send_reply_predicted_with_tokens_and_stats(
     predicted_tokens: &[i32],
     stats: StageReplyStats,
 ) -> io::Result<()> {
+    send_reply_predicted_with_tokens_window_and_stats(
+        &mut writer,
+        predicted,
+        predicted_tokens,
+        StageReplyWindow::default(),
+        stats,
+    )
+}
+
+pub fn send_reply_predicted_with_tokens_window_and_stats(
+    mut writer: impl Write,
+    predicted: i32,
+    predicted_tokens: &[i32],
+    window: StageReplyWindow,
+    stats: StageReplyStats,
+) -> io::Result<()> {
     if predicted_tokens.len() > MAX_STAGE_PREDICTED_TOKENS {
         return Err(invalid_input("too many predicted tokens"));
     }
-    write_i32(&mut writer, WireReplyKind::PredictedToken as i32)?;
-    write_i32(&mut writer, predicted)?;
-    write_i32(
+    write_reply_header(
         &mut writer,
-        i32::try_from(predicted_tokens.len())
-            .map_err(|_| invalid_input("too many predicted tokens"))?,
+        WireReplyKind::PredictedToken,
+        predicted,
+        predicted_tokens,
+        window,
     )?;
-    for token in predicted_tokens {
-        write_i32(&mut writer, *token)?;
-    }
+    write_native_mtp_draft(&mut writer, None)?;
     write_reply_stats(&mut writer, stats)
 }
 
@@ -74,21 +102,48 @@ pub fn send_reply_predicted_tokens_with_stats(
     predicted_tokens: &[i32],
     stats: StageReplyStats,
 ) -> io::Result<()> {
+    send_reply_predicted_tokens_with_window_and_stats(
+        &mut writer,
+        predicted_tokens,
+        StageReplyWindow::default(),
+        stats,
+    )
+}
+
+pub fn send_reply_predicted_tokens_with_window_and_stats(
+    mut writer: impl Write,
+    predicted_tokens: &[i32],
+    window: StageReplyWindow,
+    stats: StageReplyStats,
+) -> io::Result<()> {
     if predicted_tokens.len() > MAX_STAGE_PREDICTED_TOKENS {
         return Err(invalid_input("too many predicted tokens"));
     }
     let predicted = predicted_tokens.first().copied().unwrap_or(0);
-    write_i32(&mut writer, WireReplyKind::PredictedTokens as i32)?;
-    write_i32(&mut writer, predicted)?;
-    write_i32(
+    write_reply_header(
         &mut writer,
-        i32::try_from(predicted_tokens.len())
-            .map_err(|_| invalid_input("too many predicted tokens"))?,
+        WireReplyKind::PredictedTokens,
+        predicted,
+        predicted_tokens,
+        window,
     )?;
-    for token in predicted_tokens {
-        write_i32(&mut writer, *token)?;
-    }
+    write_native_mtp_draft(&mut writer, None)?;
     write_reply_stats(&mut writer, stats)
+}
+
+pub fn send_reply_message(mut writer: impl Write, reply: &StageReply) -> io::Result<()> {
+    if reply.predicted_tokens.len() > MAX_STAGE_PREDICTED_TOKENS {
+        return Err(invalid_input("too many predicted tokens"));
+    }
+    write_reply_header(
+        &mut writer,
+        reply.kind,
+        reply.predicted,
+        &reply.predicted_tokens,
+        reply.window,
+    )?;
+    write_native_mtp_draft(&mut writer, reply.native_mtp_draft.as_ref())?;
+    write_reply_stats(&mut writer, reply.stats)
 }
 
 pub fn recv_reply(mut reader: impl Read) -> io::Result<StageReply> {
@@ -104,13 +159,82 @@ pub fn recv_reply(mut reader: impl Read) -> io::Result<StageReply> {
     for _ in 0..predicted_count {
         predicted_tokens.push(read_i32(&mut reader)?);
     }
+    let window = read_reply_window(&mut reader)?;
+    let native_mtp_draft = read_native_mtp_draft(&mut reader)?;
     let stats = read_reply_stats(&mut reader)?;
     Ok(StageReply {
         kind,
         predicted,
         predicted_tokens,
+        native_mtp_draft,
+        window,
         stats,
     })
+}
+
+fn write_reply_header(
+    mut writer: impl Write,
+    kind: WireReplyKind,
+    predicted: i32,
+    predicted_tokens: &[i32],
+    window: StageReplyWindow,
+) -> io::Result<()> {
+    write_i32(&mut writer, kind as i32)?;
+    write_i32(&mut writer, predicted)?;
+    write_i32(
+        &mut writer,
+        i32::try_from(predicted_tokens.len())
+            .map_err(|_| invalid_input("too many predicted tokens"))?,
+    )?;
+    for token in predicted_tokens {
+        write_i32(&mut writer, *token)?;
+    }
+    write_reply_window(&mut writer, window)
+}
+
+fn write_native_mtp_draft(
+    mut writer: impl Write,
+    draft: Option<&StageNativeMtpDraft>,
+) -> io::Result<()> {
+    let Some(draft) = draft else {
+        return write_i32(&mut writer, 0);
+    };
+    if draft.token_ids.len() > MAX_STAGE_PREDICTED_TOKENS {
+        return Err(invalid_input("too many native MTP draft tokens"));
+    }
+    write_i32(&mut writer, 1)?;
+    write_i32(
+        &mut writer,
+        i32::try_from(draft.token_ids.len())
+            .map_err(|_| invalid_input("too many native MTP draft tokens"))?,
+    )?;
+    for token in &draft.token_ids {
+        write_i32(&mut writer, *token)?;
+    }
+    write_i64(&mut writer, draft.proposal_compute_us)
+}
+
+fn read_native_mtp_draft(mut reader: impl Read) -> io::Result<Option<StageNativeMtpDraft>> {
+    match read_i32(&mut reader)? {
+        0 => Ok(None),
+        1 => {
+            let token_count = checked_i32_len(
+                read_i32(&mut reader)?,
+                MAX_STAGE_PREDICTED_TOKENS,
+                "negative native MTP draft token count",
+                "native MTP draft token count exceeds maximum",
+            )?;
+            let mut token_ids = Vec::with_capacity(token_count);
+            for _ in 0..token_count {
+                token_ids.push(read_i32(&mut reader)?);
+            }
+            Ok(Some(StageNativeMtpDraft {
+                token_ids,
+                proposal_compute_us: read_i64(&mut reader)?,
+            }))
+        }
+        _ => Err(invalid_data("unknown native MTP draft reply marker")),
+    }
 }
 
 pub fn write_stage_message(
@@ -435,7 +559,7 @@ fn read_sampling_config(mut reader: impl Read) -> io::Result<StageSamplingConfig
     Ok(sampling)
 }
 
-const REPLY_STATS_FIELD_COUNT: usize = 39;
+const REPLY_STATS_FIELD_COUNT: usize = 23;
 const REPLY_STATS_WIRE_BYTES: usize = REPLY_STATS_FIELD_COUNT * std::mem::size_of::<i64>();
 
 fn write_reply_stats(mut writer: impl Write, stats: StageReplyStats) -> io::Result<()> {
@@ -463,6 +587,16 @@ fn read_reply_stats(mut reader: impl Read) -> io::Result<StageReplyStats> {
     Ok(reply_stats_from_fields(fields))
 }
 
+fn write_reply_window(mut writer: impl Write, window: StageReplyWindow) -> io::Result<()> {
+    write_i32(&mut writer, window.window_id)
+}
+
+fn read_reply_window(mut reader: impl Read) -> io::Result<StageReplyWindow> {
+    Ok(StageReplyWindow {
+        window_id: read_i32(&mut reader)?,
+    })
+}
+
 fn reply_stats_fields(stats: StageReplyStats) -> [i64; REPLY_STATS_FIELD_COUNT] {
     [
         stats.kv_lookup_hits,
@@ -474,30 +608,14 @@ fn reply_stats_fields(stats: StageReplyStats) -> [i64; REPLY_STATS_FIELD_COUNT] 
         stats.kv_recorded_bytes,
         stats.kv_hit_stage_mask,
         stats.kv_record_stage_mask,
-        stats.checkpoint_flush_us,
-        stats.checkpoint_prefill_drain_us,
-        stats.checkpoint_local_us,
-        stats.checkpoint_downstream_write_us,
-        stats.checkpoint_downstream_wait_us,
-        stats.checkpoint_total_us,
-        stats.checkpoint_prefill_drained_replies,
-        stats.restore_flush_us,
-        stats.restore_prefill_drain_us,
-        stats.restore_local_us,
-        stats.restore_downstream_write_us,
-        stats.restore_downstream_wait_us,
-        stats.restore_total_us,
-        stats.restore_prefill_drained_replies,
-        stats.verify_span_compute_us,
-        stats.verify_span_forward_write_us,
-        stats.verify_span_downstream_wait_us,
-        stats.verify_span_total_us,
-        stats.verify_span_stage_count,
-        stats.verify_span_request_count,
-        stats.verify_span_token_count,
-        stats.verify_span_max_tokens,
-        stats.verify_span_checkpointed_requests,
-        stats.verify_span_skip_checkpoint_requests,
+        stats.verify_window_compute_us,
+        stats.verify_window_forward_write_us,
+        stats.verify_window_downstream_wait_us,
+        stats.verify_window_total_us,
+        stats.verify_window_stage_count,
+        stats.verify_window_request_count,
+        stats.verify_window_token_count,
+        stats.verify_window_max_tokens,
         stats.prefill_edge_write_us_max,
         stats.prefill_edge_wait_us_max,
         stats.prefill_edge_total_us_max,
@@ -518,36 +636,20 @@ fn reply_stats_from_fields(fields: [i64; REPLY_STATS_FIELD_COUNT]) -> StageReply
         kv_recorded_bytes: fields[6],
         kv_hit_stage_mask: fields[7],
         kv_record_stage_mask: fields[8],
-        checkpoint_flush_us: fields[9],
-        checkpoint_prefill_drain_us: fields[10],
-        checkpoint_local_us: fields[11],
-        checkpoint_downstream_write_us: fields[12],
-        checkpoint_downstream_wait_us: fields[13],
-        checkpoint_total_us: fields[14],
-        checkpoint_prefill_drained_replies: fields[15],
-        restore_flush_us: fields[16],
-        restore_prefill_drain_us: fields[17],
-        restore_local_us: fields[18],
-        restore_downstream_write_us: fields[19],
-        restore_downstream_wait_us: fields[20],
-        restore_total_us: fields[21],
-        restore_prefill_drained_replies: fields[22],
-        verify_span_compute_us: fields[23],
-        verify_span_forward_write_us: fields[24],
-        verify_span_downstream_wait_us: fields[25],
-        verify_span_total_us: fields[26],
-        verify_span_stage_count: fields[27],
-        verify_span_request_count: fields[28],
-        verify_span_token_count: fields[29],
-        verify_span_max_tokens: fields[30],
-        verify_span_checkpointed_requests: fields[31],
-        verify_span_skip_checkpoint_requests: fields[32],
-        prefill_edge_write_us_max: fields[33],
-        prefill_edge_wait_us_max: fields[34],
-        prefill_edge_total_us_max: fields[35],
-        prefill_edge_stage_index: fields[36],
-        prefill_edge_activation_bytes_max: fields[37],
-        prefill_edge_observation_count: fields[38],
+        verify_window_compute_us: fields[9],
+        verify_window_forward_write_us: fields[10],
+        verify_window_downstream_wait_us: fields[11],
+        verify_window_total_us: fields[12],
+        verify_window_stage_count: fields[13],
+        verify_window_request_count: fields[14],
+        verify_window_token_count: fields[15],
+        verify_window_max_tokens: fields[16],
+        prefill_edge_write_us_max: fields[17],
+        prefill_edge_wait_us_max: fields[18],
+        prefill_edge_total_us_max: fields[19],
+        prefill_edge_stage_index: fields[20],
+        prefill_edge_activation_bytes_max: fields[21],
+        prefill_edge_observation_count: fields[22],
     }
 }
 
@@ -558,6 +660,16 @@ fn read_i32(mut reader: impl Read) -> io::Result<i32> {
 }
 
 fn write_i32(mut writer: impl Write, value: i32) -> io::Result<()> {
+    writer.write_all(&value.to_le_bytes())
+}
+
+fn read_i64(mut reader: impl Read) -> io::Result<i64> {
+    let mut bytes = [0_u8; 8];
+    reader.read_exact(&mut bytes)?;
+    Ok(i64::from_le_bytes(bytes))
+}
+
+fn write_i64(mut writer: impl Write, value: i64) -> io::Result<()> {
     writer.write_all(&value.to_le_bytes())
 }
 

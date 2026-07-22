@@ -603,9 +603,10 @@ fn skippy_settings(prefix: &str) -> Vec<ConfigSettingSchema> {
 
 fn speculative_settings(prefix: &str) -> Vec<ConfigSettingSchema> {
     vec![
+        basic_setting(&format!("{prefix}.strategy"), ConfigValueSchema::String),
         basic_setting(
             &format!("{prefix}.mode"),
-            string_enum(["auto", "disabled", "draft", "ngram"]),
+            string_enum(["auto", "disabled", "draft"]),
         ),
         basic_setting(&format!("{prefix}.draft_model"), ConfigValueSchema::Path),
         basic_setting(
@@ -665,6 +666,38 @@ fn speculative_settings(prefix: &str) -> Vec<ConfigSettingSchema> {
         ),
         basic_setting(&format!("{prefix}.ngram_min"), ConfigValueSchema::Integer),
         basic_setting(&format!("{prefix}.ngram_max"), ConfigValueSchema::Integer),
+        basic_setting(
+            &format!("{prefix}.ngram_max_proposal_tokens"),
+            ConfigValueSchema::Integer,
+        ),
+        basic_setting(
+            &format!("{prefix}.extension_max_tokens"),
+            ConfigValueSchema::Integer,
+        ),
+        basic_setting(
+            &format!("{prefix}.native_mtp_reject_cooldown_tokens"),
+            ConfigValueSchema::Integer,
+        ),
+        basic_setting(
+            &format!("{prefix}.native_mtp_suppress_cooldown_drafts"),
+            ConfigValueSchema::Boolean,
+        ),
+        basic_setting(
+            &format!("{prefix}.native_mtp_suppress_cooldown_draft_limit"),
+            ConfigValueSchema::Integer,
+        ),
+        basic_setting(
+            &format!("{prefix}.verify_window_min_tokens"),
+            ConfigValueSchema::Integer,
+        ),
+        basic_setting(
+            &format!("{prefix}.verify_window_max_tokens"),
+            ConfigValueSchema::Integer,
+        ),
+        basic_setting(
+            &format!("{prefix}.verify_window_pipeline_depth"),
+            ConfigValueSchema::Integer,
+        ),
         basic_setting(&format!("{prefix}.spec_default"), bool_or_auto_schema()),
     ]
 }
@@ -1384,10 +1417,7 @@ mod tests {
         let ngram_max = schema_setting("defaults.speculative.ngram_max");
         let mirostat_entropy = schema_setting("defaults.request_defaults.mirostat_entropy");
 
-        assert_static_choices(
-            "defaults.speculative.mode",
-            &["auto", "disabled", "draft", "ngram"],
-        );
+        assert_static_choices("defaults.speculative.mode", &["auto", "disabled", "draft"]);
         assert_static_choices(
             "defaults.speculative.draft_selection_policy",
             &["manual", "auto"],
@@ -1536,7 +1566,7 @@ mod tests {
             ),
             (
                 "defaults.speculative.mode",
-                vec!["auto", "disabled", "draft", "ngram"],
+                vec!["auto", "disabled", "draft"],
             ),
             (
                 "defaults.speculative.draft_selection_policy",

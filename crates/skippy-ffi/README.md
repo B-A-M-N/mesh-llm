@@ -52,11 +52,10 @@ same Rust crate.
 
 ## ABI Contract
 
-The staged ABI is versioned as `0.1.26`. The patch header in
-`third_party/llama.cpp/patches/0083-skippy-add-model-open-runtime-events-ABI.patch`
-and the Rust constants in `crates/skippy-ffi/src/lib.rs` are the source of
-truth, so keep this README aligned with those files instead of treating it as
-canonical prose.
+The staged ABI is versioned as `0.1.31`. The patch header in
+`third_party/llama.cpp/patches/` and the Rust constants in
+`crates/skippy-ffi/src/lib.rs` are the source of truth, so keep this README
+aligned with those files instead of treating it as canonical prose.
 
 Version `0` is still experimental, so callers should treat the ABI as
 feature-probed rather than permanently stable.
@@ -66,6 +65,10 @@ The runtime-event additions are part of that `0.1.26` bump. They add versioned
 `detail_len` fixed-width as `u64`, and pass the reporter as a separate pointer
 argument on the `_with_events` model-open entrypoints instead of extending
 `RuntimeConfig`.
+
+Version `0.1.31` adds a request-owned adapter for llama.cpp's upstream
+`ngram-cache` proposer. Callers reset or append only target-committed tokens;
+an optional provisional continuation is read-only input to drafting.
 
 The Rust FFI layer binds `skippy_abi_features`. This README records ABI intent
 and compatibility expectations only; higher-level gating belongs in
@@ -136,7 +139,6 @@ read it directly:
 | `BATCH_VERIFY_FRAME` | `1 << 13` | `skippy_verify_tokens_frame` |
 | `LOGIT_BIAS` | `1 << 15` | `SamplingConfig.logit_bias` |
 | `SESSION_TRIM` | `1 << 16` | `skippy_trim_session` |
-| `SESSION_CHECKPOINT` | `1 << 17` | Native checkpoint/restore calls |
 | `PACKAGE_PART_LOAD` | `1 << 18` | Ordered GGUF package part loading |
 | `GENERATION_SIGNALS` | `1 << 19` | Generation progress and cancellation signal hooks |
 | `EXTERNAL_MEDIA_PREFILL` | `1 << 20` | Multimodal prefill from externally materialized media chunks |
@@ -144,6 +146,8 @@ read it directly:
 | `CHAT_SAMPLING_GRAMMAR` | `1 << 22` | Session-local llama.cpp grammar-constrained sampling from chat template metadata |
 | `BACKEND_DEVICES` | `1 << 23` | Backend-device capability reporting |
 | `RUNTIME_EVENTS` | `1 << 24` | `_with_events` model-open entrypoints and runtime-event callbacks |
+| `NATIVE_MTP_N1` | `1 << 25` | Typed, non-frame native MTP draft sideband |
+| `NGRAM_CACHE_DRAFT` | `1 << 26` | Stateful request-local llama.cpp `ngram-cache` proposer |
 
 Runtime-event compatibility expectations are narrow on purpose:
 
@@ -190,8 +194,6 @@ hook currently bound by this crate.
 | `skippy_model_free` | Releases a model handle. |
 | `skippy_session_create` | Creates a decode session/context from an opened model. |
 | `skippy_session_reset` | Clears session state so the session can be reused. |
-| `skippy_checkpoint_session` | Records a native session checkpoint and returns the checkpoint token count. |
-| `skippy_restore_session_checkpoint` | Restores the native checkpoint when the requested token count matches. |
 | `skippy_session_configure_chat_sampling` | Configures session-local sampling with llama.cpp chat metadata so tool-call grammars constrain generated tokens. |
 | `skippy_session_free` | Releases a session handle. |
 | `skippy_trim_session` | Trims session state to a token count. |
@@ -212,6 +214,14 @@ hook currently bound by this crate.
 | `skippy_decode_step_sampled` | Decodes one token with `SamplingConfig`, including penalties and logit bias. |
 | `skippy_prefill_chunk_frame` | Prefills a token chunk using `ActivationDesc` plus payload buffers. |
 | `skippy_decode_step_frame_sampled` | Decodes one token with activation-frame I/O and `SamplingConfig`. |
+
+### Self-speculative proposal
+
+| Function | Purpose |
+| --- | --- |
+| `skippy_ngram_cache_create` / `free` | Allocates or releases a request-owned cache handle. |
+| `skippy_ngram_cache_reset` / `append` | Rebuilds or extends the cache with target-committed token history only. |
+| `skippy_ngram_cache_draft` | Drafts after committed history and an optional non-mutating continuation prefix, such as a native MTP candidate. |
 
 ### Token and chat helpers
 

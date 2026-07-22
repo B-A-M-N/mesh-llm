@@ -43,6 +43,7 @@
 //! and `/api/models` per-model `routing_metrics.targets` are measured on the
 //! current node only; not mesh-wide aggregates.
 
+mod access;
 mod assets;
 mod http;
 mod model_target_capacity;
@@ -86,7 +87,7 @@ use tokio::sync::Mutex;
 #[cfg(test)]
 use self::http::http_body_text;
 #[cfg(test)]
-use self::status::{LocalInstance, NodeState, WakeableNode, WakeableNodeState, build_gpus};
+use self::status::{NodeState, WakeableNode, WakeableNodeState, build_gpus};
 #[cfg(test)]
 use crate::inference::election;
 #[cfg(test)]
@@ -700,6 +701,7 @@ impl MeshApi {
                 crate::models::scan_local_inventory_snapshot_with_progress(|_| {})
             })
             .await
+            .unwrap_or_else(|_| runtime_data_collector.local_inventory_snapshot())
     }
 
     async fn mesh_models(&self) -> Vec<MeshModelPayload> {

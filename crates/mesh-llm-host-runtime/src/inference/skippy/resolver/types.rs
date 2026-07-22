@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 
 use skippy_protocol::{FlashAttentionType, StageKvCacheMode, StageKvCachePayload};
 use skippy_runtime::package::PackageGenerationInfo;
-use skippy_server::EmbeddedOpenAiRequestDefaults;
+use skippy_server::{EmbeddedOpenAiRequestDefaults, SpeculativeDecodeConfig};
 
 use super::super::StageWireDType;
 use crate::plugin::{MeshConfig, ReasoningBudget, ReasoningEnabled, RequestDefaultsConfig};
@@ -100,8 +100,7 @@ pub(crate) struct ResolvedSpeculativeConfig {
     pub(crate) draft_min_tokens: u32,
     pub(crate) explicit: bool,
     pub(crate) draft_n_gpu_layers: Option<i32>,
-    pub(crate) ngram_min: u32,
-    pub(crate) ngram_max: u32,
+    pub(crate) decode: SpeculativeDecodeConfig,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -157,8 +156,7 @@ pub(crate) struct ResolvedEmbeddedOpenAiArgs {
     pub(crate) speculative_window: usize,
     pub(crate) adaptive_speculative_window: bool,
     pub(crate) draft_n_gpu_layers: Option<i32>,
-    pub(crate) ngram_min: usize,
-    pub(crate) ngram_max: usize,
+    pub(crate) speculative: SpeculativeDecodeConfig,
     pub(crate) native_mtp_enabled: bool,
     pub(crate) native_mtp_draft_model_path: Option<PathBuf>,
     pub(crate) native_mtp_max_tokens: usize,
