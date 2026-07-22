@@ -98,7 +98,8 @@ pub fn assert_mesh_requirements_docs_examples_parse() {
 
 #[cfg(test)]
 mod tests {
-    use super::Cli;
+    use super::{Cli, Command};
+    use crate::models::ModelsCommand;
     use clap::Parser;
 
     #[test]
