@@ -1650,8 +1650,8 @@ impl Node {
             // (e.g. relay → direct), trigger a re-election so the peer can now
             // be included in split mode.
             let became_split_eligible = old_rtt
-                .map(|old| old > MAX_SPLIT_RTT_MS && rtt_ms <= MAX_SPLIT_RTT_MS)
-                .unwrap_or(rtt_ms <= MAX_SPLIT_RTT_MS);
+                .map(|old| old > max_split_rtt_ms() && rtt_ms <= max_split_rtt_ms())
+                .unwrap_or(rtt_ms <= max_split_rtt_ms());
             if became_split_eligible {
                 emit_mesh_info(format!(
                     "📡 Peer {} RTT improved ({}ms → {}ms) — re-electing for split",

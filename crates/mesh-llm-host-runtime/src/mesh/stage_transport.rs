@@ -129,10 +129,10 @@ impl SplitStagePathSnapshot {
         }
     }
 
-    pub(crate) const fn stage_path_rejection(self) -> Option<SplitStagePathRejection> {
+    pub(crate) fn stage_path_rejection(self) -> Option<SplitStagePathRejection> {
         match self.kind {
             SplitStagePathKind::Direct => match self.rtt_ms {
-                Some(rtt_ms) if rtt_ms <= MAX_SPLIT_RTT_MS => None,
+                Some(rtt_ms) if rtt_ms <= super::max_split_rtt_ms() => None,
                 Some(_) => Some(SplitStagePathRejection::StagePathTooSlow),
                 None => Some(SplitStagePathRejection::MissingStagePath),
             },
