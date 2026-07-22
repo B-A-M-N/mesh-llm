@@ -16,6 +16,14 @@ chunk and every normal decode token.
 > predicted-token / span returns exist (`binary_transport/direct_return.rs`).
 > Checkboxes that remain `[ ]` are still open or unverified.
 
+> **See also:** [docs/skippy/WAN_SPLIT_TRANSPORT_STATUS.md](docs/skippy/WAN_SPLIT_TRANSPORT_STATUS.md)
+> for the WAN split transport status/handoff (branch
+> `wip/wan-direct-prediction-return`, PR #1028): what is proven over WAN, the
+> landed transport keep-set, why fixed pipeline depth is diagnostic-only, the
+> go-forward suffix-ngram + adaptive-depth direction (PR #1037), and the 2-node
+> bringup config trap. Draft-model speculation is deferred on branch
+> `wip/wan-draft-ahead`.
+
 ## Current Observations
 
 - Prefill and decode use the same neighbor-chain shape:
