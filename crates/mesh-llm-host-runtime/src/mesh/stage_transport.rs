@@ -136,7 +136,13 @@ impl SplitStagePathSnapshot {
                 Some(_) => Some(SplitStagePathRejection::StagePathTooSlow),
                 None => Some(SplitStagePathRejection::MissingStagePath),
             },
-            SplitStagePathKind::Relay => Some(SplitStagePathRejection::StagePathRelayOnly),
+            SplitStagePathKind::Relay => {
+                if super::split_allow_relay_paths() {
+                    None
+                } else {
+                    Some(SplitStagePathRejection::StagePathRelayOnly)
+                }
+            }
             SplitStagePathKind::Unknown => Some(SplitStagePathRejection::MissingStagePath),
         }
     }

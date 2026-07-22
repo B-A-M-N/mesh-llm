@@ -433,3 +433,15 @@ fn identity_hash_for(input: &str) -> String {
     hasher.update(input.as_bytes());
     hex::encode(hasher.finalize())
 }
+
+/// Whether relay-only stage paths may participate in splits. Off by default;
+/// `MESH_SPLIT_ALLOW_RELAY=1` enables it for WAN experiments where NAT
+/// prevents direct QUIC paths between stage peers.
+pub fn split_allow_relay_paths() -> bool {
+    static VALUE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *VALUE.get_or_init(|| {
+        std::env::var("MESH_SPLIT_ALLOW_RELAY")
+            .map(|raw| raw.trim() == "1")
+            .unwrap_or(false)
+    })
+}
