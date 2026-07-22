@@ -1,17 +1,17 @@
-From 450bf0d3ab61dc5d9b67a7dc0b268996c89ddc22 Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Mesh-LLM CI <ci@mesh-llm.local>
 Date: Fri, 17 Jul 2026 14:46:51 +1000
-Subject: [PATCH 19/19] Advance native MTP depth per draft step
+Subject: [PATCH 3/7] Advance native MTP depth per draft step
 
 ---
  src/skippy.cpp | 37 +++++++++++++++++++++++++++++++++++++
  1 file changed, 37 insertions(+)
 
 diff --git a/src/skippy.cpp b/src/skippy.cpp
-index 06d1a161..a5c6e072 100644
+index 2de4e1254..04ddafbd2 100644
 --- a/src/skippy.cpp
 +++ b/src/skippy.cpp
-@@ -1306,6 +1306,40 @@ static bool skippy_mtp_available(const skippy_session * session) {
+@@ -1302,6 +1302,40 @@ static bool skippy_mtp_available(const skippy_session * session) {
             session->stage_model->config.include_output;
  }
  
@@ -52,7 +52,7 @@ index 06d1a161..a5c6e072 100644
  static bool skippy_env_enabled(const char * name) {
      const char * value = std::getenv(name);
      if (value == nullptr || value[0] == '\0') {
-@@ -1353,6 +1387,7 @@ static enum skippy_status skippy_mtp_sync_target_tokens(
+@@ -1350,6 +1384,7 @@ static enum skippy_status skippy_mtp_sync_target_tokens(
      }
  
      llama_context * mtp_ctx = session->stage_model->mtp_ctx;
@@ -60,7 +60,7 @@ index 06d1a161..a5c6e072 100644
      const bool mtp_shares_target_memory = llama_get_ctx_other(mtp_ctx) == session->ctx;
      const int32_t n_embd = llama_model_n_embd(session->stage_model->model);
      const size_t row_bytes = static_cast<size_t>(n_embd)*sizeof(float);
-@@ -2096,6 +2131,7 @@ static enum skippy_status skippy_mtp_propose_next(
+@@ -2116,6 +2151,7 @@ static enum skippy_status skippy_mtp_propose_next(
      }
  
      llama_context * mtp_ctx = session->stage_model->mtp_ctx;
@@ -68,7 +68,7 @@ index 06d1a161..a5c6e072 100644
      const bool mtp_shares_target_memory = llama_get_ctx_other(mtp_ctx) == session->ctx;
      const int32_t n_embd = llama_model_n_embd(session->stage_model->model);
      if (session->mtp_pending_h.size() != static_cast<size_t>(n_embd)) {
-@@ -2115,6 +2151,7 @@ static enum skippy_status skippy_mtp_propose_next(
+@@ -2135,6 +2171,7 @@ static enum skippy_status skippy_mtp_propose_next(
      std::vector<float> proposal_h = session->mtp_pending_h;
      int32_t token_count = 0;
      for (size_t i = 0; i < draft_limit; ++i) {
@@ -76,6 +76,3 @@ index 06d1a161..a5c6e072 100644
          llama_batch batch = {
              /*n_tokens =*/ 1,
              /*token    =*/ &token,
--- 
-2.50.1 (Apple Git-155)
-

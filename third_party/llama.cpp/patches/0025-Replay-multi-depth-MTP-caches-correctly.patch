@@ -1,7 +1,7 @@
-From f80a50cb6aa6c9f1875ede881de354c2759754ae Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Mesh-LLM CI <ci@mesh-llm.local>
 Date: Fri, 17 Jul 2026 14:58:19 +1000
-Subject: [PATCH 20/20] Replay multi-depth MTP caches correctly
+Subject: [PATCH 4/7] Replay multi-depth MTP caches correctly
 
 ---
  src/models/step35.cpp |  12 ++-
@@ -9,7 +9,7 @@ Subject: [PATCH 20/20] Replay multi-depth MTP caches correctly
  2 files changed, 189 insertions(+), 49 deletions(-)
 
 diff --git a/src/models/step35.cpp b/src/models/step35.cpp
-index 4df4605b..2d546c20 100644
+index 4df4605bf..2d546c20f 100644
 --- a/src/models/step35.cpp
 +++ b/src/models/step35.cpp
 @@ -544,12 +544,16 @@ llama_model_step35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
@@ -34,10 +34,10 @@ index 4df4605b..2d546c20 100644
      ggml_tensor * head_norm_w = layer.nextn.shared_head_norm
              ? layer.nextn.shared_head_norm
 diff --git a/src/skippy.cpp b/src/skippy.cpp
-index a5c6e072..b46bf0c7 100644
+index 04ddafbd2..453888731 100644
 --- a/src/skippy.cpp
 +++ b/src/skippy.cpp
-@@ -1336,6 +1336,14 @@ struct skippy_mtp_depth_scope {
+@@ -1332,6 +1332,14 @@ struct skippy_mtp_depth_scope {
          }
      }
  
@@ -52,7 +52,7 @@ index a5c6e072..b46bf0c7 100644
      llama_context * ctx;
      uint32_t depth_count;
  };
-@@ -1372,6 +1380,11 @@ static void skippy_mtp_clear_session_state(skippy_session * session) {
+@@ -1369,6 +1377,11 @@ static void skippy_mtp_clear_session_state(skippy_session * session) {
      }
  }
  
@@ -64,7 +64,7 @@ index a5c6e072..b46bf0c7 100644
  static enum skippy_status skippy_mtp_sync_target_tokens(
          skippy_session * session,
          const llama_token * token_ids,
-@@ -1389,6 +1402,8 @@ static enum skippy_status skippy_mtp_sync_target_tokens(
+@@ -1386,6 +1399,8 @@ static enum skippy_status skippy_mtp_sync_target_tokens(
      llama_context * mtp_ctx = session->stage_model->mtp_ctx;
      skippy_mtp_depth_scope mtp_depth_scope(mtp_ctx);
      const bool mtp_shares_target_memory = llama_get_ctx_other(mtp_ctx) == session->ctx;
@@ -73,9 +73,9 @@ index a5c6e072..b46bf0c7 100644
      const int32_t n_embd = llama_model_n_embd(session->stage_model->model);
      const size_t row_bytes = static_cast<size_t>(n_embd)*sizeof(float);
      if (session->mtp_pending_h.size() != static_cast<size_t>(n_embd)) {
-@@ -1396,7 +1411,15 @@ static enum skippy_status skippy_mtp_sync_target_tokens(
-         session->mtp_has_pending_h = false;
-     }
+@@ -1410,7 +1425,15 @@ static enum skippy_status skippy_mtp_sync_target_tokens(
+ 
+     const bool reprime_prefix = !session->mtp_prefix_valid;
  
 -    if (session->mtp_has_pending_draft) {
 +    if (chain_heads && session->mtp_has_pending_draft) {
@@ -90,7 +90,7 @@ index a5c6e072..b46bf0c7 100644
          const llama_pos token_end = token_start + static_cast<llama_pos>(token_count);
          if (session->mtp_pending_draft_pos >= token_start &&
                  session->mtp_pending_draft_pos < token_end) {
-@@ -1416,7 +1439,7 @@ static enum skippy_status skippy_mtp_sync_target_tokens(
+@@ -1430,7 +1453,7 @@ static enum skippy_status skippy_mtp_sync_target_tokens(
      }
  
      size_t first_index = 0;
@@ -99,7 +99,7 @@ index a5c6e072..b46bf0c7 100644
          first_index = static_cast<size_t>(std::min<llama_pos>(
                  static_cast<llama_pos>(token_count),
                  session->mtp_next_pos - token_start));
-@@ -1439,7 +1462,7 @@ static enum skippy_status skippy_mtp_sync_target_tokens(
+@@ -1453,7 +1476,7 @@ static enum skippy_status skippy_mtp_sync_target_tokens(
              batch.pos[out_i] = token_start + static_cast<llama_pos>(src_i);
              batch.n_seq_id[out_i] = 1;
              batch.seq_id[out_i][0] = session->seq_id;
@@ -108,7 +108,7 @@ index a5c6e072..b46bf0c7 100644
  
              float * dst = batch.embd + static_cast<size_t>(out_i)*n_embd;
              if (src_i == 0) {
-@@ -1457,8 +1480,46 @@ static enum skippy_status skippy_mtp_sync_target_tokens(
+@@ -1471,8 +1494,46 @@ static enum skippy_status skippy_mtp_sync_target_tokens(
              }
          }
  
@@ -157,7 +157,7 @@ index a5c6e072..b46bf0c7 100644
          std::free(batch.token);
          batch.token = nullptr;
          llama_batch_free(batch);
-@@ -1589,13 +1650,17 @@ static enum skippy_status skippy_verify_token_batch(
+@@ -1606,13 +1667,17 @@ static enum skippy_status skippy_verify_token_batch(
          batch.logits[i] = 1;
      }
  
@@ -176,7 +176,7 @@ index a5c6e072..b46bf0c7 100644
          llama_context * ctx,
          int32_t index) {
      if (model == nullptr || ctx == nullptr) {
-@@ -2138,52 +2203,123 @@ static enum skippy_status skippy_mtp_propose_next(
+@@ -2158,52 +2223,123 @@ static enum skippy_status skippy_mtp_propose_next(
          return skippy_success(out_error);
      }
  
@@ -337,7 +337,7 @@ index a5c6e072..b46bf0c7 100644
      }
  
      if (out_mtp_draft != nullptr && token_count > 0) {
-@@ -2784,7 +2920,7 @@ static enum skippy_status skippy_finish_model_open(
+@@ -2804,7 +2940,7 @@ static enum skippy_status skippy_finish_model_open(
          }
          if (stage_model->mtp_ctx != nullptr) {
              llama_set_embeddings_nextn(stage_model->ctx, true, false);
@@ -346,7 +346,7 @@ index a5c6e072..b46bf0c7 100644
          } else {
              fprintf(stderr, "skippy: native MTP sidecar unavailable for this final stage; continuing without drafts\n");
          }
-@@ -3049,7 +3185,7 @@ enum skippy_status skippy_model_attach_mtp_draft_model(
+@@ -3069,7 +3205,7 @@ enum skippy_status skippy_model_attach_mtp_draft_model(
  
      target_model->mtp_model = draft_model;
      llama_set_embeddings_nextn(target_model->ctx, true, false);
@@ -355,6 +355,3 @@ index a5c6e072..b46bf0c7 100644
      return skippy_success(out_error);
  }
  
--- 
-2.50.1 (Apple Git-155)
-

@@ -1,7 +1,7 @@
-From 812d5621d209e420c31f688feb07a6e970aee616 Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Mesh-LLM CI <ci@mesh-llm.local>
 Date: Fri, 17 Jul 2026 13:47:13 +1000
-Subject: [PATCH 18/18] Add staged execution support for Inkling
+Subject: [PATCH 2/7] Add staged execution support for Inkling
 
 ---
  src/models/inkling.cpp | 30 +++++++++++++++++++++++-------
@@ -9,7 +9,7 @@ Subject: [PATCH 18/18] Add staged execution support for Inkling
  2 files changed, 24 insertions(+), 7 deletions(-)
 
 diff --git a/src/models/inkling.cpp b/src/models/inkling.cpp
-index f83930c6..8e5c7bb2 100644
+index f83930c69..8e5c7bb29 100644
 --- a/src/models/inkling.cpp
 +++ b/src/models/inkling.cpp
 @@ -195,6 +195,11 @@ std::unique_ptr<llm_graph_context> llama_model_inkling::build_arch_graph(const l
@@ -92,10 +92,10 @@ index f83930c6..8e5c7bb2 100644
      if (inp_out_ids) {
          cur = ggml_get_rows(ctx0, cur, inp_out_ids);
 diff --git a/src/skippy.cpp b/src/skippy.cpp
-index 5f5596ce..06d1a161 100644
+index 7f561a8d7..2de4e1254 100644
 --- a/src/skippy.cpp
 +++ b/src/skippy.cpp
-@@ -2578,6 +2578,7 @@ static enum skippy_status skippy_finish_model_open(
+@@ -2598,6 +2598,7 @@ static enum skippy_status skippy_finish_model_open(
              model->arch != LLM_ARCH_HUNYUAN_DENSE &&
              model->arch != LLM_ARCH_HUNYUAN_MOE &&
              model->arch != LLM_ARCH_HUNYUAN_VL &&
@@ -103,6 +103,3 @@ index 5f5596ce..06d1a161 100644
              model->arch != LLM_ARCH_INTERNLM2 &&
              model->arch != LLM_ARCH_JAIS &&
              model->arch != LLM_ARCH_JAIS2 &&
--- 
-2.50.1 (Apple Git-155)
-

@@ -1,7 +1,7 @@
-From 2a81bff138f3f5df6f6cb05b93fe3f9d3ffd0ca7 Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Mesh-LLM CI <ci@mesh-llm.local>
 Date: Fri, 17 Jul 2026 15:09:39 +1000
-Subject: [PATCH] Add Inkling multi-depth MTP sidecars
+Subject: [PATCH 5/7] Add Inkling multi-depth MTP sidecars
 
 ---
  conversion/inkling.py  |  78 ++++++++++++++++-
@@ -12,7 +12,7 @@ Subject: [PATCH] Add Inkling multi-depth MTP sidecars
  5 files changed, 247 insertions(+), 54 deletions(-)
 
 diff --git a/conversion/inkling.py b/conversion/inkling.py
-index 90ef65c3..07984290 100644
+index 90ef65c3b..079842903 100644
 --- a/conversion/inkling.py
 +++ b/conversion/inkling.py
 @@ -1,5 +1,7 @@
@@ -152,7 +152,7 @@ index 90ef65c3..07984290 100644
  @ModelBase.register("InklingForConditionalGeneration")
  class InklingMmprojModel(MmprojModel):
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index 9ab7be4b..59b31ff9 100644
+index 9ab7be4b2..59b31ff92 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -158,6 +158,12 @@ llama_context::llama_context(
@@ -169,7 +169,7 @@ index 9ab7be4b..59b31ff9 100644
      // before the reserve passes run later in this function. This avoids a later
      // re-reserve when graph nodes change.
 diff --git a/src/llama-model.cpp b/src/llama-model.cpp
-index 68c04f4d..a08a4e57 100644
+index 68c04f4d3..a08a4e579 100644
 --- a/src/llama-model.cpp
 +++ b/src/llama-model.cpp
 @@ -2104,10 +2104,20 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
@@ -195,7 +195,7 @@ index 68c04f4d..a08a4e57 100644
                          filter_attn = [&](uint32_t il) {
                              return !hparams.is_recr(il) && hparams.n_ff(il) == 0;
 diff --git a/src/models/inkling.cpp b/src/models/inkling.cpp
-index 8e5c7bb2..5f9baaa3 100644
+index 8e5c7bb29..5f9baaa33 100644
 --- a/src/models/inkling.cpp
 +++ b/src/models/inkling.cpp
 @@ -12,6 +12,9 @@
@@ -492,10 +492,10 @@ index 8e5c7bb2..5f9baaa3 100644
      res->t_embd = cur;
  
 diff --git a/src/skippy.cpp b/src/skippy.cpp
-index b46bf0c7..1ee05fea 100644
+index 453888731..535c7b071 100644
 --- a/src/skippy.cpp
 +++ b/src/skippy.cpp
-@@ -1337,7 +1337,7 @@ struct skippy_mtp_depth_scope {
+@@ -1333,7 +1333,7 @@ struct skippy_mtp_depth_scope {
      }
  
      bool chains_heads() const {
@@ -504,7 +504,7 @@ index b46bf0c7..1ee05fea 100644
      }
  
      bool chains_at_same_position() const {
-@@ -1385,6 +1385,17 @@ static llama_token skippy_greedy_sample_context(
+@@ -1382,6 +1382,17 @@ static llama_token skippy_greedy_sample_context(
          llama_context * ctx,
          int32_t index);
  
@@ -522,7 +522,7 @@ index b46bf0c7..1ee05fea 100644
  static enum skippy_status skippy_mtp_sync_target_tokens(
          skippy_session * session,
          const llama_token * token_ids,
-@@ -1401,7 +1412,7 @@ static enum skippy_status skippy_mtp_sync_target_tokens(
+@@ -1398,7 +1409,7 @@ static enum skippy_status skippy_mtp_sync_target_tokens(
  
      llama_context * mtp_ctx = session->stage_model->mtp_ctx;
      skippy_mtp_depth_scope mtp_depth_scope(mtp_ctx);
@@ -531,7 +531,7 @@ index b46bf0c7..1ee05fea 100644
      const bool chain_heads = mtp_depth_scope.chains_heads();
      const bool chain_at_same_position = mtp_depth_scope.chains_at_same_position();
      const int32_t n_embd = llama_model_n_embd(session->stage_model->model);
-@@ -2197,7 +2208,7 @@ static enum skippy_status skippy_mtp_propose_next(
+@@ -2217,7 +2228,7 @@ static enum skippy_status skippy_mtp_propose_next(
  
      llama_context * mtp_ctx = session->stage_model->mtp_ctx;
      skippy_mtp_depth_scope mtp_depth_scope(mtp_ctx);
@@ -540,6 +540,3 @@ index b46bf0c7..1ee05fea 100644
      const int32_t n_embd = llama_model_n_embd(session->stage_model->model);
      if (session->mtp_pending_h.size() != static_cast<size_t>(n_embd)) {
          return skippy_success(out_error);
--- 
-2.50.1 (Apple Git-155)
-
