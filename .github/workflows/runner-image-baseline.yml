@@ -1,0 +1,81 @@
+name: Runner Image Timing - Baseline
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/runner-image-baseline.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  baseline:
+    name: Runner timing / baseline
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_NET_RETRY: "10"
+      CARGO_HTTP_MULTIPLEXING: "false"
+    steps:
+      - name: Record runner start
+        id: runner_start
+        shell: bash
+        run: |
+          echo "epoch=$(date +%s)" >> "$GITHUB_OUTPUT"
+          uname -a
+
+      - name: Checkout MeshLLM
+        uses: actions/checkout@v7
+
+      - name: Install baseline system toolchain
+        id: system_toolchain
+        shell: bash
+        run: |
+          started_at=$(date +%s)
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            build-essential \
+            cmake \
+            git-lfs \
+            jq \
+            libdbus-1-dev \
+            libssl-dev \
+            lld \
+            ninja-build \
+            pkg-config
+          echo "seconds=$(( $(date +%s) - started_at ))" >> "$GITHUB_OUTPUT"
+
+      - name: Install baseline Rust toolchain
+        id: rust_toolchain
+        shell: bash
+        run: |
+          started_at=$(date +%s)
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup component add clippy rustfmt
+          echo "seconds=$(( $(date +%s) - started_at ))" >> "$GITHUB_OUTPUT"
+
+      - name: Run controlled Rust check
+        id: rust_check
+        shell: bash
+        run: |
+          started_at=$(date +%s)
+          cargo check -p mesh-llm-config
+          echo "seconds=$(( $(date +%s) - started_at ))" >> "$GITHUB_OUTPUT"
+
+      - name: Write timing summary
+        if: always()
+        shell: bash
+        run: |
+          measured_seconds=$(( $(date +%s) - ${{ steps.runner_start.outputs.epoch }} ))
+          {
+            echo "## GitHub-hosted baseline"
+            echo
+            echo "- system toolchain: ${{ steps.system_toolchain.outputs.seconds || 'failed' }} s"
+            echo "- Rust toolchain: ${{ steps.rust_toolchain.outputs.seconds || 'failed' }} s"
+            echo "- cargo check: ${{ steps.rust_check.outputs.seconds || 'failed' }} s"
+            echo "- measured steps: ${measured_seconds} s"
+            echo "- source: \`${GITHUB_SHA}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
