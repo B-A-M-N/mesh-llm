@@ -53,7 +53,7 @@ def capture_response_timings(self, *args, **kwargs):
         }
         with timings_lock:
             with open(timings_path, "a", encoding="utf-8") as output:
-                output.write(json.dumps({"timings": safe_timings}, sort_keys=True) + "\\n")
+                output.write(json.dumps({"timings": safe_timings}, sort_keys=True) + "\n")
         self._skippy_timings_captured = True
     return response
 
@@ -119,4 +119,21 @@ pub(in crate::evals) fn speed_bench_command(
         )
         .secret_env("SKIPPY_BENCH_API_KEY", args.api_key.clone());
     Ok(command)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AUTH_LAUNCHER;
+
+    #[test]
+    fn response_timings_are_written_as_json_lines() {
+        assert!(
+            AUTH_LAUNCHER.contains(r#"sort_keys=True) + "\n")"#),
+            "launcher must emit a real newline between timing records"
+        );
+        assert!(
+            !AUTH_LAUNCHER.contains(r#"sort_keys=True) + "\\n")"#),
+            "launcher must not emit a literal backslash-n separator"
+        );
+    }
 }
