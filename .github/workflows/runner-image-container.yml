@@ -1,0 +1,187 @@
+name: Runner Image Timing - Container
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/runner-image-container.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  container:
+    name: Runner timing / custom container
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    container:
+      image: ghcr.io/mesh-llm/mesh-llm-cuda-runner@sha256:b00684f3837ee1671dee57d8b5fe2a98c91d6684e451132a5361dfd0585bd115
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_NET_RETRY: "10"
+      CARGO_HTTP_MULTIPLEXING: "false"
+      RUNNER_IMAGE: ghcr.io/mesh-llm/mesh-llm-cuda-runner@sha256:b00684f3837ee1671dee57d8b5fe2a98c91d6684e451132a5361dfd0585bd115
+      CONTROLLED_SOURCE: 6bd55216f7c8425ac760bc22225a64d3093598a8
+    steps:
+      - name: Record runner start
+        id: runner_start
+        shell: bash
+        run: |
+          echo "epoch=$(date +%s)" >> "$GITHUB_OUTPUT"
+          uname -a
+
+      - name: Checkout MeshLLM
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ env.CONTROLLED_SOURCE }}
+
+      - name: Verify injected runner environment
+        id: image_verification
+        shell: bash
+        run: |
+          started_at=$(date +%s)
+          verify-runner-image public
+          test "$(cat /etc/mesh-runner-environment)" = public
+          printf 'image_revision=%s\n' "$(cat /etc/mesh-llm-revision)"
+          echo "seconds=$(( $(date +%s) - started_at ))" >> "$GITHUB_OUTPUT"
+
+      - name: Run controlled Rust check
+        id: rust_check
+        shell: bash
+        run: |
+          started_at=$(date +%s)
+          cargo check -p mesh-llm-config
+          echo "seconds=$(( $(date +%s) - started_at ))" >> "$GITHUB_OUTPUT"
+
+      - name: Write timing summary
+        if: always()
+        shell: bash
+        run: |
+          measured_seconds=$(( $(date +%s) - ${{ steps.runner_start.outputs.epoch }} ))
+          {
+            echo "## GitHub-hosted custom container"
+            echo
+            echo "- image verification: ${{ steps.image_verification.outputs.seconds || 'failed' }} s"
+            echo "- cargo check: ${{ steps.rust_check.outputs.seconds || 'failed' }} s"
+            echo "- measured steps: ${measured_seconds} s"
+            echo "- controlled source: \`${CONTROLLED_SOURCE}\`"
+            echo "- image: \`${RUNNER_IMAGE}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  arc-arm64:
+    name: Runner timing / ARC arm64
+    runs-on: mesh-llm-arm64
+    timeout-minutes: 30
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_NET_RETRY: "10"
+      CARGO_HTTP_MULTIPLEXING: "false"
+      RUNNER_IMAGE: ghcr.io/mesh-llm/mesh-llm-cuda-runner@sha256:fa1e07fdb4c71719783d3b6cde22ccb48e8c980c37db26b067343e1da3769f0c
+      CONTROLLED_SOURCE: 6bd55216f7c8425ac760bc22225a64d3093598a8
+    steps:
+      - name: Record runner start
+        id: runner_start
+        shell: bash
+        run: |
+          echo "epoch=$(date +%s)" >> "$GITHUB_OUTPUT"
+          test "$(uname -m)" = aarch64
+          uname -a
+
+      - name: Checkout MeshLLM
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ env.CONTROLLED_SOURCE }}
+
+      - name: Verify ARC runner environment
+        id: image_verification
+        shell: bash
+        run: |
+          started_at=$(date +%s)
+          verify-runner-image self-hosted
+          test "$(cat /etc/mesh-runner-environment)" = self-hosted
+          echo "seconds=$(( $(date +%s) - started_at ))" >> "$GITHUB_OUTPUT"
+
+      - name: Run controlled Rust check
+        id: rust_check
+        shell: bash
+        run: |
+          started_at=$(date +%s)
+          cargo check -p mesh-llm-config
+          echo "seconds=$(( $(date +%s) - started_at ))" >> "$GITHUB_OUTPUT"
+
+      - name: Write timing summary
+        if: always()
+        shell: bash
+        run: |
+          measured_seconds=$(( $(date +%s) - ${{ steps.runner_start.outputs.epoch }} ))
+          {
+            echo "## ARC ARM64 custom runner"
+            echo
+            echo "- image verification: ${{ steps.image_verification.outputs.seconds || 'failed' }} s"
+            echo "- cargo check: ${{ steps.rust_check.outputs.seconds || 'failed' }} s"
+            echo "- measured steps: ${measured_seconds} s"
+            echo "- controlled source: \`${CONTROLLED_SOURCE}\`"
+            echo "- image: \`${RUNNER_IMAGE}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  arc-amd64:
+    name: Runner timing / ARC amd64 CUDA
+    runs-on: mesh-llm-amd64
+    timeout-minutes: 30
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_NET_RETRY: "10"
+      CARGO_HTTP_MULTIPLEXING: "false"
+      RUNNER_IMAGE: ghcr.io/mesh-llm/mesh-llm-cuda-runner@sha256:fa1e07fdb4c71719783d3b6cde22ccb48e8c980c37db26b067343e1da3769f0c
+      CONTROLLED_SOURCE: 6bd55216f7c8425ac760bc22225a64d3093598a8
+    steps:
+      - name: Record runner start
+        id: runner_start
+        shell: bash
+        run: |
+          echo "epoch=$(date +%s)" >> "$GITHUB_OUTPUT"
+          test "$(uname -m)" = x86_64
+          uname -a
+
+      - name: Checkout MeshLLM
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ env.CONTROLLED_SOURCE }}
+
+      - name: Verify ARC runner and CUDA environment
+        id: image_verification
+        shell: bash
+        run: |
+          started_at=$(date +%s)
+          verify-runner-image self-hosted
+          test "$(cat /etc/mesh-runner-environment)" = self-hosted
+          nvcc --version
+          nvidia-smi
+          echo "seconds=$(( $(date +%s) - started_at ))" >> "$GITHUB_OUTPUT"
+
+      - name: Run controlled Rust check
+        id: rust_check
+        shell: bash
+        run: |
+          started_at=$(date +%s)
+          cargo check -p mesh-llm-config
+          echo "seconds=$(( $(date +%s) - started_at ))" >> "$GITHUB_OUTPUT"
+
+      - name: Write timing summary
+        if: always()
+        shell: bash
+        run: |
+          measured_seconds=$(( $(date +%s) - ${{ steps.runner_start.outputs.epoch }} ))
+          {
+            echo "## ARC AMD64 CUDA custom runner"
+            echo
+            echo "- image verification: ${{ steps.image_verification.outputs.seconds || 'failed' }} s"
+            echo "- cargo check: ${{ steps.rust_check.outputs.seconds || 'failed' }} s"
+            echo "- measured steps: ${measured_seconds} s"
+            echo "- controlled source: \`${CONTROLLED_SOURCE}\`"
+            echo "- image: \`${RUNNER_IMAGE}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
