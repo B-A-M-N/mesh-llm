@@ -914,10 +914,18 @@ impl StageOpenAiBackend {
             );
             let composite_sidecar_enabled =
                 native_mtp_options.ngram_hybrid && draft_guard.is_none();
+            // A standalone N-gram plan (no native MTP, no draft model) can drive
+            // the same verify-window pipeline; the single-window native-MTP path
+            // stays composite-only, so standalone drafting still falls back to the
+            // serial block at depth 1.
+            let standalone_ngram_pipelining = !request.native_mtp_enabled
+                && request.speculative.ngram.is_some()
+                && draft_guard.is_none();
             let native_mtp_verify_windows_enabled =
                 (request.native_mtp_enabled || composite_sidecar_enabled) && draft_guard.is_none();
-            let pipelined_decode_enabled =
-                composite_sidecar_enabled && verify_window_scheduler.depth() > 1;
+            let pipelined_decode_enabled = (composite_sidecar_enabled
+                || standalone_ngram_pipelining)
+                && verify_window_scheduler.depth() > 1;
             let mut verify_window_forwarder = None;
             if let Some(direct_return_path) = direct_prediction_return_path(
                 native_mtp_verify_windows_enabled,
@@ -1442,7 +1450,9 @@ impl StageOpenAiBackend {
                         continue;
                     }
                 }
-                if draft_guard.is_some() || request.speculative.ngram.is_some() {
+                if draft_guard.is_some()
+                    || (request.speculative.ngram.is_some() && !pipelined_decode_enabled)
+                {
                     let remaining = (request.max_tokens as usize).saturating_sub(decoded_tokens);
                     if remaining == 0 {
                         break;

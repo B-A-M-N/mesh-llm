@@ -252,6 +252,7 @@ fn generated_text_timings_prefer_composite_proposal_totals() {
         suppress_cooldown_drafts: false,
         suppress_cooldown_draft_limit: 0,
         ngram_hybrid: true,
+        ngram_proposals_enabled: true,
         ngram_proposer: "cache",
         ngram_size: 2,
         ngram_max_proposal_tokens: 4,

@@ -13,6 +13,9 @@ pub(in crate::frontend) struct NativeMtpDecodeOptions {
     pub(in crate::frontend) suppress_cooldown_drafts: bool,
     pub(in crate::frontend) suppress_cooldown_draft_limit: usize,
     pub(in crate::frontend) ngram_hybrid: bool,
+    /// The composite provider should generate N-gram proposals — true for both
+    /// the MTP+extension composite and a standalone (no-MTP) N-gram plan.
+    pub(in crate::frontend) ngram_proposals_enabled: bool,
     pub(in crate::frontend) ngram_proposer: &'static str,
     pub(in crate::frontend) ngram_size: usize,
     pub(in crate::frontend) ngram_max_proposal_tokens: usize,
@@ -32,15 +35,24 @@ impl NativeMtpDecodeOptions {
             suppress_cooldown_drafts: config.native_mtp.suppress_cooldown_drafts,
             suppress_cooldown_draft_limit: config.native_mtp.suppress_cooldown_draft_limit,
             ngram_hybrid: config.extension.is_some() && config.ngram.is_some(),
+            ngram_proposals_enabled: config.ngram.is_some()
+                && (config.extension.is_some() || !config.native_mtp.enabled),
             ngram_proposer: config
                 .ngram
                 .as_ref()
                 .map_or("none", |ngram| ngram.kind.as_str()),
             ngram_size: config.ngram.as_ref().map_or(0, |ngram| ngram.min_ngram),
-            ngram_max_proposal_tokens: config
-                .extension
-                .as_ref()
-                .map_or(0, |extension| extension.max_tokens),
+            // The composite path takes its horizon from the extension policy; a
+            // standalone N-gram plan (no extension) uses the proposer's own limit.
+            ngram_max_proposal_tokens: config.extension.as_ref().map_or_else(
+                || {
+                    config
+                        .ngram
+                        .as_ref()
+                        .map_or(0, |ngram| ngram.max_proposal_tokens)
+                },
+                |extension| extension.max_tokens,
+            ),
             verify_window_min_tokens: config.verify_window.min_tokens.max(1),
             verify_window_max_tokens: config.verify_window.max_tokens.max(1),
         }
@@ -623,6 +635,7 @@ mod tests {
             suppress_cooldown_drafts: false,
             suppress_cooldown_draft_limit: 0,
             ngram_hybrid: true,
+            ngram_proposals_enabled: true,
             ngram_proposer: "cache",
             ngram_size: 2,
             ngram_max_proposal_tokens: 4,
@@ -659,6 +672,29 @@ mod tests {
     }
 
     #[test]
+    fn standalone_ngram_enables_proposals_without_extension() {
+        // A standalone plan has no native MTP and no extension policy. It must
+        // still enable the composite provider (so the verify-window pipeline can
+        // seed) and source its horizon from the proposer's own limit.
+        let config = SpeculativeDecodeConfig {
+            ngram: Some(crate::frontend::NgramProposalConfig {
+                kind: crate::frontend::NgramProposerKind::Suffix,
+                min_ngram: 5,
+                max_ngram: 32,
+                max_proposal_tokens: 48,
+            }),
+            ..SpeculativeDecodeConfig::default()
+        };
+
+        let options = NativeMtpDecodeOptions::from_config(&config);
+
+        assert!(options.ngram_proposals_enabled);
+        assert!(!options.ngram_hybrid, "standalone is not an MTP composite");
+        assert_eq!(options.ngram_max_proposal_tokens, 48);
+        assert_eq!(options.ngram_proposer, "suffix");
+    }
+
+    #[test]
     fn counters_track_verify_window_verification_by_origin() {
         let mut counters = NativeMtpDecodeCounters::default();
         counters.observe_verify_window_verification(NativeMtpDraftOrigin::InitialSerial, true);
@@ -681,6 +717,7 @@ mod tests {
                 suppress_cooldown_drafts: false,
                 suppress_cooldown_draft_limit: 2,
                 ngram_hybrid: true,
+                ngram_proposals_enabled: true,
                 ngram_proposer: "cache",
                 ngram_size: 8,
                 ngram_max_proposal_tokens: 4,
@@ -800,6 +837,7 @@ mod tests {
                 suppress_cooldown_drafts: false,
                 suppress_cooldown_draft_limit: 0,
                 ngram_hybrid: true,
+                ngram_proposals_enabled: true,
                 ngram_proposer: "cache",
                 ngram_size: 8,
                 ngram_max_proposal_tokens: 4,
