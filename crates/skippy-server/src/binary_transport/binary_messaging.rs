@@ -11,8 +11,8 @@ use std::{
 };
 
 use super::stage_execution::{
-    consume_optional_client_ready_hello, prepare_binary_stage_connection,
-    take_warm_or_connect_downstream, warm_downstream_preconnect_enabled,
+    consume_optional_client_ready_hello, prepare_binary_stage_connection, take_ready_downstream,
+    warm_downstream_preconnect_enabled,
 };
 use super::{
     decode_batcher::DecodeFrameBatcher,
@@ -240,7 +240,7 @@ fn run_binary_stage(options: BinaryStageOptions, shutdown: Arc<AtomicBool>) -> R
                     }
                     return prediction_return_sinks.insert_opened_sink(first_message, upstream);
                 }
-                let downstream = take_warm_or_connect_downstream(
+                let downstream = take_ready_downstream(
                     &config,
                     &warm_downstream,
                     downstream_connect_timeout_secs,

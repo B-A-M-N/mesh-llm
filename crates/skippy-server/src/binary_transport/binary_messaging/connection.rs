@@ -26,7 +26,6 @@ use crate::binary_transport::kv_eviction::binary_proactive_eviction_plan;
 use crate::binary_transport::kv_eviction::evict_binary_resident_prefix_for_decode;
 use crate::binary_transport::restore_prefill_decode::handle_binary_restore_prefill_decode_control;
 use crate::binary_transport::run_binary_stage_message;
-use crate::binary_transport::send_client_ready_hello_if_enabled;
 use crate::binary_transport::stage_execution::binary_message_attrs;
 use crate::binary_transport::stage_execution::binary_message_base;
 use crate::binary_transport::stage_execution::binary_message_session_id;
@@ -95,13 +94,6 @@ pub(super) fn handle_binary_connection(
     prediction_return_sinks: &PredictionReturnSinks,
     first_message: StageWireMessage,
 ) -> Result<()> {
-    if let Some(downstream) = downstream.as_mut() {
-        send_client_ready_hello_if_enabled(&mut *downstream)
-            .context("send downstream client ready hello")?;
-        skippy_protocol::binary::recv_ready(&mut *downstream)
-            .context("downstream binary stage did not become ready")?;
-    }
-
     let connection_session_id = BINARY_SESSION_COUNTER.fetch_add(1, Ordering::Relaxed);
     let positional_speculation_supported = !model_requires_recurrent_state(config);
     let max_deferred_prefill_replies =

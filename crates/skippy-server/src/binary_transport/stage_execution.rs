@@ -68,6 +68,55 @@ pub(in crate::binary_transport) fn take_warm_or_connect_downstream(
     }
 }
 
+pub(in crate::binary_transport) fn take_ready_downstream(
+    config: &StageConfig,
+    warm_downstream: &Arc<Mutex<Option<TcpStream>>>,
+    timeout_secs: u64,
+) -> Result<Option<TcpStream>> {
+    if config.downstream.is_none() {
+        return Ok(None);
+    }
+    let deadline = Instant::now() + Duration::from_secs(timeout_secs.max(1));
+    let mut last_error = None;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match take_warm_or_connect_downstream(config, warm_downstream, 1) {
+            Ok(Some(mut stream)) => {
+                match complete_downstream_ready(&mut stream, remaining.min(Duration::from_secs(10)))
+                {
+                    Ok(()) => return Ok(Some(stream)),
+                    Err(error) => last_error = Some(error),
+                }
+            }
+            Ok(None) => return Ok(None),
+            Err(error) => last_error = Some(error),
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    Err(last_error
+        .unwrap_or_else(|| anyhow!("downstream ready deadline expired"))
+        .context(format!(
+            "downstream stage did not become ready within {}s",
+            timeout_secs.max(1)
+        )))
+}
+
+fn complete_downstream_ready(stream: &mut TcpStream, timeout: Duration) -> Result<()> {
+    send_client_ready_hello_if_enabled(stream).context("send downstream client ready hello")?;
+    stream
+        .set_read_timeout(Some(timeout))
+        .context("set downstream ready timeout")?;
+    let result = skippy_protocol::binary::recv_ready(&mut *stream)
+        .context("downstream binary stage did not become ready");
+    stream
+        .set_read_timeout(None)
+        .context("clear downstream ready timeout")?;
+    result
+}
+
 pub(in crate::binary_transport) fn warm_downstream_is_healthy(stream: &TcpStream) -> Result<bool> {
     let previous_timeout = stream
         .read_timeout()
@@ -781,8 +830,9 @@ mod tests {
     use super::{
         decode_record_tokens_sideband, first_decode_message_with_full_prompt_sideband,
         is_decode_frame_batch_candidate, prefix_cache_test_config, prepare_binary_stage_connection,
-        split_native_mtp_reply, take_warm_or_connect_downstream, token_sideband_or_fill,
-        warm_downstream_is_healthy, warm_downstream_preconnect_enabled_from,
+        split_native_mtp_reply, take_ready_downstream, take_warm_or_connect_downstream,
+        token_sideband_or_fill, warm_downstream_is_healthy,
+        warm_downstream_preconnect_enabled_from,
     };
     use skippy_protocol::binary::{
         StageStateHeader, StageWireMessage, WireActivationDType, WireMessageKind,
@@ -873,6 +923,28 @@ mod tests {
         );
         assert!(warm.lock().unwrap().is_none());
     }
+    #[test]
+    fn downstream_ready_retries_after_failed_handshake() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = listener.local_addr().unwrap().to_string();
+        let server = thread::spawn(move || {
+            let (first, _) = listener.accept().unwrap();
+            drop(first);
+            let (mut second, _) = listener.accept().unwrap();
+            skippy_protocol::binary::send_ready(&mut second).unwrap();
+        });
+        let mut config = prefix_cache_test_config();
+        config.downstream.as_mut().unwrap().endpoint = endpoint;
+        let warm = std::sync::Arc::new(std::sync::Mutex::new(None));
+
+        let ready = take_ready_downstream(&config, &warm, 2)
+            .unwrap()
+            .expect("downstream should be present");
+
+        assert!(ready.peer_addr().is_ok());
+        server.join().unwrap();
+    }
+
     #[test]
     fn decode_record_tokens_sideband_records_metadata_without_changing_exec_token() {
         let message = first_decode_message_with_full_prompt_sideband();
