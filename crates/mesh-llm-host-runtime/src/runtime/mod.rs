@@ -24,6 +24,7 @@ mod split_topology_lock;
 mod startup_handles;
 mod startup_identity;
 mod startup_models;
+mod startup_retry;
 mod status;
 pub(crate) mod survey;
 #[cfg(test)]

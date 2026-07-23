@@ -1,3 +1,4 @@
+use super::startup_retry::is_retryable_split_start_failure;
 use super::status::current_time_unix_ms;
 use super::status::single_quote_shell_arg;
 use super::{
@@ -399,11 +400,9 @@ where
             Err(err) => {
                 drop(startup_load_guard);
                 let err_msg = format!("{err:#}");
-                let is_participant_shortage = err_msg.contains("at least two participating nodes")
-                    || err_msg.contains("at least two stage participants");
-                if is_participant_shortage {
+                if is_retryable_split_start_failure(&err_msg) {
                     let _ = emit_event(OutputEvent::Info {
-                        message: format!("Split waiting for peers: {err_msg}"),
+                        message: format!("Split waiting to retry: {err_msg}"),
                         context: Some(format!("model={model_name}")),
                     });
                 } else {

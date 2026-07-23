@@ -1,4 +1,4 @@
-use super::{MAX_SPLIT_RTT_MS, Node, PeerInfo, StageTransportBridgeLabel};
+use super::{Node, PeerInfo, StageTransportBridgeLabel};
 use crate::mesh::node::LocalRequestMetricsSampler;
 use crate::mesh::stage_proto::{
     stage_control_request_to_proto, stage_control_response_from_proto,
