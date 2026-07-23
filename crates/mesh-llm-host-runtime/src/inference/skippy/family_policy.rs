@@ -9,6 +9,7 @@ use crate::models::gguf::{GgufCompactMeta, scan_gguf_compact_meta};
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct FamilyPolicy {
     pub(crate) activation_wire_dtype: StageWireDType,
+    pub(crate) default_kv_cache_type: Option<&'static str>,
     pub(crate) prefix_cache: FamilyPrefixCachePolicy,
 }
 
@@ -159,10 +160,14 @@ fn family_policy_for_gguf_meta(meta: &GgufCompactMeta, model_id: Option<&str>) -
 }
 
 fn family_policy_for_capability(capability: &FamilyCapabilityRecord) -> FamilyPolicy {
-    family_policy_for_normalized_family_id(
+    let mut policy = family_policy_for_normalized_family_id(
         capability.family_id.as_str(),
         wire_dtype_from_capability(capability.default_wire_dtype),
-    )
+    );
+    if capability.family_id == "inkling" {
+        policy.default_kv_cache_type = Some("f16");
+    }
+    policy
 }
 
 fn family_policy_for_model_id(model_id: &str) -> FamilyPolicy {
@@ -239,6 +244,7 @@ fn family_policy_for_normalized_family_id(
 fn resident_kv_policy(activation_wire_dtype: StageWireDType) -> FamilyPolicy {
     FamilyPolicy {
         activation_wire_dtype,
+        default_kv_cache_type: None,
         prefix_cache: FamilyPrefixCachePolicy::Auto {
             payload: FamilyPrefixCachePayload::ResidentKv,
             min_tokens: 256,
@@ -276,6 +282,7 @@ fn resident_kv_policy(activation_wire_dtype: StageWireDType) -> FamilyPolicy {
 fn kv_recurrent_policy(activation_wire_dtype: StageWireDType) -> FamilyPolicy {
     FamilyPolicy {
         activation_wire_dtype,
+        default_kv_cache_type: None,
         prefix_cache: FamilyPrefixCachePolicy::Auto {
             payload: FamilyPrefixCachePayload::KvRecurrent,
             min_tokens: 256,
@@ -304,6 +311,7 @@ fn disabled_family_policy(
 ) -> FamilyPolicy {
     FamilyPolicy {
         activation_wire_dtype,
+        default_kv_cache_type: None,
         prefix_cache: FamilyPrefixCachePolicy::Disabled { reason },
     }
 }

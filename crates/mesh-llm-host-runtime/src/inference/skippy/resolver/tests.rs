@@ -715,6 +715,75 @@ fn family_policy_beats_builtin_wire_dtype_when_config_is_unset() {
 }
 
 #[test]
+fn inkling_family_defaults_to_f32_wire_and_f16_kv() {
+    let resolved = resolve_skippy_config(SkippyConfigResolveRequest {
+        mesh_config: &MeshConfig::default(),
+        model_id: "meshllm/inkling-UD-Q2_K_XL-layers",
+        model_path: Path::new("/models/inkling.gguf"),
+        model_bytes: 316 * 1024 * 1024 * 1024,
+        allocatable_memory_bytes: None,
+        request_defaults: None,
+        package_generation: None,
+    })
+    .unwrap();
+
+    assert_eq!(resolved.skippy.activation_wire_dtype, StageWireDType::F32);
+    assert_eq!(resolved.model_fit.cache_type_k, "f16");
+    assert_eq!(resolved.model_fit.cache_type_v, "f16");
+}
+
+#[test]
+fn inkling_family_kv_default_beats_generic_saver_macro() {
+    let mesh_config = parse_config(
+        r#"
+[[models]]
+model = "meshllm/inkling-UD-Q2_K_XL-layers"
+
+[models.model_fit]
+kv_cache_policy = "saver"
+"#,
+    );
+    let resolved = resolve_skippy_config(SkippyConfigResolveRequest {
+        mesh_config: &mesh_config,
+        model_id: "meshllm/inkling-UD-Q2_K_XL-layers",
+        model_path: Path::new("/models/inkling.gguf"),
+        model_bytes: 316 * 1024 * 1024 * 1024,
+        allocatable_memory_bytes: None,
+        request_defaults: None,
+        package_generation: None,
+    })
+    .unwrap();
+
+    assert_eq!(resolved.model_fit.cache_type_k, "f16");
+    assert_eq!(resolved.model_fit.cache_type_v, "f16");
+}
+
+#[test]
+fn explicit_inkling_kv_override_beats_family_default() {
+    let mesh_config = parse_config(
+        r#"
+[[models]]
+model = "meshllm/inkling-UD-Q2_K_XL-layers"
+cache_type_k = "q8_0"
+cache_type_v = "q8_0"
+"#,
+    );
+    let resolved = resolve_skippy_config(SkippyConfigResolveRequest {
+        mesh_config: &mesh_config,
+        model_id: "meshllm/inkling-UD-Q2_K_XL-layers",
+        model_path: Path::new("/models/inkling.gguf"),
+        model_bytes: 316 * 1024 * 1024 * 1024,
+        allocatable_memory_bytes: None,
+        request_defaults: None,
+        package_generation: None,
+    })
+    .unwrap();
+
+    assert_eq!(resolved.model_fit.cache_type_k, "q8_0");
+    assert_eq!(resolved.model_fit.cache_type_v, "q8_0");
+}
+
+#[test]
 fn family_policy_wires_prefix_cache_by_default_for_supported_models() {
     let model_file = temp_model_file();
     let resolved = resolve_skippy_config(SkippyConfigResolveRequest {
