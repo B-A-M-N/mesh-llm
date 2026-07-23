@@ -2265,23 +2265,6 @@ fn init_owner_runtime(
     })
 }
 
-fn configure_control_relay(
-    mut builder: iroh::endpoint::Builder,
-    relay: Option<RelayConfig<'_>>,
-) -> iroh::endpoint::Builder {
-    if let Some(relay) = relay.filter(|relay| relay.policy.uses_relay()) {
-        let urls = effective_relay_urls(relay.policy, relay.urls);
-        tracing::info!("Owner-control relay: {:?}", urls);
-        builder = builder.relay_mode(iroh::endpoint::RelayMode::Custom(relay_map_from_urls(
-            &urls,
-            relay.auths,
-        )));
-    } else {
-        builder = builder.relay_mode(iroh::endpoint::RelayMode::Disabled);
-    }
-    builder
-}
-
 fn default_plugin_event_source(endpoint_id: EndpointId, source_peer_id: &mut String) {
     if source_peer_id.is_empty() {
         *source_peer_id = endpoint_id_hex(endpoint_id);
@@ -3887,7 +3870,6 @@ impl Node {
             owner_config
                 .as_ref()
                 .and_then(|config| config.control_advertise_addr),
-            relay.policy.uses_relay().then_some(relay),
         )
         .await?;
 
@@ -4052,26 +4034,48 @@ impl Node {
         secret_key: SecretKey,
         bind_addr: Option<std::net::SocketAddr>,
         advertise_addr: Option<std::net::SocketAddr>,
-        relay: Option<RelayConfig<'_>>,
     ) -> Result<()> {
         if self.local_verified_owner_id().await.is_none() {
             return Ok(());
         }
 
-        let mut builder = Endpoint::builder(iroh::endpoint::presets::Minimal)
+        // The owner-control listener deliberately shares the node's secret key
+        // (and therefore its iroh endpoint id) with the main mesh endpoint: the
+        // control protocol validates the dialed `target_node_id` against the
+        // main endpoint id (`verify_control_plane_target_node`), so the control
+        // endpoint MUST present that same id.
+        //
+        // Because the id is shared, this endpoint must NOT register with the
+        // relay. An iroh relay keeps only one active connection per endpoint id:
+        // a second same-id registration evicts the first ("Another endpoint
+        // connected with the same endpoint id. No more messages will be
+        // received."). The control listener binds *after* the main mesh
+        // endpoint, so if it also joined the relay it would steal the main
+        // endpoint's relay slot and silently cut off all relay-delivered mesh
+        // traffic (gossip, joins, inference routing) — breaking relay fallback
+        // for any peer that cannot reach this node directly. Keeping the control
+        // endpoint relay-disabled leaves the main mesh endpoint as the sole
+        // relay registrant for this id. Owner-control is therefore reachable
+        // over its direct / advertised address only; relay-assisted remote
+        // owner-control is intentionally unsupported while the control and mesh
+        // endpoints share one id.
+        // With relay disabled and a specific IPv4 bind, clear the preset sockets
+        // first. `bind_addr` only replaces the default for the *same* address
+        // family, so an explicit IPv4 bind would otherwise leave iroh's implicit
+        // `[::]:0` IPv6 socket in place. With no relay to arbitrate, multipath
+        // negotiation across the IPv4+IPv6 locals can fail with
+        // `MultipathNotNegotiated` (same reasoning as the main endpoint's
+        // LAN-only path above). Clearing keeps a single local path family so the
+        // direct/advertised control address is reachable cleanly. It also makes
+        // the `127.0.0.1:0` default genuinely loopback-only on dual-stack hosts.
+        let endpoint = Endpoint::builder(iroh::endpoint::presets::Minimal)
             .secret_key(secret_key)
             .alpns(vec![ALPN_CONTROL_V1.to_vec()])
-            .bind_addr(bind_addr.unwrap_or_else(default_control_bind_addr))?;
-        builder = configure_control_relay(builder, relay);
-        let endpoint = builder.bind().await?;
-        if relay.is_some_and(|relay| relay.policy.uses_relay()) {
-            wait_for_endpoint_online(
-                &endpoint,
-                "Owner-control relay connected",
-                "Owner-control relay connection timed out (5s) — proceeding with direct endpoint addresses only",
-            )
-            .await;
-        }
+            .clear_ip_transports()
+            .bind_addr(bind_addr.unwrap_or_else(default_control_bind_addr))?
+            .relay_mode(iroh::endpoint::RelayMode::Disabled)
+            .bind()
+            .await?;
         let token = encode_endpoint_addr_token(&control_endpoint_addr(&endpoint, advertise_addr));
         let shutdown_requested = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let shutdown = Arc::new(tokio::sync::Notify::new());
