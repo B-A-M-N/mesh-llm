@@ -121,7 +121,7 @@ subgraph PRCI["pr_builds.yml · PR Builds"]
         MainCI["ci.yml\npush main / dispatch"]
         WebsiteDeploy["website-pages.yml\nActions Pages deploy\nPublic Website environment"]
         DockerValidate["docker.yml\nmanual client Dockerfile validation"]
-        Release["release.yml\nrelease artifacts + packaging dispatch"]
+        Release["release.yml\nrelease artifacts + npm/crates.io publishing\n+ packaging dispatch"]
         FlyConsole["fly-deploy-console.yml\nmanual Fly console deploy"]
     end
 
@@ -199,9 +199,10 @@ subgraph PRCI["pr_builds.yml · PR Builds"]
   Rust/build/smoke jobs.
 - Docker image validation and publishing are intentionally not part of pull
   request CI. `docker.yml` is a manual, non-publishing client Dockerfile
-  validation workflow. `release.yml` owns release archives and dispatches the
-  completed full release to `Mesh-LLM/mesh-agent-images`, which is the sole
-  GHCR publisher.
+  validation workflow. `release.yml` owns release archives, publishes the Rust
+  crate chain and the prebuilt `@meshllm/sdk` npm package, and dispatches the
+  completed full release to the packaging repository, which is the sole GHCR
+  publisher.
 - `fly-deploy-console.yml` is a manual (`workflow_dispatch`) deploy of the
   `mesh-llm-console` Fly app. It builds the image on Fly's remote builders from
   `fly/Dockerfile` and authenticates with the app-scoped `FLY_API_TOKEN` repo

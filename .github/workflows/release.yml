@@ -257,6 +257,88 @@ jobs:
             dist/native-sdk-crates/*/target/package/*.crate
           if-no-files-found: error
 
+  build_node_sdk_addon:
+    name: Build Node SDK addon ${{ matrix.name }}
+    needs: metadata
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macOS ARM64
+            os: macos-15
+            backend: metal
+            platform_arch: darwin-arm64
+          - name: macOS x64
+            os: macos-15-intel
+            backend: metal
+            platform_arch: darwin-x64
+          - name: Linux ARM64
+            os: ubuntu-24.04-arm
+            backend: cpu
+            platform_arch: linux-arm64
+          - name: Linux x64
+            os: ubuntu-24.04
+            backend: cpu
+            platform_arch: linux-x64
+          - name: Windows x64
+            os: windows-2022
+            backend: cpu
+            platform_arch: win32-x64
+    env:
+      LLAMA_STAGE_BACKEND: ${{ matrix.backend }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          package-manager-cache: false
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: mozilla-actions/sccache-action@v0.0.9
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y build-essential cmake ninja-build pkg-config libssl-dev libdbus-1-dev curl lld
+
+      - name: Install macOS dependencies
+        if: runner.os == 'macOS'
+        run: brew install cmake ninja lld
+
+      - name: Prepare dispatched release version
+        if: github.event_name == 'workflow_dispatch'
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ needs.metadata.outputs.tag }}
+        run: scripts/release-version.sh "$RELEASE_TAG"
+
+      - name: Test Node SDK JavaScript
+        run: npm test --prefix sdk/node
+
+      - name: Build Node SDK addon
+        run: npm run build:native --prefix sdk/node
+
+      - name: Stage Node SDK addon
+        shell: bash
+        run: |
+          set -euo pipefail
+          source="sdk/node/native/${{ matrix.platform_arch }}/mesh_llm_nodejs.node"
+          test -s "$source"
+          destination="dist/node-sdk-addons/${{ matrix.platform_arch }}"
+          mkdir -p "$destination"
+          cp "$source" "$destination/mesh_llm_nodejs.node"
+
+      - name: Upload Node SDK addon
+        uses: actions/upload-artifact@v6
+        with:
+          name: node-sdk-addon-${{ matrix.platform_arch }}
+          path: dist/node-sdk-addons/
+          if-no-files-found: error
+
   build_native_runtime:
     name: Build native runtime ${{ matrix.name }}
     needs: metadata
@@ -1442,3 +1524,121 @@ jobs:
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: scripts/publish-crates.sh
+
+  publish_node_sdk_preflight:
+    name: Preflight npm Node SDK package
+    needs: [metadata, publish, build_node_sdk_addon]
+    if: ${{ needs.metadata.outputs.canary != 'true' }}
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.metadata.outputs.tag }}
+          persist-credentials: false
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+
+      - name: Install OIDC-capable npm CLI
+        run: npm install --global npm@11.18.0
+
+      - name: Download Node SDK addons
+        uses: actions/download-artifact@v7
+        with:
+          pattern: node-sdk-addon-*
+          path: node-sdk-addons
+          merge-multiple: true
+
+      - name: Verify tagged Node SDK console assets
+        run: scripts/verify-sdk-console-assets.sh --sdk node
+
+      - name: Assemble Node SDK package
+        env:
+          EXPECTED_VERSION: ${{ needs.metadata.outputs.version }}
+        run: |
+          set -euo pipefail
+          scripts/package-node-sdk.mjs node-sdk-addons dist/node-sdk-package
+          actual_version="$(node -p "require('./dist/node-sdk-package/package.json').version")"
+          if [[ "$actual_version" != "$EXPECTED_VERSION" ]]; then
+            echo "Node SDK version mismatch: expected $EXPECTED_VERSION, got $actual_version" >&2
+            exit 1
+          fi
+
+      - name: Test assembled Node SDK package
+        run: |
+          npm test --prefix dist/node-sdk-package
+          node -e "const sdk = require('./dist/node-sdk-package'); console.log(sdk.currentMeshVersion())"
+
+      - name: Pack and dry-run Node SDK package
+        run: |
+          set -euo pipefail
+          mkdir -p dist/npm
+          (
+            cd dist/node-sdk-package
+            npm pack --pack-destination "$GITHUB_WORKSPACE/dist/npm"
+          )
+          tarball="$(find dist/npm -maxdepth 1 -type f -name '*.tgz' -print -quit)"
+          test -n "$tarball"
+          npm publish "./$tarball" --dry-run --access public --provenance=false
+
+      - name: Upload Node SDK npm package
+        uses: actions/upload-artifact@v6
+        with:
+          name: node-sdk-npm-package
+          path: dist/npm/*.tgz
+          if-no-files-found: error
+
+  publish_node_sdk:
+    name: Publish Node SDK to npm
+    needs: [metadata, publish_node_sdk_preflight]
+    if: ${{ needs.metadata.outputs.canary != 'true' }}
+    runs-on: ubuntu-24.04
+    environment: npm
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.metadata.outputs.tag }}
+          persist-credentials: false
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+
+      - name: Install OIDC-capable npm CLI
+        run: npm install --global npm@11.18.0
+
+      - name: Download Node SDK npm package
+        uses: actions/download-artifact@v7
+        with:
+          name: node-sdk-npm-package
+          path: dist/npm
+
+      - name: Publish Node SDK package
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          RELEASE_VERSION: ${{ needs.metadata.outputs.version }}
+          PRERELEASE: ${{ needs.metadata.outputs.prerelease }}
+        run: |
+          set -euo pipefail
+          if npm view "@meshllm/sdk@$RELEASE_VERSION" version >/dev/null 2>&1; then
+            echo "@meshllm/sdk@$RELEASE_VERSION is already published"
+            exit 0
+          fi
+          dist_tag=latest
+          if [[ "$PRERELEASE" == "true" ]]; then
+            dist_tag=next
+          fi
+          tarball="$(find dist/npm -maxdepth 1 -type f -name '*.tgz' -print -quit)"
+          test -n "$tarball"
+          npm publish "./$tarball" \
+            --access public \
+            --tag "$dist_tag" \
+            --provenance

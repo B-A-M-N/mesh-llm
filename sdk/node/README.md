@@ -7,6 +7,18 @@ The package uses a native N-API addon built from `crates/mesh-llm-nodejs`. It is
 not a mock wrapper around the CLI. Local serving uses the same embedded runtime
 path as the Swift and Kotlin SDKs.
 
+## Install
+
+```bash
+npm install @meshllm/sdk
+```
+
+Release packages include prebuilt addons for:
+
+- macOS on Apple Silicon and Intel
+- Linux on ARM64 and x64
+- Windows on x64
+
 ## Build From Source
 
 ```bash
@@ -117,7 +129,6 @@ Windows is supported through the same N-API addon shape:
   `meshllm-native-windows-x86_64-cuda`, `meshllm-native-windows-x86_64-rocm`,
   or `meshllm-native-windows-x86_64-vulkan`
 
-The Windows release pipeline already builds CPU, CUDA, ROCm, and Vulkan runtime
-bundles. The Node SDK should publish matching prebuilt addon/runtime packages
-for Electron consumers instead of requiring local Visual Studio/CUDA/ROCm/Vulkan
-toolchains.
+The npm package includes the Windows x64 N-API addon. CPU, CUDA, ROCm, and
+Vulkan serving runtimes remain separate release artifacts that the SDK can
+resolve or download for Electron consumers.

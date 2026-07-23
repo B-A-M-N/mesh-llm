@@ -245,3 +245,17 @@ script relies on `cargo publish` to report crate versions that were already
 uploaded, continues past those already-uploaded crates, and retries HTTP 429
 new-crate rate-limit responses using the retry time from crates.io when one is
 provided.
+
+The release workflow also builds the Node SDK N-API addon on macOS ARM64 and
+x64, Linux ARM64 and x64, and Windows x64. After the GitHub release is
+published, it assembles those addons with the tagged `sdk/node` sources and
+console assets, validates the package on Linux, and publishes `@meshllm/sdk` to
+npm. Stable versions use the `latest` dist-tag; prerelease versions use `next`.
+
+npm publishing runs from the GitHub-hosted `publish_node_sdk` job in
+`.github/workflows/release.yml`. The job requests an OIDC token and publishes
+with provenance. `NPM_TOKEN` is accepted only to bootstrap the package's first
+version; npm requires the package to exist before a trusted publisher can be
+configured. Remove that repository secret after configuring the npm trusted
+publisher for `Mesh-LLM/mesh-llm`, workflow `release.yml`, and environment
+`npm`.
