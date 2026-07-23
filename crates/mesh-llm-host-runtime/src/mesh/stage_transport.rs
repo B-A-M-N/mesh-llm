@@ -921,6 +921,9 @@ impl Node {
             self.record_stage_topology(stage_topology_from_load(self.endpoint.id(), load))
                 .await;
         }
+        // Load/Prepare can take minutes on large stages; use the same
+        // per-request budget remote control uses instead of the short default.
+        let timeout = Self::stage_control_request_timeout(&request);
         let control_tx = self.stage_control_tx.lock().await.clone();
         let Some(tx) = control_tx else {
             anyhow::bail!("stage control is not available");
@@ -931,9 +934,7 @@ impl Node {
             resp: resp_tx,
         })
         .map_err(|_| anyhow::anyhow!("stage control loop is unavailable"))?;
-        let response =
-            wait_local_stage_control_response(resp_rx, LOCAL_STAGE_CONTROL_RESPONSE_TIMEOUT)
-                .await?;
+        let response = wait_local_stage_control_response(resp_rx, timeout).await?;
         match &response {
             crate::inference::skippy::StageControlResponse::Ready(ready) => {
                 self.record_stage_status(Some(self.endpoint.id()), ready.status.clone())
