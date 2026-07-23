@@ -322,9 +322,7 @@ fn emit_system_links(
         println!("cargo:rustc-link-lib=dylib=m");
         println!("cargo:rustc-link-lib=dylib=dl");
         println!("cargo:rustc-link-lib=dylib=pthread");
-        for lib in linux_openmp_libs(cmake_cache) {
-            println!("cargo:rustc-link-lib=dylib={lib}");
-        }
+        link_linux_openmp(cmake_cache);
         if has_cuda {
             link_linux_cuda_libs(cmake_cache);
         }
@@ -334,6 +332,35 @@ fn emit_system_links(
         if has_vulkan {
             println!("cargo:rustc-link-lib=dylib=vulkan");
         }
+    }
+}
+
+fn link_linux_openmp(cmake_cache: &std::path::Path) {
+    let Ok(cache) = std::fs::read_to_string(cmake_cache) else {
+        return;
+    };
+    if cmake_cache_value(&cache, "GGML_OPENMP_ENABLED").as_deref() != Some("ON") {
+        return;
+    }
+
+    let mut libraries = Vec::new();
+    for cache_key in ["OpenMP_C_LIB_NAMES", "OpenMP_CXX_LIB_NAMES"] {
+        if let Some(names) = cmake_cache_value(&cache, cache_key) {
+            for library in names
+                .split(';')
+                .filter(|library| !library.is_empty() && *library != "pthread")
+            {
+                if !libraries.iter().any(|existing| existing == library) {
+                    libraries.push(library.to_string());
+                }
+            }
+        }
+    }
+    if libraries.is_empty() {
+        libraries.push("gomp".to_string());
+    }
+    for library in libraries {
+        link_linux_lib_from_cache(cmake_cache, &format!("OpenMP_{library}_LIBRARY"), &library);
     }
 }
 
@@ -412,49 +439,4 @@ fn cmake_cache_value(cache: &str, key: &str) -> Option<String> {
         let (name, _) = lhs.split_once(':')?;
         (name == key).then(|| rhs.to_string())
     })
-}
-
-fn linux_openmp_libs(cmake_cache: &std::path::Path) -> Vec<String> {
-    let Ok(cache) = std::fs::read_to_string(cmake_cache) else {
-        return Vec::new();
-    };
-
-    let mut libs = Vec::new();
-    for key in ["OpenMP_C_LIB_NAMES", "OpenMP_CXX_LIB_NAMES"] {
-        if let Some(value) = cmake_cache_value(&cache, key) {
-            for lib in value.split(';') {
-                let lib = lib.trim();
-                if lib.is_empty() || lib == "NOTFOUND" || lib == "pthread" {
-                    continue;
-                }
-                if !libs.iter().any(|existing| existing == lib) {
-                    libs.push(lib.to_string());
-                }
-            }
-        }
-    }
-
-    if libs.is_empty() && cmake_cache_bool(&cache, "GGML_OPENMP_ENABLED") {
-        let fallback = if openmp_flags_reference_libomp(&cache) {
-            "libomp"
-        } else {
-            "gomp"
-        };
-        libs.push(fallback.to_string());
-    }
-
-    libs
-}
-
-fn openmp_flags_reference_libomp(cache: &str) -> bool {
-    ["OpenMP_C_FLAGS", "OpenMP_CXX_FLAGS"]
-        .iter()
-        .filter_map(|key| cmake_cache_value(cache, key))
-        .any(|value| value.to_ascii_lowercase().contains("libomp"))
-}
-
-fn cmake_cache_bool(cache: &str, key: &str) -> bool {
-    cmake_cache_value(cache, key)
-        .map(|value| matches!(value.as_str(), "ON" | "TRUE" | "1"))
-        .unwrap_or(false)
 }

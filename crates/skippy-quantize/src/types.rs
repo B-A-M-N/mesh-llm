@@ -608,6 +608,7 @@ mod tests {
     #[test]
     fn accepts_raw_tensor_types_but_not_ftype_mixtures() {
         assert!(TensorType::parse("Q1_0").is_some());
+        assert!(TensorType::parse("Q2_0").is_some());
         assert!(TensorType::parse("Q3_K").is_some());
         assert!(TensorType::parse("q4_K").is_some());
         assert!(TensorType::parse("Q6_K").is_some());
