@@ -200,6 +200,8 @@ pub(crate) fn effective_relay_urls(policy: RelayPolicy, relay_urls: &[String]) -
         RelayPolicy::DefaultPublic if relay_urls.is_empty() => vec![
             "https://usw1-2.relay.michaelneale.mesh-llm.iroh.link./".into(),
             "https://aps1-1.relay.michaelneale.mesh-llm.iroh.link./".into(),
+            "https://euc1-1.relay.michaelneale.mesh-llm.iroh.link./".into(),
+            "https://use1-1.relay.michaelneale.mesh-llm.iroh.link./".into(),
         ],
         RelayPolicy::DefaultPublic => relay_urls.to_vec(),
     }
@@ -210,10 +212,22 @@ mod relay_policy_tests {
     use super::{RelayPolicy, effective_relay_urls};
 
     #[test]
-    pub(crate) fn default_policy_uses_managed_relays_when_no_urls_are_given() {
+    pub(crate) fn default_policy_uses_all_managed_relays_when_no_urls_are_given() {
         let urls = effective_relay_urls(RelayPolicy::DefaultPublic, &[]);
+        let expected = [
+            "usw1-2.relay.michaelneale.mesh-llm.iroh.link",
+            "aps1-1.relay.michaelneale.mesh-llm.iroh.link",
+            "euc1-1.relay.michaelneale.mesh-llm.iroh.link",
+            "use1-1.relay.michaelneale.mesh-llm.iroh.link",
+        ];
 
-        assert!(urls.iter().any(|url| url.contains("relay.michaelneale")));
+        assert_eq!(urls.len(), expected.len());
+        for relay in expected {
+            assert!(
+                urls.iter().any(|url| url.contains(relay)),
+                "managed relay {relay} should be configured"
+            );
+        }
     }
 
     #[test]
@@ -256,10 +270,10 @@ pub(crate) fn relay_map_from_urls(
     auths: &std::collections::HashMap<String, String>,
 ) -> Result<iroh::RelayMap> {
     let configs = urls.iter().map(|url| {
-        let parsed = url
+        let parsed: iroh::RelayUrl = url
             .parse()
             .with_context(|| format!("invalid relay URL `{url}`"))?;
-        let cfg = iroh::RelayConfig::new(parsed, None);
+        let cfg: iroh::RelayConfig = parsed.into();
         Ok(match auths.get(url) {
             Some(token) => cfg.with_auth_token(token.clone()),
             None => cfg,
@@ -290,6 +304,11 @@ mod relay_map_tests {
             cfgs[0].auth_token.is_none(),
             "no auth supplied → no auth_token set"
         );
+        let quic = cfgs[0]
+            .quic
+            .as_ref()
+            .expect("default QUIC address discovery should be enabled");
+        assert_eq!(quic.port, 7842);
     }
 
     #[test]
