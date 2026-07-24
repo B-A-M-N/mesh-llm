@@ -30,7 +30,10 @@ pub(super) fn mesh_capacity_bytes(hw: &HardwareSurvey) -> u64 {
     if legacy_gpu_capacity > 0 {
         legacy_gpu_capacity
     } else {
-        hw.vram_bytes
+        // A non-SoC node without enumerated accelerator memory cannot host a
+        // GPU stage. Keep the broader RAM/offload budget local-only instead
+        // of advertising it as accelerator capacity.
+        0
     }
 }
 
@@ -86,6 +89,20 @@ mod tests {
 
         assert_eq!(snapshot.vram_bytes, 96_000_000_000);
         assert_eq!(snapshot.local_runtime_capacity_bytes, 96_000_000_000);
+    }
+
+    #[test]
+    fn missing_discrete_gpu_facts_do_not_advertise_host_ram_as_stage_capacity() {
+        let hw = HardwareSurvey {
+            vram_bytes: 491_000_000_000,
+            is_soc: false,
+            ..HardwareSurvey::default()
+        };
+
+        let snapshot = hardware_snapshot_for_start(hw, &NodeRole::Worker, None);
+
+        assert_eq!(snapshot.vram_bytes, 0);
+        assert_eq!(snapshot.local_runtime_capacity_bytes, 491_000_000_000);
     }
 
     #[test]
