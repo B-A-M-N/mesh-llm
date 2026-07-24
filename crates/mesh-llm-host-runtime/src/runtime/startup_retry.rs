@@ -5,6 +5,7 @@ pub(super) fn is_retryable_split_start_failure(message: &str) -> bool {
 fn split_participants_are_still_converging(message: &str) -> bool {
     message.contains("at least two participating nodes")
         || message.contains("at least two stage participants")
+        || message.contains("split_capacity_shortfall")
         || (message.contains("split topology lock stage")
             && message.contains("matched 0 eligible nodes"))
 }
@@ -30,6 +31,13 @@ mod tests {
         ));
         assert!(is_retryable_split_start_failure(
             "split runtime needs at least two stage participants"
+        ));
+    }
+
+    #[test]
+    fn transient_capacity_shortfall_is_retryable() {
+        assert!(is_retryable_split_start_failure(
+            "split_capacity_shortfall: unable to plan split topology: max_placeable_layers_at_evaluated_shape=21/66"
         ));
     }
 
