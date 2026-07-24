@@ -281,13 +281,20 @@ while runtime GPU assertions require a matching restricted self-hosted pool.
 Linux workflow-local toolchain and package setup blocks are migration debt and
 must be removed when their lane adopts an image, not copied elsewhere.
 
-PR Builds runs `public_runner_image_contract` inside the public image and a
-two-row `arc_runner_image_contract` matrix directly on `mesh-llm-amd64` and
-`mesh-llm-arm64`. The public job validates the baked dependency/tool contract.
-The ARC job checks the native machine architecture, validates the self-hosted
-image, and performs a small Rust check. It has no hosted fallback by design: it
-is the pull-request gate that detects ARC, K3s scheduling, multi-architecture
-image, and runner startup regressions.
+PR Builds runs `public_runner_image_contract` inside the public image and an
+`arc_runner_image_contract` matrix directly on the ARC scale-set labels. The
+public job validates the baked dependency/tool contract. The ARC job checks the
+native machine architecture, validates the self-hosted image, and performs a
+small Rust check. It has no hosted fallback by design: it is the pull-request
+gate that detects ARC, K3s scheduling, multi-architecture image, and runner
+startup regressions.
+
+The matrix currently contains only the `mesh-llm-arm64` row. The
+`mesh-llm-amd64` row is temporarily removed because that scale set is not
+scheduling pods, which wedged every PR Builds run indefinitely (the job has no
+hosted fallback). Restore the amd64 row once the `mesh-llm-amd64` scale set is
+healthy again; the `mesh-llm-amd64` label remains in `.github/actionlint.yaml`
+so the row can be re-added without a lint change.
 
 Repository visibility and GHCR package visibility are separate controls. If an
 anonymous pull still returns `401` or `403`, public-container jobs must grant

@@ -175,9 +175,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - architecture: amd64
-            runner: mesh-llm-amd64
-            machine: x86_64
+          # NOTE: the amd64 ARC row (mesh-llm-amd64) is temporarily removed
+          # because that scale set is not scheduling pods, which wedges every
+          # PR Builds run indefinitely (no hosted fallback by design). arm64
+          # ARC coverage is retained. Restore the amd64 row once the
+          # mesh-llm-amd64 scale set is healthy again.
           - architecture: arm64
             runner: mesh-llm-arm64
             machine: aarch64
