@@ -37,6 +37,66 @@ fn runtime_local_targets_keep_duplicate_same_model_ports() {
 }
 
 #[test]
+fn canonical_coordinator_is_identical_with_divergent_observer_signals() {
+    let capacities = [
+        (1, 24_000_000_000),
+        (2, 48_000_000_000),
+        (3, 48_000_000_000),
+    ];
+    let observer_a = capacities
+        .into_iter()
+        .map(|(seed, capacity)| {
+            SplitParticipant::new(make_id(seed), capacity, None).with_package_signals(
+                SplitParticipantPackageSignal {
+                    cached_slice_bytes: u64::from(seed) * 10_000,
+                    missing_artifact_bytes: u64::from(4 - seed) * 20_000,
+                    availability_score: u32::from(seed),
+                },
+                Some(u32::from(seed) * 40),
+                true,
+            )
+        })
+        .collect::<Vec<_>>();
+    let observer_b = capacities
+        .into_iter()
+        .rev()
+        .map(|(seed, capacity)| {
+            SplitParticipant::new(make_id(seed), capacity, None).with_package_signals(
+                SplitParticipantPackageSignal {
+                    cached_slice_bytes: u64::from(4 - seed) * 100_000,
+                    missing_artifact_bytes: u64::from(seed) * 50_000,
+                    availability_score: u32::from(4 - seed),
+                },
+                Some(u32::from(4 - seed)),
+                false,
+            )
+        })
+        .collect::<Vec<_>>();
+
+    let expected = [make_id(2), make_id(3)].into_iter().min().unwrap();
+    assert_eq!(canonical_split_coordinator(&observer_a), Some(expected));
+    assert_eq!(canonical_split_coordinator(&observer_b), Some(expected));
+}
+
+#[test]
+fn noncanonical_gate_returns_standby_without_invoking_package_planning() {
+    let local = SplitParticipant::new(make_id(1), 24_000_000_000, None);
+    let coordinator = SplitParticipant::new(make_id(2), 48_000_000_000, None);
+    let mut package_planning_called = false;
+
+    let gate = canonical_coordinator_gate(local.node_id, vec![local, coordinator])
+        .expect("canonical coordinator gate");
+    match gate {
+        CanonicalCoordinatorGate::Standby {
+            coordinator: selected,
+        } => assert_eq!(selected, coordinator.node_id),
+        CanonicalCoordinatorGate::Coordinator(_) => package_planning_called = true,
+    }
+
+    assert!(!package_planning_called);
+}
+
+#[test]
 fn split_topology_planner_uses_all_eligible_participants() {
     let participants = vec![
         SplitParticipant::new(make_id(1), 16_000_000_000, None),
@@ -65,6 +125,57 @@ fn split_topology_planner_uses_all_eligible_participants() {
     );
     assert_eq!(stages.first().unwrap().layer_start, 0);
     assert_eq!(stages.last().unwrap().layer_end, 40);
+}
+
+#[test]
+fn resource_planner_keeps_canonical_coordinator_at_stage_zero() {
+    let canonical = SplitParticipant::new(make_id(1), 48_000_000_000, None).with_package_signals(
+        SplitParticipantPackageSignal {
+            cached_slice_bytes: 0,
+            missing_artifact_bytes: 40_000_000,
+            availability_score: 0,
+        },
+        Some(200),
+        true,
+    );
+    let fast_a = SplitParticipant::new(make_id(2), 32_000_000_000, None).with_package_signals(
+        SplitParticipantPackageSignal {
+            cached_slice_bytes: 40_000_000,
+            missing_artifact_bytes: 0,
+            availability_score: 40,
+        },
+        Some(1),
+        true,
+    );
+    let fast_b = SplitParticipant::new(make_id(3), 32_000_000_000, None).with_package_signals(
+        SplitParticipantPackageSignal {
+            cached_slice_bytes: 40_000_000,
+            missing_artifact_bytes: 0,
+            availability_score: 40,
+        },
+        Some(1),
+        true,
+    );
+    let participants = [canonical, fast_a, fast_b];
+    let package = package(40);
+
+    let planned = plan_runtime_slice_topology_with_resources_and_stage0(
+        "topology-test",
+        "test-model",
+        &package,
+        &participants,
+        &[],
+        SplitTopologyResourceInputs {
+            native_context_length: 65_536,
+            kv_bytes_per_token: 64 * 1024,
+            ctx_size_override: Some(65_536),
+            parallel_override: Some(1),
+        },
+        Some(canonical.node_id),
+    )
+    .expect("canonical stage-zero topology");
+
+    assert_eq!(planned.stages.first().unwrap().node_id, canonical.node_id);
 }
 
 #[test]
@@ -745,7 +856,7 @@ fn split_participant_signature_includes_vram_for_stability() {
 }
 
 #[test]
-fn split_participant_signature_includes_package_signals_for_stability() {
+fn split_participant_signature_includes_package_signals_for_claim_identity() {
     let node_id = make_id(9);
     let first = vec![SplitParticipant::new(node_id, 24_000_000_000, None)];
     let second = vec![

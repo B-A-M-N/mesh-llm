@@ -509,7 +509,7 @@ pub(super) async fn start_runtime_local_model(
     let my_vram = spec
         .capacity_budget_bytes
         .or_else(|| spec.pinned_gpu.map(|gpu| gpu.allocatable_vram_bytes()))
-        .unwrap_or_else(|| spec.node.vram_bytes());
+        .unwrap_or_else(|| spec.node.local_runtime_capacity_bytes());
 
     // For split/layer-package models, compute the local share of model weights
     // and the layer fraction so the context planner budgets correctly.

@@ -148,7 +148,12 @@ pub(crate) fn hardware_snapshot_for_start(
     role: &NodeRole,
     max_vram_gb: Option<f64>,
 ) -> NodeHardwareSnapshot {
-    let mut vram_bytes = hw.vram_bytes;
+    let local_runtime_capacity_bytes =
+        super::capacity::capped_capacity_bytes(hw.vram_bytes, max_vram_gb);
+    let mut vram_bytes = super::capacity::capped_capacity_bytes(
+        super::capacity::mesh_capacity_bytes(&hw),
+        max_vram_gb,
+    );
     let gpu_name = if matches!(role, NodeRole::Client) {
         None
     } else {
@@ -179,6 +184,7 @@ pub(crate) fn hardware_snapshot_for_start(
 
     NodeHardwareSnapshot {
         vram_bytes,
+        local_runtime_capacity_bytes,
         gpu_name,
         hostname,
         is_soc,
@@ -316,7 +322,10 @@ pub struct Node {
     pub(crate) join_targets: Arc<Mutex<Vec<EndpointAddr>>>,
     pub(crate) first_joined_mesh_ts: Arc<Mutex<Option<u64>>>,
     pub(crate) accepting: Arc<(tokio::sync::Notify, std::sync::atomic::AtomicBool)>,
+    /// Accelerator-resident capacity advertised to peers and split placement.
     pub(crate) vram_bytes: u64,
+    /// Local fit budget, which may additionally include CPU offload memory.
+    pub(crate) local_runtime_capacity_bytes: u64,
     pub(crate) peer_change_tx: watch::Sender<usize>,
     pub peer_change_rx: watch::Receiver<usize>,
     pub(crate) inflight_requests: Arc<std::sync::atomic::AtomicUsize>,
@@ -1011,6 +1020,7 @@ impl Node {
                 std::sync::atomic::AtomicBool::new(false),
             )),
             vram_bytes: hardware.vram_bytes,
+            local_runtime_capacity_bytes: hardware.local_runtime_capacity_bytes,
             peer_change_tx,
             peer_change_rx,
             inflight_requests: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -1176,6 +1186,7 @@ impl Node {
                 std::sync::atomic::AtomicBool::new(false),
             )),
             vram_bytes: 0,
+            local_runtime_capacity_bytes: 0,
             peer_change_tx,
             peer_change_rx,
             inflight_requests: Arc::new(std::sync::atomic::AtomicUsize::new(0)),

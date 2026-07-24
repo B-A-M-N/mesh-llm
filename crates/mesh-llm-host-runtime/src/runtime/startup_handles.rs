@@ -981,7 +981,7 @@ pub(super) async fn startup_prepare_launch(
     let local_capacity = ctx
         .pinned_gpu
         .map(|gpu| gpu.allocatable_vram_bytes())
-        .unwrap_or_else(|| ctx.node.vram_bytes());
+        .unwrap_or_else(|| ctx.node.local_runtime_capacity_bytes());
     let model_bytes = startup_planning_model_bytes(&ctx).await?;
     let runtime_plan = startup_runtime_plan(ctx.split, local_capacity, model_bytes);
     let launch_kind = startup_launch_kind(runtime_plan, ctx.survey_launch_kind);

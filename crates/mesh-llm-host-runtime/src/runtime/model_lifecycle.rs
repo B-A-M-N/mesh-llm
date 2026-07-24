@@ -85,7 +85,7 @@ pub(super) async fn reconcile_model_targets_once(ctx: ReconcileModelTargetsConte
     }
 
     let target_lookup = console_state.model_target_lookup().await;
-    let local_vram_bytes = node.vram_bytes();
+    let local_vram_bytes = node.local_runtime_capacity_bytes();
     let targets = target_lookup
         .targets
         .into_iter()
@@ -379,7 +379,7 @@ pub(super) async fn run_auto_load_runtime_model(
         &instance_id,
         &runtime_model_name,
         None,
-        ctx.node.vram_bytes(),
+        ctx.node.local_runtime_capacity_bytes(),
         model_bytes,
     )?;
     add_serving_assignment(ctx.node, ctx.primary_model_name, &runtime_model_name).await;

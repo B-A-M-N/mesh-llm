@@ -77,6 +77,7 @@ pub(crate) fn elapsed_ms_u64(duration: std::time::Duration) -> u64 {
 }
 
 mod artifact_transfer_io;
+mod capacity;
 mod connection_reservation;
 mod connections;
 mod direct_path;

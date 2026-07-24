@@ -358,9 +358,9 @@ pub(super) async fn pick_model_assignment(
         }
     }
 
-    let my_vram = node.vram_bytes();
+    let my_vram = node.local_runtime_capacity_bytes();
 
-    /// Check if a model fits in our VRAM. Returns false and logs if it doesn't.
+    /// Check if a model fits in our local runtime budget. Returns false and logs if it doesn't.
     fn model_fits(model: &str, my_vram: u64) -> bool {
         let capacity = runtime_model_capacity_for_ref(model, my_vram);
         if !capacity.fits {
@@ -551,7 +551,7 @@ pub(super) async fn check_unserved_model(
         }
     }
 
-    let my_vram = node.vram_bytes();
+    let my_vram = node.local_runtime_capacity_bytes();
 
     // Only consider models with recent activity (last 60 minutes).
     // This prevents stale cumulative request_count from triggering promotions
@@ -1083,7 +1083,8 @@ pub(super) async fn select_run_auto_model_path(
         && (ctx.options.auto || ctx.options.discover.is_some())
         && !ctx.is_client
     {
-        let pack = auto_model_pack_blocking(ctx.node.vram_bytes() as f64 / 1e9).await?;
+        let pack =
+            auto_model_pack_blocking(ctx.node.local_runtime_capacity_bytes() as f64 / 1e9).await?;
         if !pack.is_empty() {
             Some(pack[0].clone())
         } else {

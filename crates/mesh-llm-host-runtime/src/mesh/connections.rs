@@ -2,7 +2,10 @@ use super::*;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 pub(crate) struct NodeHardwareSnapshot {
+    /// Accelerator-resident capacity advertised for mesh stage placement.
     pub(crate) vram_bytes: u64,
+    /// Broader local fit budget, which may include CPU offload memory.
+    pub(crate) local_runtime_capacity_bytes: u64,
     pub(crate) gpu_name: Option<String>,
     pub(crate) hostname: Option<String>,
     pub(crate) is_soc: Option<bool>,
