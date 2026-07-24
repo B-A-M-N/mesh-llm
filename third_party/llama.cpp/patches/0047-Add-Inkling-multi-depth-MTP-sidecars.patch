@@ -1,7 +1,7 @@
-From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From c49c0f7ee6f771a492818f47c414f11b92297c77 Mon Sep 17 00:00:00 2001
 From: Mesh-LLM CI <ci@mesh-llm.local>
 Date: Fri, 17 Jul 2026 15:09:39 +1000
-Subject: [PATCH 5/7] Add Inkling multi-depth MTP sidecars
+Subject: [PATCH 47/54] Add Inkling multi-depth MTP sidecars
 
 ---
  conversion/inkling.py  |  78 ++++++++++++++++-
@@ -152,7 +152,7 @@ index 90ef65c3b..079842903 100644
  @ModelBase.register("InklingForConditionalGeneration")
  class InklingMmprojModel(MmprojModel):
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index 9ab7be4b2..59b31ff92 100644
+index 4342e96eb..8b2a65d67 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -158,6 +158,12 @@ llama_context::llama_context(
@@ -169,10 +169,10 @@ index 9ab7be4b2..59b31ff92 100644
      // before the reserve passes run later in this function. This avoids a later
      // re-reserve when graph nodes change.
 diff --git a/src/llama-model.cpp b/src/llama-model.cpp
-index 68c04f4d3..a08a4e579 100644
+index 9c6843dda..0944cb7c3 100644
 --- a/src/llama-model.cpp
 +++ b/src/llama-model.cpp
-@@ -2104,10 +2104,20 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
+@@ -2105,10 +2105,20 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
                      // layer filters, so pick the right one here
                      llama_memory_hybrid::layer_filter_cb filter_attn = nullptr;
                      llama_memory_hybrid::layer_filter_cb filter_recr = nullptr;
@@ -492,10 +492,10 @@ index 8e5c7bb29..5f9baaa33 100644
      res->t_embd = cur;
  
 diff --git a/src/skippy.cpp b/src/skippy.cpp
-index 453888731..535c7b071 100644
+index 3106e6aa0..5fea14e4e 100644
 --- a/src/skippy.cpp
 +++ b/src/skippy.cpp
-@@ -1333,7 +1333,7 @@ struct skippy_mtp_depth_scope {
+@@ -1772,7 +1772,7 @@ struct skippy_mtp_depth_scope {
      }
  
      bool chains_heads() const {
@@ -504,7 +504,7 @@ index 453888731..535c7b071 100644
      }
  
      bool chains_at_same_position() const {
-@@ -1382,6 +1382,17 @@ static llama_token skippy_greedy_sample_context(
+@@ -2793,6 +2793,17 @@ static llama_token skippy_greedy_sample_context(
          llama_context * ctx,
          int32_t index);
  
@@ -522,7 +522,7 @@ index 453888731..535c7b071 100644
  static enum skippy_status skippy_mtp_sync_target_tokens(
          skippy_session * session,
          const llama_token * token_ids,
-@@ -1398,7 +1409,7 @@ static enum skippy_status skippy_mtp_sync_target_tokens(
+@@ -2809,7 +2820,7 @@ static enum skippy_status skippy_mtp_sync_target_tokens(
  
      llama_context * mtp_ctx = session->stage_model->mtp_ctx;
      skippy_mtp_depth_scope mtp_depth_scope(mtp_ctx);
@@ -531,7 +531,7 @@ index 453888731..535c7b071 100644
      const bool chain_heads = mtp_depth_scope.chains_heads();
      const bool chain_at_same_position = mtp_depth_scope.chains_at_same_position();
      const int32_t n_embd = llama_model_n_embd(session->stage_model->model);
-@@ -2217,7 +2228,7 @@ static enum skippy_status skippy_mtp_propose_next(
+@@ -3634,7 +3645,7 @@ static enum skippy_status skippy_mtp_propose_next(
  
      llama_context * mtp_ctx = session->stage_model->mtp_ctx;
      skippy_mtp_depth_scope mtp_depth_scope(mtp_ctx);

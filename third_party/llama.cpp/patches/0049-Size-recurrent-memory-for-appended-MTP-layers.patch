@@ -1,7 +1,7 @@
-From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From 677468de8a58cecb8b2747f7c4ec3a02273e34da Mon Sep 17 00:00:00 2001
 From: Mesh-LLM CI <ci@mesh-llm.local>
 Date: Fri, 17 Jul 2026 20:20:45 +1000
-Subject: [PATCH 7/7] Size recurrent memory for appended MTP layers
+Subject: [PATCH 49/54] Size recurrent memory for appended MTP layers
 
 ---
  src/llama-memory-recurrent.cpp | 8 ++++----

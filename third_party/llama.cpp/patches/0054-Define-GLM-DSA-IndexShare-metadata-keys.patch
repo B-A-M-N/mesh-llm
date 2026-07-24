@@ -1,0 +1,101 @@
+From 956fe5b9909e6c55660d0a7d231db3cd3ca651f7 Mon Sep 17 00:00:00 2001
+From: Mesh-LLM CI <ci@mesh-llm.local>
+Date: Sat, 25 Jul 2026 03:01:18 +1000
+Subject: [PATCH 54/54] Define GLM DSA IndexShare metadata keys
+
+---
+ src/llama-arch.cpp     |  3 +++
+ src/llama-arch.h       |  3 +++
+ src/llama-model.cpp    |  1 +
+ src/models/glm-dsa.cpp | 31 +++++++++++++++++++++++++++++++
+ 4 files changed, 38 insertions(+)
+
+diff --git a/src/llama-arch.cpp b/src/llama-arch.cpp
+index a01bad68d..2a907c14e 100644
+--- a/src/llama-arch.cpp
++++ b/src/llama-arch.cpp
+@@ -253,6 +253,9 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
+     { LLM_KV_ATTENTION_INDEXER_HEAD_COUNT,           "%s.attention.indexer.head_count"           },
+     { LLM_KV_ATTENTION_INDEXER_KEY_LENGTH,           "%s.attention.indexer.key_length"           },
+     { LLM_KV_ATTENTION_INDEXER_TOP_K,                "%s.attention.indexer.top_k"                },
++    { LLM_KV_ATTENTION_INDEXER_TOP_K_FREQUENCY,      "%s.attention.indexer.top_k_frequency"      },
++    { LLM_KV_ATTENTION_INDEXER_SKIP_TOP_K_OFFSET,    "%s.attention.indexer.skip_top_k_offset"    },
++    { LLM_KV_ATTENTION_INDEXER_TYPES,                "%s.attention.indexer.types"                },
+     { LLM_KV_ATTENTION_OUTPUT_GROUP_COUNT,           "%s.attention.output_group_count"           },
+     { LLM_KV_ATTENTION_OUTPUT_LORA_RANK,             "%s.attention.output_lora_rank"             },
+     { LLM_KV_ATTENTION_COMPRESS_ROPE_FREQ_BASE,      "%s.attention.compress_rope_freq_base"      },
+diff --git a/src/llama-arch.h b/src/llama-arch.h
+index 9d2eb4a92..b36882cba 100644
+--- a/src/llama-arch.h
++++ b/src/llama-arch.h
+@@ -258,6 +258,9 @@ enum llm_kv {
+     LLM_KV_ATTENTION_INDEXER_HEAD_COUNT,
+     LLM_KV_ATTENTION_INDEXER_KEY_LENGTH,
+     LLM_KV_ATTENTION_INDEXER_TOP_K,
++    LLM_KV_ATTENTION_INDEXER_TOP_K_FREQUENCY,
++    LLM_KV_ATTENTION_INDEXER_SKIP_TOP_K_OFFSET,
++    LLM_KV_ATTENTION_INDEXER_TYPES,
+     LLM_KV_ATTENTION_OUTPUT_GROUP_COUNT,
+     LLM_KV_ATTENTION_OUTPUT_LORA_RANK,
+     LLM_KV_ATTENTION_COMPRESS_ROPE_FREQ_BASE,
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index 01320de64..464c7e0fb 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -1128,6 +1128,7 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
+     std::fill(hparams.rope_sections.begin(), hparams.rope_sections.end(), 0);
+     std::fill(hparams.is_swa_impl.begin(),   hparams.is_swa_impl.end(), 0);
+     std::fill(hparams.is_recr_impl.begin(),  hparams.is_recr_impl.end(),  llm_arch_is_recurrent(ml.get_arch()) ? 1 : 0);
++    std::fill(hparams.indexer_types.begin(), hparams.indexer_types.end(), -1);
+ 
+     std::fill(hparams.xielu_alpha_n.begin(), hparams.xielu_alpha_n.end(), 0.0f);
+     std::fill(hparams.xielu_alpha_p.begin(), hparams.xielu_alpha_p.end(), 0.0f);
+diff --git a/src/models/glm-dsa.cpp b/src/models/glm-dsa.cpp
+index 16d605c4f..2db2e48e0 100644
+--- a/src/models/glm-dsa.cpp
++++ b/src/models/glm-dsa.cpp
+@@ -2,6 +2,9 @@
+ 
+ #include "llama-kv-cache-dsa.h"
+ 
++#include <string>
++#include <vector>
++
+ void llama_model_glm_dsa::load_arch_hparams(llama_model_loader & ml) {
+     ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH,     hparams.n_ff_exp);
+     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,    hparams.f_norm_rms_eps);
+@@ -28,6 +31,34 @@ void llama_model_glm_dsa::load_arch_hparams(llama_model_loader & ml) {
+     ml.get_key(LLM_KV_ATTENTION_INDEXER_KEY_LENGTH, hparams.indexer_head_size);
+     ml.get_key(LLM_KV_ATTENTION_INDEXER_TOP_K,      hparams.indexer_top_k);
+ 
++    const bool has_indexer_top_k_freq =
++            ml.get_key(LLM_KV_ATTENTION_INDEXER_TOP_K_FREQUENCY, hparams.indexer_top_k_freq, false);
++    const bool has_indexer_skip_top_k_offset =
++            ml.get_key(LLM_KV_ATTENTION_INDEXER_SKIP_TOP_K_OFFSET, hparams.indexer_skip_top_k_offset, false);
++    if (has_indexer_top_k_freq && hparams.indexer_top_k_freq == 0) {
++        throw std::runtime_error("GLM_DSA attention.indexer.top_k_frequency must be positive when present");
++    }
++    if (has_indexer_top_k_freq && !has_indexer_skip_top_k_offset) {
++        throw std::runtime_error("GLM_DSA attention.indexer.skip_top_k_offset is required when top_k_frequency is present");
++    }
++
++    std::vector<std::string> indexer_types;
++    if (ml.get_arr(LLM_KV_ATTENTION_INDEXER_TYPES, indexer_types, false)) {
++        if (indexer_types.size() != hparams.n_layer()) {
++            throw std::runtime_error("GLM_DSA attention.indexer.types length must match effective decoder layer count");
++        }
++        hparams.indexer_types_present = true;
++        for (size_t il = 0; il < indexer_types.size(); ++il) {
++            if (indexer_types[il] == "full") {
++                hparams.indexer_types[il] = 1;
++            } else if (indexer_types[il] == "shared") {
++                hparams.indexer_types[il] = 0;
++            } else {
++                throw std::runtime_error("GLM_DSA attention.indexer.types values must be \"full\" or \"shared\"");
++            }
++        }
++    }
++
+     // Expert gating function (GLM-4.5 uses sigmoid)
+     ml.get_key(LLM_KV_EXPERT_GATING_FUNC,          hparams.expert_gating_func, false);
+     if (hparams.expert_gating_func == LLAMA_EXPERT_GATING_FUNC_TYPE_NONE) {

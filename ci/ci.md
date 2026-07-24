@@ -208,6 +208,102 @@ subgraph PRCI["pr_builds.yml · PR Builds"]
   secret. It carries no pull request trigger and does not run release or smoke
   jobs.
 
+## Prebuilt runner image contract
+
+Linux CI environments are maintained in
+[`Mesh-LLM/mesh-llm-runner-images`](https://github.com/Mesh-LLM/mesh-llm-runner-images)
+and published at `ghcr.io/mesh-llm/mesh-llm-cuda-runner`. Every image is built
+from the same core toolchain and selects an execution environment independently
+from its backend SDK:
+
+- `public-<backend>-*` runs as a job-level `container:` on an Ubuntu GitHub-hosted
+  or legacy container-capable self-hosted runner.
+- `self-hosted-<backend>-*` adds the Actions runner and is used directly as an
+  ARC pod image. Jobs targeting an ARC scale-set label must not wrap that pod in
+  a second job container.
+- CPU, Vulkan, CUDA 12, and CUDA 13 publish AMD64 and ARM64 manifest children.
+  ROCm 7.0 and 7.2 are AMD64-only until an ARM64 ROCm lane is supported and
+  verified by MeshLLM.
+
+The compatibility `public-*` manifest selects CPU on both architectures. The
+compatibility `self-hosted-*` manifest preserves the deployed K3s topology by
+selecting CUDA 12 on AMD64 and CPU on ARM64. New consumers should use an
+explicit backend image instead of relying on those aliases.
+
+Production workflows and Flux resources must pin the multi-architecture OCI
+digest, using `ghcr.io/mesh-llm/mesh-llm-cuda-runner@sha256:<digest>`. Timestamp,
+source-revision, and `*-latest` tags are discovery or evaluation inputs only;
+the registry publishing path does not enforce or document no-retag protection.
+Resolve the selected tag to its published digest before updating a production
+consumer. Once pulled, unchanged image layers are reusable from the container
+runtime's cache. This removes repeated operating-system package installation
+from the job path and reduces failures caused by package mirrors, repository
+metadata, transient downloads, or host drift.
+
+ARC pods benefit directly from the persistent image cache on each K3s node.
+GitHub-hosted runners may still start on a cold host and pull the image, so
+their local layer cache is opportunistic rather than guaranteed; immutable,
+shared layers still make those pulls deterministic and cacheable by the
+available container and registry infrastructure.
+
+The runner-image build checks out a requested MeshLLM revision, discovers its
+Cargo, Node, Python, and Go manifests, and injects an environment-specific,
+content-addressed manifest bundle. It then warms the locked dependency caches.
+That process improves startup time, but does not move dependency ownership out
+of MeshLLM's checked-in manifests.
+
+| Dependency need | Authoritative location | Required change |
+| --- | --- | --- |
+| Rust, Node, Python, or Go project/test dependency | MeshLLM manifest and lockfile | Update and validate the manifest/lockfile in this repository. |
+| Shared Linux package or CLI used by both runner types | `profiles/common.yml` in `mesh-llm-runner-images` | Update the YAML profile, rebuild all architectures, and publish a new image. |
+| Backend SDK package | `profiles/backends/<backend>.yml` in `mesh-llm-runner-images` | Update the backend profile and verify every supported architecture. |
+| Public-only or self-hosted-only system capability | `profiles/public.yml` or `profiles/self-hosted.yml` | Update the environment profile, verify its architecture matrix, and publish a new image. |
+| Toolchain or capability requiring custom installation | Owning installer in `mesh-llm-runner-images` | Update the installer and image verification, then roll forward the pinned consumer. |
+| Truly job-scoped external service | Pinned action or service container | Document why it cannot be part of a manifest or runner image. |
+
+The key review rule is: **a missing dependency must cause a manifest,
+lockfile, runner profile, or runner installer update; it must not be repaired by
+adding a one-off package installation to a MeshLLM workflow.** New workflow-local
+`apt-get`, `pip`, global `npm`, `cargo install`, or downloaded-tool bootstrap
+steps—and setup actions that download an already-standardized toolchain—should
+be rejected. Existing setup blocks are migration debt and should be removed as
+each lane adopts the runner image, not copied into new jobs.
+
+An emergency exception must be temporary and include a reason, owner, and
+linked removal issue or expiry date. It is not an alternative dependency
+management path.
+
+The production rollout applies explicit public CPU, Vulkan, CUDA, and ROCm
+digests to the applicable Linux jobs in `pr_builds.yml`, `ci.yml`,
+`pr_quality.yml`, and `release.yml`. Backend images contain their compiler and
+SDK but do not manufacture GPU access: hosted lanes are compile/package checks,
+while runtime GPU assertions require a matching restricted self-hosted pool.
+Linux workflow-local toolchain and package setup blocks are migration debt and
+must be removed when their lane adopts an image, not copied elsewhere.
+
+PR Builds runs `public_runner_image_contract` inside the public image and a
+two-row `arc_runner_image_contract` matrix directly on `mesh-llm-amd64` and
+`mesh-llm-arm64`. The public job validates the baked dependency/tool contract.
+The ARC job checks the native machine architecture, validates the self-hosted
+image, and performs a small Rust check. It has no hosted fallback by design: it
+is the pull-request gate that detects ARC, K3s scheduling, multi-architecture
+image, and runner startup regressions.
+
+Repository visibility and GHCR package visibility are separate controls. If an
+anonymous pull still returns `401` or `403`, public-container jobs must grant
+`packages: read` and authenticate `container.credentials` with `github.actor`
+and `secrets.GITHUB_TOKEN`. Making `mesh-llm-runner-images` public does not by
+itself prove that an existing package is anonymously readable.
+
+The public image already contains `sccache`. Public-image Rust jobs start with
+its GHA remote backend disabled, then use the repository-local
+`configure-sccache-gha` action to export the ephemeral Actions cache URL/token
+and probe the remote backend. A failed probe stops the remote-configured server
+and restarts `sccache` with its job-local disk cache, so cache availability
+cannot block compiler startup. Persistent Cargo target and ABI caches continue
+through the existing cache actions. Do not download a second sccache binary
+just to configure the GHA backend.
+
 ## Public website deployment
 
 - `website-pages.yml` deploys the public static site through GitHub Pages' Actions
@@ -276,4 +372,6 @@ Use these checks when reviewing PR CI wall-clock regressions:
   class (Blacksmith Windows 2025 for Windows ABI products, Blacksmith macOS for Swift/Metal, Linux
   for Linux backends) and skip unsupported combinations explicitly.
 
-For agent-facing workflow editing rules, see `.github/AGENTS.md`.
+For canonical agent-facing CI rules, start with
+`.agents/skills/manage-ci/SKILL.md`. The scoped `.github/AGENTS.md` file routes
+all GitHub workflow work to that skill.

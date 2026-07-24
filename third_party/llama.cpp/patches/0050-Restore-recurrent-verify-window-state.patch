@@ -1,18 +1,18 @@
-From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From ce655b0e8760c9579c4fb5f6ec66200045702c15 Mon Sep 17 00:00:00 2001
 From: Mesh-LLM CI <ci@mesh-llm.local>
 Date: Fri, 24 Jul 2026 03:57:28 +1000
-Subject: [PATCH] Restore recurrent verify-window state
+Subject: [PATCH 50/54] Restore recurrent verify-window state
 
 Assisted-by: codex
 ---
- src/skippy.cpp | 221 ++++++++++++++++++++++++++++++++++++++++++++-----
- 1 file changed, 202 insertions(+), 19 deletions(-)
+ src/skippy.cpp | 233 ++++++++++++++++++++++++++++++++++++++++++++-----
+ 1 file changed, 210 insertions(+), 23 deletions(-)
 
 diff --git a/src/skippy.cpp b/src/skippy.cpp
-index 0484a712a..122a31312 100644
+index 86826edda..c3ab63ea8 100644
 --- a/src/skippy.cpp
 +++ b/src/skippy.cpp
-@@ -55,6 +55,17 @@ struct skippy_model {
+@@ -124,6 +124,17 @@ struct skippy_model {
      std::vector<std::vector<llama_token>> lane_resident_prefix_tokens;
  };
  
@@ -30,7 +30,7 @@ index 0484a712a..122a31312 100644
  struct skippy_session {
      skippy_model * stage_model = nullptr;
      llama_context * ctx = nullptr;
-@@ -82,6 +93,7 @@ struct skippy_session {
+@@ -151,6 +162,7 @@ struct skippy_session {
      llama_token mtp_pending_draft_token = -1;
      bool external_mtp_embeddings_available = false;
      std::vector<float> external_mtp_embeddings;
@@ -38,10 +38,11 @@ index 0484a712a..122a31312 100644
  };
  
  static thread_local skippy_session * g_skippy_external_decode_session = nullptr;
-@@ -1173,6 +1185,60 @@ static bool skippy_has_activation_payload(const skippy_activation_desc * desc, c
+@@ -1539,7 +1551,63 @@ static bool skippy_has_activation_payload(const skippy_activation_desc * desc, c
      return desc != nullptr && desc->payload_bytes > 0 && payload != nullptr;
  }
  
++
 +static bool skippy_memory_needs_verify_checkpoint(llama_memory_t memory) {
 +    return dynamic_cast<llama_memory_hybrid *>(memory) != nullptr ||
 +           dynamic_cast<llama_memory_hybrid_iswa *>(memory) != nullptr ||
@@ -96,10 +97,12 @@ index 0484a712a..122a31312 100644
 +    return skippy_success(out_error);
 +}
 +
- static enum skippy_status skippy_validate_frame_input(
+ static enum skippy_status skippy_validate_frame_input_sequences(
++
          skippy_session * session,
          const skippy_activation_desc * input_desc,
-@@ -1396,6 +1462,7 @@ static void skippy_mtp_clear_session_state(skippy_session * session) {
+         const void * input_payload,
+@@ -2808,6 +2876,7 @@ static void skippy_mtp_clear_session_state(skippy_session * session) {
      if (session == nullptr) {
          return;
      }
@@ -107,7 +110,7 @@ index 0484a712a..122a31312 100644
      session->mtp_next_pos = session->n_past;
      session->mtp_prefix_valid = session->n_past == 0;
      session->mtp_has_pending_h = false;
-@@ -2763,6 +2830,97 @@ static enum skippy_status skippy_verify_activation_frame(
+@@ -4283,6 +4352,97 @@ static enum skippy_status skippy_verify_activation_frame(
      return status;
  }
  
@@ -205,7 +208,7 @@ index 0484a712a..122a31312 100644
  extern "C" {
  
  struct skippy_abi_version skippy_abi_version(void) {
-@@ -3927,7 +4085,12 @@ enum skippy_status skippy_verify_tokens(
+@@ -5481,7 +5641,12 @@ enum skippy_status skippy_verify_tokens(
          return SKIPPY_STATUS_INVALID_ARGUMENT;
      }
  
@@ -219,7 +222,7 @@ index 0484a712a..122a31312 100644
      if (status == SKIPPY_STATUS_OK) {
          const int32_t n_tokens = static_cast<int32_t>(token_count);
          for (int32_t i = 0; i < n_tokens; ++i) {
-@@ -4464,7 +4627,19 @@ enum skippy_status skippy_verify_tokens_frame_sampled(
+@@ -6178,7 +6343,19 @@ enum skippy_status skippy_verify_tokens_frame_sampled(
          }
      }
  
@@ -239,8 +242,8 @@ index 0484a712a..122a31312 100644
 +    if (activation_input) {
          status = session->stage_model->config.include_output ?
                  skippy_verify_activation_frame(session, input_desc, input_payload, token_ids, token_count, out_error) :
-                 skippy_decode_activation_frame(session, input_desc, input_payload, token_ids, nullptr, 0, token_count, false, out_error);
-@@ -5008,24 +5183,32 @@ enum skippy_status skippy_trim_session(
+                 skippy_decode_activation_frame(
+@@ -6751,29 +6928,39 @@ enum skippy_status skippy_trim_session(
          return SKIPPY_STATUS_RUNTIME_ERROR;
      }
      const llama_pos p0 = static_cast<llama_pos>(token_count);
@@ -254,9 +257,9 @@ index 0484a712a..122a31312 100644
 -            skippy_set_error(out_error, SKIPPY_STATUS_RUNTIME_ERROR, "failed to trim hybrid ISWA memory suffix");
 -            return SKIPPY_STATUS_RUNTIME_ERROR;
 -        }
--    } else if (auto * kv = dynamic_cast<llama_kv_cache *>(memory)) {
--        if (!kv->seq_rm(session->seq_id, p0, -1)) {
--            skippy_set_error(out_error, SKIPPY_STATUS_RUNTIME_ERROR, "failed to trim native KV suffix");
+-    } else if (auto * dsa = dynamic_cast<llama_kv_cache_dsa *>(memory)) {
+-        if (!dsa->seq_rm(session->seq_id, p0, -1)) {
+-            skippy_set_error(out_error, SKIPPY_STATUS_RUNTIME_ERROR, "failed to trim GLM-DSA KV suffix");
 -            return SKIPPY_STATUS_RUNTIME_ERROR;
 +    bool restored_verify_prefix = false;
 +    enum skippy_status status = skippy_restore_verify_prefix(
@@ -275,6 +278,11 @@ index 0484a712a..122a31312 100644
 +                skippy_set_error(out_error, SKIPPY_STATUS_RUNTIME_ERROR, "failed to trim hybrid ISWA memory suffix");
 +                return SKIPPY_STATUS_RUNTIME_ERROR;
 +            }
++        } else if (auto * dsa = dynamic_cast<llama_kv_cache_dsa *>(memory)) {
++            if (!dsa->seq_rm(session->seq_id, p0, -1)) {
++                skippy_set_error(out_error, SKIPPY_STATUS_RUNTIME_ERROR, "failed to trim GLM-DSA KV suffix");
++                return SKIPPY_STATUS_RUNTIME_ERROR;
++            }
 +        } else if (auto * kv = dynamic_cast<llama_kv_cache *>(memory)) {
 +            if (!kv->seq_rm(session->seq_id, p0, -1)) {
 +                skippy_set_error(out_error, SKIPPY_STATUS_RUNTIME_ERROR, "failed to trim native KV suffix");
@@ -284,12 +292,15 @@ index 0484a712a..122a31312 100644
 +            skippy_set_error(out_error, SKIPPY_STATUS_UNSUPPORTED, "runtime memory type is not supported for trim");
 +            return SKIPPY_STATUS_UNSUPPORTED;
          }
+-    } else if (auto * kv = dynamic_cast<llama_kv_cache *>(memory)) {
+-        if (!kv->seq_rm(session->seq_id, p0, -1)) {
+-            skippy_set_error(out_error, SKIPPY_STATUS_RUNTIME_ERROR, "failed to trim native KV suffix");
+-            return SKIPPY_STATUS_RUNTIME_ERROR;
++    }
+         }
 -    } else if (dynamic_cast<llama_memory_recurrent *>(memory) == nullptr) {
 -        skippy_set_error(out_error, SKIPPY_STATUS_UNSUPPORTED, "runtime memory type is not supported for trim");
 -        return SKIPPY_STATUS_UNSUPPORTED;
      }
      session->n_past = static_cast<int32_t>(token_count);
      if (session->token_history.size() > token_count) {
--- 
-2.54.0
-

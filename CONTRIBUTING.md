@@ -167,7 +167,24 @@ On native Windows, `just check-release` runs the host-safe Rust/doc invariant su
 
 CI uses [`dorny/paths-filter`](https://github.com/dorny/paths-filter) to skip jobs when unchanged areas of the repo are modified. A `changes` detection job runs first on every push and PR, then each build job gates on its output.
 
-For the current PR build topology, see [`ci/ci.md`](ci/ci.md). For workflow-editing rules agents must follow, see [`.github/AGENTS.md`](.github/AGENTS.md).
+For the current PR build topology, see [`ci/ci.md`](ci/ci.md). Agents must start
+every CI edit with the canonical
+[`manage-ci` skill](.agents/skills/manage-ci/SKILL.md); `.github/AGENTS.md`
+routes all GitHub workflow work there.
+
+Linux CI uses prebuilt public and self-hosted images from
+[`Mesh-LLM/mesh-llm-runner-images`](https://github.com/Mesh-LLM/mesh-llm-runner-images).
+CPU, Vulkan, versioned CUDA, and versioned ROCm images share a core environment,
+warm dependencies from MeshLLM's checked-in manifests, and allow container
+runtimes to reuse cached layers where the runner host or K3s node retains them
+instead of reinstalling host packages in every job.
+
+If CI is missing a dependency, update the appropriate MeshLLM manifest and
+lockfile or the runner image's YAML profile/installer, then publish the image
+and pin its OCI digest. Do not add a one-off `apt-get`, `pip`, global `npm`,
+`cargo install`, downloaded binary, or similar setup step to an individual
+workflow. Existing workflow-local setup is migration debt, not a pattern for
+new jobs.
 
 ### What triggers what
 

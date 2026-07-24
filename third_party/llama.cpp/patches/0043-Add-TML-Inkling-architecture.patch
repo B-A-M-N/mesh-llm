@@ -1,7 +1,7 @@
-From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From 9cd5c188fd68a778d9a45b49d107b04cb5a8b435 Mon Sep 17 00:00:00 2001
 From: Daniel Han <danielhanchen@gmail.com>
 Date: Wed, 15 Jul 2026 18:14:40 +0000
-Subject: [PATCH 1/7] Add TML Inkling architecture
+Subject: [PATCH 43/54] Add TML Inkling architecture
 
 Hybrid attention model: 55 sliding-window plus 11 global layers, banded
 content-dependent relative position bias instead of RoPE, per-layer short
@@ -59,7 +59,7 @@ and audio support, and backend op tests at production shapes.
  src/models/inkling.cpp                 | 666 +++++++++++++++++++++++++
  src/models/models.h                    |  13 +
  tests/CMakeLists.txt                   |   8 +
- tests/test-backend-ops.cpp             | 114 ++++-
+ tests/test-backend-ops.cpp             | 117 ++++-
  tests/test-chat.cpp                    |  79 +++
  tests/test-flash-attn-bias.cpp         | 525 +++++++++++++++++++
  tests/test-flash-attn-generic-hash.cpp | 142 ++++++
@@ -75,7 +75,7 @@ and audio support, and backend op tests at production shapes.
  tools/mtmd/mtmd-image.cpp              | 203 +++++++-
  tools/mtmd/mtmd-image.h                |  20 +
  tools/mtmd/mtmd.cpp                    |  37 +-
- 61 files changed, 4018 insertions(+), 121 deletions(-)
+ 61 files changed, 4021 insertions(+), 121 deletions(-)
  create mode 100644 conversion/inkling.py
  create mode 100644 ggml/src/ggml-cuda/fattn-banded.cu
  create mode 100644 ggml/src/ggml-cuda/fattn-banded.cuh
@@ -694,7 +694,7 @@ index 000000000..90ef65c3b
 +
 +        raise ValueError(f"unexpected Inkling vision tensor {name!r}")
 diff --git a/ggml/include/ggml-rpc.h b/ggml/include/ggml-rpc.h
-index 16ca33947..7ca7f5fbf 100644
+index 82d274109..086dddd96 100644
 --- a/ggml/include/ggml-rpc.h
 +++ b/ggml/include/ggml-rpc.h
 @@ -8,10 +8,10 @@ extern "C" {
@@ -705,13 +705,13 @@ index 16ca33947..7ca7f5fbf 100644
 +#define RPC_PROTO_PATCH_VERSION    4
  
  #ifdef  __cplusplus
--static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");
-+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");
+-static_assert(GGML_OP_COUNT == 107, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");
++static_assert(GGML_OP_COUNT == 108, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");
  #endif
  
  #define GGML_RPC_MAX_SERVERS       16
 diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
-index 35f0c44ec..6e51f5734 100644
+index 7ef0ec88f..6a5925ce4 100644
 --- a/ggml/include/ggml.h
 +++ b/ggml/include/ggml.h
 @@ -435,8 +435,9 @@ extern "C" {
@@ -734,7 +734,7 @@ index 35f0c44ec..6e51f5734 100644
          GGML_OP_FLASH_ATTN_BACK,
          GGML_OP_SSM_CONV,
          GGML_OP_SSM_SCAN,
-@@ -1432,6 +1434,7 @@ extern "C" {
+@@ -1440,6 +1442,7 @@ extern "C" {
  
      // change the precision of a matrix multiplication
      // set to GGML_PREC_F32 for higher precision (useful for phi-2)
@@ -742,7 +742,7 @@ index 35f0c44ec..6e51f5734 100644
      GGML_API void ggml_mul_mat_set_prec(
              struct ggml_tensor * a,
              enum ggml_prec       prec);
-@@ -2426,6 +2429,19 @@ extern "C" {
+@@ -2439,6 +2442,19 @@ extern "C" {
              float                 max_bias,
              float                 logit_softcap);
  
@@ -794,10 +794,10 @@ index a5a3a58ad..b397fb6ba 100644
                  split_state = handle_generic(src_ss, /*scalar_only =*/ true);
              } break;
 diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
-index 491316f74..1c335b07b 100644
+index eed46cfe2..6f7cc39d1 100644
 --- a/ggml/src/ggml-cpu/ggml-cpu.c
 +++ b/ggml/src/ggml-cpu/ggml-cpu.c
-@@ -1998,6 +1998,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
+@@ -2016,6 +2016,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                  ggml_compute_forward_fill(params, tensor);
              } break;
          case GGML_OP_FLASH_ATTN_EXT:
@@ -805,7 +805,7 @@ index 491316f74..1c335b07b 100644
              {
                  ggml_compute_forward_flash_attn_ext(params, tensor);
              } break;
-@@ -2396,6 +2397,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
+@@ -2438,6 +2439,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
          case GGML_OP_ARGSORT:
          case GGML_OP_TOP_K:
          case GGML_OP_FLASH_ATTN_EXT:
@@ -813,7 +813,7 @@ index 491316f74..1c335b07b 100644
          case GGML_OP_FLASH_ATTN_BACK:
          case GGML_OP_SSM_CONV:
          case GGML_OP_SSM_SCAN:
-@@ -2944,6 +2946,7 @@ struct ggml_cplan ggml_graph_plan(
+@@ -2995,6 +2997,7 @@ struct ggml_cplan ggml_graph_plan(
                          cur += sizeof(int32_t)*node->src[0]->ne[0]*n_tasks;
                      } break;
                  case GGML_OP_FLASH_ATTN_EXT:
@@ -822,10 +822,10 @@ index 491316f74..1c335b07b 100644
                          const int64_t neq2 = node->src[0]->ne[2]; // number of query heads
                          const int64_t DK = node->src[1]->ne[0];
 diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
-index 42ec809ce..ba8e8c69b 100644
+index 61237ed06..9e9b1227b 100644
 --- a/ggml/src/ggml-cpu/ops.cpp
 +++ b/ggml/src/ggml-cpu/ops.cpp
-@@ -8332,10 +8332,11 @@ template<enum ggml_sort_order order>
+@@ -8340,10 +8340,11 @@ template<enum ggml_sort_order order>
  struct cmp_argsort {
      const float * data;
      bool operator()(int32_t a, int32_t b) const {
@@ -839,7 +839,7 @@ index 42ec809ce..ba8e8c69b 100644
          }
      }
  };
-@@ -8404,7 +8405,8 @@ void ggml_compute_forward_argsort(
+@@ -8412,7 +8413,8 @@ void ggml_compute_forward_argsort(
  struct cmp_top_k {
      const float * data;
      bool operator()(int32_t a, int32_t b) const {
@@ -849,7 +849,7 @@ index 42ec809ce..ba8e8c69b 100644
      }
  };
  
-@@ -8465,6 +8467,30 @@ void ggml_compute_forward_top_k(
+@@ -8473,6 +8475,30 @@ void ggml_compute_forward_top_k(
      }
  }
  
@@ -880,7 +880,7 @@ index 42ec809ce..ba8e8c69b 100644
  static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
          const ggml_compute_params * params,
          ggml_tensor * dst,
-@@ -8478,6 +8504,7 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
+@@ -8486,6 +8512,7 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
      const ggml_tensor * v     = dst->src[2];
      const ggml_tensor * mask  = dst->src[3];
      const ggml_tensor * sinks = dst->src[4];
@@ -888,7 +888,7 @@ index 42ec809ce..ba8e8c69b 100644
  
      GGML_TENSOR_LOCALS(int64_t, neq, q,   ne)
      GGML_TENSOR_LOCALS(size_t,  nbq, q,   nb)
-@@ -8606,6 +8633,14 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
+@@ -8614,6 +8641,14 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
                  s = logit_softcap*tanhf(s);
              }
  
@@ -903,7 +903,7 @@ index 42ec809ce..ba8e8c69b 100644
              s += mv; // apply mask
  
              const float Mold = M;
-@@ -9070,6 +9105,7 @@ static void ggml_compute_forward_flash_attn_ext_f16(
+@@ -9078,6 +9113,7 @@ static void ggml_compute_forward_flash_attn_ext_f16(
      const ggml_tensor * q     = dst->src[0];
      const ggml_tensor * k     = dst->src[1];
      const ggml_tensor * v     = dst->src[2];
@@ -911,7 +911,7 @@ index 42ec809ce..ba8e8c69b 100644
  
      GGML_TENSOR_LOCALS(int64_t, neq, q,   ne)
      GGML_TENSOR_LOCALS(size_t,  nbq, q,   nb)
-@@ -9169,7 +9205,7 @@ static void ggml_compute_forward_flash_attn_ext_f16(
+@@ -9177,7 +9213,7 @@ static void ggml_compute_forward_flash_attn_ext_f16(
          const int64_t dr = (nr + nchunk - 1) / nchunk;
  
          static constexpr int64_t Q_TILE_SZ  = ggml_fa_tile_config::Q;
@@ -1949,7 +1949,7 @@ index d38057721..1166178b7 100644
  
      if (rpc_get) {
 diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
-index a7d1fe7d9..9c3d172a8 100644
+index cdc85b083..fc775677b 100644
 --- a/ggml/src/ggml.c
 +++ b/ggml/src/ggml.c
 @@ -1067,6 +1067,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
@@ -1960,16 +1960,16 @@ index a7d1fe7d9..9c3d172a8 100644
      "FLASH_ATTN_BACK",
      "SSM_CONV",
      "SSM_SCAN",
-@@ -1100,7 +1101,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
-     "GLU",
+@@ -1107,7 +1108,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
+     "MOE_MUL_MAT_ID",
  };
  
--static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
-+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+-static_assert(GGML_OP_COUNT == 107, "GGML_OP_COUNT != 107");
++static_assert(GGML_OP_COUNT == 108, "GGML_OP_COUNT != 108");
  
  static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
      "none",
-@@ -1182,6 +1183,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+@@ -1189,6 +1190,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
      "fill(x, c)",
  
      "flash_attn_ext(x)",
@@ -1977,16 +1977,16 @@ index a7d1fe7d9..9c3d172a8 100644
      "flash_attn_back(x)",
      "ssm_conv(x)",
      "ssm_scan(x)",
-@@ -1215,7 +1217,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
-     "glu(x)",
+@@ -1229,7 +1231,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+     "moe_mul_mat_id(experts, input, ids, weights)",
  };
  
--static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
-+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+-static_assert(GGML_OP_COUNT == 107, "GGML_OP_COUNT != 107");
++static_assert(GGML_OP_COUNT == 108, "GGML_OP_COUNT != 108");
  
  static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
  
-@@ -5443,11 +5445,60 @@ struct ggml_tensor * ggml_flash_attn_ext(
+@@ -5480,11 +5482,60 @@ struct ggml_tensor * ggml_flash_attn_ext(
      return result;
  }
  
@@ -2048,7 +2048,7 @@ index a7d1fe7d9..9c3d172a8 100644
  
      const int32_t prec_i32 = (int32_t) prec;
  
-@@ -5456,7 +5507,7 @@ void ggml_flash_attn_ext_set_prec(
+@@ -5493,7 +5544,7 @@ void ggml_flash_attn_ext_set_prec(
  
  enum ggml_prec ggml_flash_attn_ext_get_prec(
          const struct ggml_tensor * a) {
@@ -2895,10 +2895,10 @@ index b74d53af4..9d2eb4a92 100644
      LLM_TENSOR_VISEXP_ATTN_OUT,
      LLM_TENSOR_VISEXP_FFN_GATE,
 diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
-index 6613747ad..fdad618c9 100644
+index 6cef391d1..aa569a34f 100644
 --- a/src/llama-graph.cpp
 +++ b/src/llama-graph.cpp
-@@ -1519,9 +1519,15 @@ ggml_tensor * llm_graph_context::build_cvec(
+@@ -1574,9 +1574,15 @@ ggml_tensor * llm_graph_context::build_cvec(
  ggml_tensor * llm_graph_context::build_lora_mm(
            ggml_tensor * w,
            ggml_tensor * cur,
@@ -2916,10 +2916,10 @@ index 6613747ad..fdad618c9 100644
          res = ggml_mul(ctx0, res, w_s);
      }
 diff --git a/src/llama-graph.h b/src/llama-graph.h
-index 2e0d9c3bd..f37bd6a9f 100644
+index ab6e111e1..e74a58a56 100644
 --- a/src/llama-graph.h
 +++ b/src/llama-graph.h
-@@ -1040,7 +1040,8 @@ struct llm_graph_context {
+@@ -1083,7 +1083,8 @@ struct llm_graph_context {
      ggml_tensor * build_lora_mm(
                ggml_tensor * w,
                ggml_tensor * cur,
@@ -2946,7 +2946,7 @@ index 9d0683d2f..d0cf45f64 100644
          // for RWKV models
          return token_shift_count * n_embd;
 diff --git a/src/llama-hparams.h b/src/llama-hparams.h
-index 8be5f28f3..38b864032 100644
+index 92626b4d5..885c972cb 100644
 --- a/src/llama-hparams.h
 +++ b/src/llama-hparams.h
 @@ -79,6 +79,17 @@ struct llama_hparams {
@@ -2968,10 +2968,10 @@ index 8be5f28f3..38b864032 100644
      std::array<uint32_t, LLAMA_MAX_LAYERS> n_head_kv_arr;
      std::array<uint32_t, LLAMA_MAX_LAYERS> n_ff_arr;
 diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
-index 43e9492a0..2151c28f0 100644
+index 9df4984b3..4a9ca5768 100644
 --- a/src/llama-kv-cache.cpp
 +++ b/src/llama-kv-cache.cpp
-@@ -1709,6 +1709,51 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
+@@ -1710,6 +1710,51 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
      return result;
  }
  
@@ -3023,7 +3023,7 @@ index 43e9492a0..2151c28f0 100644
  ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const {
      const int32_t ikv = map_layer_ids.at(il);
  
-@@ -2248,6 +2293,39 @@ void llama_kv_cache::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch
+@@ -2249,6 +2294,39 @@ void llama_kv_cache::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch
      }
  }
  
@@ -3063,7 +3063,7 @@ index 43e9492a0..2151c28f0 100644
  void llama_kv_cache::set_input_k_rot(ggml_tensor * dst) const {
      GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
  
-@@ -3037,6 +3115,21 @@ uint32_t llama_kv_cache_context::get_n_kv() const {
+@@ -3038,6 +3116,21 @@ uint32_t llama_kv_cache_context::get_n_kv() const {
      return n_kv;
  }
  
@@ -3085,7 +3085,7 @@ index 43e9492a0..2151c28f0 100644
  ggml_type llama_kv_cache_context::type_k() const {
      return kv->type_k();
  }
-@@ -3097,6 +3190,10 @@ void llama_kv_cache_context::set_input_pos_bucket(ggml_tensor * dst, const llama
+@@ -3098,6 +3191,10 @@ void llama_kv_cache_context::set_input_pos_bucket(ggml_tensor * dst, const llama
      kv->set_input_pos_bucket(dst, ubatch);
  }
  
@@ -3161,7 +3161,7 @@ index a3928523b..0d39901ab 100644
          default:
              return true;
 diff --git a/src/llama-model.cpp b/src/llama-model.cpp
-index 5b83c0c08..68c04f4d3 100644
+index a325a4edc..9c6843dda 100644
 --- a/src/llama-model.cpp
 +++ b/src/llama-model.cpp
 @@ -304,6 +304,8 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
@@ -3173,7 +3173,7 @@ index 5b83c0c08..68c04f4d3 100644
          default:
              throw std::runtime_error(std::string("unsupported model architecture: '") + llm_arch_name(arch) + "'");
      }
-@@ -2102,7 +2104,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
+@@ -2103,7 +2105,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
                      // layer filters, so pick the right one here
                      llama_memory_hybrid::layer_filter_cb filter_attn = nullptr;
                      llama_memory_hybrid::layer_filter_cb filter_recr = nullptr;
@@ -3183,7 +3183,7 @@ index 5b83c0c08..68c04f4d3 100644
                          filter_attn = [&](uint32_t) { return true; };
                          filter_recr = [&](uint32_t) { return true; };
                      } else if (arch == LLM_ARCH_NEMOTRON_H || arch == LLM_ARCH_NEMOTRON_H_MOE) {
-@@ -2452,6 +2455,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
+@@ -2453,6 +2456,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
          case LLM_ARCH_NEMOTRON_H:
          case LLM_ARCH_NEMOTRON_H_MOE:
          case LLM_ARCH_KIMI_LINEAR:
@@ -3945,10 +3945,10 @@ index 000000000..f83930c69
 +    ggml_build_forward_expand(gf, cur);
 +}
 diff --git a/src/models/models.h b/src/models/models.h
-index e9a7c0c25..14b0253c1 100644
+index fa1e36c1d..7111c5c8f 100644
 --- a/src/models/models.h
 +++ b/src/models/models.h
-@@ -1840,6 +1840,19 @@ struct llama_model_lfm2moe : public llama_model_base {
+@@ -1845,6 +1845,19 @@ struct llama_model_lfm2moe : public llama_model_base {
  };
  
  
@@ -3988,13 +3988,22 @@ index 7a93b19a0..8fda15806 100644
  llama_build_and_test(test-autorelease.cpp       LABEL "model")
  llama_build_and_test(test-backend-sampler.cpp   LABEL "model")
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index e3553c5e9..243d2aaee 100644
+index 4c1f8c687..b4242f629 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
-@@ -6912,6 +6912,101 @@ struct test_flash_attn_ext : public test_case {
+@@ -11867,6 +11867,7 @@ struct test_flash_attn_ext : public test_case {
      }
  };
  
++
+ struct test_glm_dsa_selected_row_flash : public test_case {
+     const int64_t kv;
+     const int64_t top_k;
+@@ -12285,6 +12286,103 @@ struct test_glm_dsa_compact_k_gather : public test_case {
+     }
+ };
+ 
++
 +// GGML_OP_FLASH_ATTN_EXT_BANDED
 +struct test_flash_attn_ext_banded : public test_case {
 +    const int64_t d;
@@ -4090,10 +4099,11 @@ index e3553c5e9..243d2aaee 100644
 +    }
 +};
 +
++
  // GGML_OP_CROSS_ENTROPY_LOSS
  struct test_cross_entropy_loss : public test_case {
      const ggml_type type;
-@@ -7491,6 +7586,7 @@ struct test_generic_op : public test_case {
+@@ -12864,6 +12962,7 @@ struct test_generic_op : public test_case {
          case GGML_OP_RWKV_WKV7:
              return 5e-3;
          case GGML_OP_FLASH_ATTN_EXT:
@@ -4101,7 +4111,7 @@ index e3553c5e9..243d2aaee 100644
          {
              // Scale error with kv length to account for accumulating floating point error
              const int64_t kv = sources[1].ne[1];
-@@ -7514,7 +7610,7 @@ struct test_generic_op : public test_case {
+@@ -12887,7 +12986,7 @@ struct test_generic_op : public test_case {
              }
  
              // FLASH_ATTN_EXT: src[3] is the KQ mask
@@ -4110,7 +4120,7 @@ index e3553c5e9..243d2aaee 100644
                  init_tensor_kq_mask(t);
                  continue;
              }
-@@ -9542,6 +9638,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -14934,6 +15033,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      test_cases.emplace_back(new test_flash_attn_ext(64, 128, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q1_0));
      test_cases.emplace_back(new test_flash_attn_ext(128, 64, 4, {1, 1}, 64, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q1_0, GGML_TYPE_F16));
  
@@ -4903,10 +4913,10 @@ index 000000000..4e3aca44f
 +    return 0;
 +}
 diff --git a/tests/test-llama-archs.cpp b/tests/test-llama-archs.cpp
-index 57d33a627..9ada66a24 100644
+index fe0accc87..43d762637 100644
 --- a/tests/test-llama-archs.cpp
 +++ b/tests/test-llama-archs.cpp
-@@ -418,6 +418,9 @@ static bool arch_supported(const llm_arch arch) {
+@@ -1349,6 +1349,9 @@ static bool arch_supported(const llm_arch arch) {
      if (arch == LLM_ARCH_DEEPSEEK4) {
          return false;
      }

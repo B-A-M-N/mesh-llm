@@ -1,6 +1,6 @@
 pub const ABI_VERSION_MAJOR: u32 = 0;
 pub const ABI_VERSION_MINOR: u32 = 1;
-pub const ABI_VERSION_PATCH: u32 = 32;
+pub const ABI_VERSION_PATCH: u32 = 33;
 pub const FEATURE_BACKEND_DEVICES: u64 = 1 << 23;
 pub const FEATURE_RUNTIME_EVENTS: u64 = 1 << 24;
 pub const FEATURE_NATIVE_MTP_N1: u64 = 1 << 25;
@@ -19,13 +19,12 @@ pub struct AbiVersion {
 }
 
 /// Whether a native runtime reporting `version` can back this binary's ABI
-/// bindings. Required symbol signatures may change between patches (for
-/// example `skippy_apply_chat_template_json` gained an argument in 0.1.28),
-/// so older runtimes must be rejected at load time.
+/// bindings. Required symbol signatures and by-value struct layouts may change
+/// between patches, so the loader requires an exact ABI match.
 pub const fn runtime_abi_supported(version: AbiVersion) -> bool {
     version.major == ABI_VERSION_MAJOR
         && version.minor == ABI_VERSION_MINOR
-        && version.patch >= ABI_VERSION_PATCH
+        && version.patch == ABI_VERSION_PATCH
 }
 
 use std::ffi::{c_char, c_int, c_void};
@@ -222,10 +221,18 @@ pub struct RuntimeConfig {
     pub flash_attn_type: i32,
     pub load_mode: LoadMode,
     pub disable_repack: bool,
+    pub use_mmap_prefetch: bool,
+    pub use_mmap_buffer: bool,
     pub filter_tensors_on_load: bool,
     pub include_embeddings: bool,
     pub include_output: bool,
     pub selected_backend_device: *const c_char,
+    pub glm_dsa_policy_profile: i32,
+    pub glm_dsa_policy_flags: u32,
+    pub glm_dsa_short_prefill_max_tokens: i32,
+    pub glm_dsa_direct_sparse_decode_max_top_k: i32,
+    pub glm_dsa_dense_sparse_mask_max_bytes: u64,
+    pub glm_dsa_compact_flash_min_kv: i32,
 }
 
 #[repr(C)]
@@ -1872,21 +1879,21 @@ mod tests {
     }
 
     #[test]
-    fn accepts_current_and_newer_patch_runtimes() {
+    fn accepts_current_patch_runtime() {
         assert!(runtime_abi_supported(version(
             ABI_VERSION_MAJOR,
             ABI_VERSION_MINOR,
             ABI_VERSION_PATCH,
         )));
-        assert!(runtime_abi_supported(version(
+    }
+
+    #[test]
+    fn rejects_other_patch_runtimes() {
+        assert!(!runtime_abi_supported(version(
             ABI_VERSION_MAJOR,
             ABI_VERSION_MINOR,
             ABI_VERSION_PATCH + 1,
         )));
-    }
-
-    #[test]
-    fn rejects_older_patch_runtimes() {
         assert!(!runtime_abi_supported(version(
             ABI_VERSION_MAJOR,
             ABI_VERSION_MINOR,

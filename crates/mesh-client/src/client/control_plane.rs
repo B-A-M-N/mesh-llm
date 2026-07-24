@@ -835,7 +835,10 @@ fn relay_map_from_endpoint_addr(addr: &EndpointAddr) -> Option<iroh::RelayMap> {
     let configs: Vec<_> = addr
         .relay_urls()
         .cloned()
-        .map(|url| iroh::RelayConfig::new(url, None))
+        // Preserve iroh's default QUIC Address Discovery (QAD). `new(url, None)`
+        // disables it, preventing reflexive candidate discovery and direct-path
+        // upgrades across NAT (see issue #1065). `RelayUrl::into()` keeps QAD on.
+        .map(|url| -> iroh::RelayConfig { url.into() })
         .collect();
     if configs.is_empty() {
         None
@@ -954,6 +957,27 @@ mod tests {
             relay_mode_from_endpoint_addr(&addr),
             iroh::endpoint::RelayMode::Custom(_)
         ));
+    }
+
+    #[test]
+    fn endpoint_addr_relays_preserve_default_qad() {
+        let addr = EndpointAddr::new(iroh::SecretKey::generate().public())
+            .with_relay_url(
+                iroh::RelayUrl::from_str("https://relay-a.example.com").expect("relay URL parses"),
+            )
+            .with_relay_url(
+                iroh::RelayUrl::from_str("https://relay-b.example.com").expect("relay URL parses"),
+            );
+
+        let map = relay_map_from_endpoint_addr(&addr).expect("relay map should be enabled");
+        let configs = map.relays::<Vec<_>>();
+
+        assert_eq!(configs.len(), 2);
+        assert!(
+            configs
+                .iter()
+                .all(|config| { config.quic.as_ref().is_some_and(|quic| quic.port == 7842) })
+        );
     }
 
     #[test]
