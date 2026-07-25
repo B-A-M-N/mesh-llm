@@ -10,10 +10,10 @@ Subject: [PATCH 11/16] Pass reasoning format through stage chat templates
  3 files changed, 6 insertions(+), 1 deletion(-)
 
 diff --git a/common/stage-chat.cpp b/common/stage-chat.cpp
-index bde9feda..3298ed66 100644
+index bffc2d44..16ce255a 100644
 --- a/common/stage-chat.cpp
 +++ b/common/stage-chat.cpp
-@@ -230,6 +230,7 @@ enum skippy_status skippy_apply_chat_template_json(
+@@ -233,6 +233,7 @@ enum skippy_status skippy_apply_chat_template_json(
          bool override_enable_thinking,
          bool enable_thinking,
          bool parallel_tool_calls,
@@ -21,9 +21,9 @@ index bde9feda..3298ed66 100644
          char * output_text,
          size_t output_text_capacity,
          size_t * out_text_bytes,
-@@ -282,6 +283,9 @@ enum skippy_status skippy_apply_chat_template_json(
-             inputs.chat_template_kwargs["enable_think"] = value;
-             inputs.chat_template_kwargs["think_enabled"] = value;
+@@ -288,6 +289,9 @@ enum skippy_status skippy_apply_chat_template_json(
+                 inputs.chat_template_kwargs["reasoning_effort"] = "0";
+             }
          }
 +        if (reasoning_format_name != nullptr && reasoning_format_name[0] != '\0') {
 +            inputs.reasoning_format = common_reasoning_format_from_name(reasoning_format_name);
