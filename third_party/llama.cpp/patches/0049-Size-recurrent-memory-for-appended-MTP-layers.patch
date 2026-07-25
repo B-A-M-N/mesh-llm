@@ -4,17 +4,18 @@ Date: Fri, 17 Jul 2026 20:20:45 +1000
 Subject: [PATCH 49/54] Size recurrent memory for appended MTP layers
 
 ---
- src/llama-memory-recurrent.cpp | 8 ++++----
- 1 file changed, 4 insertions(+), 4 deletions(-)
+ src/llama-memory-recurrent.cpp | 9 +++++----
+ 1 file changed, 5 insertions(+), 4 deletions(-)
 
 diff --git a/src/llama-memory-recurrent.cpp b/src/llama-memory-recurrent.cpp
 --- a/src/llama-memory-recurrent.cpp
 +++ b/src/llama-memory-recurrent.cpp
-@@ -26,7 +26,7 @@ llama_memory_recurrent::llama_memory_recurrent(
+@@ -26,7 +26,8 @@ llama_memory_recurrent::llama_memory_recurrent(
                   uint32_t   n_seq_max,
                   uint32_t   n_rs_seq,
      const layer_filter_cb & filter) : hparams(model.hparams), n_seq_max(n_seq_max) {
 -    const int32_t n_layer = hparams.n_layer();
++    // MTP layers append recurrent state beyond the trunk layer count.
 +    const int32_t n_layer = hparams.n_layer_all;
  
      head = 0;
