@@ -2605,7 +2605,7 @@ index 000000000..512d92685
 +  {{- '<|end_message|>' -}}
 +{%- endmacro -%}
 +
-+{%- set effort_value = reasoning_effort if (reasoning_effort is defined and reasoning_effort is not none) else 0.9 -%}
++{%- set effort_value = 0.0 if (enable_thinking is defined and enable_thinking is not none and not enable_thinking) else (reasoning_effort if (reasoning_effort is defined and reasoning_effort is not none) else 0.9) -%}
 +{%- set eff_ns = namespace(emitted=false) -%}
 +{%- set first_ns = namespace(idx=-1) -%}
 +{%- for m in messages -%}
