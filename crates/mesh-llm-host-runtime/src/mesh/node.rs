@@ -150,10 +150,7 @@ pub(crate) fn hardware_snapshot_for_start(
 ) -> NodeHardwareSnapshot {
     let local_runtime_capacity_bytes =
         super::capacity::capped_capacity_bytes(hw.vram_bytes, max_vram_gb);
-    let mut vram_bytes = super::capacity::capped_capacity_bytes(
-        super::capacity::mesh_capacity_bytes(&hw),
-        max_vram_gb,
-    );
+    let mut vram_bytes = super::capacity::advertised_capacity_bytes(&hw, max_vram_gb);
     let gpu_name = if matches!(role, NodeRole::Client) {
         None
     } else {

@@ -43,6 +43,14 @@ pub(super) fn capped_capacity_bytes(capacity_bytes: u64, max_vram_gb: Option<f64
         .unwrap_or(capacity_bytes)
 }
 
+pub(super) fn advertised_capacity_bytes(hw: &HardwareSurvey, max_vram_gb: Option<f64>) -> u64 {
+    let detected = mesh_capacity_bytes(hw);
+    match (detected, max_vram_gb) {
+        (0, Some(cap)) => hw.vram_bytes.min((cap * 1e9) as u64),
+        _ => capped_capacity_bytes(detected, max_vram_gb),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -103,6 +111,20 @@ mod tests {
 
         assert_eq!(snapshot.vram_bytes, 0);
         assert_eq!(snapshot.local_runtime_capacity_bytes, 491_000_000_000);
+    }
+
+    #[test]
+    fn explicit_cpu_budget_advertises_bounded_stage_capacity() {
+        let hw = HardwareSurvey {
+            vram_bytes: 16_000_000_000,
+            is_soc: false,
+            ..HardwareSurvey::default()
+        };
+
+        let snapshot = hardware_snapshot_for_start(hw, &NodeRole::Worker, Some(1.0));
+
+        assert_eq!(snapshot.vram_bytes, 1_000_000_000);
+        assert_eq!(snapshot.local_runtime_capacity_bytes, 1_000_000_000);
     }
 
     #[test]
