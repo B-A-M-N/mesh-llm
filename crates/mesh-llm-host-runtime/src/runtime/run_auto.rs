@@ -729,7 +729,8 @@ pub(super) async fn build_run_auto_node_setup(
     node.set_available_models(local_models.clone()).await;
     node.start_heartbeat();
     node.start_rtt_refresh();
-    node.start_direct_path_maintenance();
+    // iroh owns NAT traversal and relay-to-direct migration; modern nodes do
+    // not start the legacy application-level reverse-dial sender.
     start_relay_health_monitor_for_discovery_mode(&node, options.mesh_discovery_mode);
     let lan_bootstrap_tasks = spawn_mdns_reverse_dial(options, &node);
 

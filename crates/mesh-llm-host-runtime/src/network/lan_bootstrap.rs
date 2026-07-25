@@ -5,22 +5,16 @@ use std::net::IpAddr;
 use tokio::task::JoinHandle;
 
 pub(crate) fn effective_quic_bind_ip(options: &RuntimeOptions) -> Option<IpAddr> {
+    // Explicit operator override always wins.
     if let Some(ip) = options.bind_ip {
         return Some(ip);
     }
 
-    let detected = mesh::detect_primary_lan_ipv4();
-    if let Some(ip) = detected {
-        tracing::info!(
-            "Auto-binding QUIC endpoint to detected LAN address {ip}; override with --bind-ip"
-        );
-        Some(ip)
-    } else {
-        tracing::debug!(
-            "Unable to detect a LAN IPv4 address for QUIC bind; using wildcard socket bind"
-        );
-        None
-    }
+    // Use iroh's default wildcard sockets and candidate discovery unless the
+    // operator explicitly needs to select an interface. Auto-pinning a detected
+    // LAN IPv4 restricted iroh's normal dual-stack path set and duplicated
+    // address-selection logic that iroh already owns.
+    None
 }
 
 /// Background tasks spawned by [`spawn_mdns_reverse_dial`] for relay-less LAN

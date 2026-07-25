@@ -44,37 +44,18 @@ pub(crate) async fn startup_secret_key(role: &NodeRole) -> Result<SecretKey> {
 }
 
 pub(crate) fn startup_transport_config() -> iroh::endpoint::QuicTransportConfig {
-    // Keep QUIC connections alive during long inference calls.
+    // We only raise the concurrent bidi-stream ceiling; everything else uses
+    // iroh's tuned defaults.
     //
-    // noq-proto's default `max_idle_timeout` is ~30s and `keep_alive_interval`
-    // is `None`. A non-streaming inference request (e.g. MoA reducer or any
-    // `stream:false` call) sends nothing on the wire while the remote model is
-    // generating tokens. Under concurrent load (multiple in-flight model
-    // requests + gossip + heartbeats) noq's multipath bookkeeping will close
-    // an idle path, and if it is the last open path the whole connection
-    // drops mid-stream. The in-flight stream errors with `connection lost`
-    // and the caller has to retry from scratch.
-    //
-    // A 10s keep-alive sends a small PING every 10s on each path, keeping
-    // paths and the connection healthy during long compute. The 5-minute idle
-    // timeout is defense in depth for truly silent connections (paused
-    // agents, suspended laptops); short-term silence is handled by
-    // keep-alive.
-    let max_idle = iroh::endpoint::IdleTimeout::try_from(std::time::Duration::from_secs(300))
-        .expect("5-minute idle timeout fits in a VarInt");
-    let keep_alive = std::time::Duration::from_secs(10);
-    let path_idle = std::time::Duration::from_secs(300);
+    // History: this function used to override keep-alive (10s) and idle
+    // timeouts (300s connection + 300s per path). iroh 1.0 clamps per-path idle
+    // to 15s and already sends keep-alive PINGs every 5s, so those overrides do
+    // not provide the intended behavior and needlessly diverge from iroh's path
+    // management defaults.
+    // Mesh multiplexes many concurrent streams (gossip + heartbeat + inference
+    // tunnels) over one connection per peer, so we keep a generous bidi ceiling.
     iroh::endpoint::QuicTransportConfig::builder()
         .max_concurrent_bidi_streams(1024u32.into())
-        .keep_alive_interval(keep_alive)
-        .max_idle_timeout(Some(max_idle))
-        // noq-proto's multipath uses per-path idle timers independent of the
-        // connection-level idle. Without these, a path can be torn down while
-        // the connection idle timer is fine, and when the last path closes the
-        // connection dies with `LastOpenPath`. Mirror connection-level
-        // settings onto the default per-path config.
-        .default_path_max_idle_timeout(path_idle)
-        .default_path_keep_alive_interval(keep_alive)
         .build()
 }
 
@@ -259,23 +240,6 @@ pub(crate) fn init_owner_runtime(
         trust_policy,
         owner_attestation,
     })
-}
-
-pub(crate) fn configure_control_relay(
-    mut builder: iroh::endpoint::Builder,
-    relay: Option<RelayConfig<'_>>,
-) -> Result<iroh::endpoint::Builder> {
-    if let Some(relay) = relay.filter(|relay| relay.policy.uses_relay()) {
-        let urls = effective_relay_urls(relay.policy, relay.urls);
-        tracing::info!("Owner-control relay: {:?}", urls);
-        builder = builder.relay_mode(iroh::endpoint::RelayMode::Custom(relay_map_from_urls(
-            &urls,
-            relay.auths,
-        )?));
-    } else {
-        builder = builder.relay_mode(iroh::endpoint::RelayMode::Disabled);
-    }
-    Ok(builder)
 }
 
 pub(crate) fn default_plugin_event_source(endpoint_id: EndpointId, source_peer_id: &mut String) {
@@ -1067,7 +1031,6 @@ impl Node {
             owner_config
                 .as_ref()
                 .and_then(|config| config.control_advertise_addr),
-            relay.policy.uses_relay().then_some(relay),
         )
         .await?;
 
@@ -1235,26 +1198,39 @@ impl Node {
         secret_key: SecretKey,
         bind_addr: Option<std::net::SocketAddr>,
         advertise_addr: Option<std::net::SocketAddr>,
-        relay: Option<RelayConfig<'_>>,
     ) -> Result<()> {
         if self.local_verified_owner_id().await.is_none() {
             return Ok(());
         }
 
-        let mut builder = Endpoint::builder(iroh::endpoint::presets::Minimal)
+        // The owner-control listener deliberately shares the node's secret key
+        // (and therefore its iroh endpoint id) with the main mesh endpoint: the
+        // control protocol validates the dialed `target_node_id` against the
+        // main endpoint id (`verify_control_plane_target_node`), so the control
+        // endpoint MUST present that same id.
+        //
+        // Because the id is shared, this endpoint must NOT register with the
+        // relay. An iroh relay keeps only one active connection per endpoint id:
+        // a second same-id registration evicts the first ("Another endpoint
+        // connected with the same endpoint id. No more messages will be
+        // received."). The control listener binds *after* the main mesh
+        // endpoint, so if it also joined the relay it would steal the main
+        // endpoint's relay slot and silently cut off all relay-delivered mesh
+        // traffic (gossip, joins, inference routing) — breaking relay fallback
+        // for any peer that cannot reach this node directly. Keeping the control
+        // endpoint relay-disabled leaves the main mesh endpoint as the sole
+        // relay registrant for this id. Owner-control is therefore reachable
+        // over its direct / advertised address only; relay-assisted remote
+        // owner-control is intentionally unsupported while the control and mesh
+        // endpoints share one id.
+        let endpoint = Endpoint::builder(iroh::endpoint::presets::Minimal)
             .secret_key(secret_key)
             .alpns(vec![ALPN_CONTROL_V1.to_vec()])
-            .bind_addr(bind_addr.unwrap_or_else(default_control_bind_addr))?;
-        builder = configure_control_relay(builder, relay)?;
-        let endpoint = builder.bind().await?;
-        if relay.is_some_and(|relay| relay.policy.uses_relay()) {
-            wait_for_endpoint_online(
-                &endpoint,
-                "Owner-control relay connected",
-                "Owner-control relay connection timed out (5s) — proceeding with direct endpoint addresses only",
-            )
-            .await;
-        }
+            .clear_ip_transports()
+            .bind_addr(bind_addr.unwrap_or_else(default_control_bind_addr))?
+            .relay_mode(iroh::endpoint::RelayMode::Disabled)
+            .bind()
+            .await?;
         let token = encode_endpoint_addr_token(&control_endpoint_addr(&endpoint, advertise_addr));
         let shutdown_requested = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let shutdown = Arc::new(tokio::sync::Notify::new());
