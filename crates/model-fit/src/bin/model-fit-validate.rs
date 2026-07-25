@@ -916,10 +916,9 @@ fn run_native_probe_isolated(
         .output()
         .with_context(|| format!("run isolated native probe {}", kind.as_str()))?;
     if !output.status.success() {
-        if let Ok(probes) = parse_isolated_native_probe_stdout(kind, &output.stdout)
-            && !probes.is_empty()
-        {
-            return Ok(probes);
+        match parse_isolated_native_probe_stdout(kind, &output.stdout) {
+            Ok(probes) if !probes.is_empty() => return Ok(probes),
+            Ok(_) | Err(_) => {}
         }
         let stderr = diagnostic_prefix(&String::from_utf8_lossy(&output.stderr), 2048);
         bail!(
@@ -2874,6 +2873,7 @@ fn dense_probe_repeat_layers(args: &Args, profile: &ModelProfile, tensor_type: &
 
 fn supports_dense_depth_probe_tensor_type(tensor_type: &str) -> bool {
     tensor_type.eq_ignore_ascii_case("q4_k")
+        || tensor_type.eq_ignore_ascii_case("q5_k")
         || tensor_type.eq_ignore_ascii_case("q6_k")
         || tensor_type.eq_ignore_ascii_case("q8_0")
 }
@@ -2936,6 +2936,7 @@ fn dense_probe_tensor_types(profile: &ModelProfile) -> Vec<&'static str> {
     let mut candidates = [
         ("f16", bytes.f16_bytes),
         ("q4_k", bytes.q4_k_bytes),
+        ("q5_k", bytes.q5_k_bytes),
         ("q6_k", bytes.q6_k_bytes),
         ("q8_0", bytes.q8_0_bytes),
     ];
@@ -2957,6 +2958,8 @@ fn dense_probe_tensor_type_from_quant(quantization: Option<&str>) -> Option<&'st
     let quantization = quantization?.to_ascii_lowercase();
     if quantization.contains("q4_k") {
         Some("q4_k")
+    } else if quantization.contains("q5_k") {
+        Some("q5_k")
     } else if quantization.contains("q6_k") {
         Some("q6_k")
     } else if quantization.contains("q8_0") || quantization.contains("q8") {
@@ -9353,8 +9356,8 @@ mod tests {
     use super::*;
     use model_fit::{
         CapabilityEvidence, DenseGraphFeatures, ModelArchitectureClass, ModelSource,
-        RecurrentAttentionProfile, RopeProfile, TensorGroupBytes, TensorMatmulProfile,
-        TokenizerProfile, WeightCoverage,
+        RecurrentAttentionProfile, RopeProfile, TensorGroupBytes, TensorMatmulGroupProfile,
+        TensorMatmulProfile, TensorTypeBytes, TokenizerProfile, WeightCoverage,
     };
 
     fn test_args() -> Args {
@@ -9377,6 +9380,66 @@ mod tests {
                 "unsloth/Qwen2.5-Coder-7B-Instruct-GGUF:Q4_K_M".into(),
             )],
         }
+    }
+
+    fn minimal_dense_profile() -> ModelProfile {
+        ModelProfile {
+            source: ModelSource {
+                id: "test/model:Q5_K_M".into(),
+                path: None,
+                metadata_name: None,
+            },
+            architecture: Some("qwen2".into()),
+            architecture_class: ModelArchitectureClass::DenseTransformer,
+            weight_coverage: WeightCoverage::Full,
+            file_size_bytes: 1,
+            tensor_bytes: Some(1),
+            base_resident_bytes: Some(1),
+            expert_tensor_bytes: Some(0),
+            tensor_group_bytes: TensorGroupBytes::default(),
+            tensor_matmul: TensorMatmulProfile::default(),
+            dense_graph_features: DenseGraphFeatures::default(),
+            recurrent_attention: RecurrentAttentionProfile::default(),
+            parameter_count: None,
+            quantization: Some("Q5_K_M".into()),
+            layer_count: Some(28),
+            hidden_size: Some(3584),
+            ffn_size: Some(18944),
+            attention_heads: Some(28),
+            kv_heads: Some(4),
+            key_length: Some(128),
+            value_length: Some(128),
+            context_length: Some(32768),
+            expert_count: None,
+            expert_used_count: None,
+            rope: RopeProfile::default(),
+            tokenizer: TokenizerProfile::default(),
+            capability_evidence: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn dense_probe_tensor_types_include_q5_k_when_metadata_contains_q5_weights() {
+        let mut profile = minimal_dense_profile();
+        profile.tensor_matmul.attention = TensorMatmulGroupProfile {
+            type_bytes: TensorTypeBytes {
+                q5_k_bytes: 500,
+                q6_k_bytes: 100,
+                ..TensorTypeBytes::default()
+            },
+            ..TensorMatmulGroupProfile::default()
+        };
+        profile.tensor_matmul.feed_forward = TensorMatmulGroupProfile {
+            type_bytes: TensorTypeBytes {
+                q5_k_bytes: 5_000,
+                q6_k_bytes: 1_000,
+                ..TensorTypeBytes::default()
+            },
+            ..TensorMatmulGroupProfile::default()
+        };
+
+        assert_eq!(dense_probe_tensor_types(&profile), vec!["q5_k", "q6_k"]);
+        assert!(supports_dense_depth_probe_tensor_type("q5_k"));
     }
 
     #[test]

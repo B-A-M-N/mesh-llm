@@ -2,6 +2,9 @@
 
 `model-fit` ranks GGUF model artifacts against a local hardware profile.
 
+See [DESIGN.md](DESIGN.md) for the estimator objectives, evidence rules,
+confidence boundaries, and validation strategy.
+
 The crate is intentionally metadata-first and deterministic. It consumes:
 
 - hardware facts and measured GPU bandwidth, decode overhead, scalar compute,

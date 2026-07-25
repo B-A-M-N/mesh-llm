@@ -1065,6 +1065,7 @@ fn dense_graph_tensor_type_kind(tensor_type: &str) -> Result<c_int> {
         "q6_k" => Ok(1),
         "q8_0" => Ok(2),
         "f16" => Ok(3),
+        "q5_k" => Ok(4),
         other => Err(anyhow!("unsupported dense graph probe tensor type {other}")),
     }
 }

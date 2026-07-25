@@ -57,6 +57,7 @@ enum ProbeTensorType {
     PROBE_TENSOR_Q6_K = 1,
     PROBE_TENSOR_Q8_0 = 2,
     PROBE_TENSOR_F16 = 3,
+    PROBE_TENSOR_Q5_K = 4,
 };
 
 struct GraphInventoryBucket {
@@ -182,6 +183,8 @@ enum ggml_type probe_tensor_type(int tensor_type_kind) {
     switch (tensor_type_kind) {
         case PROBE_TENSOR_Q4_K:
             return GGML_TYPE_Q4_K;
+        case PROBE_TENSOR_Q5_K:
+            return GGML_TYPE_Q5_K;
         case PROBE_TENSOR_Q6_K:
             return GGML_TYPE_Q6_K;
         case PROBE_TENSOR_Q8_0:
@@ -234,6 +237,8 @@ const char * probe_tensor_type_name(int tensor_type_kind) {
     switch (tensor_type_kind) {
         case PROBE_TENSOR_Q4_K:
             return "q4_k";
+        case PROBE_TENSOR_Q5_K:
+            return "q5_k";
         case PROBE_TENSOR_Q6_K:
             return "q6_k";
         case PROBE_TENSOR_Q8_0:

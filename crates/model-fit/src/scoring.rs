@@ -1816,7 +1816,14 @@ fn dense_full_token_decode_cost(
     }
     if !block_graph_covers_residual_types {
         for group in dense_block_residual_groups(model, block_tensor_type) {
-            add_group_decode_cost(group, model, budget, fallback_bandwidth, &mut cost);
+            add_dense_full_token_residual_delta_cost(
+                group,
+                block_tensor_type,
+                model,
+                budget,
+                fallback_bandwidth,
+                &mut cost,
+            );
         }
     }
     // Do not add the older standalone logits-sync/readback groups here. The
@@ -1844,6 +1851,187 @@ fn dense_full_token_decode_cost(
         add_logits_readback_decode_cost(model, budget, &mut cost);
     }
     Some(cost)
+}
+
+fn add_dense_full_token_residual_delta_cost(
+    group: DecodeTrafficGroup,
+    block_tensor_type: &'static str,
+    model: &ModelProfile,
+    budget: &ExecutionBudget,
+    fallback_bandwidth: u64,
+    cost: &mut GroupedDecodeCost,
+) {
+    for (residual_tensor_type, resident_bytes) in tensor_type_byte_entries(group.type_bytes) {
+        let residual_traffic_bytes =
+            tensor_type_kernel_traffic_bytes_for_kind(resident_bytes, residual_tensor_type);
+        if residual_traffic_bytes == 0 {
+            continue;
+        }
+        let Some(delta) = dense_full_token_residual_delta(
+            group,
+            block_tensor_type,
+            residual_tensor_type,
+            resident_bytes,
+            model,
+            budget,
+        ) else {
+            add_group_decode_cost(
+                DecodeTrafficGroup {
+                    type_bytes: tensor_type_bytes_for_single_kind(
+                        residual_tensor_type,
+                        resident_bytes,
+                    ),
+                    ..group
+                },
+                model,
+                budget,
+                fallback_bandwidth,
+                cost,
+            );
+            continue;
+        };
+        if delta.bandwidth_ms <= 0.0 {
+            continue;
+        }
+        cost.probed_bytes = cost.probed_bytes.saturating_add(delta.traffic_bytes);
+        cost.bandwidth_ms += delta.bandwidth_ms;
+        cost.groups
+            .push(decode_cost_group_breakdown(DecodeGroupBreakdownInput {
+                group,
+                tensor_type: residual_tensor_type,
+                resident_bytes,
+                traffic_bytes: delta.traffic_bytes,
+                bandwidth: delta.bandwidth_bytes_per_sec,
+                bandwidth_ms: delta.bandwidth_ms,
+                selection: Some(delta.selection),
+                source: "probe_mixed_residual_replacement_delta",
+            }));
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct DenseFullTokenResidualDelta<'a> {
+    selection: DecodeProbeSelection<'a>,
+    traffic_bytes: u64,
+    bandwidth_bytes_per_sec: u64,
+    bandwidth_ms: f32,
+}
+
+fn dense_full_token_residual_delta<'a>(
+    group: DecodeTrafficGroup,
+    block_tensor_type: &'static str,
+    residual_tensor_type: &'static str,
+    resident_bytes: u64,
+    model: &ModelProfile,
+    budget: &'a ExecutionBudget,
+) -> Option<DenseFullTokenResidualDelta<'a>> {
+    // A dense full-token probe builds the same llama.cpp transformer operation
+    // slots for every layer, but with one synthetic block tensor type. If GGUF
+    // metadata says some of those slots are really another tensor type, the
+    // full-token graph has not missed the operations; it has paid for them as
+    // stand-ins. When we have same-shape probes for both the stand-in and the
+    // residual type, charge only the measured replacement delta:
+    //
+    //   max(real residual type time - synthetic stand-in time, 0)
+    //
+    // This follows the source topology instead of adding the full residual
+    // tensor cost on top of an already complete graph. If either side lacks
+    // same-shape evidence, callers fall back to the older conservative full
+    // residual charge and confidence remains guarded.
+    let actual_selection = select_decode_group_probe(group, residual_tensor_type, model, budget)?;
+    let stand_in_selection = select_decode_group_probe(group, block_tensor_type, model, budget)?;
+    let actual_bandwidth = decode_group_probe_bandwidth_bytes_per_sec(
+        actual_selection.probe,
+        group.kind,
+        model,
+        budget,
+    );
+    let stand_in_bandwidth = decode_group_probe_bandwidth_bytes_per_sec(
+        stand_in_selection.probe,
+        group.kind,
+        model,
+        budget,
+    );
+    if actual_bandwidth == 0 || stand_in_bandwidth == 0 {
+        return None;
+    }
+    let actual_traffic =
+        tensor_type_kernel_traffic_bytes_for_kind(resident_bytes, residual_tensor_type);
+    let stand_in_resident = tensor_type_equivalent_resident_bytes(
+        resident_bytes,
+        residual_tensor_type,
+        block_tensor_type,
+    )?;
+    let stand_in_traffic =
+        tensor_type_kernel_traffic_bytes_for_kind(stand_in_resident, block_tensor_type);
+    if actual_traffic == 0 || stand_in_traffic == 0 {
+        return None;
+    }
+    let actual_ms = actual_traffic as f32 / actual_bandwidth as f32 * 1000.0;
+    let stand_in_ms = stand_in_traffic as f32 / stand_in_bandwidth as f32 * 1000.0;
+    let bandwidth_ms = (actual_ms - stand_in_ms).max(0.0);
+    let bandwidth_bytes_per_sec = if bandwidth_ms > 0.0 {
+        (actual_traffic as f32 / (bandwidth_ms / 1000.0))
+            .round()
+            .max(1.0) as u64
+    } else {
+        actual_bandwidth
+    };
+    Some(DenseFullTokenResidualDelta {
+        selection: actual_selection,
+        traffic_bytes: actual_traffic,
+        bandwidth_bytes_per_sec,
+        bandwidth_ms,
+    })
+}
+
+fn tensor_type_bytes_for_single_kind(tensor_type: &str, bytes: u64) -> TensorTypeBytes {
+    let mut type_bytes = TensorTypeBytes::default();
+    match tensor_type {
+        "f32" => type_bytes.f32_bytes = bytes,
+        "f16" => type_bytes.f16_bytes = bytes,
+        "bf16" => type_bytes.bf16_bytes = bytes,
+        "q4_0" => type_bytes.q4_0_bytes = bytes,
+        "q4_k" => type_bytes.q4_k_bytes = bytes,
+        "q5_k" => type_bytes.q5_k_bytes = bytes,
+        "q6_k" => type_bytes.q6_k_bytes = bytes,
+        "q8_0" => type_bytes.q8_0_bytes = bytes,
+        "iq" => type_bytes.iq_bytes = bytes,
+        "other_quantized" => type_bytes.other_quantized_bytes = bytes,
+        "unknown" => type_bytes.unknown_bytes = bytes,
+        _ => type_bytes.unknown_bytes = bytes,
+    }
+    type_bytes
+}
+
+fn tensor_type_equivalent_resident_bytes(
+    resident_bytes: u64,
+    from_tensor_type: &str,
+    to_tensor_type: &str,
+) -> Option<u64> {
+    let from_bytes_per_weight = ggml_tensor_type_bytes_per_weight(from_tensor_type)?;
+    let to_bytes_per_weight = ggml_tensor_type_bytes_per_weight(to_tensor_type)?;
+    let equivalent = resident_bytes as f64 / from_bytes_per_weight * to_bytes_per_weight;
+    equivalent.is_finite().then_some(equivalent.round() as u64)
+}
+
+fn ggml_tensor_type_bytes_per_weight(tensor_type: &str) -> Option<f64> {
+    // These are source-format sizes from GGML block layouts, not fitted
+    // validation constants. K-quants use QK_K = 256 element blocks:
+    // q4_K = 144 bytes, q5_K = 176 bytes, q6_K = 210 bytes. q8_0 and q4_0 use
+    // 32-element blocks with a 2-byte scale header. The helper exists only to
+    // convert "same tensor elements encoded as another GGML type" when a
+    // synthetic full-token graph has already paid for the operation slot.
+    match tensor_type.to_ascii_lowercase().as_str() {
+        "f32" => Some(4.0),
+        "f16" | "bf16" => Some(2.0),
+        "q4_0" => Some(18.0 / 32.0),
+        "q4_k" => Some(144.0 / 256.0),
+        "q5_k" => Some(176.0 / 256.0),
+        "q6_k" => Some(210.0 / 256.0),
+        "q8_0" => Some(34.0 / 32.0),
+        _ => None,
+    }
 }
 
 fn full_token_probe_source(

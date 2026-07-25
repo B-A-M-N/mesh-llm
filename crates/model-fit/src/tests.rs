@@ -2376,6 +2376,103 @@ fn dense_full_token_probe_charges_mixed_block_residual_types_separately() {
 }
 
 #[test]
+fn dense_full_token_probe_charges_only_mixed_residual_replacement_delta() {
+    let mut hardware = m1_ultra();
+    hardware.accelerators[0].decode_fixed_overhead_ms = Some(0.25);
+    hardware.accelerators[0].decode_kernel_probes = vec![
+        DecodeKernelProbe {
+            name: "ggml_decode_q4_k_full_token_outq6_k_l32_gqa_4096_kv1024_16384_vocab32000_ctx4096_h128_qh32_kvh8".into(),
+            tensor_type: "q4_k".into(),
+            rows: 32_000,
+            cols: 4096,
+            batch_tokens: 1,
+            graph_features: 0,
+            graph_node_count: None,
+            effective_gbps: 200.0,
+            tflops: Some(1.0),
+            elapsed_ms: Some(4.25),
+            min_elapsed_ms: None,
+            max_elapsed_ms: None,
+            spread_pct: None,
+            graph_inventory: Vec::new(),
+            runs: 3,
+        },
+        DecodeKernelProbe {
+            name: "ggml_decode_q4_k_llama_graph_l32_gqa_4096_kv1024_16384".into(),
+            tensor_type: "q4_k".into(),
+            rows: 16_384,
+            cols: 4096,
+            batch_tokens: 1,
+            graph_features: 0,
+            graph_node_count: None,
+            effective_gbps: 200.0,
+            tflops: Some(1.0),
+            elapsed_ms: Some(6.0),
+            min_elapsed_ms: None,
+            max_elapsed_ms: None,
+            spread_pct: None,
+            graph_inventory: Vec::new(),
+            runs: 3,
+        },
+        DecodeKernelProbe {
+            name: "ggml_decode_q6_k_llama_graph_l32_gqa_4096_kv1024_16384".into(),
+            tensor_type: "q6_k".into(),
+            rows: 16_384,
+            cols: 4096,
+            batch_tokens: 1,
+            graph_features: 0,
+            graph_node_count: None,
+            effective_gbps: 400.0,
+            tflops: Some(1.0),
+            elapsed_ms: Some(4.0),
+            min_elapsed_ms: None,
+            max_elapsed_ms: None,
+            spread_pct: None,
+            graph_inventory: Vec::new(),
+            runs: 3,
+        },
+    ];
+
+    let mut config = SelectionConfig {
+        workload: WorkloadProfile::chat(),
+        ..SelectionConfig::default()
+    };
+    config.workload.interaction.expected_prompt_tokens = Some(4096);
+    config.weights = config.workload.default_weights();
+    let mut model = dense_model("mixed-full-token-q4-delta", 8 * GIB, 32, 4096, 32_768);
+    model.value_length = model.key_length;
+    let residual_bytes = model.tensor_matmul.feed_forward.type_bytes.q4_k_bytes / 5;
+    model.tensor_matmul.feed_forward.type_bytes.q4_k_bytes -= residual_bytes;
+    model.tensor_matmul.feed_forward.type_bytes.q6_k_bytes = residual_bytes;
+    model.tensor_matmul.output.type_bytes.q6_k_bytes =
+        model.tensor_matmul.output.type_bytes.q4_k_bytes;
+    model.tensor_matmul.output.type_bytes.q4_k_bytes = 0;
+
+    let rec = score_model(&hardware, &model, &config);
+    let groups = &rec
+        .decode_cost_breakdown
+        .as_ref()
+        .expect("decode breakdown")
+        .groups;
+
+    assert!(
+        groups.iter().any(|group| {
+            group.group == "full_token_graph"
+                && group.source == "probe_full_token_elapsed"
+                && group.tensor_type == "q4_k"
+        }),
+        "groups={groups:#?}"
+    );
+    assert!(
+        groups.iter().all(|group| {
+            group.source != "probe_mixed_residual_replacement_delta"
+                && !(group.group == "feed_forward_matmul" && group.tensor_type == "q6_k")
+        }),
+        "faster same-shape q6 residual evidence should not add a second full residual charge: {groups:#?}"
+    );
+}
+
+#[test]
 fn recurrent_attention_requires_linear_attention_graph_probe() {
     let mut hardware = m1_ultra();
     hardware.accelerators[0].decode_effective_bandwidth_bytes_per_sec = Some(400_000_000_000);
