@@ -7,7 +7,7 @@ Use `@meshllm/sdk` from npm for Node.js and Electron applications.
 ```json
 {
   "dependencies": {
-    "@meshllm/sdk": "0.72.1"
+    "@meshllm/sdk": "0.74.0-rc6"
   }
 }
 ```
