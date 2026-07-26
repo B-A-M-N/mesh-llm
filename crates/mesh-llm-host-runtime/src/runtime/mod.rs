@@ -5493,6 +5493,18 @@ async fn pick_model_assignment(node: &mesh::Node, local_models: &[String]) -> Op
     None
 }
 
+/// Pick a model assignment only when this node's mesh role can serve models.
+async fn pick_model_assignment_for_role(
+    node: &mesh::Node,
+    local_models: &[String],
+) -> Option<String> {
+    if matches!(node.role().await, NodeRole::Client) {
+        None
+    } else {
+        pick_model_assignment(node, local_models).await
+    }
+}
+
 /// Check if a standby node should promote to serve a model.
 /// Uses demand signals — promotes for unserved models with active demand,
 /// or for demand-based rebalancing when one model is much hotter than others.
@@ -6528,7 +6540,7 @@ async fn select_run_auto_model_path(
     });
     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
 
-    let assignment = pick_model_assignment(ctx.node, ctx.local_models).await;
+    let assignment = pick_model_assignment_for_role(ctx.node, ctx.local_models).await;
     let assignment = if assignment.is_none()
         && (ctx.options.auto || ctx.options.discover.is_some())
         && !ctx.is_client
@@ -9235,6 +9247,36 @@ mod tests {
             // TODO: Audit that the environment access only happens in single-threaded code.
             unsafe { std::env::remove_var(key) };
         }
+    }
+
+    #[tokio::test]
+    async fn model_assignment_is_derived_from_node_role() {
+        let model_file = tempfile::Builder::new()
+            .suffix(".gguf")
+            .tempfile()
+            .expect("temporary model file");
+        std::fs::write(model_file.path(), b"test model").expect("write temporary model");
+        let model_ref = models::model_ref_for_path(model_file.path());
+        let local_models = [model_ref.clone()];
+
+        let mut node = mesh::Node::new_for_tests(mesh::NodeRole::Client)
+            .await
+            .expect("test node");
+        node.set_vram_bytes_for_tests(1_000_000_000);
+        node.record_request(&model_ref);
+
+        assert_eq!(
+            pick_model_assignment_for_role(&node, &local_models).await,
+            None,
+            "client roles must remain proxy-only"
+        );
+
+        node.set_role(mesh::NodeRole::Worker).await;
+        assert_eq!(
+            pick_model_assignment_for_role(&node, &local_models).await,
+            Some(model_ref),
+            "worker roles must still receive normal assignments"
+        );
     }
 
     #[test]

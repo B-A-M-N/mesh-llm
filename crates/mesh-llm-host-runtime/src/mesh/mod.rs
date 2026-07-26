@@ -6131,6 +6131,11 @@ impl Node {
         self.vram_bytes
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_vram_bytes_for_tests(&mut self, vram_bytes: u64) {
+        self.vram_bytes = vram_bytes;
+    }
+
     pub async fn peers(&self) -> Vec<PeerInfo> {
         self.state
             .lock()
