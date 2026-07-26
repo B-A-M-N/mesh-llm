@@ -4,6 +4,19 @@ use clap::{Parser, Subcommand, ValueEnum};
 
 pub const DEFAULT_LOCAL_MODEL_ID: &str = "jc-builds/SmolLM2-135M-Instruct-Q4_K_M-GGUF:Q4_K_M";
 pub const DEFAULT_RUN_MAX_NEW_TOKENS: usize = 1;
+pub const MAX_VERIFY_WINDOW_WIDTH: usize = 16;
+
+fn parse_verify_window_width(value: &str) -> Result<usize, String> {
+    let width = value
+        .parse::<usize>()
+        .map_err(|error| format!("invalid verification width: {error}"))?;
+    if !(1..=MAX_VERIFY_WINDOW_WIDTH).contains(&width) {
+        return Err(format!(
+            "verification width must be between 1 and {MAX_VERIFY_WINDOW_WIDTH}"
+        ));
+    }
+    Ok(width)
+}
 
 #[derive(Parser)]
 #[command(about = "Llama stage benchmark launcher")]
@@ -66,6 +79,14 @@ impl EvalId {
             Self::McpAtlas => "mcp-atlas",
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+#[clap(rename_all = "kebab-case")]
+pub enum FlashAttentionArg {
+    Auto,
+    Disabled,
+    Enabled,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -236,6 +257,21 @@ pub struct VerifyWindowLocalArgs {
     pub iterations: usize,
     #[arg(long, default_value_t = 8)]
     pub warmup: usize,
+    /// Verification widths checked for canonical parity (maximum 16).
+    #[arg(
+        long,
+        value_delimiter = ',',
+        value_parser = parse_verify_window_width,
+        default_value = "2"
+    )]
+    pub verify_widths: Vec<usize>,
+    /// Independent verification width used for timing samples (maximum 16).
+    #[arg(long, value_parser = parse_verify_window_width, default_value_t = 2)]
+    pub sample_width: usize,
+    #[arg(long, default_value_t = 1)]
+    pub continuation_steps: usize,
+    #[arg(long = "flash-attn", value_enum, default_value = "auto")]
+    pub flash_attn: FlashAttentionArg,
     #[arg(
         long,
         default_value = "Write a Rust function that parses a list of integers and returns the median."
@@ -584,7 +620,7 @@ mod tests {
 
     use clap::Parser;
 
-    use super::{Cli, CommandKind, EvalCommandKind, FocusedRuntimeScenario};
+    use super::{Cli, CommandKind, EvalCommandKind, FlashAttentionArg, FocusedRuntimeScenario};
 
     #[test]
     fn parses_eval_run_metrics_finalize_only() {
@@ -687,6 +723,10 @@ mod tests {
         assert_eq!(args.iterations, 3);
         assert_eq!(args.warmup, 1);
         assert_eq!(args.n_gpu_layers, -1);
+        assert_eq!(args.verify_widths, vec![2]);
+        assert_eq!(args.sample_width, 2);
+        assert_eq!(args.continuation_steps, 1);
+        assert_eq!(args.flash_attn, FlashAttentionArg::Auto);
     }
 
     #[test]
@@ -706,5 +746,107 @@ mod tests {
         };
 
         assert_eq!(args.split_layer, Some(24));
+    }
+
+    #[test]
+    fn parses_verify_window_local_widths() {
+        let cli = Cli::try_parse_from([
+            "skippy-bench",
+            "verify-window-local",
+            "--model-path",
+            "/tmp/model.gguf",
+            "--verify-widths",
+            "1,2,4,9",
+        ])
+        .unwrap();
+
+        let CommandKind::VerifyWindowLocal(args) = cli.command else {
+            panic!("expected verify-window-local subcommand");
+        };
+
+        assert_eq!(args.verify_widths, vec![1, 2, 4, 9]);
+    }
+
+    #[test]
+    fn parses_verify_window_local_sample_width() {
+        let cli = Cli::try_parse_from([
+            "skippy-bench",
+            "verify-window-local",
+            "--model-path",
+            "/tmp/model.gguf",
+            "--verify-widths",
+            "1,2,4,9",
+            "--sample-width",
+            "9",
+        ])
+        .unwrap();
+
+        let CommandKind::VerifyWindowLocal(args) = cli.command else {
+            panic!("expected verify-window-local subcommand");
+        };
+
+        assert_eq!(args.verify_widths, vec![1, 2, 4, 9]);
+        assert_eq!(args.sample_width, 9);
+    }
+
+    #[test]
+    fn rejects_verify_window_local_widths_above_kernel_ceiling() {
+        let widths = Cli::try_parse_from([
+            "skippy-bench",
+            "verify-window-local",
+            "--model-path",
+            "/tmp/model.gguf",
+            "--verify-widths",
+            "1,17",
+        ]);
+        assert!(widths.is_err());
+
+        let sample = Cli::try_parse_from([
+            "skippy-bench",
+            "verify-window-local",
+            "--model-path",
+            "/tmp/model.gguf",
+            "--sample-width",
+            "17",
+        ]);
+        assert!(sample.is_err());
+    }
+
+    #[test]
+    fn parses_verify_window_local_continuation_steps() {
+        let cli = Cli::try_parse_from([
+            "skippy-bench",
+            "verify-window-local",
+            "--model-path",
+            "/tmp/model.gguf",
+            "--continuation-steps",
+            "256",
+        ])
+        .unwrap();
+
+        let CommandKind::VerifyWindowLocal(args) = cli.command else {
+            panic!("expected verify-window-local subcommand");
+        };
+
+        assert_eq!(args.continuation_steps, 256);
+    }
+
+    #[test]
+    fn parses_verify_window_local_flash_attention() {
+        let cli = Cli::try_parse_from([
+            "skippy-bench",
+            "verify-window-local",
+            "--model-path",
+            "/tmp/model.gguf",
+            "--flash-attn",
+            "disabled",
+        ])
+        .unwrap();
+
+        let CommandKind::VerifyWindowLocal(args) = cli.command else {
+            panic!("expected verify-window-local subcommand");
+        };
+
+        assert_eq!(args.flash_attn, FlashAttentionArg::Disabled);
     }
 }
