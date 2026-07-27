@@ -1,13 +1,14 @@
-From 677468de8a58cecb8b2747f7c4ec3a02273e34da Mon Sep 17 00:00:00 2001
+From a9e809a459aa57503959fee4aa208d68c4171efd Mon Sep 17 00:00:00 2001
 From: Mesh-LLM CI <ci@mesh-llm.local>
 Date: Fri, 17 Jul 2026 20:20:45 +1000
-Subject: [PATCH 49/54] Size recurrent memory for appended MTP layers
+Subject: [PATCH 07/12] Size recurrent memory for appended MTP layers
 
 ---
  src/llama-memory-recurrent.cpp | 9 +++++----
  1 file changed, 5 insertions(+), 4 deletions(-)
 
 diff --git a/src/llama-memory-recurrent.cpp b/src/llama-memory-recurrent.cpp
+index ef82eb976..4f1f1df8d 100644
 --- a/src/llama-memory-recurrent.cpp
 +++ b/src/llama-memory-recurrent.cpp
 @@ -26,7 +26,8 @@ llama_memory_recurrent::llama_memory_recurrent(
@@ -20,7 +21,7 @@ diff --git a/src/llama-memory-recurrent.cpp b/src/llama-memory-recurrent.cpp
  
      head = 0;
      size = mem_size;
-@@ -860,7 +860,7 @@ void llama_memory_recurrent::state_write_meta(llama_io_write_i & io, const std::
+@@ -865,7 +866,7 @@ void llama_memory_recurrent::state_write_meta(llama_io_write_i & io, const std::
  
  void llama_memory_recurrent::state_write_data(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges) const {
      const uint32_t s_trans = 0;
@@ -29,7 +30,7 @@ diff --git a/src/llama-memory-recurrent.cpp b/src/llama-memory-recurrent.cpp
  
      io.write(&s_trans, sizeof(s_trans));
      io.write(&n_layer, sizeof(n_layer));
-@@ -1044,8 +1044,8 @@ bool llama_memory_recurrent::state_read_data(llama_io_read_i & io, uint32_t cell
+@@ -1049,8 +1050,8 @@ bool llama_memory_recurrent::state_read_data(llama_io_read_i & io, uint32_t cell
      io.read(&s_trans, sizeof(s_trans));
      io.read(&n_layer, sizeof(n_layer));
  
@@ -40,3 +41,6 @@ diff --git a/src/llama-memory-recurrent.cpp b/src/llama-memory-recurrent.cpp
          return false;
      }
      if (cell_count > size) {
+-- 
+2.54.0
+

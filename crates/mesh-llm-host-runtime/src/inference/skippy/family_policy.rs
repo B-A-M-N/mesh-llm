@@ -136,6 +136,18 @@ pub(crate) fn family_policy_for_stage_config(config: &StageConfig) -> FamilyPoli
     .unwrap_or_else(|| family_policy_for_model_id(&config.model_id))
 }
 
+/// Family policy derived from already-scanned GGUF metadata.
+///
+/// Split topology planning uses this so it applies the same family K/V
+/// defaults that stage loading will apply, instead of re-deriving a
+/// size-tiered guess that can badly under-estimate the KV budget.
+pub(crate) fn family_policy_for_compact_meta(
+    meta: &GgufCompactMeta,
+    model_id: Option<&str>,
+) -> FamilyPolicy {
+    family_policy_for_gguf_meta(meta, model_id)
+}
+
 pub(crate) fn family_policy_for_model_path(
     path: impl AsRef<Path>,
     model_id: Option<&str>,

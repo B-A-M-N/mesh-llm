@@ -69,7 +69,6 @@ struct SplitMembershipWait<'a> {
     deadline: tokio::time::Instant,
     barrier: SplitMembershipSettleBarrier,
     last_logged_signature: SplitMembershipSignature,
-    best: SplitParticipantSnapshot,
 }
 
 impl<'a> SplitMembershipWait<'a> {
@@ -86,7 +85,6 @@ impl<'a> SplitMembershipWait<'a> {
             deadline: tokio::time::Instant::now() + timeout,
             barrier: SplitMembershipSettleBarrier::default(),
             last_logged_signature: Vec::new(),
-            best: empty_snapshot(),
         }
     }
 
@@ -95,7 +93,6 @@ impl<'a> SplitMembershipWait<'a> {
             let snapshot =
                 collect_split_participant_membership(self.node, self.model_name, self.model_ref)
                     .await;
-            record_best_snapshot(&snapshot, &mut self.best);
             let signature = split_membership_signature(&snapshot.participants);
             self.log_membership_change(&snapshot, &signature);
             let now = tokio::time::Instant::now();
@@ -104,7 +101,7 @@ impl<'a> SplitMembershipWait<'a> {
                 return Ok(snapshot);
             }
             if now >= self.deadline {
-                return self.finish_at_timeout();
+                return self.finish_at_timeout().await;
             }
             tokio::time::sleep(SPLIT_PARTICIPANT_POLL_INTERVAL).await;
         }
@@ -136,19 +133,26 @@ impl<'a> SplitMembershipWait<'a> {
         );
     }
 
-    fn finish_at_timeout(self) -> Result<SplitParticipantSnapshot> {
+    /// Elect only from a freshly revalidated snapshot.
+    ///
+    /// A best-ever set can name peers that have since vanished, which puts
+    /// dead nodes into the elected topology. Re-collect at the deadline so the
+    /// final membership reflects peers that are still present.
+    async fn finish_at_timeout(self) -> Result<SplitParticipantSnapshot> {
+        let snapshot =
+            collect_split_participant_membership(self.node, self.model_name, self.model_ref).await;
         ensure_split_participant_timeout_has_quorum(
             self.model_ref,
-            &self.best.participants,
-            &self.best.excluded,
+            &snapshot.participants,
+            &snapshot.excluded,
         )?;
         tracing::warn!(
             model_ref = self.model_ref,
-            participants = ?split_participant_labels(&self.best.participants),
-            excluded = ?split_participant_exclusion_labels(&self.best.excluded),
-            "split topology membership settle timed out; using best membership snapshot"
+            participants = ?split_participant_labels(&snapshot.participants),
+            excluded = ?split_participant_exclusion_labels(&snapshot.excluded),
+            "split topology membership settle timed out; using revalidated final snapshot"
         );
-        Ok(self.best)
+        Ok(snapshot)
     }
 }
 
@@ -160,20 +164,18 @@ struct SplitEligibilityWait<'a> {
     local_vram_override: Option<u64>,
     expected_node_ids: Vec<String>,
     deadline: tokio::time::Instant,
-    best: SplitParticipantSnapshot,
 }
 
 impl<'a> SplitEligibilityWait<'a> {
-    async fn run(mut self) -> Result<SplitParticipantSnapshot> {
+    async fn run(self) -> Result<SplitParticipantSnapshot> {
         loop {
             let snapshot = self.collect_snapshot().await;
-            record_best_snapshot(&snapshot, &mut self.best);
             if self.snapshot_is_complete(&snapshot) {
                 self.log_complete(&snapshot);
                 return Ok(snapshot);
             }
             if tokio::time::Instant::now() >= self.deadline {
-                return self.finish_at_timeout();
+                return self.finish_at_timeout().await;
             }
             self.log_pending(&snapshot);
             tokio::time::sleep(SPLIT_PARTICIPANT_POLL_INTERVAL).await;
@@ -203,19 +205,22 @@ impl<'a> SplitEligibilityWait<'a> {
         );
     }
 
-    fn finish_at_timeout(self) -> Result<SplitParticipantSnapshot> {
+    /// Elect only from a freshly revalidated eligible snapshot; see
+    /// `SplitMembershipWait::finish_at_timeout`.
+    async fn finish_at_timeout(self) -> Result<SplitParticipantSnapshot> {
+        let snapshot = self.collect_snapshot().await;
         ensure_split_participant_timeout_has_quorum(
             self.model_ref,
-            &self.best.participants,
-            &self.best.excluded,
+            &snapshot.participants,
+            &snapshot.excluded,
         )?;
         tracing::warn!(
             model_ref = self.model_ref,
-            participants = ?split_participant_labels(&self.best.participants),
-            excluded = ?split_participant_exclusion_labels(&self.best.excluded),
-            "split package inventory wait timed out; using best eligible snapshot"
+            participants = ?split_participant_labels(&snapshot.participants),
+            excluded = ?split_participant_exclusion_labels(&snapshot.excluded),
+            "split package inventory wait timed out; using revalidated final snapshot"
         );
-        Ok(self.best)
+        Ok(snapshot)
     }
 
     fn log_pending(&self, snapshot: &SplitParticipantSnapshot) {
@@ -257,17 +262,9 @@ pub(super) async fn wait_for_split_participants(
         local_vram_override,
         expected_node_ids: split_membership_node_ids(expected_membership),
         deadline: tokio::time::Instant::now() + timeout,
-        best: empty_snapshot(),
     }
     .run()
     .await
-}
-
-fn empty_snapshot() -> SplitParticipantSnapshot {
-    SplitParticipantSnapshot {
-        participants: Vec::new(),
-        excluded: Vec::new(),
-    }
 }
 
 fn split_membership_signature(participants: &[SplitParticipant]) -> SplitMembershipSignature {
@@ -282,12 +279,6 @@ fn split_membership_node_ids(participants: &[SplitParticipant]) -> Vec<String> {
         .iter()
         .map(|participant| participant.node_id.to_string())
         .collect()
-}
-
-fn record_best_snapshot(snapshot: &SplitParticipantSnapshot, best: &mut SplitParticipantSnapshot) {
-    if snapshot.participants.len() >= best.participants.len() {
-        *best = snapshot.clone();
-    }
 }
 
 #[cfg(test)]

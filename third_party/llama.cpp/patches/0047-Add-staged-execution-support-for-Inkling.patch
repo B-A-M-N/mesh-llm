@@ -1,7 +1,7 @@
-From 7bc397bcef2800f6fccde5d76985e095871abb9d Mon Sep 17 00:00:00 2001
+From 5305cc89b9eb045b9e494cc79398947a64d7422e Mon Sep 17 00:00:00 2001
 From: Mesh-LLM CI <ci@mesh-llm.local>
 Date: Fri, 17 Jul 2026 13:47:13 +1000
-Subject: [PATCH 44/54] Add staged execution support for Inkling
+Subject: [PATCH 02/12] Add staged execution support for Inkling
 
 ---
  src/models/inkling.cpp | 30 +++++++++++++++++++++++-------
@@ -92,10 +92,10 @@ index f83930c69..8e5c7bb29 100644
      if (inp_out_ids) {
          cur = ggml_get_rows(ctx0, cur, inp_out_ids);
 diff --git a/src/skippy.cpp b/src/skippy.cpp
-index a8cc03cbc..5baef50b5 100644
+index 47f0a549c..8dbc1241f 100644
 --- a/src/skippy.cpp
 +++ b/src/skippy.cpp
-@@ -4117,6 +4117,7 @@ static enum skippy_status skippy_finish_model_open(
+@@ -4108,6 +4108,7 @@ static enum skippy_status skippy_finish_model_open(
              model->arch != LLM_ARCH_HUNYUAN_DENSE &&
              model->arch != LLM_ARCH_HUNYUAN_MOE &&
              model->arch != LLM_ARCH_HUNYUAN_VL &&
@@ -103,3 +103,6 @@ index a8cc03cbc..5baef50b5 100644
              model->arch != LLM_ARCH_INTERNLM2 &&
              model->arch != LLM_ARCH_JAIS &&
              model->arch != LLM_ARCH_JAIS2 &&
+-- 
+2.54.0
+

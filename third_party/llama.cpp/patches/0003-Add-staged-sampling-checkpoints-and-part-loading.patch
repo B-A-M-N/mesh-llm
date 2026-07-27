@@ -5,7 +5,7 @@ Subject: [PATCH 03/45] Add staged sampling, checkpoints, and part loading
 
 Squashes sampling configuration, batched verification frames, recurrent/native session checkpoints, logit bias, session trim, verification handoff fixes, split-metadata stripping, thinking toggle support, and ordered GGUF part loading.
 ---
- common/stage-chat.cpp      |  18 +
+ common/stage-chat.cpp      |  15 +
  include/llama.h            |   7 +
  include/skippy.h           | 104 +++++-
  src/llama-model-loader.cpp |  42 ++-
@@ -13,7 +13,7 @@ Squashes sampling configuration, batched verification frames, recurrent/native s
  src/llama-quant.cpp        |   2 +-
  src/llama.cpp              |  36 +-
  src/skippy.cpp             | 734 ++++++++++++++++++++++++++++++++++---
- 8 files changed, 879 insertions(+), 65 deletions(-)
+ 8 files changed, 876 insertions(+), 65 deletions(-)
 
 diff --git a/common/stage-chat.cpp b/common/stage-chat.cpp
 index 39d6331a..60d53fc4 100644
@@ -28,7 +28,7 @@ index 39d6331a..60d53fc4 100644
          char * output_text,
          size_t output_text_capacity,
          size_t * out_text_bytes,
-@@ -79,6 +81,22 @@ enum skippy_status skippy_apply_chat_template(
+@@ -79,6 +81,19 @@ enum skippy_status skippy_apply_chat_template(
      common_chat_templates_inputs inputs;
      inputs.add_generation_prompt = add_assistant;
      inputs.use_jinja             = true;
@@ -44,9 +44,6 @@ index 39d6331a..60d53fc4 100644
 +        inputs.chat_template_kwargs["thinking_enabled"] = value;
 +        inputs.chat_template_kwargs["enable_think"] = value;
 +        inputs.chat_template_kwargs["think_enabled"] = value;
-+        if (!enable_thinking) {
-+            inputs.chat_template_kwargs["reasoning_effort"] = "0";
-+        }
 +    }
      inputs.messages.reserve(message_count);
  

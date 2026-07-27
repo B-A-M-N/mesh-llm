@@ -1,70 +1,83 @@
-From 956fe5b9909e6c55660d0a7d231db3cd3ca651f7 Mon Sep 17 00:00:00 2001
+From da2d781f9418be7b90f4885c25d71da497b8d93f Mon Sep 17 00:00:00 2001
 From: Mesh-LLM CI <ci@mesh-llm.local>
-Date: Sat, 25 Jul 2026 03:01:18 +1000
-Subject: [PATCH 54/54] Define GLM DSA IndexShare metadata keys
+Date: Mon, 27 Jul 2026 12:01:26 +1000
+Subject: [PATCH 12/12] Complete Inkling and GLM metadata integration
 
 ---
- src/llama-arch.cpp     |  3 +++
- src/llama-arch.h       |  3 +++
+ common/stage-chat.cpp  |  6 ++++++
+ src/llama-arch.cpp     |  2 ++
+ src/llama-arch.h       |  2 ++
  src/llama-model.cpp    |  1 +
- src/models/glm-dsa.cpp | 31 +++++++++++++++++++++++++++++++
- 4 files changed, 38 insertions(+)
+ src/models/glm-dsa.cpp | 46 +++++++++++++++++++++++++++++++++++-------
+ 5 files changed, 50 insertions(+), 7 deletions(-)
 
+diff --git a/common/stage-chat.cpp b/common/stage-chat.cpp
+index 3298ed669..16ce255af 100644
+--- a/common/stage-chat.cpp
++++ b/common/stage-chat.cpp
+@@ -178,6 +178,9 @@ enum skippy_status skippy_apply_chat_template(
+         inputs.chat_template_kwargs["thinking_enabled"] = value;
+         inputs.chat_template_kwargs["enable_think"] = value;
+         inputs.chat_template_kwargs["think_enabled"] = value;
++        if (!enable_thinking) {
++            inputs.chat_template_kwargs["reasoning_effort"] = "0";
++        }
+     }
+     inputs.messages.reserve(message_count);
+ 
+@@ -282,6 +285,9 @@ enum skippy_status skippy_apply_chat_template_json(
+             inputs.chat_template_kwargs["thinking_enabled"] = value;
+             inputs.chat_template_kwargs["enable_think"] = value;
+             inputs.chat_template_kwargs["think_enabled"] = value;
++            if (!enable_thinking) {
++                inputs.chat_template_kwargs["reasoning_effort"] = "0";
++            }
+         }
+         if (reasoning_format_name != nullptr && reasoning_format_name[0] != '\0') {
+             inputs.reasoning_format = common_reasoning_format_from_name(reasoning_format_name);
 diff --git a/src/llama-arch.cpp b/src/llama-arch.cpp
-index a01bad68d..2a907c14e 100644
+index 9f15b096c..10be867b5 100644
 --- a/src/llama-arch.cpp
 +++ b/src/llama-arch.cpp
-@@ -253,6 +253,9 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
+@@ -254,6 +254,8 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
      { LLM_KV_ATTENTION_INDEXER_HEAD_COUNT,           "%s.attention.indexer.head_count"           },
      { LLM_KV_ATTENTION_INDEXER_KEY_LENGTH,           "%s.attention.indexer.key_length"           },
      { LLM_KV_ATTENTION_INDEXER_TOP_K,                "%s.attention.indexer.top_k"                },
 +    { LLM_KV_ATTENTION_INDEXER_TOP_K_FREQUENCY,      "%s.attention.indexer.top_k_frequency"      },
 +    { LLM_KV_ATTENTION_INDEXER_SKIP_TOP_K_OFFSET,    "%s.attention.indexer.skip_top_k_offset"    },
-+    { LLM_KV_ATTENTION_INDEXER_TYPES,                "%s.attention.indexer.types"                },
+     { LLM_KV_ATTENTION_INDEXER_TYPES,                "%s.attention.indexer.types"                },
      { LLM_KV_ATTENTION_OUTPUT_GROUP_COUNT,           "%s.attention.output_group_count"           },
      { LLM_KV_ATTENTION_OUTPUT_LORA_RANK,             "%s.attention.output_lora_rank"             },
-     { LLM_KV_ATTENTION_COMPRESS_ROPE_FREQ_BASE,      "%s.attention.compress_rope_freq_base"      },
 diff --git a/src/llama-arch.h b/src/llama-arch.h
-index 9d2eb4a92..b36882cba 100644
+index b5ee26abb..eec925f75 100644
 --- a/src/llama-arch.h
 +++ b/src/llama-arch.h
-@@ -258,6 +258,9 @@ enum llm_kv {
+@@ -259,6 +259,8 @@ enum llm_kv {
      LLM_KV_ATTENTION_INDEXER_HEAD_COUNT,
      LLM_KV_ATTENTION_INDEXER_KEY_LENGTH,
      LLM_KV_ATTENTION_INDEXER_TOP_K,
 +    LLM_KV_ATTENTION_INDEXER_TOP_K_FREQUENCY,
 +    LLM_KV_ATTENTION_INDEXER_SKIP_TOP_K_OFFSET,
-+    LLM_KV_ATTENTION_INDEXER_TYPES,
+     LLM_KV_ATTENTION_INDEXER_TYPES,
      LLM_KV_ATTENTION_OUTPUT_GROUP_COUNT,
      LLM_KV_ATTENTION_OUTPUT_LORA_RANK,
-     LLM_KV_ATTENTION_COMPRESS_ROPE_FREQ_BASE,
 diff --git a/src/llama-model.cpp b/src/llama-model.cpp
-index 01320de64..464c7e0fb 100644
+index 275c9ba5e..d79913df9 100644
 --- a/src/llama-model.cpp
 +++ b/src/llama-model.cpp
-@@ -1128,6 +1128,7 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
-     std::fill(hparams.rope_sections.begin(), hparams.rope_sections.end(), 0);
+@@ -1133,6 +1133,7 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
      std::fill(hparams.is_swa_impl.begin(),   hparams.is_swa_impl.end(), 0);
      std::fill(hparams.is_recr_impl.begin(),  hparams.is_recr_impl.end(),  llm_arch_is_recurrent(ml.get_arch()) ? 1 : 0);
+     std::fill(hparams.is_indexer_full_impl.begin(), hparams.is_indexer_full_impl.end(), 0);
 +    std::fill(hparams.indexer_types.begin(), hparams.indexer_types.end(), -1);
  
      std::fill(hparams.xielu_alpha_n.begin(), hparams.xielu_alpha_n.end(), 0.0f);
      std::fill(hparams.xielu_alpha_p.begin(), hparams.xielu_alpha_p.end(), 0.0f);
 diff --git a/src/models/glm-dsa.cpp b/src/models/glm-dsa.cpp
-index 16d605c4f..2db2e48e0 100644
+index 2ddbfbe13..417b0cf12 100644
 --- a/src/models/glm-dsa.cpp
 +++ b/src/models/glm-dsa.cpp
-@@ -2,6 +2,9 @@
- 
- #include "llama-kv-cache-dsa.h"
- 
-+#include <string>
-+#include <vector>
-+
- void llama_model_glm_dsa::load_arch_hparams(llama_model_loader & ml) {
-     ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH,     hparams.n_ff_exp);
-     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,    hparams.f_norm_rms_eps);
-@@ -28,6 +31,34 @@ void llama_model_glm_dsa::load_arch_hparams(llama_model_loader & ml) {
+@@ -52,6 +52,36 @@ void llama_model_glm_dsa::load_arch_hparams(llama_model_loader & ml) {
      ml.get_key(LLM_KV_ATTENTION_INDEXER_KEY_LENGTH, hparams.indexer_head_size);
      ml.get_key(LLM_KV_ATTENTION_INDEXER_TOP_K,      hparams.indexer_top_k);
  
@@ -88,8 +101,10 @@ index 16d605c4f..2db2e48e0 100644
 +        for (size_t il = 0; il < indexer_types.size(); ++il) {
 +            if (indexer_types[il] == "full") {
 +                hparams.indexer_types[il] = 1;
++                hparams.is_indexer_full_impl[il] = 1;
 +            } else if (indexer_types[il] == "shared") {
 +                hparams.indexer_types[il] = 0;
++                hparams.is_indexer_full_impl[il] = 0;
 +            } else {
 +                throw std::runtime_error("GLM_DSA attention.indexer.types values must be \"full\" or \"shared\"");
 +            }
@@ -99,3 +114,30 @@ index 16d605c4f..2db2e48e0 100644
      // Expert gating function (GLM-4.5 uses sigmoid)
      ml.get_key(LLM_KV_EXPERT_GATING_FUNC,          hparams.expert_gating_func, false);
      if (hparams.expert_gating_func == LLAMA_EXPERT_GATING_FUNC_TYPE_NONE) {
+@@ -62,14 +92,16 @@ void llama_model_glm_dsa::load_arch_hparams(llama_model_loader & ml) {
+     ml.get_key(LLM_KV_NEXTN_PREDICT_LAYERS, hparams.n_layer_nextn, false);
+     GGML_ASSERT(hparams.n_layer_nextn < hparams.n_layer_all && "n_layer_nextn must be < n_layer_all");
+ 
+-    // BC for GLM 5, 5.1 (full indexers) without indexer_types metadata
+-    const bool is_pre_5_2 = hparams.n_ctx_train < 1048576;
+-    if (is_pre_5_2) {
+-        std::fill(hparams.is_indexer_full_impl.begin(), hparams.is_indexer_full_impl.end(), 1);
+-    } else {
+-        hparams.is_indexer_full_impl = GLM_5_2_DEFAULT_INDEXER_TYPES;
++    if (!hparams.indexer_types_present) {
++        // BC for GLM 5, 5.1 and numeric role metadata.
++        const bool is_pre_5_2 = hparams.n_ctx_train < 1048576;
++        if (is_pre_5_2) {
++            std::fill(hparams.is_indexer_full_impl.begin(), hparams.is_indexer_full_impl.end(), 1);
++        } else {
++            hparams.is_indexer_full_impl = GLM_5_2_DEFAULT_INDEXER_TYPES;
++        }
++        ml.get_key_or_arr(LLM_KV_ATTENTION_INDEXER_TYPES, hparams.is_indexer_full_impl, hparams.n_layer(), false);
+     }
+-    ml.get_key_or_arr(LLM_KV_ATTENTION_INDEXER_TYPES, hparams.is_indexer_full_impl, hparams.n_layer(), false);
+ 
+     switch (hparams.n_layer()) {
+         case 78: type = LLM_TYPE_744B_A40B; break;
+-- 
+2.54.0
+

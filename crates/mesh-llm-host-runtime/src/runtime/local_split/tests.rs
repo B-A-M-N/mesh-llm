@@ -1535,3 +1535,44 @@ fn split_topology_minimum_rejects_single_stage_split_candidate() {
     ]));
     assert!(!split_stages_meet_minimum(&[stage(1, 0, 0, 40)]));
 }
+
+#[test]
+fn split_planning_uses_family_kv_defaults_for_inkling() {
+    let mut meta = crate::models::gguf::GgufCompactMeta {
+        architecture: "inkling".to_string(),
+        context_length: 65_536,
+        embedding_size: 4096,
+        head_count: 32,
+        kv_head_count: 8,
+        layer_count: 66,
+        key_length: 128,
+        value_length: 128,
+        ..Default::default()
+    };
+    meta.kv_head_counts = vec![8; 66];
+
+    // A >=50GB package would otherwise be planned with the size-tiered Q4_0
+    // policy, but Inkling stages load F16 K/V. Planning has to agree with the
+    // loader or it under-budgets the KV cache and over-packs the topology.
+    let mut identity = package(66);
+    identity.source_model_bytes = 318 * 1024 * 1024 * 1024;
+
+    let planned =
+        split_runtime_kv_bytes_per_token(&identity, &meta, "tml/inkling-q2", None, None).unwrap();
+    let expected_f16 = crate::models::gguf::GgufKvCacheQuant::from_llama_args("f16", "f16")
+        .unwrap()
+        .kv_cache_bytes_per_token(&meta)
+        .unwrap();
+    assert_eq!(planned, expected_f16);
+
+    // Explicit user overrides still win over the family default.
+    let overridden = split_runtime_kv_bytes_per_token(
+        &identity,
+        &meta,
+        "tml/inkling-q2",
+        Some("q8_0"),
+        Some("q8_0"),
+    )
+    .unwrap();
+    assert!(overridden < planned);
+}
