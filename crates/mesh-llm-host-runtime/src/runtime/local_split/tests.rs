@@ -1576,3 +1576,65 @@ fn split_planning_uses_family_kv_defaults_for_inkling() {
     .unwrap();
     assert!(overridden < planned);
 }
+
+/// Validates the finding-#1 fix against a real Inkling layer package.
+///
+/// Set `INKLING_METADATA_GGUF` to a package's `shared/metadata.gguf` to run it;
+/// skipped otherwise so CI stays hermetic.
+#[test]
+fn real_inkling_metadata_plans_family_kv_not_size_tiered() {
+    let Ok(path) = std::env::var("INKLING_METADATA_GGUF") else {
+        eprintln!("skip: INKLING_METADATA_GGUF not set");
+        return;
+    };
+    let meta = crate::models::gguf::scan_gguf_compact_meta(std::path::Path::new(&path))
+        .expect("scan real inkling metadata gguf");
+    eprintln!(
+        "REAL META arch={} layers={} embed={} kv_heads={} k_len={} v_len={} ctx={}",
+        meta.architecture,
+        meta.layer_count,
+        meta.embedding_size,
+        meta.kv_head_count,
+        meta.key_length,
+        meta.value_length,
+        meta.context_length
+    );
+
+    let model_ref = "unsloth/inkling-GGUF:UD-Q2_K_XL";
+    let policy = crate::inference::skippy::family_policy_for_compact_meta(&meta, Some(model_ref));
+    eprintln!(
+        "FAMILY default_kv_cache_type={:?}",
+        policy.default_kv_cache_type
+    );
+
+    let mut identity = package(meta.layer_count);
+    identity.source_model_bytes = 318 * 1024 * 1024 * 1024;
+
+    let planned =
+        split_runtime_kv_bytes_per_token(&identity, &meta, model_ref, None, None).unwrap();
+    let size_tiered = {
+        let p =
+            crate::inference::skippy::KvCachePolicy::for_model_size(identity.source_model_bytes);
+        split_kv_cache_quant(&p, None, None)
+            .kv_cache_bytes_per_token(&meta)
+            .unwrap()
+    };
+    let ctx = u64::from(meta.context_length.max(1));
+    eprintln!(
+        "KV/token planned={planned} size_tiered={size_tiered} ratio={:.2}x | @ctx{ctx}: planned={:.1}GiB size_tiered={:.1}GiB under_budget={:.1}GiB",
+        planned as f64 / size_tiered.max(1) as f64,
+        (planned * ctx) as f64 / (1024.0 * 1024.0 * 1024.0),
+        (size_tiered * ctx) as f64 / (1024.0 * 1024.0 * 1024.0),
+        ((planned - size_tiered.min(planned)) * ctx) as f64 / (1024.0 * 1024.0 * 1024.0),
+    );
+
+    assert_eq!(
+        policy.default_kv_cache_type,
+        Some("f16"),
+        "inkling must resolve an f16 family K/V default"
+    );
+    assert!(
+        planned > size_tiered,
+        "family-aware planning must budget more than the size-tiered guess"
+    );
+}
