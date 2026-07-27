@@ -358,9 +358,9 @@ pub(super) async fn pick_model_assignment(
         }
     }
 
-    let my_vram = node.local_runtime_capacity_bytes();
+    let my_vram = node.vram_bytes();
 
-    /// Check if a model fits in our local runtime budget. Returns false and logs if it doesn't.
+    /// Check if a model fits in our VRAM. Returns false and logs if it doesn't.
     fn model_fits(model: &str, my_vram: u64) -> bool {
         let capacity = runtime_model_capacity_for_ref(model, my_vram);
         if !capacity.fits {
@@ -520,6 +520,18 @@ pub(super) async fn pick_model_assignment(
     None
 }
 
+/// Pick a model assignment only when this node's mesh role can serve models.
+pub(super) async fn pick_model_assignment_for_role(
+    node: &mesh::Node,
+    local_models: &[String],
+) -> Option<String> {
+    if matches!(node.role().await, NodeRole::Client) {
+        None
+    } else {
+        pick_model_assignment(node, local_models).await
+    }
+}
+
 /// Check if a standby node should promote to serve a model.
 /// Uses demand signals — promotes for unserved models with active demand,
 /// or for demand-based rebalancing when one model is much hotter than others.
@@ -527,18 +539,6 @@ pub(super) async fn pick_model_assignment(
 /// Rebalancing uses `last_active` to gate on recency (only models active within
 /// the last 60 minutes are considered), then `request_count / servers` for
 /// relative hotness among those recent models.
-pub(super) async fn pick_model_assignment_for_role(
-    node: &mesh::Node,
-    local_models: &[String],
-    is_client: bool,
-) -> Option<String> {
-    if is_client {
-        None
-    } else {
-        pick_model_assignment(node, local_models).await
-    }
-}
-
 pub(super) async fn check_unserved_model(
     node: &mesh::Node,
     local_models: &[String],
@@ -563,7 +563,7 @@ pub(super) async fn check_unserved_model(
         }
     }
 
-    let my_vram = node.local_runtime_capacity_bytes();
+    let my_vram = node.vram_bytes();
 
     // Only consider models with recent activity (last 60 minutes).
     // This prevents stale cumulative request_count from triggering promotions
@@ -1091,14 +1091,12 @@ pub(super) async fn select_run_auto_model_path(
     });
     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
 
-    let assignment =
-        pick_model_assignment_for_role(ctx.node, ctx.local_models, ctx.is_client).await;
+    let assignment = pick_model_assignment_for_role(ctx.node, ctx.local_models).await;
     let assignment = if assignment.is_none()
         && (ctx.options.auto || ctx.options.discover.is_some())
         && !ctx.is_client
     {
-        let pack =
-            auto_model_pack_blocking(ctx.node.local_runtime_capacity_bytes() as f64 / 1e9).await?;
+        let pack = auto_model_pack_blocking(ctx.node.vram_bytes() as f64 / 1e9).await?;
         if !pack.is_empty() {
             Some(pack[0].clone())
         } else {
