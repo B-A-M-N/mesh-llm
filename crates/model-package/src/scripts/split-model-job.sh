@@ -522,6 +522,7 @@ source_revision = os.environ.get("SOURCE_REVISION", "main")
 target_repo = os.environ["TARGET_REPO"]
 model_id = os.environ.get("MODEL_ID", manifest.get("model_id", target_repo))
 mesh_llm_ref = os.environ.get("MESH_LLM_REF", "main")
+api = HfApi(token=os.environ["HF_TOKEN"])
 
 def sha256(path: Path) -> str:
     digest = hashlib.sha256()
@@ -554,6 +555,38 @@ def code(value) -> str:
 
 def yaml_quote(value: str) -> str:
     return json.dumps(value)
+
+def card_value(info, key: str):
+    card_data = getattr(info, "card_data", None)
+    if card_data is None:
+        return None
+    if isinstance(card_data, dict):
+        return card_data.get(key)
+    return getattr(card_data, key, None)
+
+def first_model_id(value):
+    if isinstance(value, list):
+        value = value[0] if value else None
+    if isinstance(value, dict):
+        return value.get("id") or value.get("modelId")
+    return value if isinstance(value, str) and value else None
+
+def resolve_upstream_license():
+    try:
+        source_info = api.model_info(source_repo, revision=source_revision)
+        source_license = card_value(source_info, "license")
+        if source_license:
+            return str(source_license), source_repo
+
+        base_repo = first_model_id(card_value(source_info, "base_model"))
+        if base_repo:
+            base_info = api.model_info(base_repo)
+            base_license = card_value(base_info, "license")
+            if base_license:
+                return str(base_license), base_repo
+    except Exception as error:
+        print(f"  WARNING: could not resolve upstream license metadata: {error}")
+    return None, None
 
 def infer_model_family(name: str) -> str:
     lowered = name.lower()
@@ -601,6 +634,10 @@ activation_width = manifest.get("activation_width") or "not recorded"
 skippy_abi = manifest.get("skippy_abi_version") or "not recorded"
 source_sha = source_model.get("sha256") or "not recorded"
 canonical_ref = source_model.get("canonical_ref") or f"{source_repo}@{source_revision}/{source_file}"
+upstream_license, license_source_repo = resolve_upstream_license()
+license_frontmatter = (
+    f"license: {yaml_quote(upstream_license)}\n" if upstream_license else ""
+)
 
 file_rows = [
     ("Manifest", "model-package.json", "Package schema, source identity, checksums", manifest_hash),
@@ -647,10 +684,16 @@ rows = [
     ("Source file", code(source_file)),
     ("Package repo", link(target_repo, f"https://huggingface.co/{target_repo}")),
 ]
+if upstream_license and license_source_repo:
+    rows.append((
+        "License",
+        f"{code(upstream_license)} from "
+        f"{link(license_source_repo, f'https://huggingface.co/{license_source_repo}')}",
+    ))
 
 readme = f"""---
 library_name: mesh-llm
-base_model:
+{license_frontmatter}base_model:
 - {yaml_quote(source_repo)}
 pipeline_tag: text-generation
 tags:
@@ -781,7 +824,6 @@ skippy-model-package write-package "{source_path}" --out-dir "{package_dir}"
 
 Path("/tmp/README.md").write_text(readme)
 
-api = HfApi(token=os.environ["HF_TOKEN"])
 api.upload_file(
     path_or_fileobj="/tmp/README.md",
     path_in_repo="README.md",

@@ -130,6 +130,9 @@ mod tests {
     #[test]
     fn embedded_script_writes_rich_model_card() {
         assert!(EMBEDDED_SCRIPT.contains("pipeline_tag: text-generation"));
+        assert!(EMBEDDED_SCRIPT.contains("resolve_upstream_license"));
+        assert!(EMBEDDED_SCRIPT.contains("license_frontmatter"));
+        assert!(EMBEDDED_SCRIPT.contains("could not resolve upstream license metadata"));
         assert!(EMBEDDED_SCRIPT.contains("- openai-compatible"));
         assert!(EMBEDDED_SCRIPT.contains("## Model Overview"));
         assert!(EMBEDDED_SCRIPT.contains("## Highlights"));
