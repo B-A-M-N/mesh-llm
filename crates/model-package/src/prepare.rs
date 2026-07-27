@@ -16,6 +16,7 @@ use crate::permissions::PermissionCheck;
 /// Parameters for a model-package job.
 pub struct PrepareParams {
     pub source_repo: String,
+    pub source_revision: Option<String>,
     pub quant: Option<String>,
     pub target: Option<String>,
     pub model_id: Option<String>,
@@ -51,12 +52,17 @@ pub struct DiscoveredQuant {
 }
 
 /// List all available GGUF quant variants in a HF model repo.
-pub async fn list_quants(client: &HFClient, repo: &str) -> Result<Vec<DiscoveredQuant>> {
+pub async fn list_quants(
+    client: &HFClient,
+    repo: &str,
+    revision: Option<&str>,
+) -> Result<Vec<DiscoveredQuant>> {
     let (owner, name) = parse_repo(repo)?;
     let hf_repo = client.model(&owner, &name);
 
     let stream = hf_repo
         .list_tree()
+        .maybe_revision(revision.map(str::to_owned))
         .recursive(true)
         .send()
         .context("list repo tree")?;
@@ -122,7 +128,12 @@ pub async fn resolve(
         .as_deref()
         .context("--quant is required when submitting a job")?;
 
-    let quants = list_quants(client, &params.source_repo).await?;
+    let source_revision = params
+        .source_revision
+        .as_deref()
+        .unwrap_or("main")
+        .to_string();
+    let quants = list_quants(client, &params.source_repo, Some(&source_revision)).await?;
 
     if quants.is_empty() {
         anyhow::bail!("No GGUF files found in {}", params.source_repo);
@@ -194,7 +205,7 @@ pub async fn resolve(
     environment.insert("SOURCE_TOTAL_BYTES".into(), matched.total_bytes.to_string());
     environment.insert("TARGET_REPO".into(), target_repo.clone());
     environment.insert("MODEL_ID".into(), model_id.clone());
-    environment.insert("SOURCE_REVISION".into(), "main".into());
+    environment.insert("SOURCE_REVISION".into(), source_revision.clone());
     environment.insert("MESH_LLM_REF".into(), params.mesh_llm_ref.clone());
     environment.insert(
         "CATALOG_CREATE_PR".into(),
@@ -217,12 +228,14 @@ pub async fn resolve(
         JobVolume {
             volume_type: "bucket".into(),
             source: "meshllm/layer-split-output".into(),
+            revision: None,
             mount_path: "/bucket".into(),
             read_only: None,
         },
         JobVolume {
             volume_type: "model".into(),
             source: params.source_repo.clone(),
+            revision: Some(source_revision),
             mount_path: "/source".into(),
             read_only: Some(true),
         },

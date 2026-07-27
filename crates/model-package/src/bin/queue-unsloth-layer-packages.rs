@@ -685,7 +685,7 @@ async fn build_candidate(
         return Ok(None);
     }
 
-    let quants = match prepare::list_quants(client, &model.repo_id).await {
+    let quants = match prepare::list_quants(client, &model.repo_id, None).await {
         Ok(quants) => quants,
         Err(err) => {
             eprintln!(
@@ -1096,12 +1096,14 @@ fn job_spec_with_token(
             JobVolume {
                 volume_type: "bucket".into(),
                 source: "meshllm/layer-split-output".into(),
+                revision: None,
                 mount_path: "/bucket".into(),
                 read_only: None,
             },
             JobVolume {
                 volume_type: "model".into(),
                 source: candidate.model.repo_id.clone(),
+                revision: Some("main".into()),
                 mount_path: "/source".into(),
                 read_only: Some(true),
             },

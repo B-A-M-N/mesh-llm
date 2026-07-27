@@ -37,6 +37,8 @@ pub struct JobVolume {
     #[serde(rename = "type")]
     pub volume_type: String,
     pub source: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub revision: Option<String>,
     #[serde(rename = "mountPath")]
     pub mount_path: String,
     #[serde(rename = "readOnly", skip_serializing_if = "Option::is_none")]
@@ -544,6 +546,39 @@ mod tests {
             unit_cost_micro_usd: None,
             unit_label: Some("minute".to_string()),
         }
+    }
+
+    #[test]
+    fn model_volume_serializes_pinned_revision() {
+        let volume = JobVolume {
+            volume_type: "model".into(),
+            source: "poolside/Laguna-S-2.1-GGUF".into(),
+            revision: Some("edd093522473dc7313b0738d8b4116b7f8b9745f".into()),
+            mount_path: "/source".into(),
+            read_only: Some(true),
+        };
+
+        let value = serde_json::to_value(volume).unwrap();
+        assert_eq!(
+            value["revision"],
+            "edd093522473dc7313b0738d8b4116b7f8b9745f"
+        );
+        assert_eq!(value["mountPath"], "/source");
+        assert_eq!(value["readOnly"], true);
+    }
+
+    #[test]
+    fn bucket_volume_omits_revision() {
+        let volume = JobVolume {
+            volume_type: "bucket".into(),
+            source: "meshllm/layer-split-output".into(),
+            revision: None,
+            mount_path: "/bucket".into(),
+            read_only: None,
+        };
+
+        let value = serde_json::to_value(volume).unwrap();
+        assert!(value.get("revision").is_none());
     }
 
     #[test]

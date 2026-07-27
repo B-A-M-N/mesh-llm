@@ -77,6 +77,7 @@ pub async fn dispatch_model_package(args: ModelPrepareArgs<'_>) -> Result<()> {
     let source_model_ref = model_ref::ModelRef::parse(source_ref)
         .with_context(|| format!("invalid source model ref: {source_ref}"))?;
     let source_repo = source_model_ref.repo.as_str();
+    let source_revision = source_model_ref.revision.as_deref();
     let source_quant = match (source_model_ref.selector.as_deref(), quant) {
         (Some(selector), Some(quant)) if selector != quant => {
             bail!(
@@ -95,7 +96,7 @@ pub async fn dispatch_model_package(args: ModelPrepareArgs<'_>) -> Result<()> {
     // If no quant specified, list available quants and exit.
     // This path doesn't need HF_TOKEN — works for public repos.
     if source_quant.is_none() {
-        return run_list_quants(&hf_client, source_repo, json).await;
+        return run_list_quants(&hf_client, source_repo, source_revision, json).await;
     }
 
     let submitting = confirm && !dry_run;
@@ -116,6 +117,7 @@ pub async fn dispatch_model_package(args: ModelPrepareArgs<'_>) -> Result<()> {
     eprintln!("🔍 Resolving source...");
     let params = PrepareParams {
         source_repo: source_repo.to_string(),
+        source_revision: source_model_ref.revision.clone(),
         quant: source_quant.map(|s| s.to_string()),
         target: target.map(|s| s.to_string()),
         model_id: model_id.map(|s| s.to_string()),
@@ -254,9 +256,10 @@ pub async fn dispatch_model_package(args: ModelPrepareArgs<'_>) -> Result<()> {
 async fn run_list_quants(
     client: &hf_hub::HFClient,
     source_repo: &str,
+    source_revision: Option<&str>,
     json_output: bool,
 ) -> Result<()> {
-    let quants = prepare::list_quants(client, source_repo).await?;
+    let quants = prepare::list_quants(client, source_repo, source_revision).await?;
 
     if json_output {
         println!(
