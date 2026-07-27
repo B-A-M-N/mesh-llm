@@ -100,6 +100,39 @@ mesh-llm serve --model Qwen3-0.6B-Q4_K_M
 mesh-llm client --auto
 ```
 
+## Runtime lifecycle and modes
+
+Bare `mesh-llm serve` is valid. It starts the durable API, console, mesh,
+plugins, and owner-control surfaces even when no startup model is configured.
+
+Persisted `[runtime].mode` controls configured models:
+
+- `serve` (default) loads configured and explicit CLI models eagerly.
+- `on_demand` keeps configured models as candidate metadata but does not load
+  them eagerly. Explicit `--model` and `--gguf` remain eager.
+- `client` is routing-only and disables local loading. Persisted client mode
+  conflicts with explicit `serve` and local model/serving flags.
+
+`startup_failure_policy = "best_effort"` is the default and keeps durable
+surfaces running after an eager model failure. `fail_fast` exits instead.
+
+Local `mesh-llm load` and `mesh-llm unload` target the daemon on this machine.
+Remote `mesh-llm runtime load-model`, `ensure-model`, `unload-model`, and
+`drain-model` require an explicit same-owner endpoint and target exactly one
+remote node. They are not mesh-wide placement commands.
+
+Lifecycle changes may be asynchronous. Observe them with:
+
+```bash
+mesh-llm status
+curl -s localhost:3131/api/runtime/intents | jq .
+curl -s localhost:3131/api/status | jq '.runtime'
+curl -s localhost:9337/v1/models | jq '.data[].id'
+```
+
+See [Runtime Lifecycle](/docs/pages/runtime-lifecycle/) for the complete state,
+draining, activity, privacy, and compatibility model.
+
 ### `setup`
 
 Use this to finish a fresh install after the executable is on your `PATH`.
@@ -502,6 +535,10 @@ mesh-llm runtime remove <RUNTIME_ID>
 mesh-llm runtime prune --active-only
 mesh-llm runtime scan-refresh --endpoint '<control-endpoint>'
 mesh-llm runtime scan-refresh --endpoint '<control-endpoint>' --json
+mesh-llm runtime load-model --endpoint '<control-endpoint>' --model '<canonical-model-ref>'
+mesh-llm runtime unload-model --endpoint '<control-endpoint>' --model '<canonical-model-ref>'
+mesh-llm runtime ensure-model --endpoint '<control-endpoint>' --model '<canonical-model-ref>'
+mesh-llm runtime drain-model --endpoint '<control-endpoint>' --instance-id '<instance-id>'
 ```
 
 Use `--json` for machine-readable output. Runtime selection is constrained by
@@ -547,6 +584,45 @@ The older hidden `runtime refresh-inventory` spelling remains available for
 compatibility and returns its legacy snapshot-only shape. New clients also
 accept snapshot-only responses from older owner-control servers without
 claiming that detailed inventory metadata was returned.
+
+#### Owner-control model lifecycle
+
+Use the lifecycle subcommands to manage models on exactly one remote,
+owner-attested node:
+
+```bash
+mesh-llm runtime load-model \
+  --endpoint '<control-endpoint>' \
+  --model 'org/model:file.gguf'
+
+mesh-llm runtime ensure-model \
+  --endpoint '<control-endpoint>' \
+  --model 'org/model:file.gguf' \
+  --profile low-ctx
+
+mesh-llm runtime unload-model \
+  --endpoint '<control-endpoint>' \
+  --model 'org/model:file.gguf'
+
+mesh-llm runtime drain-model \
+  --endpoint '<control-endpoint>' \
+  --instance-id '<instance-id>'
+```
+
+`load-model` and `ensure-model` require a canonical model reference and accept
+an optional `--profile`. `unload-model` and `drain-model` require exactly one
+of `--model` or `--instance-id`. All four commands accept `--port <PORT>`
+(default `3131`) and `--json`.
+
+The endpoint token and ownership requirements are the same as for
+`runtime scan-refresh`. A successful response means the target accepted the
+lifecycle intent; use runtime status to observe the resulting instance state.
+`drain-model` stops new admission, waits for in-flight work within the target
+policy, and then unloads the selected model or instance.
+
+These intents last only for the target daemon session and never edit its
+configuration. Older targets return a typed unsupported result; the client
+does not retry over the public mesh plane.
 
 
 ### `gpus`
@@ -610,6 +686,9 @@ Switches:
 
 - `--port <PORT>`: target management/API port (default `3131`).
 
+The command targets the local runtime. Use `status`,
+`GET /api/runtime/intents`, and `/v1/models` to observe completion.
+
 ### `unload`
 
 Use this to unload a model from a running local runtime.
@@ -617,6 +696,9 @@ Use this to unload a model from a running local runtime.
 Switches:
 
 - `--port <PORT>`: target management/API port (default `3131`).
+
+The command targets the local runtime. Remote same-owner control uses
+`runtime unload-model`.
 
 ### `status`
 

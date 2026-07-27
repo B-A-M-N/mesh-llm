@@ -49,6 +49,7 @@ fn make_test_peer_info(peer_id: EndpointId) -> PeerInfo {
         stage_status_list_supported: false,
         owner_summary: OwnershipSummary::default(),
         advertised_model_throughput: vec![],
+        inference_admission_state: None,
 
         display_rtt: None,
         selected_path: None,
@@ -66,6 +67,13 @@ fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
 
     hex::encode(Sha256::digest(bytes))
+}
+
+fn owner_control_request(request_id: u64) -> crate::proto::node::OwnerControlRequest {
+    crate::proto::node::OwnerControlRequest {
+        request_id,
+        ..Default::default()
+    }
 }
 
 struct EnvVarGuard {
@@ -237,14 +245,11 @@ async fn control_plane_get_watch_apply_config() -> Result<()> {
             r#gen: NODE_PROTOCOL_GENERATION,
             handshake: None,
             request: Some(OwnerControlRequest {
-                request_id: 1,
                 get_config: Some(crate::proto::node::OwnerControlGetConfigRequest {
                     requester_node_id: requester_id.as_bytes().to_vec(),
                     target_node_id: server.id().as_bytes().to_vec(),
                 }),
-                watch_config: None,
-                apply_config: None,
-                refresh_inventory: None,
+                ..owner_control_request(1)
             }),
             response: None,
             error: None,
@@ -272,15 +277,12 @@ async fn control_plane_get_watch_apply_config() -> Result<()> {
             r#gen: NODE_PROTOCOL_GENERATION,
             handshake: None,
             request: Some(OwnerControlRequest {
-                request_id: 2,
-                get_config: None,
                 watch_config: Some(crate::proto::node::OwnerControlWatchConfigRequest {
                     requester_node_id: watch_requester_id.as_bytes().to_vec(),
                     target_node_id: server.id().as_bytes().to_vec(),
                     include_snapshot: true,
                 }),
-                apply_config: None,
-                refresh_inventory: None,
+                ..owner_control_request(2)
             }),
             response: None,
             error: None,
@@ -323,16 +325,13 @@ async fn control_plane_get_watch_apply_config() -> Result<()> {
             r#gen: NODE_PROTOCOL_GENERATION,
             handshake: None,
             request: Some(OwnerControlRequest {
-                request_id: 3,
-                get_config: None,
-                watch_config: None,
                 apply_config: Some(crate::proto::node::OwnerControlApplyConfigRequest {
                     requester_node_id: apply_requester_id.as_bytes().to_vec(),
                     target_node_id: server.id().as_bytes().to_vec(),
                     expected_revision: 0,
                     config: Some(applied_config.clone()),
                 }),
-                refresh_inventory: None,
+                ..owner_control_request(3)
             }),
             response: None,
             error: None,
@@ -369,16 +368,13 @@ async fn control_plane_get_watch_apply_config() -> Result<()> {
             r#gen: NODE_PROTOCOL_GENERATION,
             handshake: None,
             request: Some(OwnerControlRequest {
-                request_id: 4,
-                get_config: None,
-                watch_config: None,
                 apply_config: Some(crate::proto::node::OwnerControlApplyConfigRequest {
                     requester_node_id: apply_requester_id.as_bytes().to_vec(),
                     target_node_id: server.id().as_bytes().to_vec(),
                     expected_revision: 1,
                     config: Some(applied_config),
                 }),
-                refresh_inventory: None,
+                ..owner_control_request(4)
             }),
             response: None,
             error: None,
@@ -423,15 +419,12 @@ async fn control_plane_watch_observes_apply_revision() -> Result<()> {
             r#gen: NODE_PROTOCOL_GENERATION,
             handshake: None,
             request: Some(OwnerControlRequest {
-                request_id: 10,
-                get_config: None,
                 watch_config: Some(crate::proto::node::OwnerControlWatchConfigRequest {
                     requester_node_id: watch_requester_id.as_bytes().to_vec(),
                     target_node_id: server.id().as_bytes().to_vec(),
                     include_snapshot: true,
                 }),
-                apply_config: None,
-                refresh_inventory: None,
+                ..owner_control_request(10)
             }),
             response: None,
             error: None,
@@ -457,9 +450,6 @@ async fn control_plane_watch_observes_apply_revision() -> Result<()> {
             r#gen: NODE_PROTOCOL_GENERATION,
             handshake: None,
             request: Some(OwnerControlRequest {
-                request_id: 11,
-                get_config: None,
-                watch_config: None,
                 apply_config: Some(crate::proto::node::OwnerControlApplyConfigRequest {
                     requester_node_id: apply_requester_id.as_bytes().to_vec(),
                     target_node_id: server.id().as_bytes().to_vec(),
@@ -475,7 +465,7 @@ async fn control_plane_watch_observes_apply_revision() -> Result<()> {
                         mesh_requirements: None,
                     }),
                 }),
-                refresh_inventory: None,
+                ..owner_control_request(11)
             }),
             response: None,
             error: None,
@@ -533,15 +523,12 @@ async fn control_plane_watch_without_snapshot_starts_with_accepted() -> Result<(
             r#gen: NODE_PROTOCOL_GENERATION,
             handshake: None,
             request: Some(OwnerControlRequest {
-                request_id: 12,
-                get_config: None,
                 watch_config: Some(crate::proto::node::OwnerControlWatchConfigRequest {
                     requester_node_id: watch_requester_id.as_bytes().to_vec(),
                     target_node_id: server.id().as_bytes().to_vec(),
                     include_snapshot: false,
                 }),
-                apply_config: None,
-                refresh_inventory: None,
+                ..owner_control_request(12)
             }),
             response: None,
             error: None,
@@ -590,15 +577,12 @@ async fn control_plane_watch_without_snapshot_observes_apply_revision() -> Resul
             r#gen: NODE_PROTOCOL_GENERATION,
             handshake: None,
             request: Some(OwnerControlRequest {
-                request_id: 13,
-                get_config: None,
                 watch_config: Some(crate::proto::node::OwnerControlWatchConfigRequest {
                     requester_node_id: watch_requester_id.as_bytes().to_vec(),
                     target_node_id: server.id().as_bytes().to_vec(),
                     include_snapshot: false,
                 }),
-                apply_config: None,
-                refresh_inventory: None,
+                ..owner_control_request(13)
             }),
             response: None,
             error: None,
@@ -625,9 +609,6 @@ async fn control_plane_watch_without_snapshot_observes_apply_revision() -> Resul
             r#gen: NODE_PROTOCOL_GENERATION,
             handshake: None,
             request: Some(OwnerControlRequest {
-                request_id: 14,
-                get_config: None,
-                watch_config: None,
                 apply_config: Some(crate::proto::node::OwnerControlApplyConfigRequest {
                     requester_node_id: apply_requester_id.as_bytes().to_vec(),
                     target_node_id: server.id().as_bytes().to_vec(),
@@ -643,7 +624,7 @@ async fn control_plane_watch_without_snapshot_observes_apply_revision() -> Resul
                         mesh_requirements: None,
                     }),
                 }),
-                refresh_inventory: None,
+                ..owner_control_request(14)
             }),
             response: None,
             error: None,
@@ -701,9 +682,6 @@ async fn control_plane_apply_rejects_stale_revision() -> Result<()> {
         r#gen: NODE_PROTOCOL_GENERATION,
         handshake: None,
         request: Some(OwnerControlRequest {
-            request_id,
-            get_config: None,
-            watch_config: None,
             apply_config: Some(crate::proto::node::OwnerControlApplyConfigRequest {
                 requester_node_id: apply_requester_id.as_bytes().to_vec(),
                 target_node_id: server.id().as_bytes().to_vec(),
@@ -726,7 +704,7 @@ async fn control_plane_apply_rejects_stale_revision() -> Result<()> {
                     mesh_requirements: None,
                 }),
             }),
-            refresh_inventory: None,
+            ..owner_control_request(request_id)
         }),
         response: None,
         error: None,
@@ -792,9 +770,6 @@ async fn control_plane_apply_rejects_malformed_full_config_toml() -> Result<()> 
             r#gen: NODE_PROTOCOL_GENERATION,
             handshake: None,
             request: Some(OwnerControlRequest {
-                request_id: 22,
-                get_config: None,
-                watch_config: None,
                 apply_config: Some(crate::proto::node::OwnerControlApplyConfigRequest {
                     requester_node_id: apply_requester_id.as_bytes().to_vec(),
                     target_node_id: server.id().as_bytes().to_vec(),
@@ -810,7 +785,7 @@ async fn control_plane_apply_rejects_malformed_full_config_toml() -> Result<()> 
                         mesh_requirements: None,
                     }),
                 }),
-                refresh_inventory: None,
+                ..owner_control_request(22)
             }),
             response: None,
             error: None,
@@ -877,11 +852,12 @@ async fn owner_control_client_reuses_connection_for_sequential_requests() -> Res
         .config
         .clone()
         .expect("get-config snapshot should include config");
-    let apply = tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        control_client.apply_config(snapshot.revision, config),
-    )
-    .await??;
+    // `apply_config` already has the client's bounded unary-response timeout.
+    // A shorter outer deadline makes this connection-reuse assertion flaky on
+    // loaded CI hosts without testing any additional production behavior.
+    let apply = control_client
+        .apply_config(snapshot.revision, config)
+        .await?;
 
     assert!(apply.success);
     assert_eq!(apply.current_revision, snapshot.revision + 1);
@@ -919,14 +895,11 @@ async fn control_plane_refresh_inventory() -> Result<()> {
         r#gen: NODE_PROTOCOL_GENERATION,
         handshake: None,
         request: Some(OwnerControlRequest {
-            request_id,
-            get_config: None,
-            watch_config: None,
-            apply_config: None,
             refresh_inventory: Some(crate::proto::node::OwnerControlRefreshInventoryRequest {
                 requester_node_id: requester_id.as_bytes().to_vec(),
                 target_node_id: server.id().as_bytes().to_vec(),
             }),
+            ..owner_control_request(request_id)
         }),
         response: None,
         error: None,

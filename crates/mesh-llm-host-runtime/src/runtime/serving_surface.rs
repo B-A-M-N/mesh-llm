@@ -2,7 +2,7 @@ use super::{
     BootstrapProxyStopTx, ConsoleSessionMode, DASHBOARD_FIRST_PAINT_TIMEOUT, DashboardContextUsage,
     InitialPromptMode, ManagedModelController, OpenAiGuardrailPolicyHandle,
     PassivePublicationSetup, RunAutoModelSelection, RunAutoModelSelectionContext,
-    RuntimeCapacityLedger, RuntimeDashboardSnapshotProvider, RuntimeInstanceRegistry,
+    RuntimeCapacityLedger, RuntimeDashboardSnapshotProvider, RuntimeEvent, RuntimeInstanceRegistry,
     RuntimeOptions, StartupLocalModelTask, StartupModelPlan, StartupReadyReporter, api_proxy,
     bootstrap_proxy, bridge_publication_state, maybe_spawn_passive_promotion_task,
     next_runtime_instance_id, node_display_name, nostr_relays, resolve_runtime_owner_key_path,
@@ -17,6 +17,7 @@ use crate::network::{affinity, discovery as mesh_discovery, nostr, tunnel};
 use crate::plugin;
 use crate::runtime::interactive;
 use crate::runtime::survey;
+use crate::runtime::{InstanceLifecycleRecord, InstanceLifecycleState};
 #[cfg(test)]
 use crate::runtime::{StartupPinnedGpuTarget, dashboard_lanes_for_process};
 use crate::system::backend;
@@ -60,6 +61,13 @@ pub(super) fn serve_path_interactive_spawn_request(
     })
 }
 
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "used by the retained passive runtime compatibility lane and its focused tests"
+    )
+)]
 pub(super) fn passive_path_interactive_spawn_request(
     console_session_mode: Option<ConsoleSessionMode>,
     stdin_is_tty: bool,
@@ -191,6 +199,13 @@ pub(super) fn socket_addr_http_url(addr: std::net::SocketAddr) -> String {
     format!("http://{addr}")
 }
 
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "used by the retained passive runtime compatibility lane and listener tests"
+    )
+)]
 pub(super) fn listener_http_url(
     listener: &tokio::net::TcpListener,
     fallback_port: u16,
@@ -361,9 +376,7 @@ pub(crate) fn assert_quitting_during_startup_cancels_without_late_ready_render()
     );
     reporter.mark_shutdown_requested();
     assert!(
-        reporter
-            .mark_ready_and_build_event("Qwen3-8B-Q4_K_M")
-            .is_none(),
+        reporter.mark_ready_and_build_event(0).is_none(),
         "startup shutdown should cancel any late RuntimeReady emission"
     );
 }
@@ -381,12 +394,16 @@ pub(crate) fn assert_startup_ready_reporter_waits_for_rust_owned_model_ready_edg
     );
 
     assert!(
-        reporter.mark_ready_and_build_event("model-a").is_none(),
+        reporter.mark_ready_and_build_event(0).is_none(),
         "one model-ready edge must not replace the remaining Rust-owned readiness edges"
     );
     assert!(
+        reporter.mark_ready_and_build_event(0).is_none(),
+        "a repeated edge for one startup slot must not mark a different slot ready"
+    );
+    assert!(
         matches!(
-            reporter.mark_ready_and_build_event("model-b"),
+            reporter.mark_ready_and_build_event(1),
             Some(OutputEvent::RuntimeReady { .. })
         ),
         "RuntimeReady should appear only after every startup model hits the Rust-owned ready path"
@@ -642,7 +659,7 @@ pub(super) async fn startup_ready_reporter_uses_bound_urls_for_runtime_ready() {
         api_port: reported_api_port,
         console_port: reported_console_port,
         ..
-    }) = reporter.mark_ready_and_build_event("model-a")
+    }) = reporter.mark_ready_and_build_event(0)
     else {
         panic!("reporter should emit RuntimeReady when the model is ready");
     };
@@ -813,11 +830,19 @@ pub(super) fn start_run_auto_bootstrap_proxy(
     Some(stop_tx)
 }
 
+#[expect(
+    dead_code,
+    reason = "owned by the retained passive runtime compatibility lane"
+)]
 pub(super) struct PassiveConsoleRuntime {
     pub(super) control_rx: tokio::sync::mpsc::UnboundedReceiver<api::RuntimeControlRequest>,
     pub(super) console_server_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
+#[expect(
+    dead_code,
+    reason = "owned by the retained passive runtime compatibility lane"
+)]
 pub(super) struct PassiveConsoleSetupContext<'a> {
     pub(super) options: &'a RuntimeOptions,
     pub(super) node: &'a mesh::Node,
@@ -861,6 +886,7 @@ pub(super) struct RunAutoAdditionalModelsContext<'a> {
     pub(super) startup_ready_reporter: &'a StartupReadyReporter,
     pub(super) startup_load_gate: &'a Arc<tokio::sync::Mutex<()>>,
     pub(super) control_tx: &'a tokio::sync::mpsc::UnboundedSender<api::RuntimeControlRequest>,
+    pub(super) runtime_event_tx: &'a tokio::sync::mpsc::UnboundedSender<RuntimeEvent>,
     pub(super) survey_telemetry: &'a survey::SurveyTelemetry,
     pub(super) skippy_telemetry: &'a skippy::SkippyTelemetryOptions,
     pub(super) openai_guardrail_policy: &'a OpenAiGuardrailPolicyHandle,
@@ -952,6 +978,10 @@ pub(super) async fn setup_run_auto_console_state(
     Ok(Some(console_state))
 }
 
+#[expect(
+    dead_code,
+    reason = "bridges the retained advertised-model and passive runtime compatibility lanes"
+)]
 pub(super) async fn run_auto_model_path_or_shutdown(
     ctx: &mut RunAutoModelSelectionContext<'_>,
 ) -> Result<Option<PathBuf>> {
@@ -1098,10 +1128,15 @@ pub(super) async fn spawn_run_auto_additional_model_tasks(ctx: RunAutoAdditional
     ctx.node.set_models(all_names).await;
     ctx.node.regossip().await;
 
-    for extra_model in ctx.startup_models.iter().skip(1) {
+    for (readiness_index, extra_model) in ctx.startup_models.iter().enumerate().skip(1) {
         let extra_name = extra_model.declared_ref.clone();
         let (extra_stop_tx, extra_stop_rx) = tokio::sync::watch::channel(false);
         let extra_instance_id = next_runtime_instance_id(ctx.next_runtime_instance_sequence);
+        let extra_lifecycle = Arc::new(tokio::sync::Mutex::new(InstanceLifecycleRecord::new(
+            InstanceLifecycleState::Planned,
+            32,
+        )));
+        let extra_lifecycle_port = Arc::new(std::sync::atomic::AtomicU16::new(0));
         let extra_task = tokio::spawn(Box::pin(startup_local_model_loop(StartupLocalModelTask {
             node: ctx.node.clone(),
             config: ctx.config.clone(),
@@ -1109,6 +1144,8 @@ pub(super) async fn spawn_run_auto_additional_model_tasks(ctx: RunAutoAdditional
             target_tx: ctx.target_tx.clone(),
             model_path: extra_model.resolved_path.clone(),
             model_ref: extra_model.declared_ref.clone(),
+            readiness_index,
+            profile: extra_model.profile.clone(),
             model_name: extra_name.clone(),
             instance_id: extra_instance_id.clone(),
             primary_model_name: ctx.primary_model_name.to_string(),
@@ -1139,18 +1176,24 @@ pub(super) async fn spawn_run_auto_additional_model_tasks(ctx: RunAutoAdditional
             console_state: ctx.console_state.cloned(),
             api_port: ctx.options.port,
             startup_ready_reporter: ctx.startup_ready_reporter.clone(),
+            runtime_event_tx: ctx.runtime_event_tx.clone(),
             startup_load_gate: ctx.startup_load_gate.clone(),
             input_handler_enabled: false,
             interactive_started: Arc::new(AtomicBool::new(true)),
             interactive_control_tx: ctx.control_tx.clone(),
             interactive_console_state: None,
+            lifecycle: extra_lifecycle.clone(),
+            lifecycle_port: extra_lifecycle_port.clone(),
         })));
         ctx.managed_models.insert(
             extra_instance_id,
             ManagedModelController {
                 model_name: extra_name,
+                profile: extra_model.profile.clone(),
                 stop_tx: extra_stop_tx,
                 task: extra_task,
+                lifecycle: extra_lifecycle,
+                port: extra_lifecycle_port,
             },
         );
     }
@@ -1356,6 +1399,10 @@ pub(super) async fn spawn_run_auto_local_instance_scanner(
     );
 }
 
+#[expect(
+    dead_code,
+    reason = "owned by the retained passive runtime compatibility lane"
+)]
 pub(super) async fn setup_passive_console_runtime(
     ctx: PassiveConsoleSetupContext<'_>,
     console_listener: tokio::net::TcpListener,
@@ -1477,6 +1524,10 @@ pub(super) async fn setup_passive_console_runtime(
     })
 }
 
+#[expect(
+    dead_code,
+    reason = "owned by the retained passive runtime compatibility lane"
+)]
 pub(super) async fn run_passive_listener_loop(
     listener: tokio::net::TcpListener,
     node: mesh::Node,
@@ -1532,6 +1583,10 @@ pub(super) async fn run_passive_listener_loop(
     }
 }
 
+#[expect(
+    dead_code,
+    reason = "retained for compatibility with passive client and standby startup"
+)]
 pub(super) async fn run_passive(
     options: &RuntimeOptions,
     node: mesh::Node,
@@ -1600,6 +1655,10 @@ pub(super) async fn run_passive(
     .await
 }
 
+#[expect(
+    dead_code,
+    reason = "owned by the retained passive runtime compatibility lane and its ready-event tests"
+)]
 pub(super) async fn emit_passive_ready_events(
     options: &RuntimeOptions,
     node: &mesh::Node,
