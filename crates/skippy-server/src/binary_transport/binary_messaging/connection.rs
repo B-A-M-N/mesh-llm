@@ -2,6 +2,7 @@ use super::async_forwarder::AsyncForwarder;
 use super::reply::drain_deferred_prefill_replies;
 use super::reply::send_stage_reply;
 use super::reply::{configure_prediction_return_stream, reply_window_for_message};
+use super::session_tracker::{ConnectionSessionTracker, release_tracked_connection_sessions};
 use super::summary::BinaryMessageObservation;
 use super::summary::BinaryRequestSummary;
 use super::telemetry::UpstreamReplyWriteSpan;
@@ -81,6 +82,53 @@ pub(super) fn handle_binary_connection(
     kv: Option<&Arc<KvStageIntegration>>,
     telemetry: &Telemetry,
     upstream: &mut TcpStream,
+    downstream: Option<TcpStream>,
+    activation_width: i32,
+    wire_dtype: WireActivationDType,
+    max_inflight: usize,
+    reply_credit_limit: Option<usize>,
+    async_prefill_forward: bool,
+    downstream_wire_condition: WireCondition,
+    downstream_connect_timeout_secs: u64,
+    native_mtp_enabled: bool,
+    prediction_return_sinks: &PredictionReturnSinks,
+    first_message: StageWireMessage,
+) -> Result<()> {
+    let mut session_tracker = ConnectionSessionTracker::default();
+    let result = handle_binary_connection_messages(
+        config,
+        topology,
+        runtime,
+        decode_frame_batcher,
+        kv,
+        telemetry,
+        upstream,
+        downstream,
+        activation_width,
+        wire_dtype,
+        max_inflight,
+        reply_credit_limit,
+        async_prefill_forward,
+        downstream_wire_condition,
+        downstream_connect_timeout_secs,
+        native_mtp_enabled,
+        prediction_return_sinks,
+        first_message,
+        &mut session_tracker,
+    );
+    release_tracked_connection_sessions(config, runtime, telemetry, &mut session_tracker);
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn handle_binary_connection_messages(
+    config: &StageConfig,
+    topology: Option<&StageTopology>,
+    runtime: &Arc<Mutex<RuntimeState>>,
+    decode_frame_batcher: &DecodeFrameBatcher,
+    kv: Option<&Arc<KvStageIntegration>>,
+    telemetry: &Telemetry,
+    upstream: &mut TcpStream,
     mut downstream: Option<TcpStream>,
     activation_width: i32,
     wire_dtype: WireActivationDType,
@@ -92,6 +140,7 @@ pub(super) fn handle_binary_connection(
     native_mtp_enabled: bool,
     prediction_return_sinks: &PredictionReturnSinks,
     first_message: StageWireMessage,
+    session_tracker: &mut ConnectionSessionTracker,
 ) -> Result<()> {
     if let Some(downstream) = downstream.as_mut() {
         send_client_ready_hello_if_enabled(&mut *downstream)
@@ -146,6 +195,7 @@ pub(super) fn handle_binary_connection(
         let message_started = Instant::now();
         let session_id = binary_message_session_id(connection_session_id, &message);
         let session_key = session_id.to_string();
+        session_tracker.touch(&session_key);
         if message.kind == WireMessageKind::VerifyWindow && !positional_speculation_supported {
             bail!(
                 "stage-state v10 positional speculation requires an attention-only stage; {} contains recurrent state",
@@ -278,6 +328,7 @@ pub(super) fn handle_binary_connection(
                 reset_start_unix_nanos,
                 reset_end_unix_nanos,
             );
+            session_tracker.stopped(&session_key);
             prediction_return_streams.remove(&(message.request_id, message.session_id));
             prediction_return_sinks.remove(message.request_id, message.session_id);
             send_reply_ack_with_stats(&mut *upstream, stop_stats).context("send stop ACK")?;
