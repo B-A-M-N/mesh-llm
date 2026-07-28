@@ -59,7 +59,14 @@ impl FamilyPolicy {
                 min_tokens,
                 max_entries,
             } => {
-                let max_bytes = derive_stage_cache_max_bytes(config)?;
+                // Layer-package configs can be resolved before their GGUF
+                // parts are materialized, so there may be no scannable model
+                // metadata here yet. Keep the certified family cache enabled
+                // in that case: the resident cache still enforces its
+                // ctx-derived token budget, while zero means no additional
+                // byte cap. Disabling the cache entirely made every packaged
+                // model silently miss the family default.
+                let max_bytes = derive_stage_cache_max_bytes(config).unwrap_or(0);
                 // The family policy's `max_entries` is a generous
                 // upper bound on cache cardinality. The real ceiling
                 // is the unified KV cell pool size: each resident

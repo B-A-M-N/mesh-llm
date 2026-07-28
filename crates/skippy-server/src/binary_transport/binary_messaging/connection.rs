@@ -1,7 +1,10 @@
 use super::async_forwarder::AsyncForwarder;
 use super::reply::drain_deferred_prefill_replies;
 use super::reply::send_stage_reply;
-use super::reply::{configure_prediction_return_stream, reply_window_for_message};
+use super::reply::{
+    configure_prediction_return_stream, normalize_downstream_prefix_restore_reply,
+    reply_window_for_message,
+};
 use super::summary::BinaryMessageObservation;
 use super::summary::BinaryRequestSummary;
 use super::telemetry::UpstreamReplyWriteSpan;
@@ -558,14 +561,13 @@ fn handle_binary_connection_messages(
                     downstream_wire_condition,
                 )
                 .context("forward prefix cache control")?;
-                let reply = recv_reply(&mut *downstream).context("prefix cache downstream ACK")?;
+                let mut reply =
+                    recv_reply(&mut *downstream).context("prefix cache downstream ACK")?;
                 if reply.kind != WireReplyKind::Ack {
                     bail!("prefix cache control expected downstream ACK");
                 }
-                let downstream_missed = message.kind == WireMessageKind::TryRestorePrefill
-                    && (reply.stats.kv_lookup_misses > 0
-                        || reply.stats.kv_lookup_errors > 0
-                        || reply.stats.kv_lookup_hits == 0);
+                let downstream_missed =
+                    normalize_downstream_prefix_restore_reply(message.kind, &mut reply.stats);
                 control_stats.merge(reply.stats);
                 if downstream_missed {
                     let mut runtime = runtime.lock().expect("runtime lock poisoned");

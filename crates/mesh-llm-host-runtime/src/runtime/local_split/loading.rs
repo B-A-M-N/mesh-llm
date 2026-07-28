@@ -20,6 +20,11 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+pub(super) const MIN_STAGE_SOURCE_PREPARE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+pub(super) const MAX_STAGE_SOURCE_PREPARE_TIMEOUT: Duration = Duration::from_secs(6 * 60 * 60);
+const STAGE_SOURCE_PREPARE_ALLOWANCE: Duration = Duration::from_secs(10 * 60);
+const STAGE_SOURCE_MIN_BYTES_PER_SEC: u64 = 16 * 1024 * 1024;
+
 pub(super) struct SplitGenerationLoadSpec<'a> {
     pub(super) node: &'a mesh::Node,
     pub(super) mesh_config: &'a plugin::MeshConfig,
@@ -274,7 +279,7 @@ pub(super) async fn load_downstream_split_runtime_stages(
             spec.node,
             stage.node_id,
             &load,
-            Duration::from_secs(30 * 60),
+            stage_source_prepare_timeout(spec.package, stage),
         )
         .await
         .with_context(|| {
@@ -324,6 +329,25 @@ pub(super) async fn load_downstream_split_runtime_stages(
     downstream
         .clone()
         .context("split topology missing downstream stage")
+}
+
+pub(super) fn stage_source_prepare_timeout(
+    package: &skippy::SkippyPackageIdentity,
+    stage: &RuntimeSliceStagePlan,
+) -> Duration {
+    let package_layers = u64::from(package.layer_count.max(1));
+    let stage_layers = u64::from(stage.layer_end.saturating_sub(stage.layer_start).max(1));
+    let estimated_stage_bytes = package
+        .source_model_bytes
+        .saturating_mul(stage_layers)
+        .div_ceil(package_layers);
+    let transfer_secs = estimated_stage_bytes.div_ceil(STAGE_SOURCE_MIN_BYTES_PER_SEC);
+    Duration::from_secs(transfer_secs)
+        .saturating_add(STAGE_SOURCE_PREPARE_ALLOWANCE)
+        .clamp(
+            MIN_STAGE_SOURCE_PREPARE_TIMEOUT,
+            MAX_STAGE_SOURCE_PREPARE_TIMEOUT,
+        )
 }
 
 pub(super) fn split_runtime_stage_load_request(

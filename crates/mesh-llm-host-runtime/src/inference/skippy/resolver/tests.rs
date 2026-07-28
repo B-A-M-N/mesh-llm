@@ -939,6 +939,43 @@ fn layer_package_translation_does_not_treat_hf_ref_as_direct_gguf() {
 
     assert_eq!(options.config.load_mode, LoadMode::LayerPackage);
     assert_eq!(options.config.model_path.as_deref(), Some(package_ref));
+    let kv_cache = options
+        .config
+        .kv_cache
+        .expect("packaged supported family should retain its cache policy");
+    assert_eq!(kv_cache.mode, StageKvCacheMode::LookupRecord);
+    assert_eq!(kv_cache.payload, StageKvCachePayload::ResidentKv);
+    assert_eq!(kv_cache.max_bytes, 0);
+}
+
+#[test]
+fn inkling_layer_package_retains_recurrent_cache_policy_before_materialization() {
+    let config = MeshConfig::default();
+    let package_ref = "hf://meshllm/inkling-UD-Q2_K_XL-layers";
+    let resolved = resolve_skippy_config(SkippyConfigResolveRequest {
+        mesh_config: &config,
+        model_id: "meshllm/inkling-UD-Q2_K_XL-layers",
+        model_path: Path::new(package_ref),
+        model_bytes: 316 * 1024 * 1024 * 1024,
+        allocatable_memory_bytes: None,
+        request_defaults: None,
+        package_generation: None,
+    })
+    .expect("Inkling package config should resolve");
+
+    let stage = resolved
+        .to_stage_config(Some(fake_hf_package_identity(66)), LoadMode::LayerPackage)
+        .expect("Inkling package stage config should build");
+    let kv_cache = stage
+        .kv_cache
+        .expect("Inkling package should retain its recurrent cache policy");
+
+    assert_eq!(kv_cache.mode, StageKvCacheMode::LookupRecord);
+    assert_eq!(kv_cache.payload, StageKvCachePayload::KvRecurrent);
+    assert!(kv_cache.max_entries > 0);
+    assert!(kv_cache.max_entries <= 16);
+    assert_eq!(kv_cache.max_bytes, 0);
+    assert_eq!(kv_cache.min_tokens, 256);
 }
 
 #[test]

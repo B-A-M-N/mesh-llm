@@ -614,6 +614,38 @@ fn split_startup_error_messages_include_specific_blocker_tokens() {
 }
 
 #[test]
+fn stage_source_prepare_timeout_scales_with_assigned_package_bytes() {
+    let package = skippy::SkippyPackageIdentity {
+        source_model_bytes: 321_400_000_000,
+        layer_count: 66,
+        ..package(66)
+    };
+    let small_stage = RuntimeSliceStagePlan {
+        stage_id: "stage-2".to_string(),
+        stage_index: 2,
+        node_id: make_id(2),
+        layer_start: 59,
+        layer_end: 66,
+        parameter_bytes: 0,
+    };
+    let large_stage = RuntimeSliceStagePlan {
+        stage_id: "stage-0".to_string(),
+        stage_index: 0,
+        node_id: make_id(1),
+        layer_start: 0,
+        layer_end: 39,
+        parameter_bytes: 0,
+    };
+
+    let small_timeout = stage_source_prepare_timeout(&package, &small_stage);
+    let large_timeout = stage_source_prepare_timeout(&package, &large_stage);
+
+    assert!(small_timeout > MIN_STAGE_SOURCE_PREPARE_TIMEOUT);
+    assert!(large_timeout > small_timeout);
+    assert!(large_timeout <= MAX_STAGE_SOURCE_PREPARE_TIMEOUT);
+}
+
+#[test]
 fn startup_runtime_plan_auto_splits_when_model_exceeds_local_capacity() {
     assert_eq!(
         startup_runtime_plan(false, 3_000_000_000, 4_800_000_000),
