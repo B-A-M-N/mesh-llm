@@ -51,6 +51,16 @@ use tokio::sync::OwnedSemaphorePermit;
 use tokio::sync::mpsc;
 use tokio::task;
 
+struct NonstreamGeneration {
+    prompt: PreparedGenerationPrompt,
+    max_tokens: GenerationTokenLimit,
+    stop: Option<openai_frontend::StopSequence>,
+    sampling: SamplingConfig,
+    hook_request: Option<ChatCompletionRequest>,
+    cancellation: openai_frontend::CancellationToken,
+    ids: OpenAiGenerationIds,
+}
+
 #[async_trait]
 impl OpenAiBackend for StageOpenAiBackend {
     async fn models(&self) -> OpenAiResult<Vec<ModelObject>> {
@@ -59,7 +69,16 @@ impl OpenAiBackend for StageOpenAiBackend {
 
     async fn chat_completion(
         &self,
+        request: ChatCompletionRequest,
+    ) -> OpenAiResult<ChatCompletionResponse> {
+        self.chat_completion_with_context(request, OpenAiRequestContext::new())
+            .await
+    }
+
+    async fn chat_completion_with_context(
+        &self,
         mut request: ChatCompletionRequest,
+        context: OpenAiRequestContext,
     ) -> OpenAiResult<ChatCompletionResponse> {
         let ids = OpenAiGenerationIds::new(OpenAiCacheHints::from_chat_request(&request));
         let request_timer = PhaseTimer::start();
@@ -96,14 +115,15 @@ impl OpenAiBackend for StageOpenAiBackend {
         );
         let chat_parse_metadata = prompt.chat_parse_metadata.clone();
         let output = self
-            .run_generation(
+            .run_generation(NonstreamGeneration {
                 prompt,
                 max_tokens,
-                request.stop.clone(),
+                stop: request.stop.clone(),
                 sampling,
-                Some(request.clone()),
-                ids.clone(),
-            )
+                hook_request: Some(request.clone()),
+                cancellation: context.cancellation_token(),
+                ids: ids.clone(),
+            })
             .await?;
         let response_timer = PhaseTimer::start();
         let parsed_message = if parse_chat_output {
@@ -214,7 +234,16 @@ impl OpenAiBackend for StageOpenAiBackend {
         })))
     }
 
-    async fn completion(&self, mut request: CompletionRequest) -> OpenAiResult<CompletionResponse> {
+    async fn completion(&self, request: CompletionRequest) -> OpenAiResult<CompletionResponse> {
+        self.completion_with_context(request, OpenAiRequestContext::new())
+            .await
+    }
+
+    async fn completion_with_context(
+        &self,
+        mut request: CompletionRequest,
+        context: OpenAiRequestContext,
+    ) -> OpenAiResult<CompletionResponse> {
         let ids = OpenAiGenerationIds::new(OpenAiCacheHints::from_completion_request(&request));
         let request_timer = PhaseTimer::start();
         self.ensure_model(&request.model)?;
@@ -236,14 +265,15 @@ impl OpenAiBackend for StageOpenAiBackend {
         );
         self.emit_openai_phase("stage.openai_prompt_prepare", prompt_timer, prompt_attrs);
         let output = self
-            .run_generation(
+            .run_generation(NonstreamGeneration {
                 prompt,
                 max_tokens,
-                request.stop.clone(),
+                stop: request.stop.clone(),
                 sampling,
-                None,
-                ids.clone(),
-            )
+                hook_request: None,
+                cancellation: context.cancellation_token(),
+                ids: ids.clone(),
+            })
             .await?;
         let response_timer = PhaseTimer::start();
         let response = completion_response_from_generated_text(request.model, &output);
@@ -436,18 +466,10 @@ impl StageOpenAiBackend {
         Ok(())
     }
 
-    async fn run_generation(
-        &self,
-        prompt: PreparedGenerationPrompt,
-        max_tokens: GenerationTokenLimit,
-        stop: Option<openai_frontend::StopSequence>,
-        sampling: SamplingConfig,
-        hook_request: Option<ChatCompletionRequest>,
-        ids: OpenAiGenerationIds,
-    ) -> OpenAiResult<GeneratedText> {
+    async fn run_generation(&self, request: NonstreamGeneration) -> OpenAiResult<GeneratedText> {
         let admit_timer = PhaseTimer::start();
         let permit = self.acquire_generation_permit().await?;
-        let mut admit_attrs = self.openai_attrs(&ids);
+        let mut admit_attrs = self.openai_attrs(&request.ids);
         admit_attrs.insert(
             "llama_stage.openai_phase".to_string(),
             json!("generation_admit"),
@@ -458,14 +480,14 @@ impl StageOpenAiBackend {
         task::spawn_blocking(move || {
             let _permit = permit;
             backend.generate_text(
-                prompt,
-                max_tokens,
-                stop.as_ref(),
-                sampling,
-                hook_request,
+                request.prompt,
+                request.max_tokens,
+                request.stop.as_ref(),
+                request.sampling,
+                request.hook_request,
                 hook_runtime,
-                None,
-                ids,
+                Some(&request.cancellation),
+                request.ids,
                 |_| Ok(()),
             )
         })

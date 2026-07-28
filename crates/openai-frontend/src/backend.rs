@@ -74,6 +74,14 @@ pub trait OpenAiBackend: Send + Sync + 'static {
         request: ChatCompletionRequest,
     ) -> OpenAiResult<ChatCompletionResponse>;
 
+    async fn chat_completion_with_context(
+        &self,
+        request: ChatCompletionRequest,
+        _context: OpenAiRequestContext,
+    ) -> OpenAiResult<ChatCompletionResponse> {
+        self.chat_completion(request).await
+    }
+
     async fn chat_completion_stream(
         &self,
         request: ChatCompletionRequest,
@@ -84,6 +92,14 @@ pub trait OpenAiBackend: Send + Sync + 'static {
         Err(OpenAiError::unsupported(
             "/v1/completions is not supported by this backend",
         ))
+    }
+
+    async fn completion_with_context(
+        &self,
+        request: CompletionRequest,
+        _context: OpenAiRequestContext,
+    ) -> OpenAiResult<CompletionResponse> {
+        self.completion(request).await
     }
 
     async fn completion_stream(

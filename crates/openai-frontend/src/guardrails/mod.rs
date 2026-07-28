@@ -76,6 +76,7 @@ impl GuardedOpenAiBackend {
     async fn guarded_chat_completion(
         &self,
         request: ChatCompletionRequest,
+        context: Option<&OpenAiRequestContext>,
     ) -> OpenAiResult<ChatCompletionResponse> {
         let _guardrail_error_catalog = guardrail_error_catalog();
         let policy = self.policy.snapshot();
@@ -92,13 +93,13 @@ impl GuardedOpenAiBackend {
                     Some(GuardrailTelemetryParserStage::None),
                     None,
                 );
-                self.backend.chat_completion(request).await
+                self.backend_chat_completion(request, context).await
             }
             GuardrailRequestOutcome::Reject { kind } => Err(errors::guardrail_error(*kind)),
             GuardrailRequestOutcome::Guarded { backend_request } => {
                 if matches!(policy.mode, GuardrailMode::MetricsOnly) {
                     return self
-                        .metrics_only_chat_completion(request, &engine, &prepared)
+                        .metrics_only_chat_completion(request, &engine, &prepared, context)
                         .await;
                 }
 
@@ -108,8 +109,7 @@ impl GuardedOpenAiBackend {
 
                 loop {
                     let response = self
-                        .backend
-                        .chat_completion(attempt_request.clone())
+                        .backend_chat_completion(attempt_request.clone(), context)
                         .await?;
                     let classified = engine.classify_response(&prepared, &response);
                     let parser_stage = telemetry_parser_stage(classified.parser_stage);
@@ -178,8 +178,9 @@ impl GuardedOpenAiBackend {
         request: ChatCompletionRequest,
         engine: &GuardrailEngine,
         prepared: &state::PreparedGuardrailRequest,
+        context: Option<&OpenAiRequestContext>,
     ) -> OpenAiResult<ChatCompletionResponse> {
-        let response = self.backend.chat_completion(request).await?;
+        let response = self.backend_chat_completion(request, context).await?;
         let classified = engine.classify_response(prepared, &response);
         let parser_stage = telemetry_parser_stage(classified.parser_stage);
         self.record_outcome(
@@ -190,6 +191,21 @@ impl GuardedOpenAiBackend {
             Some(GuardrailTelemetryAttemptBucket::One),
         );
         Ok(response)
+    }
+
+    async fn backend_chat_completion(
+        &self,
+        request: ChatCompletionRequest,
+        context: Option<&OpenAiRequestContext>,
+    ) -> OpenAiResult<ChatCompletionResponse> {
+        match context {
+            Some(context) => {
+                self.backend
+                    .chat_completion_with_context(request, context.clone())
+                    .await
+            }
+            None => self.backend.chat_completion(request).await,
+        }
     }
 
     fn record_decision(&self, prepared: &state::PreparedGuardrailRequest) {
@@ -336,7 +352,15 @@ impl OpenAiBackend for GuardedOpenAiBackend {
         &self,
         request: ChatCompletionRequest,
     ) -> OpenAiResult<ChatCompletionResponse> {
-        self.guarded_chat_completion(request).await
+        self.guarded_chat_completion(request, None).await
+    }
+
+    async fn chat_completion_with_context(
+        &self,
+        request: ChatCompletionRequest,
+        context: OpenAiRequestContext,
+    ) -> OpenAiResult<ChatCompletionResponse> {
+        self.guarded_chat_completion(request, Some(&context)).await
     }
 
     async fn chat_completion_stream(
@@ -349,6 +373,14 @@ impl OpenAiBackend for GuardedOpenAiBackend {
 
     async fn completion(&self, request: CompletionRequest) -> OpenAiResult<CompletionResponse> {
         self.backend.completion(request).await
+    }
+
+    async fn completion_with_context(
+        &self,
+        request: CompletionRequest,
+        context: OpenAiRequestContext,
+    ) -> OpenAiResult<CompletionResponse> {
+        self.backend.completion_with_context(request, context).await
     }
 
     async fn completion_stream(

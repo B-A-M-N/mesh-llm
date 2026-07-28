@@ -157,10 +157,13 @@ async fn chat_completions(
         let model = request.model.clone();
         let context = OpenAiRequestContext::new();
         let cancellation = context.cancellation_token();
-        let stream = backend_call(
+        let stream = backend_call_with_context(
             &state,
             "chat_completion_stream",
-            state.backend.chat_completion_stream(request, context),
+            &context,
+            state
+                .backend
+                .chat_completion_stream(request, context.clone()),
         )
         .await?;
         let prelude = stream::once(async move { json_event(&ChatCompletionChunk::role(model)) });
@@ -175,11 +178,15 @@ async fn chat_completions(
             .chain(stream::once(async { done_event() }));
         Ok(sse_response(events, cancellation))
     } else {
+        let context = OpenAiRequestContext::new();
         Ok(Json(
-            backend_call(
+            backend_call_with_context(
                 &state,
                 "chat_completion",
-                state.backend.chat_completion(request),
+                &context,
+                state
+                    .backend
+                    .chat_completion_with_context(request, context.clone()),
             )
             .await?,
         )
@@ -202,10 +209,13 @@ async fn responses(
             let context = OpenAiRequestContext::new();
             let cancellation = context.cancellation_token();
             let state_machine = Arc::new(Mutex::new(ResponseSseState::new(request.model.clone())));
-            let stream = backend_call(
+            let stream = backend_call_with_context(
                 &state,
                 "responses_stream",
-                state.backend.chat_completion_stream(request, context),
+                &context,
+                state
+                    .backend
+                    .chat_completion_stream(request, context.clone()),
             )
             .await?;
             let body_state = state_machine.clone();
@@ -396,8 +406,16 @@ async fn responses(
             Ok(sse_response(events, cancellation))
         }
         _ => {
-            let response =
-                backend_call(&state, "responses", state.backend.chat_completion(request)).await?;
+            let context = OpenAiRequestContext::new();
+            let response = backend_call_with_context(
+                &state,
+                "responses",
+                &context,
+                state
+                    .backend
+                    .chat_completion_with_context(request, context.clone()),
+            )
+            .await?;
             let translated = translate_chat_completion_response_to_responses(&response)?;
             Ok(Json(translated).into_response())
         }
@@ -414,10 +432,11 @@ async fn completions(
         let include_usage = request.include_usage();
         let context = OpenAiRequestContext::new();
         let cancellation = context.cancellation_token();
-        let stream = backend_call(
+        let stream = backend_call_with_context(
             &state,
             "completion_stream",
-            state.backend.completion_stream(request, context),
+            &context,
+            state.backend.completion_stream(request, context.clone()),
         )
         .await?;
         let events = stream
@@ -431,10 +450,19 @@ async fn completions(
             .chain(stream::once(async { done_event() }));
         Ok(sse_response(events, cancellation))
     } else {
-        Ok(
-            Json(backend_call(&state, "completion", state.backend.completion(request)).await?)
-                .into_response(),
+        let context = OpenAiRequestContext::new();
+        Ok(Json(
+            backend_call_with_context(
+                &state,
+                "completion",
+                &context,
+                state
+                    .backend
+                    .completion_with_context(request, context.clone()),
+            )
+            .await?,
         )
+        .into_response())
     }
 }
 
@@ -446,13 +474,43 @@ async fn backend_call<T, F>(
 where
     F: Future<Output = OpenAiResult<T>>,
 {
+    backend_call_inner(state, operation, None, future).await
+}
+
+async fn backend_call_with_context<T, F>(
+    state: &FrontendState,
+    operation: &'static str,
+    context: &OpenAiRequestContext,
+    future: F,
+) -> OpenAiResult<T>
+where
+    F: Future<Output = OpenAiResult<T>>,
+{
+    backend_call_inner(state, operation, Some(context), future).await
+}
+
+async fn backend_call_inner<T, F>(
+    state: &FrontendState,
+    operation: &'static str,
+    context: Option<&OpenAiRequestContext>,
+    future: F,
+) -> OpenAiResult<T>
+where
+    F: Future<Output = OpenAiResult<T>>,
+{
     match state.config.backend_timeout {
-        Some(timeout) => tokio::time::timeout(timeout, future).await.map_err(|_| {
-            OpenAiError::timeout(format!(
-                "{operation} timed out after {} ms",
-                timeout.as_millis()
-            ))
-        })?,
+        Some(timeout) => match tokio::time::timeout(timeout, future).await {
+            Ok(result) => result,
+            Err(_) => {
+                if let Some(context) = context {
+                    context.cancel();
+                }
+                Err(OpenAiError::timeout(format!(
+                    "{operation} timed out after {} ms",
+                    timeout.as_millis()
+                )))
+            }
+        },
         None => future.await,
     }
 }
@@ -780,6 +838,10 @@ mod tests {
         token: Arc<Mutex<Option<CancellationToken>>>,
     }
 
+    struct TimeoutCancellationBackend {
+        token: Arc<Mutex<Option<CancellationToken>>>,
+    }
+
     #[derive(Default)]
     struct GuardrailRescueBackend {
         seen_chat_requests: Arc<Mutex<Vec<ChatCompletionRequest>>>,
@@ -805,6 +867,37 @@ mod tests {
         ) -> OpenAiResult<ChatCompletionStream> {
             *self.token.lock().expect("token lock poisoned") = Some(context.cancellation_token());
             Ok(Box::pin(stream::pending()))
+        }
+    }
+
+    #[async_trait]
+    impl OpenAiBackend for TimeoutCancellationBackend {
+        async fn models(&self) -> OpenAiResult<Vec<ModelObject>> {
+            Ok(vec![ModelObject::new("cancel-model")])
+        }
+
+        async fn chat_completion(
+            &self,
+            _request: ChatCompletionRequest,
+        ) -> OpenAiResult<ChatCompletionResponse> {
+            unreachable!("timeout cancellation must use the request context")
+        }
+
+        async fn chat_completion_with_context(
+            &self,
+            _request: ChatCompletionRequest,
+            context: OpenAiRequestContext,
+        ) -> OpenAiResult<ChatCompletionResponse> {
+            *self.token.lock().expect("token lock poisoned") = Some(context.cancellation_token());
+            std::future::pending().await
+        }
+
+        async fn chat_completion_stream(
+            &self,
+            _request: ChatCompletionRequest,
+            _context: OpenAiRequestContext,
+        ) -> OpenAiResult<ChatCompletionStream> {
+            unreachable!("timeout cancellation backend only calls non-stream chat")
         }
     }
 
@@ -1019,6 +1112,46 @@ mod tests {
         let body = response_body_json(response).await;
         assert_eq!(body["error"]["type"], "server_error");
         assert_eq!(body["error"]["code"], "timeout");
+    }
+
+    #[tokio::test]
+    async fn nonstream_backend_timeout_cancels_request_through_guardrails() {
+        let token = Arc::new(Mutex::new(None));
+        let backend = Arc::new(TimeoutCancellationBackend {
+            token: token.clone(),
+        });
+        let guarded = Arc::new(GuardedOpenAiBackend::new(
+            backend,
+            GuardrailPolicy::default(),
+        ));
+        let app = router_for_with_config(
+            guarded,
+            OpenAiFrontendConfig::default().with_backend_timeout(Duration::from_millis(1)),
+        );
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "model": "cancel-model",
+                            "messages": [{"role": "user", "content": "cancel me"}]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        let cancellation = token
+            .lock()
+            .expect("token lock poisoned")
+            .clone()
+            .expect("backend should receive cancellation token");
+        assert!(cancellation.is_cancelled());
     }
 
     #[tokio::test]

@@ -136,6 +136,18 @@ impl OpenAiBackend for HookedOpenAiBackend {
         self.backend.chat_completion(request).await
     }
 
+    async fn chat_completion_with_context(
+        &self,
+        mut request: ChatCompletionRequest,
+        context: OpenAiRequestContext,
+    ) -> OpenAiResult<ChatCompletionResponse> {
+        let outcome = self.hooks.before_chat_completion(&mut request).await?;
+        apply_chat_hook_outcome(&mut request, &outcome);
+        self.backend
+            .chat_completion_with_context(request, context)
+            .await
+    }
+
     async fn chat_completion_stream(
         &self,
         mut request: ChatCompletionRequest,
@@ -148,6 +160,14 @@ impl OpenAiBackend for HookedOpenAiBackend {
 
     async fn completion(&self, request: CompletionRequest) -> OpenAiResult<CompletionResponse> {
         self.backend.completion(request).await
+    }
+
+    async fn completion_with_context(
+        &self,
+        request: CompletionRequest,
+        context: OpenAiRequestContext,
+    ) -> OpenAiResult<CompletionResponse> {
+        self.backend.completion_with_context(request, context).await
     }
 
     async fn completion_stream(

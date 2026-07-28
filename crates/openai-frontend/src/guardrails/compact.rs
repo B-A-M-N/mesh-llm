@@ -69,6 +69,16 @@ impl OpenAiBackend for CompactingOpenAiBackend {
             .await
     }
 
+    async fn chat_completion_with_context(
+        &self,
+        request: ChatCompletionRequest,
+        context: OpenAiRequestContext,
+    ) -> OpenAiResult<ChatCompletionResponse> {
+        self.backend
+            .chat_completion_with_context(self.compact_request(request)?, context)
+            .await
+    }
+
     async fn chat_completion_stream(
         &self,
         request: ChatCompletionRequest,
@@ -81,6 +91,14 @@ impl OpenAiBackend for CompactingOpenAiBackend {
 
     async fn completion(&self, request: CompletionRequest) -> OpenAiResult<CompletionResponse> {
         self.backend.completion(request).await
+    }
+
+    async fn completion_with_context(
+        &self,
+        request: CompletionRequest,
+        context: OpenAiRequestContext,
+    ) -> OpenAiResult<CompletionResponse> {
+        self.backend.completion_with_context(request, context).await
     }
 
     async fn completion_stream(
