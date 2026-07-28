@@ -5,9 +5,10 @@ use super::{
     invalid_data,
 };
 
-// v10 makes the coordinator the sole owner of verify-window acceptance and removes the
-// redundant tail-stage acceptance/correction fields. Stage peers must be upgraded together.
-pub const STAGE_STATE_VERSION: i32 = 10;
+// v11 adds the Inkling MTP embedding sideband, which changes activation payload length.
+// Stage peers must be upgraded together so an older reader rejects the header before it can
+// leave the additional sideband bytes in the stream.
+pub const STAGE_STATE_VERSION: i32 = 11;
 pub const MAX_STAGE_LOGIT_BIAS: usize = 256;
 pub const MAX_STAGE_PREDICTED_TOKENS: usize = 262_144;
 pub const MAX_STAGE_SIDEBAND_VALUES: usize = 1_048_576;
