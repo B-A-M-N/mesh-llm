@@ -8,7 +8,9 @@ mod embedded_execution;
 mod embedded_generation;
 mod generation;
 mod generation_flow;
+mod generation_receipt;
 mod guardrails;
+mod linear_proposal;
 mod local_generation;
 mod native_mtp;
 mod prefill;
@@ -35,8 +37,17 @@ pub use self::generation::{
     embedded_openai_backend, embedded_openai_router, serve_embedded_openai,
     serve_embedded_openai_with_shutdown, serve_openai,
 };
+pub use self::generation_receipt::{
+    GenerationReceipt, GenerationReceiptConfig, GenerationReceiptSink, GenerationStateDigest,
+    GenerationTermination, generation_token_id_digest,
+};
 pub use self::guardrails::{
     OpenAiGuardrailsConfig, OpenAiGuardrailsStatus, OpenAiGuardrailsTarget,
+};
+pub use self::linear_proposal::{
+    LinearProposal, LinearProposalDiscardReason, LinearProposalDisposition, LinearProposalIngress,
+    LinearProposalIngressConfig, LinearProposalQuery, LinearProposalReceipt,
+    OpaqueProposalDecisionId,
 };
 pub use self::speculative::{
     NativeMtpProposalConfig, NgramExtensionConfig, NgramProposalConfig, NgramProposerKind,

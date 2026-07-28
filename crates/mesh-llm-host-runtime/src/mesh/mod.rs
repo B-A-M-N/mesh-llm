@@ -91,6 +91,7 @@ mod node_identity;
 mod node_requirements;
 mod owner_control;
 mod owner_control_response;
+mod owner_lifecycle_cache;
 mod peer_state;
 mod plugin_config;
 mod plugin_mesh;
@@ -107,6 +108,7 @@ use connections::*;
 use model_identity::*;
 use node_identity::*;
 use owner_control::*;
+use owner_lifecycle_cache::*;
 use peer_state::*;
 #[cfg(test)]
 use plugin_mesh::*;

@@ -4,6 +4,8 @@ use crate::binary_transport::WireCondition;
 use crate::cli::ServeOpenAiArgs;
 use crate::config::load_json;
 use crate::config::validate_config;
+use crate::frontend::GenerationReceiptConfig;
+use crate::frontend::LinearProposalIngressConfig;
 use crate::frontend::OpenAiGuardrailsConfig;
 use crate::frontend::OpenAiGuardrailsStatus;
 use crate::frontend::admission::GenerationTokenBudget;
@@ -138,6 +140,8 @@ pub async fn serve_openai(args: ServeOpenAiArgs) -> Result<()> {
         generation_queue_limit: args.generation_concurrency,
         generation_token_budget: Arc::new(GenerationTokenBudget::new(ctx_size)),
         hook_policy: None,
+        generation_receipt: None,
+        linear_proposal_ingress: None,
         kv,
         decode_batcher,
         decode_frame_batcher,
@@ -187,6 +191,8 @@ pub struct EmbeddedOpenAiArgs {
     pub prediction_returns: Option<Arc<PredictionReturnHub>>,
     pub telemetry: Telemetry,
     pub hook_policy: Option<Arc<dyn OpenAiHookPolicy>>,
+    pub generation_receipt: Option<GenerationReceiptConfig>,
+    pub linear_proposal_ingress: Option<LinearProposalIngressConfig>,
     pub openai_guardrails: Option<OpenAiGuardrailsConfig>,
 }
 
@@ -297,6 +303,11 @@ pub fn embedded_openai_backend(args: EmbeddedOpenAiArgs) -> Result<EmbeddedOpenA
     if args.native_mtp_draft_model_path.is_some() && !args.native_mtp_enabled {
         bail!("native MTP must be enabled when an MTP draft model is set");
     }
+    validate_generation_receipt_topology(
+        args.generation_receipt.is_some(),
+        args.config.upstream.is_some(),
+        args.config.downstream.is_some(),
+    )?;
     let speculative_windows_enabled = args.draft_model_path.is_some()
         || args.speculative.native_mtp.enabled
         || args.speculative.ngram.is_some();
@@ -387,6 +398,8 @@ pub fn embedded_openai_backend(args: EmbeddedOpenAiArgs) -> Result<EmbeddedOpenA
         generation_queue_limit: args.generation_concurrency,
         generation_token_budget: Arc::new(GenerationTokenBudget::new(ctx_size)),
         hook_policy: args.hook_policy,
+        generation_receipt: args.generation_receipt,
+        linear_proposal_ingress: args.linear_proposal_ingress,
         kv,
         decode_batcher,
         decode_frame_batcher,
@@ -408,6 +421,17 @@ pub fn embedded_openai_backend(args: EmbeddedOpenAiArgs) -> Result<EmbeddedOpenA
         generation_concurrency: args.generation_concurrency,
         openai_guardrails,
     })
+}
+
+fn validate_generation_receipt_topology(
+    receipt_enabled: bool,
+    has_upstream: bool,
+    has_downstream: bool,
+) -> Result<()> {
+    if receipt_enabled && (has_upstream || has_downstream) {
+        bail!("generation receipts are supported only for local single-stage execution");
+    }
+    Ok(())
 }
 
 pub(in crate::frontend) fn instrumented_openai_router(
@@ -446,4 +470,18 @@ pub(in crate::frontend) async fn openai_http_telemetry(
         now_unix_nanos() as u64,
     );
     response
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_generation_receipt_topology;
+
+    #[test]
+    fn generation_receipts_require_local_single_stage_topology() {
+        assert!(validate_generation_receipt_topology(true, false, false).is_ok());
+        assert!(validate_generation_receipt_topology(false, true, true).is_ok());
+        assert!(validate_generation_receipt_topology(true, true, false).is_err());
+        assert!(validate_generation_receipt_topology(true, false, true).is_err());
+        assert!(validate_generation_receipt_topology(true, true, true).is_err());
+    }
 }
