@@ -108,6 +108,18 @@ fn estimated_activation_bytes(
         .unwrap_or(0)
 }
 
+fn cleanup_partial_restore(
+    restored_tokens: usize,
+    required_tokens: usize,
+    cleanup: impl FnOnce(),
+) -> bool {
+    if restored_tokens >= required_tokens {
+        return false;
+    }
+    cleanup();
+    true
+}
+
 pub(super) fn request_allows_exact_replay(request: &EmbeddedStageZeroGeneration<'_>) -> bool {
     request.draft.is_none() && request.sampling.temperature <= 0.0
 }
@@ -719,7 +731,9 @@ impl StageOpenAiBackend {
             else {
                 continue;
             };
-            if restore.restored_tokens < checkpoint_tokens.len() {
+            if cleanup_partial_restore(restore.restored_tokens, checkpoint_tokens.len(), || {
+                self.drop_embedded_split_restore(request, session_key, downstream);
+            }) {
                 continue;
             }
             let replay = replay_tokens[..replay_len].to_vec();
@@ -808,7 +822,11 @@ impl StageOpenAiBackend {
         else {
             return Ok(None);
         };
-        if restore.restored_tokens < request.prompt_token_ids.len() {
+        if cleanup_partial_restore(
+            restore.restored_tokens,
+            request.prompt_token_ids.len(),
+            || self.drop_embedded_split_restore(request, session_key, downstream),
+        ) {
             return Ok(None);
         }
         let mut attrs = self.openai_attrs(request.ids);
@@ -995,7 +1013,9 @@ impl StageOpenAiBackend {
         let Some(local_restore) = local_restore else {
             return Ok(None);
         };
-        if local_restore.token_count < prefill_tokens.len() {
+        if cleanup_partial_restore(local_restore.token_count, prefill_tokens.len(), || {
+            self.drop_embedded_split_restore(request, session_key, downstream);
+        }) {
             return Ok(None);
         }
         reply_stats.kv_lookup_hits += 1;
@@ -1231,5 +1251,25 @@ mod tests {
         assert_eq!(q8.interstage_activation_bytes_avoided_estimate, 1_311_744);
         assert_eq!(f32.stage0_activation_bytes_avoided, 5_242_880);
         assert_eq!(f32.interstage_activation_bytes_avoided_estimate, 5_242_880);
+    }
+
+    #[test]
+    fn partial_restore_runs_cleanup_before_another_probe() {
+        let mut cleaned = false;
+
+        let rejected = cleanup_partial_restore(1_024, 1_030, || cleaned = true);
+
+        assert!(rejected);
+        assert!(cleaned);
+    }
+
+    #[test]
+    fn full_restore_keeps_the_session_active() {
+        let mut cleaned = false;
+
+        let rejected = cleanup_partial_restore(1_030, 1_030, || cleaned = true);
+
+        assert!(!rejected);
+        assert!(!cleaned);
     }
 }
