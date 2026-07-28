@@ -1,7 +1,7 @@
-From ca873452281e01f149ecc6b186b786e9acb82353 Mon Sep 17 00:00:00 2001
+From 51d6cbbe346ff1372b34c5ac50c462abec0f6ce0 Mon Sep 17 00:00:00 2001
 From: Daniel Han <danielhanchen@gmail.com>
 Date: Wed, 15 Jul 2026 18:14:40 +0000
-Subject: [PATCH 01/12] Add TML Inkling architecture
+Subject: [PATCH 48/59] Add TML Inkling architecture
 
 Hybrid attention model: 55 sliding-window plus 11 global layers, banded
 content-dependent relative position bias instead of RoPE, per-layer short
@@ -28,7 +28,7 @@ and audio support, and backend op tests at production shapes.
  ggml/src/ggml-cuda/fattn-banded.cu     | 247 +++++++++
  ggml/src/ggml-cuda/fattn-banded.cuh    |   7 +
  ggml/src/ggml-cuda/fattn-common.cuh    |  17 +-
- ggml/src/ggml-cuda/fattn-mma-f16.cuh   | 111 ++++-
+ ggml/src/ggml-cuda/fattn-mma-f16.cuh   | 111 +++-
  ggml/src/ggml-cuda/fattn.cu            |  10 +-
  ggml/src/ggml-cuda/ggml-cuda.cu        |  68 ++-
  ggml/src/ggml-cuda/mmf.cuh             |   8 +-
@@ -41,10 +41,10 @@ and audio support, and backend op tests at production shapes.
  ggml/src/ggml.c                        |  59 ++-
  gguf-py/gguf/constants.py              |  50 ++
  gguf-py/gguf/tensor_mapping.py         |  49 ++
- models/templates/Inkling.jinja         | 514 +++++++++++++++++++
+ models/templates/Inkling.jinja         | 514 ++++++++++++++++++
  src/llama-arch.cpp                     |  35 ++
  src/llama-arch.h                       |  24 +
- src/llama-graph.cpp                    |   8 +-
+ src/llama-graph.cpp                    |  30 +-
  src/llama-graph.h                      |   3 +-
  src/llama-hparams.cpp                  |   5 +
  src/llama-hparams.h                    |  11 +
@@ -56,13 +56,13 @@ and audio support, and backend op tests at production shapes.
  src/llama-quant.cpp                    |  10 +
  src/llama-vocab.cpp                    |  10 +
  src/llama-vocab.h                      |   1 +
- src/models/inkling.cpp                 | 666 +++++++++++++++++++++++++
+ src/models/inkling.cpp                 | 695 +++++++++++++++++++++++++
  src/models/models.h                    |  13 +
  tests/CMakeLists.txt                   |   8 +
  tests/test-backend-ops.cpp             | 116 ++++-
  tests/test-chat.cpp                    |  79 +++
  tests/test-flash-attn-bias.cpp         | 525 +++++++++++++++++++
- tests/test-flash-attn-generic-hash.cpp | 142 ++++++
+ tests/test-flash-attn-generic-hash.cpp | 142 +++++
  tests/test-llama-archs.cpp             |   3 +
  tools/mtmd/CMakeLists.txt              |   1 +
  tools/mtmd/clip-impl.h                 |   9 +
@@ -75,7 +75,7 @@ and audio support, and backend op tests at production shapes.
  tools/mtmd/mtmd-image.cpp              | 203 +++++++-
  tools/mtmd/mtmd-image.h                |  20 +
  tools/mtmd/mtmd.cpp                    |  37 +-
- 61 files changed, 4021 insertions(+), 122 deletions(-)
+ 61 files changed, 4069 insertions(+), 125 deletions(-)
  create mode 100644 conversion/inkling.py
  create mode 100644 ggml/src/ggml-cuda/fattn-banded.cu
  create mode 100644 ggml/src/ggml-cuda/fattn-banded.cuh
@@ -121,7 +121,7 @@ index a309f0276..db9004d84 100644
          // Build ID parsers if keys are provided
          common_peg_parser id_parser = eps();
 diff --git a/common/chat.cpp b/common/chat.cpp
-index 91658e6df..641bc86cd 100644
+index 91658e6df..89f518716 100644
 --- a/common/chat.cpp
 +++ b/common/chat.cpp
 @@ -2381,6 +2381,119 @@ static common_chat_params common_chat_params_init_cohere2moe(const common_chat_t
@@ -2898,7 +2898,7 @@ index 39c55a66a..b5ee26abb 100644
      LLM_TENSOR_VISEXP_ATTN_OUT,
      LLM_TENSOR_VISEXP_FFN_GATE,
 diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
-index 6cef391d1..aa569a34f 100644
+index 6cef391d1..a2a5fbe87 100644
 --- a/src/llama-graph.cpp
 +++ b/src/llama-graph.cpp
 @@ -1574,9 +1574,15 @@ ggml_tensor * llm_graph_context::build_cvec(
@@ -2918,6 +2918,43 @@ index 6cef391d1..aa569a34f 100644
      if (w_s) {
          res = ggml_mul(ctx0, res, w_s);
      }
+@@ -2611,9 +2617,25 @@ ggml_tensor * llm_graph_context::build_attn_mha(
+ 
+     ggml_tensor * cur;
+ 
+-    const bool use_flash_attn = cparams.flash_attn && kq_b == nullptr;
++    // backends without a fused-bias flash-attention kernel (e.g. Metal for the
++    // banded op) can still run FA by folding the additive KQ bias into the mask
++    const bool fold_kq_b_into_mask = cparams.flash_attn && kq_b != nullptr && kq_mask != nullptr &&
++            arch == LLM_ARCH_INKLING;
++    const bool use_flash_attn = cparams.flash_attn && (kq_b == nullptr || fold_kq_b_into_mask);
+     if (use_flash_attn) {
+-        GGML_ASSERT(kq_b == nullptr && "Flash attention does not support KQ bias yet");
++        ggml_tensor * fa_mask = kq_mask;
++        if (fold_kq_b_into_mask) {
++            ggml_tensor * bias = ggml_cont(ctx0, kq_b);
++            if (kq_mask->ne[1] != bias->ne[1]) {
++                // the FA mask rows are padded; pad the bias with zeros to match
++                bias = ggml_pad(ctx0, bias, 0, (int)(kq_mask->ne[1] - bias->ne[1]), 0, 0);
++            }
++            // Metal adds F32 tensors, while FA consumes an F16 mask. Keep the
++            // dense bias construction on-device, then cast the combined mask.
++            ggml_tensor * mask_f32 = ggml_cast(ctx0, kq_mask, GGML_TYPE_F32);
++            fa_mask = ggml_cast(ctx0, ggml_add(ctx0, bias, mask_f32), GGML_TYPE_F16);
++            cb(fa_mask, "kq_mask_biased", il);
++        }
+ 
+         if (v_trans) {
+             v = ggml_transpose(ctx0, v);
+@@ -2628,7 +2650,7 @@ ggml_tensor * llm_graph_context::build_attn_mha(
+             v = ggml_cast(ctx0, v, GGML_TYPE_F16);
+         }
+ 
+-        cur = ggml_flash_attn_ext(ctx0, q, k, v, kq_mask, kq_scale, hparams.f_max_alibi_bias,
++        cur = ggml_flash_attn_ext(ctx0, q, k, v, fa_mask, kq_scale, hparams.f_max_alibi_bias,
+                                   hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
+         res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, cur, il});
+ 
 diff --git a/src/llama-graph.h b/src/llama-graph.h
 index ab6e111e1..e74a58a56 100644
 --- a/src/llama-graph.h
@@ -3277,10 +3314,10 @@ index b7c289263..65e43f671 100644
  struct LLM_KV;
 diff --git a/src/models/inkling.cpp b/src/models/inkling.cpp
 new file mode 100644
-index 000000000..f83930c69
+index 000000000..6c9c1aef8
 --- /dev/null
 +++ b/src/models/inkling.cpp
-@@ -0,0 +1,666 @@
+@@ -0,0 +1,695 @@
 +// Inkling (PRIVATE arch): hybrid iSWA attention + per-layer packed shortconv state; see INKLING_DESIGN.md.
 +
 +#include "models.h"
@@ -3291,6 +3328,7 @@ index 000000000..f83930c69
 +#include "../llama-memory-recurrent.h"
 +
 +#include <algorithm>
++#include <unordered_map>
 +
 +void llama_model_inkling::load_arch_hparams(llama_model_loader & ml) {
 +    ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
@@ -3515,6 +3553,33 @@ index 000000000..f83930c69
 +        return type == GGML_TYPE_F32 || type == GGML_TYPE_F16 || type == GGML_TYPE_BF16;
 +    };
 +
++    // probe once per device whether the fused banded FA op is supported there
++    // (e.g. CUDA/CPU yes, Metal no). layers on devices without it use the
++    // dense-bias branch, which build_attn_mha folds into the FA mask.
++    std::unordered_map<ggml_backend_dev_t, bool> banded_dev_support;
++    const auto dev_supports_banded_flash = [&](int il) {
++        ggml_backend_dev_t dev = model.dev_layer(il);
++        if (dev == nullptr) {
++            return true;
++        }
++        const auto it = banded_dev_support.find(dev);
++        if (it != banded_dev_support.end()) {
++            return it->second;
++        }
++        // representative probe op; tensors are metadata-only in the graph ctx
++        // and never expanded into the compute graph
++        const int64_t ext = std::max<int64_t>(1, hparams.inkling_rel_extent);
++        ggml_tensor * pq = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, head_dim, 1, n_head, 1);
++        ggml_tensor * pk = ggml_new_tensor_4d(ctx0, GGML_TYPE_F16, head_dim, 256, hparams.n_head_kv(il), 1);
++        ggml_tensor * pv = ggml_new_tensor_4d(ctx0, GGML_TYPE_F16, head_dim, 256, hparams.n_head_kv(il), 1);
++        ggml_tensor * pm = ggml_new_tensor_4d(ctx0, GGML_TYPE_F16, 256, 1, 1, 1);
++        ggml_tensor * pr = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, ext, n_head, 1, 1);
++        ggml_tensor * op = ggml_flash_attn_ext_banded(ctx0, pq, pk, pv, pm, pr, 1.0f/float(head_dim), ext);
++        const bool ok = ggml_backend_dev_supports_op(dev, op);
++        banded_dev_support.emplace(dev, ok);
++        return ok;
++    };
++
 +    const auto use_banded_flash = [&](int il) {
 +        const auto * cache = hparams.is_swa(il) ? mctx_attn->get_swa() : mctx_attn->get_base();
 +        const uint32_t n_kv_flash = hparams.is_swa(il) ? n_kv_flash_swa : n_kv_flash_base;
@@ -3526,7 +3591,8 @@ index 000000000..f83930c69
 +            hparams.n_embd_head_v(il) == head_dim &&
 +            hparams.n_head(il) % hparams.n_head_kv(il) == 0 &&
 +            banded_cache_type_supported(cache->type_k()) &&
-+            banded_cache_type_supported(cache->type_v());
++            banded_cache_type_supported(cache->type_v()) &&
++            dev_supports_banded_flash(il);
 +    };
 +
 +    for (int il = 0; il < n_layer; ++il) {

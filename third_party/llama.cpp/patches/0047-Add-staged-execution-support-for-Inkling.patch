@@ -1,7 +1,7 @@
-From 5305cc89b9eb045b9e494cc79398947a64d7422e Mon Sep 17 00:00:00 2001
+From 1f2a797b7d0f82a57125e80c5bc4bd3a727622b6 Mon Sep 17 00:00:00 2001
 From: Mesh-LLM CI <ci@mesh-llm.local>
 Date: Fri, 17 Jul 2026 13:47:13 +1000
-Subject: [PATCH 02/12] Add staged execution support for Inkling
+Subject: [PATCH 49/59] Add staged execution support for Inkling
 
 ---
  src/models/inkling.cpp | 30 +++++++++++++++++++++++-------
@@ -9,10 +9,10 @@ Subject: [PATCH 02/12] Add staged execution support for Inkling
  2 files changed, 24 insertions(+), 7 deletions(-)
 
 diff --git a/src/models/inkling.cpp b/src/models/inkling.cpp
-index f83930c69..8e5c7bb29 100644
+index 6c9c1aef8..3d5f8ab56 100644
 --- a/src/models/inkling.cpp
 +++ b/src/models/inkling.cpp
-@@ -195,6 +195,11 @@ std::unique_ptr<llm_graph_context> llama_model_inkling::build_arch_graph(const l
+@@ -196,6 +196,11 @@ std::unique_ptr<llm_graph_context> llama_model_inkling::build_arch_graph(const l
  llama_model_inkling::graph::graph(const llama_model & model, const llm_graph_params & params) :
      llm_graph_context(params) {
  
@@ -24,8 +24,8 @@ index f83930c69..8e5c7bb29 100644
      const int64_t head_dim = hparams.n_embd_head_k();
      const int64_t d_rel    = hparams.inkling_d_rel;
      const int64_t d_conv   = hparams.n_shortconv_l_cache - 1;
-@@ -246,7 +251,7 @@ llama_model_inkling::graph::graph(const llama_model & model, const llm_graph_par
-             banded_cache_type_supported(cache->type_v());
+@@ -275,7 +280,7 @@ llama_model_inkling::graph::graph(const llama_model & model, const llm_graph_par
+             dev_supports_banded_flash(il);
      };
  
 -    for (int il = 0; il < n_layer; ++il) {
@@ -33,7 +33,7 @@ index f83930c69..8e5c7bb29 100644
          if (hparams.is_swa(il)) {
              needs_rel_idx_local |= !use_banded_flash(il);
          } else {
-@@ -278,14 +283,17 @@ llama_model_inkling::graph::graph(const llama_model & model, const llm_graph_par
+@@ -307,14 +312,17 @@ llama_model_inkling::graph::graph(const llama_model & model, const llm_graph_par
      }
  
      const int64_t n_vocab = model.vocab.n_tokens();
@@ -53,7 +53,7 @@ index f83930c69..8e5c7bb29 100644
          inp->shexp_idx = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, hparams.n_expert_shared, n_tokens);
          ggml_set_input(inp->shexp_idx);
          ggml_set_name(inp->shexp_idx, "inkling_shexp_idx");
-@@ -601,9 +609,9 @@ llama_model_inkling::graph::graph(const llama_model & model, const llm_graph_par
+@@ -630,9 +638,9 @@ llama_model_inkling::graph::graph(const llama_model & model, const llm_graph_par
          return moe_out;
      };
  
@@ -65,7 +65,7 @@ index f83930c69..8e5c7bb29 100644
          cur = build_norm(cur, model.tok_norm, NULL, LLM_NORM_RMS, -1);
          cb(cur, "inkling_embd_norm", -1);
      } else {
-@@ -612,7 +620,7 @@ llama_model_inkling::graph::graph(const llama_model & model, const llm_graph_par
+@@ -641,7 +649,7 @@ llama_model_inkling::graph::graph(const llama_model & model, const llm_graph_par
  
      ggml_build_forward_expand(gf, cur);
  
@@ -74,7 +74,7 @@ index f83930c69..8e5c7bb29 100644
          conv_rs_cur = build_rs(inp_hybrid->get_recr(), mctx_recr->get_r_l(il), n_embd_r, n_seqs);
  
          // h += attn_sconv(attn(attn_norm(h)))
-@@ -638,7 +646,15 @@ llama_model_inkling::graph::graph(const llama_model & model, const llm_graph_par
+@@ -667,7 +675,15 @@ llama_model_inkling::graph::graph(const llama_model & model, const llm_graph_par
          cb(cur, "l_out", il);
      }
  
