@@ -416,6 +416,43 @@ impl RuntimeState {
         self.verify_frame_sampled(session_id, token_ids, None, input, output_capacity)
     }
 
+    pub(crate) fn canonical_session_position(&self, session_id: &str) -> Result<u64> {
+        let tracked_position = self
+            .session_token_counts
+            .get(session_id)
+            .copied()
+            .with_context(|| format!("session {session_id} has no tracked position"))?;
+        let session = self
+            .sessions
+            .get(session_id)
+            .with_context(|| format!("session {session_id} is not active"))?;
+        let rust_position = session.session.token_count();
+        let native_position = session.session.native_position()?;
+        if tracked_position != rust_position || tracked_position != native_position {
+            bail!(
+                "session {session_id} position mismatch: tracked={tracked_position}, rust={rust_position}, native={native_position}"
+            );
+        }
+        Ok(native_position)
+    }
+
+    pub(crate) fn verify_tokens(
+        &mut self,
+        session_id: &str,
+        token_ids: &[i32],
+    ) -> Result<Vec<i32>> {
+        let token_count = u64::try_from(token_ids.len())
+            .context("linear verification token count exceeds u64")?;
+        let session = self.session(session_id)?;
+        let predicted = session.verify_tokens(token_ids)?;
+        self.add_session_tokens(session_id, token_count);
+        Ok(predicted)
+    }
+
+    pub(crate) fn session_token_count(&self, session_id: &str) -> Option<u64> {
+        self.session_token_counts.get(session_id).copied()
+    }
+
     pub fn verify_frame_sampled(
         &mut self,
         session_id: &str,

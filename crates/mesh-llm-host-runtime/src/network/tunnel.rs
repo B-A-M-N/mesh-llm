@@ -104,6 +104,18 @@ async fn handle_inbound_http_stream(
     quic_recv: iroh::endpoint::RecvStream,
     http_port: u16,
 ) -> Result<()> {
+    // Admission check for remote QUIC HTTP ingress.
+    match node
+        .activity_policy_guard
+        .check_admission(crate::runtime::IngressType::RemoteQuicHttp)
+    {
+        crate::runtime::AdmissionResult::Allowed => {}
+        crate::runtime::AdmissionResult::Paused { reason, .. } => {
+            tracing::debug!(reason, "Inbound HTTP tunnel rejected by activity policy");
+            anyhow::bail!("remote inference paused: {reason}");
+        }
+    }
+
     tracing::info!("Inbound HTTP tunnel stream -> API proxy :{http_port}");
     let tcp_stream = TcpStream::connect(format!("127.0.0.1:{http_port}")).await?;
     tcp_stream.set_nodelay(true)?;
