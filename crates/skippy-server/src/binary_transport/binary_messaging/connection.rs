@@ -2,6 +2,7 @@ use super::async_forwarder::AsyncForwarder;
 use super::reply::drain_deferred_prefill_replies;
 use super::reply::send_stage_reply;
 use super::reply::{configure_prediction_return_stream, reply_window_for_message};
+use super::session_tracker::{ConnectionSessionTracker, release_tracked_connection_sessions};
 use super::summary::BinaryMessageObservation;
 use super::summary::BinaryRequestSummary;
 use super::telemetry::UpstreamReplyWriteSpan;
@@ -72,36 +73,6 @@ use std::time::Instant;
 
 static BINARY_SESSION_COUNTER: AtomicU64 = AtomicU64::new(1);
 
-/// Tracks runtime session keys created by one binary stage connection so
-/// that a mid-request failure (connection error, protocol violation,
-/// runtime error) releases the execution lanes those sessions hold.
-///
-/// Without this, a generation that errors before the graceful `Stop`
-/// message leaks its lane session in [`RuntimeState`]: each retried
-/// request uses a fresh session id, so leaked lanes accumulate until
-/// every admission fails with "all execution lanes are busy" and only a
-/// process restart recovers.
-#[derive(Default)]
-pub(super) struct ConnectionSessionTracker {
-    active: std::collections::BTreeSet<String>,
-}
-
-impl ConnectionSessionTracker {
-    pub(super) fn touch(&mut self, session_key: &str) {
-        if !self.active.contains(session_key) {
-            self.active.insert(session_key.to_string());
-        }
-    }
-
-    pub(super) fn stopped(&mut self, session_key: &str) {
-        self.active.remove(session_key);
-    }
-
-    pub(super) fn drain(&mut self) -> Vec<String> {
-        std::mem::take(&mut self.active).into_iter().collect()
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 pub(super) fn handle_binary_connection(
     config: &StageConfig,
@@ -147,50 +118,6 @@ pub(super) fn handle_binary_connection(
     );
     release_tracked_connection_sessions(config, runtime, telemetry, &mut session_tracker);
     result
-}
-
-/// Drops any runtime sessions this connection created but never stopped
-/// gracefully, returning their execution lanes to the pool.
-fn release_tracked_connection_sessions(
-    config: &StageConfig,
-    runtime: &Arc<Mutex<RuntimeState>>,
-    telemetry: &Telemetry,
-    session_tracker: &mut ConnectionSessionTracker,
-) {
-    let orphaned = session_tracker.drain();
-    if orphaned.is_empty() {
-        return;
-    }
-    let Ok(mut runtime) = runtime.lock() else {
-        return;
-    };
-    for session_key in orphaned {
-        match runtime.drop_session_timed(&session_key) {
-            Ok(drop_stats) => {
-                let mut attrs = crate::telemetry::lifecycle_attrs(config);
-                attrs.insert("llama_stage.session_key".to_string(), json!(session_key));
-                attrs.insert(
-                    "llama_stage.session_reset".to_string(),
-                    json!(drop_stats.reset_session),
-                );
-                attrs.insert(
-                    "llama_stage.lane_discarded".to_string(),
-                    json!(drop_stats.lane_discarded),
-                );
-                insert_runtime_session_stats(
-                    &mut attrs,
-                    "llama_stage.runtime_sessions_after",
-                    &drop_stats.stats_after,
-                );
-                telemetry.emit("stage.binary_session_orphan_reclaimed", attrs);
-            }
-            Err(error) => {
-                eprintln!(
-                    "failed to reclaim orphaned binary stage session {session_key}: {error:#}"
-                );
-            }
-        }
-    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1415,34 +1342,5 @@ fn handle_binary_connection_messages(
                 message_end_unix_nanos,
             );
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::ConnectionSessionTracker;
-
-    #[test]
-    fn tracker_drains_sessions_that_never_saw_a_stop() {
-        let mut tracker = ConnectionSessionTracker::default();
-        tracker.touch("session-a");
-        tracker.touch("session-a");
-        tracker.touch("session-b");
-
-        // Simulate a mid-request stage error: session-a errored before its
-        // graceful Stop, session-b completed normally.
-        tracker.stopped("session-b");
-
-        assert_eq!(tracker.drain(), vec!["session-a".to_string()]);
-        // Idempotent: a second drain reclaims nothing.
-        assert!(tracker.drain().is_empty());
-    }
-
-    #[test]
-    fn tracker_reclaims_nothing_after_graceful_stop() {
-        let mut tracker = ConnectionSessionTracker::default();
-        tracker.touch("session-a");
-        tracker.stopped("session-a");
-        assert!(tracker.drain().is_empty());
     }
 }
