@@ -49,8 +49,8 @@ pub async fn install_native_runtime_json(
 
 #[napi(js_name = "installedNativeRuntimesJson")]
 pub fn installed_native_runtimes_json(cache_dir: Option<String>) -> Result<String> {
-    let runtimes = native_runtime_cache(cache_dir)?
-        .installed()
+    let cache = native_runtime_cache(cache_dir)?;
+    let runtimes = mesh_llm_sdk::native_runtime::discover_local_native_runtimes(&[], &cache)
         .map_err(to_napi_error)?;
     Ok(Value::Array(
         runtimes
@@ -727,6 +727,7 @@ fn parse_native_runtime_install_options(
         verification_policy: parse_native_runtime_verification_policy(
             optional_string(&value, "verificationPolicy").as_deref(),
         )?,
+        bundle_install_policy: Default::default(),
         progress: None,
         allow_download: value
             .get("allowDownload")

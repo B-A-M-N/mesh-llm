@@ -220,6 +220,34 @@ update the skill resources in the same change.
 
 ## Caches, artifacts, and smoke tests
 
+- Treat release production as a three-layer graph: one backend-neutral host per
+  OS/architecture, one native-runtime artifact per
+  OS/architecture/backend/backend-version, and product composition from those
+  two immutable inputs. A backend alias may select a runtime but must never
+  compile a distinct host.
+- Host artifacts must include and pass the dynamic-import policy report.
+  Runtime artifacts must include their manifest, file checksums, runtime ABI,
+  MeshLLM version, platform, and backend compatibility. Product artifacts must
+  record the exact host and runtime digests and preserve the
+  `mesh-bundle/native-runtimes/<runtime-id>` layout.
+- Keep host, runtime, and product matrices separate in release workflows.
+  Product jobs download producer artifacts and verify compatibility and digest
+  metadata before composition. Never satisfy a missing producer by rebuilding
+  either layer in a consumer job.
+- Host producers attest and import-check the host before upload. Consumers
+  verify that producer checksum and attestation, then copy the exact host bytes;
+  they must not re-stamp, relink, or otherwise mutate a host per backend alias.
+- Main CI executable lanes follow the same product contract: CPU artifact
+  producers upload a backend-neutral host together with its adjacent packaged
+  runtime. A backend product lane consumes the unchanged, verified host from
+  its OS/architecture producer and combines it with its selected runtime; it
+  must not independently produce a backend-specific host. Do not upload or
+  consume a raw host binary, rebuild a host after restoring a runtime cache, or
+  use a driver stub to make an executable test pass.
+- No-driver smoke is mandatory for every product alias, native package, and OCI
+  image. CUDA/ROCm/Vulkan device absence is not a skip condition for
+  `--version`, runtime discovery/listing, or client startup. Hardware-qualified
+  serving tests are additional coverage.
 - Namespace cache keys and include every compatibility boundary that can make
   reuse unsafe: OS, architecture, backend/toolchain, relevant lockfiles,
   `.github/cache-version.txt`, and build inputs. Do not broaden restore keys

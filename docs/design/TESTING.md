@@ -513,6 +513,12 @@ just build
 - Wakeable capacity renders in a separate section from topology peers and live nodes
 - Wakeable entries do not appear in the topology peer list
 - Validation uses `npm run test:run`, `npm run typecheck`, and `just build`
+- `just build` must leave `target/debug/mesh-llm` with exactly one adjacent
+  `target/debug/native-runtimes/<runtime-id>/` tree. Validate it with
+  `./target/debug/mesh-llm --log-format json runtime list`; CI also starts the
+  composed client noninteractively, observes either the JSON `Client ready`
+  message or the structured `passive_mode`/`status=ready`/`role=client` event,
+  and requires a clean SIGINT shutdown.
 
 ## Mesh Identity
 
@@ -1151,6 +1157,38 @@ mesh-llm client --join <TOKEN> --port 9338
 - `/v1/models` returns models from routing table
 - Inference routes through QUIC tunnel to host
 - Host does NOT see client in its peer list (zero per-client state)
+
+### 16. Release host/runtime/product boundary
+
+For release, installer, SDK, or packaging changes, validate the three layers
+without relying on a pre-existing user runtime:
+
+```bash
+just release-host-build
+just release-runtime-build metal # choose the platform backend
+product_out="$(mktemp -d)"
+just release-bundle "v$(./target/release/mesh-llm --version | awk '{print $NF}')" "$product_out"
+```
+
+Required evidence:
+
+- `scripts/verify-host-dependencies.py target/release/mesh-llm` reports no
+  rejected backend imports.
+- Extracting the product archive yields one host, one runtime tree,
+  `product-manifest.json`, and `host-imports.json`; all recorded digests match.
+- With isolated `HOME`, XDG cache, and
+  `MESH_LLM_NATIVE_RUNTIME_CACHE_DIR`, the extracted host passes `--version`,
+  `--help`, and `runtime list`. The adjacent runtime is listed and the isolated
+  cache remains empty.
+- A product with an incompatible MeshLLM version or Skippy ABI is rejected
+  before loading.
+- `client --auto --log-format json --no-console` starts without a native
+  runtime or GPU driver, emits a real ready event, and stops cleanly on SIGINT.
+
+Run the command-surface smoke on every product platform without device
+passthrough. Separately qualify backend loading and a minimal operation on
+suitable CUDA, ROCm, Vulkan, or Metal hardware. Preserve unique temp paths and
+ports and verify process/listener cleanup.
 
 ## Deploy to remote node
 

@@ -12,6 +12,10 @@ INSTALL_SERVICE_START="${MESH_LLM_INSTALL_SERVICE_START:-1}"
 RELEASE_URL_BASE="${MESH_LLM_INSTALL_URL_BASE:-}"
 REQUIRE_CHECKSUM="${MESH_LLM_REQUIRE_CHECKSUM:-0}"
 INSTALL_VERBOSE="${MESH_LLM_INSTALL_VERBOSE:-0}"
+# v0.75.0 is the first release whose public archives are required to contain a
+# contract-v2 host/runtime product. Keep the legacy path for older pinned tags
+# only; remove it after their documented support window ends.
+COMPOSED_PRODUCT_MIN_VERSION="0.75.0"
 AUTO_SETUP=1
 DOWNLOADED_ARCHIVE=""
 DOWNLOADED_ASSET=""
@@ -575,7 +579,6 @@ download_release_archive() {
 
 stale_binary_names() {
     cat <<'EOF'
-mesh-llm
 rpc-server
 llama-server
 llama-moe-split
@@ -601,6 +604,20 @@ remove_stale_binaries() {
     done < <(stale_binary_names)
 }
 
+restore_bundle_install() {
+    local backup_dir="$1"
+    shift
+    local installed_name
+    for installed_name in "$@"; do
+        rm -rf -- "${INSTALL_DIR:?}/$installed_name"
+    done
+
+    local backup_item
+    while IFS= read -r -d '' backup_item; do
+        mv "$backup_item" "$INSTALL_DIR/$(basename "$backup_item")"
+    done < <(find "$backup_dir" -mindepth 1 -maxdepth 1 -print0)
+}
+
 validate_bundle() {
     local bundle_dir="$1"
     local binary="$bundle_dir/mesh-llm"
@@ -612,16 +629,105 @@ validate_bundle() {
         echo "error: mesh-llm binary in release archive is not executable" >&2
         return 1
     fi
+    local has_product_manifest=0
+    local has_native_runtimes=0
+    [[ -f "$bundle_dir/product-manifest.json" ]] && has_product_manifest=1
+    [[ -d "$bundle_dir/native-runtimes" ]] && has_native_runtimes=1
+    if [[ "$has_product_manifest" != "$has_native_runtimes" ]]; then
+        echo "error: release archive has an incomplete composed native runtime bundle" >&2
+        return 1
+    fi
+    if [[ "$has_product_manifest" == 0 ]]; then
+        # Pinned/pre-contract release assets remain installable. Their hosts
+        # either carry the legacy static runtime or use their own historical
+        # runtime-install flow; requiring a v2 product manifest here would make
+        # a previously published, checksum-valid release unrecoverable.
+        local version_output legacy_version
+        if ! version_output="$("$binary" --version 2>&1)"; then
+            echo "error: cannot verify legacy release version before install: $version_output" >&2
+            return 1
+        fi
+        legacy_version="$(printf '%s\n' "$version_output" | sed -nE 's/^mesh-llm[[:space:]]+([0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?).*$/\1/p' | head -n 1)"
+        if [[ -z "$legacy_version" ]]; then
+            echo "error: release archive omitted the composed runtime bundle and its host version is not parseable" >&2
+            return 1
+        fi
+        if version_at_least "$legacy_version" "$COMPOSED_PRODUCT_MIN_VERSION"; then
+            echo "error: MeshLLM $legacy_version requires product-manifest.json and native-runtimes (contract floor: v$COMPOSED_PRODUCT_MIN_VERSION)" >&2
+            return 1
+        fi
+        warn "installing supported legacy MeshLLM $legacy_version archive without a composed native runtime bundle"
+    fi
+}
+
+version_at_least() {
+    local candidate="${1%%-*}"
+    local floor="${2%%-*}"
+    local c_major c_minor c_patch f_major f_minor f_patch
+    IFS=. read -r c_major c_minor c_patch <<< "$candidate"
+    IFS=. read -r f_major f_minor f_patch <<< "$floor"
+    ((10#$c_major > 10#$f_major)) && return 0
+    ((10#$c_major < 10#$f_major)) && return 1
+    ((10#$c_minor > 10#$f_minor)) && return 0
+    ((10#$c_minor < 10#$f_minor)) && return 1
+    ((10#$c_patch >= 10#$f_patch))
 }
 
 install_bundle() {
     local bundle_dir="$1"
     validate_bundle "$bundle_dir"
+
+    mkdir -p "$INSTALL_DIR"
+    local staging_dir
+    local backup_dir
+    if ! staging_dir="$(mktemp -d "$INSTALL_DIR/.mesh-llm-stage.XXXXXX")"; then
+        return 1
+    fi
+    if ! backup_dir="$(mktemp -d "$INSTALL_DIR/.mesh-llm-backup.XXXXXX")"; then
+        rm -rf -- "$staging_dir"
+        return 1
+    fi
+    if ! cp -R "$bundle_dir/." "$staging_dir/"; then
+        rm -rf -- "$staging_dir" "$backup_dir"
+        return 1
+    fi
+    if ! validate_bundle "$staging_dir"; then
+        rm -rf -- "$staging_dir" "$backup_dir"
+        return 1
+    fi
+
+    local -a installed_names=()
+    trap 'restore_bundle_install "$backup_dir" ${installed_names[@]+"${installed_names[@]}"}; rm -rf -- "$staging_dir" "$backup_dir"; trap - INT TERM; exit 130' INT TERM
+    local staged_item
+    local item_name
+    local destination
+    while IFS= read -r -d '' staged_item; do
+        item_name="$(basename "$staged_item")"
+        destination="$INSTALL_DIR/$item_name"
+        if [[ -e "$destination" || -L "$destination" ]]; then
+            if ! mv "$destination" "$backup_dir/$item_name"; then
+                restore_bundle_install \
+                    "$backup_dir" \
+                    ${installed_names[@]+"${installed_names[@]}"}
+                rm -rf -- "$staging_dir" "$backup_dir"
+                trap - INT TERM
+                return 1
+            fi
+        fi
+        if ! mv "$staged_item" "$destination"; then
+            restore_bundle_install \
+                "$backup_dir" \
+                ${installed_names[@]+"${installed_names[@]}"}
+            rm -rf -- "$staging_dir" "$backup_dir"
+            trap - INT TERM
+            return 1
+        fi
+        installed_names+=("$item_name")
+    done < <(find "$staging_dir" -mindepth 1 -maxdepth 1 -print0)
+
+    trap - INT TERM
+    rm -rf -- "$staging_dir" "$backup_dir"
     remove_stale_binaries
-    local file
-    for file in "$bundle_dir"/*; do
-        mv -f "$file" "$INSTALL_DIR/"
-    done
 }
 
 shell_is_interactive() {

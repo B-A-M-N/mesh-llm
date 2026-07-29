@@ -79,20 +79,19 @@ just ui-clean      # nuke node_modules + dist (fixes stale npm state)
 
 **Which build to use:**
 
-- `just build` → produces `./target/debug/mesh-llm`. Use for fast local iteration
-  and sanity-checking that the code compiles end-to-end (llama.cpp ABI + UI +
-  mesh-llm). Do **not** use this binary for serious behavior testing, perf
-  testing, or deploying to test machines — debug builds are slow and can hide
-  or surface bugs that release builds don't.
+- `just build` → produces `./target/debug/mesh-llm` plus its adjacent
+  `target/debug/native-runtimes/` directory. It is the normal fast local
+  product: a backend-neutral dynamic host and one locally packaged runtime.
+  Use it for iteration and startup checks; use a release product for serious
+  behavior/performance testing or deployment.
 - `just release-build` → produces `./target/release/mesh-llm`. Use this for any
   serious testing, deploying to test machines, bundling, or releases. Release
-  builds default to `MESH_LLM_DYNAMIC_NATIVE_RUNTIME=1`, so the binary loads a
-  compatible installed native runtime at startup instead of embedding the
-  branch-local llama.cpp ABI libraries. When validating branch-local Skippy ABI,
-  llama.cpp patch, MAS hidden-state, or native tensor changes, either use
-  `just build` for the normal static local dev loop or run
-  `MESH_LLM_DYNAMIC_NATIVE_RUNTIME=0 just release-build` before release-mode
-  behavior/performance testing.
+  builds always produce one backend-neutral host plus a packageable native
+  runtime. When validating branch-local Skippy ABI, llama.cpp patches, MAS
+  hidden-state, or native tensor changes, use `just release-host-build` and
+  `just release-runtime-build <backend>`, then point the host at
+  `dist/native-runtimes` with `MESH_LLM_NATIVE_RUNTIME_BUNDLE_DIR`. Static
+  backend linkage is not a release or packaging lane.
 - `./target/release/mesh-llm` may exist from a *previous* `just release-build`
   or `just build-dev` invocation even after you run only `just build` — its
   presence is **not** evidence that your latest code is in it. When in doubt,
@@ -102,11 +101,29 @@ just ui-clean      # nuke node_modules + dist (fixes stale npm state)
   they skip llama.cpp ABI prep and the UI, and `cargo check` produces no
   binary at all.
 
-When in doubt for testing or shipping changes: use `just release-build` and
-then copy `./target/release/mesh-llm`. For native ABI development, first decide
-whether you need the default dynamic release packaging path or an embedded
-branch-local native ABI; do not test new ABI symbols against downloaded release
-native runtimes.
+When in doubt for testing or shipping changes: use the composed output from
+`just release-bundle vX.Y.Z <output>`, which packages the backend-neutral host
+with one selected runtime under `native-runtimes/`. For native ABI development,
+first decide whether you need the default dynamic release packaging path or an
+embedded branch-local native ABI; do not test new ABI symbols against downloaded
+release native runtimes.
+
+Release artifacts follow one three-layer graph:
+
+| Layer | Command | Output |
+|---|---|---|
+| Neutral host | `just release-host-build` | `target/release/mesh-llm` plus an import-policy report during packaging |
+| Native runtime | `just release-runtime-build <backend>` | `dist/native-runtimes/<runtime-id>/` plus archive/checksum |
+| Product | `just release-bundle vX.Y.Z <output>` | `mesh-bundle/` containing the host, one runtime, and product/host-import manifests |
+
+The host dependency policy is enforced by
+`scripts/verify-host-dependencies.py`. Release, installer, SDK, native-package,
+and image lanes must not bypass it or copy backend libraries beside the host.
+For an isolated local runtime test, set
+`MESH_LLM_NATIVE_RUNTIME_BUNDLE_DIR="$PWD/dist/native-runtimes"` and a fresh
+`MESH_LLM_NATIVE_RUNTIME_CACHE_DIR`. Discovery never searches the current
+working directory. Do not reintroduce an external `llama-server` or
+`rpc-server` lane.
 
 ### npm "Exit handler never called" error
 
@@ -127,12 +144,11 @@ mesh-llm embeds the stage runtime and links patched llama.cpp static ABI
 libraries. The only durable llama.cpp patch queue is
 `third_party/llama.cpp/patches`, pinned by `third_party/llama.cpp/upstream.txt`.
 
-- `just build` prepares `.deps/llama.cpp`, applies the ABI patch queue, builds
-  the static libraries, builds the UI, and builds `mesh-llm`.
-- The dynamic native-runtime path is for release, SDK, installer, and packaged
-  app flows. It loads a compatible native runtime artifact in-process at
-  startup. It is not the normal development loop for editing the Skippy ABI or
-  llama.cpp patch queue.
+- `just build` builds the UI and a dynamic host, then packages the selected
+  local runtime next to it. The host never links a backend library.
+- Static llama.cpp compilation is the explicitly named native-runtime primitive
+  (`just build-runtime` / `scripts/package-native-runtime.sh --build`), used
+  when changing the Skippy ABI or patch queue. It is not a host build path.
 - Do not reintroduce an external `llama-server` / `rpc-server` runtime lane.
 - If you need to update upstream llama.cpp, use `scripts/prepare-llama.sh`,
   `scripts/build-llama.sh`, `scripts/update-llama-pin.sh`, and
@@ -416,7 +432,7 @@ When making changes that touch gossip, routing, proxy, election, or capability a
 For changes that affect routing, MoA, gossip, the OpenAI surface, agent harnesses, or anything multi-node, validate with these three shapes before declaring a branch ready:
 
 1. **2-node private mesh** — start one node with `mesh-llm serve --model <big> --port 9337 --console 3131`, grab its invite token from the JSON log, and start the second node with `mesh-llm serve --gguf <small.gguf> --port 9447 --console 3145 --join <token>`. Confirm peers=1 on both consoles and `/v1/models` returns the union. Exercises QUIC tunnelling and cross-node routing.
-2. **Public mesh as a client** — `mesh-llm client --auto` from a workstation. Confirm `discovery_joined` + `Client ready` in the log and an inference call against a mesh-advertised model returns. Exercises the read-only routing path agent users hit.
+2. **Public mesh as a client** — `mesh-llm client --auto` from a workstation. Confirm `discovery_joined` plus a structured client-ready event (`passive_mode`, `status=ready`, `role=client`) in the log and an inference call against a mesh-advertised model returns. Exercises the read-only routing path agent users hit.
 3. **Agent harness** — run ≥ 1 of the harnesses (“mini-agent” Python loops at `/tmp/mini-agent*.py`, Goose, OpenCode) against the local proxy with both `model=auto` and `model=mesh` to catch tool-call and reducer regressions that simple curl checks miss.
 
 ### Cargo Concurrency

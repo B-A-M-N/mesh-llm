@@ -9,7 +9,6 @@ OUT_DIR="$REPO_ROOT/dist/native-runtimes"
 BACKEND="${LLAMA_STAGE_BACKEND:-${SKIPPY_LLAMA_BACKEND:-cpu}}"
 TARGET_TRIPLE="${MESH_NATIVE_RUNTIME_TARGET:-}"
 LLAMA_WORKDIR="${LLAMA_WORKDIR:-$REPO_ROOT/.deps/llama.cpp}"
-LLAMA_BUILD_ROOT="${MESH_LLM_LLAMA_BUILD_ROOT:-$REPO_ROOT/.deps/llama-build}"
 
 usage() {
     cat >&2 <<'EOF'
@@ -134,12 +133,39 @@ sanitize_component() {
 }
 
 backend_flavor() {
+    local cuda_major
     case "$BACKEND" in
-        cuda) printf 'cuda%s\n' "${MESH_LLM_CUDA_TOOLKIT_MAJOR:-12}" ;;
-        cuda-blackwell) printf 'cuda%s-sm120\n' "${MESH_LLM_CUDA_TOOLKIT_MAJOR:-13}" ;;
+        cuda)
+            cuda_major="$(cuda_toolkit_major)"
+            printf 'cuda%s\n' "$cuda_major"
+            ;;
+        cuda-blackwell)
+            cuda_major="$(cuda_toolkit_major)"
+            printf 'cuda%s-sm120\n' "$cuda_major"
+            ;;
         rocm|hip) printf 'rocm\n' ;;
         *) printf '%s\n' "$BACKEND" ;;
     esac
+}
+
+cuda_toolkit_major() {
+    if [[ -n "${MESH_LLM_CUDA_TOOLKIT_MAJOR:-}" ]]; then
+        if [[ ! "$MESH_LLM_CUDA_TOOLKIT_MAJOR" =~ ^[0-9]+$ ]]; then
+            echo "MESH_LLM_CUDA_TOOLKIT_MAJOR must be digits-only (for example: 12)" >&2
+            exit 1
+        fi
+        printf '%s\n' "$MESH_LLM_CUDA_TOOLKIT_MAJOR"
+        return 0
+    fi
+    if [[ -n "${MESH_CUDA_VERSION:-}" ]]; then
+        printf '%s\n' "${MESH_CUDA_VERSION%%.*}"
+        return 0
+    fi
+    if [[ "$BACKEND" == "cuda-blackwell" ]]; then
+        printf '13\n'
+    else
+        printf '12\n'
+    fi
 }
 
 build_backend() {
@@ -224,6 +250,52 @@ primary_library_names() {
         *windows*) printf 'llama.dll\nlibllama.dll\n' ;;
         *) printf 'libllama.so\n' ;;
     esac
+}
+
+gpu_benchmark_tool_path() {
+    if [[ "$runtime_os" == "windows" ]]; then
+        printf 'tools/mesh-llm-gpu-benchmark.exe\n'
+    else
+        printf 'tools/mesh-llm-gpu-benchmark\n'
+    fi
+}
+
+build_gpu_benchmark_tool() {
+    local tool_rel tool_path source_root compiler
+    case "$BACKEND" in
+        cuda|cuda-blackwell|rocm|hip|metal) ;;
+        *) return 0 ;;
+    esac
+
+    tool_rel="$(gpu_benchmark_tool_path)"
+    tool_path="$stage_dir/$tool_rel"
+    source_root="$REPO_ROOT/crates/mesh-llm-gpu-bench/native"
+    mkdir -p "$(dirname "$tool_path")"
+
+    case "$BACKEND" in
+        cuda|cuda-blackwell)
+            compiler="${NVCC:-${CUDACXX:-nvcc}}"
+            "$compiler" -O3 -std=c++17 "$source_root/cuda/membench-fingerprint.cu" -o "$tool_path"
+            ;;
+        rocm|hip)
+            compiler="${HIPCC:-hipcc}"
+            "$compiler" -O3 -std=c++17 "$source_root/hip/membench-fingerprint.hip" -o "$tool_path"
+            ;;
+        metal)
+            compiler="${CC:-clang}"
+            "$compiler" -O3 -fobjc-arc \
+                "$source_root/metal/membench_metal.m" \
+                "$source_root/metal/membench_main.m" \
+                -framework Foundation -framework Metal -o "$tool_path"
+            ;;
+    esac
+
+    case "$runtime_os" in
+        linux) patchelf --set-rpath "\$ORIGIN/../lib" "$tool_path" ;;
+        macos) install_name_tool -add_rpath '@loader_path/../lib' "$tool_path" ;;
+    esac
+    chmod +x "$tool_path"
+    tool_paths+=("$tool_rel")
 }
 
 collect_runtime_libraries() {
@@ -316,7 +388,7 @@ rewrite_linux_runtime_paths() {
     local rel_path library
     for rel_path in "${library_paths[@]}"; do
         library="$stage_dir/$rel_path"
-        patchelf --set-rpath '$ORIGIN' "$library"
+        patchelf --set-rpath "\$ORIGIN" "$library"
     done
 }
 
@@ -334,7 +406,8 @@ fi
 
 if [[ "$BUILD" == "1" ]]; then
     "$SCRIPT_DIR/prepare-llama.sh" "${MESH_LLM_LLAMA_PIN_SHA:-pinned}"
-    LLAMA_STAGE_LINK_MODE=dynamic \
+    env \
+        LLAMA_STAGE_LINK_MODE=dynamic \
         LLAMA_STAGE_BACKEND="$(build_backend)" \
         LLAMA_BUILD_DIR="$LLAMA_STAGE_BUILD_DIR" \
         LLAMA_STAGE_BUILD_DIR="$LLAMA_STAGE_BUILD_DIR" \
@@ -369,6 +442,8 @@ fi
 rm -rf "$stage_dir"
 mkdir -p "$stage_dir/lib"
 
+tool_paths=()
+
 library_paths=()
 for library in "${runtime_libraries[@]}"; do
     name="$(basename "$library")"
@@ -376,13 +451,25 @@ for library in "${runtime_libraries[@]}"; do
     library_paths+=("lib/$name")
 done
 
-if [[ "$runtime_os" == "windows" && "$BACKEND" == "vulkan" ]]; then
+build_gpu_benchmark_tool
+
+if [[ "$runtime_os" == "windows" ]]; then
     dependency_args=()
     for library in "${runtime_libraries[@]}"; do
         dependency_args+=(--search-dir "$(dirname "$library")")
     done
+    for dependency_root in CUDA_PATH ROCM_PATH VULKAN_SDK; do
+        dependency_dir="${!dependency_root:-}"
+        if [[ -n "$dependency_dir" ]]; then
+            dependency_dir="$dependency_dir/$(if [[ "$dependency_root" == VULKAN_SDK ]]; then printf Bin; else printf bin; fi)"
+            if [[ -d "$dependency_dir" ]]; then
+                dependency_args+=(--search-dir "$dependency_dir")
+            fi
+        fi
+    done
     "$(python_bin)" "$SCRIPT_DIR/windows-native-runtime-deps.py" collect \
         --lib-dir "$stage_dir/lib" \
+        --scan-dir "$stage_dir/tools" \
         "${dependency_args[@]}"
 
     library_paths=()
@@ -402,6 +489,7 @@ primary_library="lib/$primary_name"
 primary_sha="$(sha256_file "$stage_dir/$primary_library")"
 mesh_version="$(workspace_version)"
 abi_version="$(skippy_abi_version)"
+cuda_major="$(cuda_toolkit_major)"
 
 patched_sha=""
 upstream_sha=""
@@ -416,14 +504,22 @@ if [[ -f "$LLAMA_WORKDIR/.mesh-llm-patch-digest" ]]; then
     patch_digest="$(tr -d '[:space:]' < "$LLAMA_WORKDIR/.mesh-llm-patch-digest")"
 fi
 
-"$(python_bin)" - "$stage_dir/manifest.json" "$primary_library" "${library_paths[@]}" <<PY
+manifest_args=("$stage_dir/manifest.json" "$primary_library" "${library_paths[@]}" --)
+if [[ "${#tool_paths[@]}" -gt 0 ]]; then
+    manifest_args+=("${tool_paths[@]}")
+fi
+
+"$(python_bin)" - "${manifest_args[@]}" <<PY
 import json
+import hashlib
 import os
 import sys
 
 manifest_path = sys.argv[1]
 primary_library = sys.argv[2]
-library_paths = sys.argv[3:]
+separator = sys.argv.index("--")
+library_paths = sys.argv[3:separator]
+tool_paths = sys.argv[separator + 1:]
 backend = "$BACKEND"
 kind = {"hip": "rocm", "cuda-blackwell": "cuda"}.get(backend, backend)
 
@@ -443,10 +539,26 @@ rocm_arches = split_arches(
     or os.environ.get("SKIPPY_AMDGPU_TARGETS")
     or ""
 )
+
+def file_sha256(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+files = {
+    path: file_sha256(os.path.join(os.path.dirname(manifest_path), path))
+    for path in library_paths
+}
+tools = {
+    path: file_sha256(os.path.join(os.path.dirname(manifest_path), path))
+    for path in tool_paths
+}
 backend_manifest = {"kind": kind}
 if kind == "cuda":
     backend_manifest["cuda"] = {
-        "toolkit_major": int(os.environ.get("MESH_LLM_CUDA_TOOLKIT_MAJOR") or (13 if backend == "cuda-blackwell" else 12)),
+        "toolkit_major": int("$cuda_major"),
         "gpu_arches": cuda_arches,
     }
     min_driver = os.environ.get("MESH_LLM_CUDA_MIN_DRIVER")
@@ -478,6 +590,8 @@ manifest = {
         "backend": backend_manifest,
         "rank": int(os.environ.get("MESH_LLM_NATIVE_RUNTIME_RANK") or 0),
         "libraries": library_paths,
+        "files": files,
+        "tools": tools,
         "url": None,
         "sha256": None,
         "signature": None,
@@ -490,7 +604,6 @@ manifest = {
         "llama_upstream_sha": "$upstream_sha" or None,
         "llama_patched_sha": "$patched_sha" or None,
         "llama_patch_digest": "$patch_digest" or None,
-        "llama_build_dir": os.path.abspath("$LLAMA_STAGE_BUILD_DIR"),
     },
 }
 with open(manifest_path, "w", encoding="utf-8") as fh:

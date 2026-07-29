@@ -89,12 +89,15 @@ means a footer was present, but signature verification failed.
 just build
 ```
 
-`just build` prepares the pinned upstream `llama.cpp` checkout, applies the
-Mesh-LLM ABI patch queue from `third_party/llama.cpp/patches`, builds the
-patched static ABI libraries, builds the UI, and builds the `mesh-llm` binary.
+`just build` builds a backend-neutral dynamic host, the UI, and one adjacent
+locally packaged native runtime. It uses the same host/runtime boundary as a
+release product. Static llama.cpp compilation is confined to the runtime
+packaging primitive, never the host executable.
 
-The release bundle is now a single `mesh-llm` runtime binary. External
-`llama-server`, `rpc-server`, and `llama-moe-*` binaries are not packaged.
+The release build graph has three layers: one backend-neutral dynamic host per
+OS/architecture, one manifested native runtime per backend lane, and a composed
+product bundle. External `llama-server`, `rpc-server`, and `llama-moe-*`
+binaries are not packaged.
 
 ## Bundle
 
@@ -102,9 +105,11 @@ The release bundle is now a single `mesh-llm` runtime binary. External
 just bundle
 ```
 
-This creates `/tmp/mesh-llm-bundle.tar.gz` containing the packaged `mesh-llm`
-executable for local deployment. Platform release archives are named by target,
-such as `mesh-llm-aarch64-apple-darwin.tar.gz`.
+This creates `/tmp/mesh-llm-bundle.tar.gz` for local deployment. Platform
+release archives contain `mesh-llm`, `host-imports.json`,
+`product-manifest.json`, and exactly one
+`native-runtimes/<runtime-id>` directory. Backend-flavored archive names select
+different runtimes while retaining byte-identical host input for an OS/arch.
 
 Verify the packaged executable with `cargo run -p xtask -- release-attestation inspect --binary /tmp/test-bundle/mesh-llm --public-key-file /tmp/mesh-release-key.pub`.
 `valid` means the packaged binary matches a trusted release signer, `missing`
@@ -120,6 +125,14 @@ Platform release archives are created with:
 ```bash
 just release-build
 just release-bundle v0.X.Y
+```
+
+For an explicit backend, build the neutral host and selected runtime through
+the compatibility recipes, then compose:
+
+```bash
+just release-build-cuda
+just release-bundle-cuda v0.X.Y
 ```
 
 Before manually cutting a tag that should be consumable through SwiftPM,

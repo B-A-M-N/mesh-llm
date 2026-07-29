@@ -4,8 +4,10 @@ mod setup_helpers;
 use anyhow::Result;
 use mesh_llm_native_runtime::{NativeRuntimePruneMode, NativeRuntimeResolver, RuntimeSelection};
 use mesh_llm_runtime_install::{
-    CURRENT_MESH_VERSION, NativeRuntimeDownloadProgressCallback, NativeRuntimeManifestOptions,
-    host_runtime_profile, install_native_runtime, load_release_manifest, native_runtime_cache,
+    CURRENT_MESH_VERSION, NativeRuntimeBundleInstallPolicy, NativeRuntimeDownloadProgressCallback,
+    NativeRuntimeInstallOptions, NativeRuntimeManifestOptions, discover_local_native_runtimes,
+    discover_native_runtime_bundle_dirs, host_runtime_profile, install_native_runtime,
+    load_release_manifest, native_runtime_cache,
 };
 use mesh_llm_tui::terminal_progress::{
     ratio_complete_u64, render_inline_gauge_with_reserved_width,
@@ -57,14 +59,15 @@ pub async fn run_native_runtime_list(
     let cache = native_runtime_cache(cache_dir)?;
     let formatter = runtime_native_formatter(json_output);
     if available {
+        let discovered_bundle_dirs = discover_native_runtime_bundle_dirs(bundle_dirs)?;
         print_configured_selector(configured, json_output);
-        if !json_output && manifest_path.is_none() && bundle_dirs.is_empty() {
+        if !json_output && manifest_path.is_none() && discovered_bundle_dirs.is_empty() {
             eprintln!("🔎 Loading native runtime release manifest");
         }
         let manifest = load_release_manifest(NativeRuntimeManifestOptions {
             mesh_version: mesh_version.to_string(),
             manifest_path: manifest_path.map(Path::to_path_buf),
-            bundle_dirs: bundle_dirs.to_vec(),
+            bundle_dirs: discovered_bundle_dirs.clone(),
             ..Default::default()
         })
         .await?;
@@ -72,7 +75,7 @@ pub async fn run_native_runtime_list(
         let cache = native_runtime_cache(cache_dir)?;
         let mut resolver =
             NativeRuntimeResolver::new(mesh_version, profile.clone(), manifest.clone(), cache)
-                .with_bundle_dirs(bundle_dirs.to_vec());
+                .with_bundle_dirs(discovered_bundle_dirs);
         if let Some(skippy_abi_version) = configured.skippy_abi_version {
             resolver = resolver.with_skippy_abi_version(skippy_abi_version);
         }
@@ -103,7 +106,7 @@ pub async fn run_native_runtime_list(
         return formatter.render_available(&rows);
     }
 
-    let installed = cache.installed()?;
+    let installed = discover_local_native_runtimes(bundle_dirs, &cache)?;
     formatter.render_installed(&installed, cache.root())
 }
 
@@ -130,14 +133,14 @@ pub async fn run_native_runtime_install(
         json_output,
     );
     let formatter = runtime_native_formatter(json_output);
-    let install_options = native_runtime_install_options(
+    let install_options = cli_native_runtime_install_options(native_runtime_install_options(
         resolved_selection.selection,
         manifest_path,
         bundle_dirs,
         cache_dir,
         configured,
         cli_download_progress(json_output),
-    );
+    ));
     let outcome = match install_native_runtime(install_options).await {
         Ok(outcome) => outcome,
         Err(error) => {
@@ -146,6 +149,14 @@ pub async fn run_native_runtime_install(
         }
     };
     formatter.render_install(&outcome)
+}
+
+fn cli_native_runtime_install_options(
+    mut options: NativeRuntimeInstallOptions,
+) -> NativeRuntimeInstallOptions {
+    options.bundle_install_policy =
+        NativeRuntimeBundleInstallPolicy::InstallExplicitBundlesIntoCache;
+    options
 }
 
 fn print_configured_selector(configured: NativeRuntimeConfigSelection<'_>, json_output: bool) {
@@ -311,7 +322,7 @@ pub fn run_native_runtime_doctor(
 ) -> Result<()> {
     let cache = native_runtime_cache(None)?;
     let profile = host_runtime_profile();
-    let installed = cache.installed()?;
+    let installed = discover_local_native_runtimes(&[], &cache)?;
     let selected_mesh_version = mesh_version.unwrap_or(CURRENT_MESH_VERSION);
     let runtime_selection = RuntimeSelection::parse(configured_selection)?;
     let selected_version_runtimes = installed
@@ -399,6 +410,37 @@ fn native_runtime_doctor_readiness(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mesh_llm_native_runtime::{
+        NativeRuntimeArtifact, NativeRuntimeBackend, NativeRuntimeCache, NativeRuntimeManifest,
+        NativeRuntimePlatform,
+    };
+
+    fn write_test_runtime(path: &Path, runtime_id: &str) {
+        std::fs::create_dir_all(path.join("lib")).unwrap();
+        std::fs::write(path.join("lib/libllama.so"), b"native runtime").unwrap();
+        NativeRuntimeManifest {
+            runtime: NativeRuntimeArtifact {
+                id: runtime_id.to_string(),
+                mesh_version: Some(CURRENT_MESH_VERSION.to_string()),
+                skippy_abi: "0.1.25".to_string(),
+                platform: NativeRuntimePlatform {
+                    os: std::env::consts::OS.to_string(),
+                    arch: std::env::consts::ARCH.to_string(),
+                    target: None,
+                },
+                backend: NativeRuntimeBackend::cpu(),
+                rank: 0,
+                libraries: vec!["lib/libllama.so".to_string()],
+                files: Default::default(),
+                tools: Default::default(),
+                url: None,
+                sha256: None,
+                signature: None,
+            },
+        }
+        .write_to_dir(path)
+        .unwrap();
+    }
 
     #[test]
     fn doctor_readiness_blocks_missing_selected_runtime() {
@@ -433,5 +475,55 @@ mod tests {
         assert!(readiness.healthy);
         assert_eq!(readiness.status, "ok");
         assert!(readiness.blockers.is_empty());
+    }
+
+    #[test]
+    fn available_runtime_bundle_dirs_expand_a_product_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let product_root = temp.path().join("mesh-bundle");
+        let runtime_dir = product_root.join("native-runtimes/runtime-a");
+        write_test_runtime(&runtime_dir, "runtime-a");
+
+        let discovered =
+            discover_native_runtime_bundle_dirs(std::slice::from_ref(&product_root)).unwrap();
+
+        assert_eq!(discovered, vec![runtime_dir.canonicalize().unwrap()]);
+    }
+
+    #[test]
+    fn doctor_discovery_includes_a_bundle_when_the_cache_is_empty() {
+        let temp = tempfile::tempdir().unwrap();
+        let product_root = temp.path().join("mesh-bundle");
+        let runtime_dir = product_root.join("native-runtimes/runtime-a");
+        write_test_runtime(&runtime_dir, "runtime-a");
+        let cache = NativeRuntimeCache::new(temp.path().join("cache"));
+
+        let discovered =
+            discover_local_native_runtimes(std::slice::from_ref(&product_root), &cache).unwrap();
+
+        assert_eq!(discovered.len(), 1);
+        assert_eq!(discovered[0].path, runtime_dir.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn cli_runtime_install_options_install_explicit_bundles_into_cache() {
+        let shared_options = native_runtime_install_options(
+            RuntimeSelection::Recommended,
+            None,
+            &[],
+            None,
+            NativeRuntimeConfigSelection::default(),
+            None,
+        );
+        let cli_options = cli_native_runtime_install_options(shared_options.clone());
+
+        assert_eq!(
+            shared_options.bundle_install_policy,
+            NativeRuntimeBundleInstallPolicy::UseInPlace
+        );
+        assert_eq!(
+            cli_options.bundle_install_policy,
+            NativeRuntimeBundleInstallPolicy::InstallExplicitBundlesIntoCache
+        );
     }
 }

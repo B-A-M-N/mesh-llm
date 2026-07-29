@@ -87,55 +87,65 @@ with-lld *COMMAND:
 with-lld *COMMAND:
     @powershell -NoProfile -ExecutionPolicy Bypass -Command "$$ErrorActionPreference = 'Stop'; $$linker = $$null; try { $$sysroot = (& rustc --print sysroot).Trim(); foreach ($$target in @('x86_64-pc-windows-msvc', 'aarch64-pc-windows-msvc')) { $$candidate = Join-Path $$sysroot \"lib\rustlib\$$target\bin\rust-lld.exe\"; if (Test-Path $$candidate) { $$linker = $$candidate; break } } } catch {}; if (-not $$linker) { foreach ($$name in @('rust-lld.exe', 'lld-link.exe')) { $$command = Get-Command $$name -ErrorAction SilentlyContinue; if ($$command) { $$linker = $$command.Source; break } } }; if (-not $$linker) { Write-Error \"LLVM lld was not found for the Windows MSVC target.`n`nlld is required for faster Rust builds (measured up to 26% faster locally).`n`nInstall one of these, then rerun the just command:`n  rustup component add llvm-tools-preview`n`nOr install LLVM lld-link:`n  winget install LLVM.LLVM`n  choco install llvm`n`nThe build requires lld. It looks for rust-lld.exe in the active Rust sysroot first, then falls back to rust-lld.exe or lld-link.exe on PATH.\"; exit 1 }; $$env:CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER = $$linker; $$env:CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_LINKER = $$linker; Invoke-Expression '{{ COMMAND }}'"
 
-# Build for the current platform (macOS Metal ABI, Linux/Windows auto ABI backend)
+# Build a local product for the current platform. This is always a
+# backend-neutral dynamic host plus an adjacent packaged runtime.
 [macos]
-build: build-mac
+build backend="" cuda_arch="" rocm_arch="":
+    @scripts/build-development-product.sh --backend "{{ backend }}" --cuda-arch "{{ cuda_arch }}" --rocm-arch "{{ rocm_arch }}"
 
-# Fast local iteration build: patched llama.cpp + UI + debug mesh-llm.
+# Fast local iteration build: dynamic host + adjacent native runtime + UI.
 [macos]
 build-dev:
-    @MESH_LLM_BUILD_PROFILE=dev scripts/build-mac.sh
+    @MESH_LLM_BUILD_PROFILE=dev scripts/build-development-product.sh --profile dev
 
 # Linux overrides:
 #   just build backend=cpu
 #   just build backend=cuda cuda_arch='120;86'
 #   just build backend=rocm rocm_arch='gfx942;gfx90a'
-#   just build backend=vulkan
+# just build backend=vulkan
 [linux]
 build backend="" cuda_arch="" rocm_arch="":
-    @scripts/build-linux.sh --backend "{{ backend }}" --cuda-arch "{{ cuda_arch }}" --rocm-arch "{{ rocm_arch }}"
+    @scripts/build-development-product.sh --backend "{{ backend }}" --cuda-arch "{{ cuda_arch }}" --rocm-arch "{{ rocm_arch }}"
 
-# Fast local iteration build: patched llama.cpp + UI + debug mesh-llm.
+# Fast local iteration build: dynamic host + adjacent native runtime + UI.
 [linux]
 build-dev backend="" cuda_arch="" rocm_arch="":
-    @MESH_LLM_BUILD_PROFILE=dev scripts/build-linux.sh --backend "{{ backend }}" --cuda-arch "{{ cuda_arch }}" --rocm-arch "{{ rocm_arch }}"
+    @MESH_LLM_BUILD_PROFILE=dev scripts/build-development-product.sh --profile dev --backend "{{ backend }}" --cuda-arch "{{ cuda_arch }}" --rocm-arch "{{ rocm_arch }}"
 
 # Windows overrides:
 #   just build backend=cpu
 #   just build backend=cuda cuda_arch='120;86'
 #   just build backend=rocm rocm_arch='gfx942;gfx90a'
-#   just build backend=vulkan
+# just build backend=vulkan
 [windows]
 build backend="" cuda_arch="" rocm_arch="":
-    @powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-windows.ps1 -Backend "{{backend}}" -CudaArch "{{cuda_arch}}" -RocmArch "{{rocm_arch}}"
+    @powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-windows.ps1 -Backend "{{ backend }}" -CudaArch "{{ cuda_arch }}" -RocmArch "{{ rocm_arch }}" -DynamicHost
 
-# Fast local iteration build: patched llama.cpp + UI + debug mesh-llm.
+# Fast local iteration build: dynamic host + adjacent native runtime + UI.
 [windows]
 build-dev backend="" cuda_arch="" rocm_arch="":
-    @powershell -NoProfile -ExecutionPolicy Bypass -Command "$env:MESH_LLM_BUILD_PROFILE='dev'; & './scripts/build-windows.ps1' -Backend '{{backend}}' -CudaArch '{{cuda_arch}}' -RocmArch '{{rocm_arch}}'"
+    @powershell -NoProfile -ExecutionPolicy Bypass -Command "$env:MESH_LLM_BUILD_PROFILE='dev'; & './scripts/build-windows.ps1' -Backend '{{ backend }}' -CudaArch '{{ cuda_arch }}' -RocmArch '{{ rocm_arch }}' -DynamicHost"
 
-# Build on macOS Apple Silicon (Metal ABI)
+# Low-level static ABI primitive. This builds only the native runtime; it never
+# builds a MeshLLM host. Use `just build` for normal development.
 build-mac:
-    @scripts/build-mac.sh
+    @scripts/package-native-runtime.sh --build --backend metal
 
-# Build patched llama.cpp ABI and mesh-llm on Linux
+# Low-level static ABI primitive. This builds only the native runtime; it never
+# builds a MeshLLM host. Use `just build` for normal development.
 build-linux backend="" cuda_arch="" rocm_arch="":
-    @scripts/build-linux.sh --backend "{{ backend }}" --cuda-arch "{{ cuda_arch }}" --rocm-arch "{{ rocm_arch }}"
+    #!/usr/bin/env bash
+    set -euo pipefail
+    backend="{{ backend }}"
+    [[ -n "$backend" ]] || backend=cpu
+    LLAMA_STAGE_CUDA_ARCHITECTURES="{{ cuda_arch }}" LLAMA_STAGE_AMDGPU_TARGETS="{{ rocm_arch }}" scripts/package-native-runtime.sh --build --backend "$backend"
 
-# Build patched llama.cpp ABI and mesh-llm on Linux without rebuilding the UI.
+# Backward-compatible spelling for the explicit native-runtime primitive.
 [linux]
 build-runtime backend="" cuda_arch="" rocm_arch="":
-    @scripts/build-linux.sh --skip-ui --backend "{{ backend }}" --cuda-arch "{{ cuda_arch }}" --rocm-arch "{{ rocm_arch }}"
+    @backend="{{ backend }}"; \
+      [[ -n "$$backend" ]] || backend=cpu; \
+      LLAMA_STAGE_CUDA_ARCHITECTURES="{{ cuda_arch }}" LLAMA_STAGE_AMDGPU_TARGETS="{{ rocm_arch }}" scripts/package-native-runtime.sh --build --backend "$$backend"
 
 # Build release artifacts for the current platform.
 
@@ -143,21 +153,38 @@ build-runtime backend="" cuda_arch="" rocm_arch="":
 release version *ARGS:
     @scripts/release.sh "{{ version }}" {{ ARGS }}
 
-# Release builds default to dynamic native runtimes. Set
-# MESH_LLM_DYNAMIC_NATIVE_RUNTIME=0 when validating a release binary with
-# branch-local llama.cpp ABI changes embedded.
-release-build:
+# Build the backend-neutral release host once for the current platform.
+release-host-build:
     @scripts/build-release.sh
 
+# Build one packageable native runtime for the current platform.
+release-runtime-build backend="" target="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    selected_backend="{{ backend }}"
+    if [[ -z "$selected_backend" ]]; then
+        if [[ "$(uname -s)" == Darwin ]]; then selected_backend=metal; else selected_backend=cpu; fi
+    fi
+    if [[ -n "{{ target }}" ]]; then
+        scripts/package-native-runtime.sh --build --backend "$selected_backend" --target "{{ target }}"
+    else
+        scripts/package-native-runtime.sh --build --backend "$selected_backend"
+    fi
+
+# Build the backend-neutral host and the default runtime for this platform.
+release-build: release-host-build release-runtime-build
+
 # Build a Linux aarch64 CPU release artifact on a native aarch64 runner.
-release-build-aarch64:
-    @scripts/build-release.sh
+release-build-aarch64: release-host-build
+    @scripts/package-native-runtime.sh --build --backend cpu --target aarch64-unknown-linux-gnu
 
 # Build a Linux aarch64 CUDA release artifact (Jetson/Orin).
 # SM arches selected by MESH_CUDA_VERSION env (set by CI matrix).
-release-build-aarch64-cuda:
-    @MESH_LLM_BUILD_PROFILE=release MESH_RELEASE_ARCH=aarch64 scripts/build-linux.sh --backend cuda \
-      --cuda-arch "$(if [[ "${MESH_CUDA_VERSION:-}" == 13.* ]]; then echo '75;80;86;87;89;90;110'; else echo '75;80;86;87;89;90'; fi)"
+release-build-aarch64-cuda: release-host-build
+    @cuda_version="${MESH_CUDA_VERSION:-12}"; \
+      MESH_LLM_CUDA_TOOLKIT_MAJOR="${MESH_LLM_CUDA_TOOLKIT_MAJOR:-${cuda_version%%.*}}" \
+      LLAMA_STAGE_CUDA_ARCHITECTURES="$(if [[ "$cuda_version" == 13.* ]]; then echo '75;80;86;87;89;90;110'; else echo '75;80;86;87;89;90'; fi)" \
+      scripts/package-native-runtime.sh --build --backend cuda --target aarch64-unknown-linux-gnu
 
 # Prepare the pinned llama.cpp checkout and apply the Mesh-LLM ABI patch queue.
 llama-prepare:
@@ -172,30 +199,36 @@ llama-build: llama-prepare
     @scripts/build-llama.sh
 
 release-build-windows:
-    @powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-windows.ps1 -Backend cpu -BuildProfile release
+    @powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-windows.ps1 -Backend cpu -BuildProfile release -DynamicHost
+
+release-host-build-windows:
+    @powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-windows.ps1 -BuildProfile release -HostOnly
 
 # Build a Linux CUDA release artifact.
 # SM arches selected by MESH_CUDA_VERSION env (set by CI matrix).
-release-build-cuda:
-    @MESH_LLM_BUILD_PROFILE=release scripts/build-linux.sh --backend cuda \
-      --cuda-arch "$(if [[ "${MESH_CUDA_VERSION:-}" == 13.* ]]; then echo '75;80;86;87;89;90;100;103;120;121'; else echo '75;80;86;87;89;90'; fi)"
+release-build-cuda: release-host-build
+    @cuda_version="${MESH_CUDA_VERSION:-12}"; \
+      MESH_LLM_CUDA_TOOLKIT_MAJOR="${MESH_LLM_CUDA_TOOLKIT_MAJOR:-${cuda_version%%.*}}" \
+      LLAMA_STAGE_CUDA_ARCHITECTURES="$(if [[ "$cuda_version" == 13.* ]]; then echo '75;80;86;87;89;90;100;103;120;121'; else echo '75;80;86;87;89;90'; fi)" \
+      scripts/package-native-runtime.sh --build --backend cuda --target x86_64-unknown-linux-gnu
 
 release-build-cuda-windows cuda_arch="75;80;86;87;89;90":
-    @powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-windows.ps1 -Backend cuda -CudaArch "{{cuda_arch}}" -BuildProfile release
+    @powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-windows.ps1 -Backend cuda -CudaArch "{{ cuda_arch }}" -BuildProfile release -DynamicHost
 
 # Build a Linux ROCm ABI release artifact with an explicit architecture list.
-release-build-rocm rocm_arch="gfx90a;gfx942;gfx1100;gfx1101;gfx1102;gfx1103;gfx1151;gfx1200;gfx1201":
-    @MESH_LLM_BUILD_PROFILE=release scripts/build-linux-rocm.sh "{{ rocm_arch }}"
+release-build-rocm rocm_arch="gfx90a;gfx942;gfx1100;gfx1101;gfx1102;gfx1103;gfx1151;gfx1200;gfx1201": release-host-build
+    @LLAMA_STAGE_AMDGPU_TARGETS="{{ rocm_arch }}" \
+      scripts/package-native-runtime.sh --build --backend rocm --target x86_64-unknown-linux-gnu
 
 release-build-rocm-windows rocm_arch="gfx90a;gfx942;gfx1100;gfx1101;gfx1102;gfx1103;gfx1151;gfx1200;gfx1201":
-    @powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-windows.ps1 -Backend rocm -RocmArch "{{rocm_arch}}" -BuildProfile release
+    @powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-windows.ps1 -Backend rocm -RocmArch "{{ rocm_arch }}" -BuildProfile release -DynamicHost
 
 # Build a Linux Vulkan ABI release artifact.
-release-build-vulkan:
-    @MESH_LLM_BUILD_PROFILE=release scripts/build-linux.sh --backend vulkan
+release-build-vulkan: release-host-build
+    @scripts/package-native-runtime.sh --build --backend vulkan --target x86_64-unknown-linux-gnu
 
 release-build-vulkan-windows:
-    @powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-windows.ps1 -Backend vulkan -BuildProfile release
+    @powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-windows.ps1 -Backend vulkan -BuildProfile release -DynamicHost
 
 # Build the skippy benchmark/debug telemetry collector.
 [unix]
@@ -294,22 +327,34 @@ mesh-join join="" port="9337" gguf=model split="":
     fi
     exec "{{ mesh_bin }}" $ARGS
 
-# Create a portable tarball with all binaries for deployment to another machine.
-bundle output="/tmp/mesh-llm-bundle.tar.gz":
+# Create a portable product tarball containing the neutral host and default runtime.
+bundle output="/tmp/mesh-llm-bundle.tar.gz": release-build
     #!/usr/bin/env bash
     set -euo pipefail
-    DIR=$(mktemp -d)
-    BUNDLE="$DIR/mesh-bundle"
-    mkdir -p "$BUNDLE"
-    cp "{{ mesh_bin }}" "$BUNDLE/"
-    # Fix rpaths for portability
-    for bin in "$BUNDLE/mesh-llm"; do
-        [ -f "$bin" ] || continue
-        install_name_tool -add_rpath @executable_path/ "$bin" 2>/dev/null || true
+    staging_dir="$(mktemp -d)"
+    trap 'rm -rf "$staging_dir"' EXIT
+    version="v$("{{ mesh_bin }}" --version | awk '{print $NF}')"
+    scripts/package-release.sh "$version" "$staging_dir"
+    stable_archive=""
+    for candidate in "$staging_dir"/mesh-llm-*.tar.gz; do
+        [[ -f "$candidate" ]] || continue
+        case "$(basename "$candidate")" in
+            mesh-llm-"$version"-*) continue ;;
+        esac
+        if [[ -n "$stable_archive" ]]; then
+            echo "multiple stable product archives were produced" >&2
+            exit 1
+        fi
+        stable_archive="$candidate"
     done
-    tar czf {{ output }} -C "$DIR" mesh-bundle/
-    rm -rf "$DIR"
-    echo "Bundle: {{ output }} ($(du -sh {{ output }} | cut -f1))"
+    if [[ -z "$stable_archive" ]]; then
+        echo "product packaging did not produce a stable archive" >&2
+        exit 1
+    fi
+    mkdir -p "$(dirname "{{ output }}")"
+    cp "$stable_archive" "{{ output }}"
+    cp "$stable_archive.sha256" "{{ output }}.sha256"
+    echo "Bundle: {{ output }} ($(du -sh "{{ output }}" | cut -f1))"
 
 # Create release archive(s) for the current platform.
 
@@ -335,28 +380,28 @@ check-release:
     @just with-lld cargo run -p xtask -- repo-consistency release-targets
 
 release-bundle-windows version output="dist":
-    @powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package-release.ps1 -Version "{{version}}" -OutputDir "{{output}}"
+    @powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package-release.ps1 -Version "{{ version }}" -OutputDir "{{ output }}"
 
 # Create Linux CUDA release archive(s).
 release-bundle-cuda version output="dist":
     MESH_RELEASE_FLAVOR=cuda scripts/package-release.sh "{{ version }}" "{{ output }}"
 
 release-bundle-cuda-windows version output="dist":
-    @powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package-release.ps1 -Version "{{version}}" -OutputDir "{{output}}" -Flavor cuda
+    @powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package-release.ps1 -Version "{{ version }}" -OutputDir "{{ output }}" -Flavor cuda
 
 # Create Linux ROCm release archive(s).
 release-bundle-rocm version output="dist":
     MESH_RELEASE_FLAVOR=rocm scripts/package-release.sh "{{ version }}" "{{ output }}"
 
 release-bundle-rocm-windows version output="dist":
-    @powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package-release.ps1 -Version "{{version}}" -OutputDir "{{output}}" -Flavor rocm
+    @powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package-release.ps1 -Version "{{ version }}" -OutputDir "{{ output }}" -Flavor rocm
 
 # Create Linux Vulkan release archive(s).
 release-bundle-vulkan version output="dist":
     MESH_RELEASE_FLAVOR=vulkan scripts/package-release.sh "{{ version }}" "{{ output }}"
 
 release-bundle-vulkan-windows version output="dist":
-    @powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package-release.ps1 -Version "{{version}}" -OutputDir "{{output}}" -Flavor vulkan
+    @powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package-release.ps1 -Version "{{ version }}" -OutputDir "{{ output }}" -Flavor vulkan
 
 # Run the UI dev server with Vite HMR, proxying /api to mesh-llm (default: http://127.0.0.1:3131)
 ui-dev api="http://127.0.0.1:3131" port="5173":
@@ -428,8 +473,8 @@ test-all:
     echo "=== 2/11 Rust format check ==="
     just with-lld cargo fmt --all -- --check
     echo ""
-    echo "=== 3/11 GPU bench Rust feature check ==="
-    MESH_LLM_GPU_BENCH_RUST_ONLY=1 just with-lld cargo check -p mesh-llm-gpu-bench --features cuda,hip,intel
+    echo "=== 3/11 GPU bench crate check ==="
+    just with-lld cargo check -p mesh-llm-gpu-bench
     echo ""
     echo "=== 4-5/11 Rust validation ==="
     # Keep Clippy and tests adjacent for each compatible feature graph. Switching

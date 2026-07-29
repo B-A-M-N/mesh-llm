@@ -95,6 +95,16 @@ class WindowsNativeRuntimeDepsTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "libstdc\\+\\+-6.dll"):
                 DEPS.verify_dependencies(lib_dir)
 
+    def test_cuda_driver_dll_is_host_provided_but_toolkit_dll_is_not(self):
+        with tempfile.TemporaryDirectory() as directory:
+            lib_dir = pathlib.Path(directory)
+            write_pe(lib_dir / "ggml-cuda.dll", ["nvcuda.dll"])
+            DEPS.verify_dependencies(lib_dir)
+
+            write_pe(lib_dir / "ggml-cuda.dll", ["cudart64_12.dll"])
+            with self.assertRaisesRegex(RuntimeError, "cudart64_12.dll"):
+                DEPS.verify_dependencies(lib_dir)
+
     def test_package_verifier_accepts_closed_windows_dependency_graph(self):
         with tempfile.TemporaryDirectory() as directory:
             artifact = pathlib.Path(directory) / "meshllm-native-runtime-windows-x86_64-vulkan"
@@ -128,6 +138,49 @@ class WindowsNativeRuntimeDepsTests(unittest.TestCase):
 
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertIn("verified native runtime artifact", result.stdout)
+
+    def test_package_verifier_rejects_present_falsy_files_and_tools(self):
+        malformed_values = [False, [], "", 0, None]
+        for field in ("files", "tools"):
+            for value in malformed_values:
+                with self.subTest(field=field, value=value):
+                    with tempfile.TemporaryDirectory() as directory:
+                        artifact = (
+                            pathlib.Path(directory)
+                            / "meshllm-native-runtime-test-x86_64-cpu"
+                        )
+                        lib_dir = artifact / "lib"
+                        lib_dir.mkdir(parents=True)
+                        (lib_dir / "llama.bin").write_bytes(b"runtime")
+                        runtime = {
+                            "id": artifact.name,
+                            "mesh_version": "0.72.1",
+                            "skippy_abi": "0.1.32",
+                            "platform": {"os": "test", "arch": "x86_64"},
+                            "backend": {"kind": "cpu"},
+                            "libraries": ["lib/llama.bin"],
+                            field: value,
+                        }
+                        (artifact / "manifest.json").write_text(
+                            json.dumps({"runtime": runtime}), encoding="utf-8"
+                        )
+
+                        result = subprocess.run(
+                            [
+                                bash_executable(),
+                                VERIFY_SCRIPT.as_posix(),
+                                artifact.as_posix(),
+                            ],
+                            check=False,
+                            capture_output=True,
+                            text=True,
+                        )
+
+                        self.assertNotEqual(result.returncode, 0)
+                        self.assertIn(
+                            "runtime files and tools must be checksum maps",
+                            result.stdout + result.stderr,
+                        )
 
 
 if __name__ == "__main__":
