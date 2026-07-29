@@ -10,6 +10,7 @@ import argparse
 import os
 import shutil
 import subprocess
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -22,6 +23,8 @@ def run(*command: str, cwd: Path | None = None) -> None:
 def ensure_build_tools() -> None:
     required = ("git", "curl", "cmake", "c++", "ld.lld")
     if any(shutil.which(tool) is None for tool in required):
+        if shutil.which("apt-get") is None:
+            raise RuntimeError(f"missing build tools: {required}")
         run("apt-get", "update")
         run(
             "apt-get",
@@ -73,6 +76,9 @@ def require_gguf_magic(path: Path) -> Path:
 def projector_path(args: argparse.Namespace) -> Path:
     if not args.projector_url:
         return require_gguf_magic(Path(args.projector))
+    scheme = urllib.parse.urlparse(args.projector_url).scheme
+    if scheme not in ("http", "https"):
+        raise RuntimeError(f"unsupported projector URL scheme: {scheme!r}")
     target = Path(args.projector_local_path)
     target.parent.mkdir(parents=True, exist_ok=True)
     temporary = target.with_suffix(f"{target.suffix}.part")

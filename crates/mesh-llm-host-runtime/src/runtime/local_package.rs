@@ -461,6 +461,15 @@ pub(super) async fn collect_split_participant_membership(
             });
             continue;
         }
+        if let Some(reason) =
+            split_peer_stage_path_exclusion_reason(node.split_stage_path_snapshot(peer.id).await)
+        {
+            excluded.push(SplitParticipantExclusion {
+                node_id: peer.id,
+                reason,
+            });
+            continue;
+        }
         participants.push(SplitParticipant::new(
             peer.id,
             peer.vram_bytes,

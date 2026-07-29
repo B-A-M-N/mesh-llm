@@ -199,6 +199,7 @@ pub async fn dispatch_model_package(args: ModelPrepareArgs<'_>) -> Result<()> {
                 "projectors": job.projectors,
                 "targetRepo": job.target_repo,
                 "modelId": job.model_id,
+                "experimental": job.experimental,
                 "jobPlan": job.job_plan,
             }))?
         );

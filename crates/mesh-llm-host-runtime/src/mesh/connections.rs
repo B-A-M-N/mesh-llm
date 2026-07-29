@@ -718,7 +718,7 @@ impl Node {
     /// connection is explicitly closed. Without the terminal close a replaced
     /// connection is preserved indefinitely; without the grace period in-flight
     /// requests are cut off mid-stream.
-    fn spawn_replaced_connection_drain(remote: EndpointId, replaced: Connection) {
+    pub(super) fn spawn_replaced_connection_drain(remote: EndpointId, replaced: Connection) {
         tokio::spawn(async move {
             tracing::debug!(
                 peer = %remote.fmt_short(),

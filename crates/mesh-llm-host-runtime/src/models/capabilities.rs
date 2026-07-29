@@ -6,7 +6,7 @@ pub use mesh_llm_types::models::capabilities::{
 use super::build_hf_tokio_api;
 use super::remote_catalog;
 use serde_json::Value;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct RuntimeMediaCapabilityEvidence {
@@ -14,13 +14,29 @@ pub struct RuntimeMediaCapabilityEvidence {
     pub audio_projector_loaded: bool,
 }
 
-pub fn runtime_media_capability_evidence(
-    projector_path: Option<&Path>,
+pub async fn runtime_media_capability_evidence(
+    projector_path: Option<PathBuf>,
+) -> RuntimeMediaCapabilityEvidence {
+    match tokio::task::spawn_blocking(move || {
+        scan_runtime_media_capability_evidence(projector_path)
+    })
+    .await
+    {
+        Ok(evidence) => evidence,
+        Err(error) => {
+            tracing::warn!(%error, "projector metadata scan task failed");
+            RuntimeMediaCapabilityEvidence::default()
+        }
+    }
+}
+
+fn scan_runtime_media_capability_evidence(
+    projector_path: Option<PathBuf>,
 ) -> RuntimeMediaCapabilityEvidence {
     let Some(projector_path) = projector_path else {
         return RuntimeMediaCapabilityEvidence::default();
     };
-    let projector_meta = model_artifact::gguf::scan_gguf_projector_meta(projector_path);
+    let projector_meta = model_artifact::gguf::scan_gguf_projector_meta(Path::new(&projector_path));
     RuntimeMediaCapabilityEvidence {
         vision_projector_loaded: projector_meta
             .and_then(|meta| meta.has_vision_encoder)

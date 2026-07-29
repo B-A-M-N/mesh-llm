@@ -220,7 +220,11 @@ impl Node {
         tokio::spawn(async move {
             node.dispatch_streams(conn_for_dispatch, remote).await;
         });
-        record_draining_replaced_connection(remote, existing.as_ref(), &conn);
+        if let Some(existing) = existing.filter(|existing| existing.stable_id() != conn.stable_id())
+        {
+            record_draining_replaced_connection(remote, Some(&existing), &conn);
+            Self::spawn_replaced_connection_drain(remote, existing);
+        }
     }
 }
 

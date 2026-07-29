@@ -7,6 +7,13 @@ use skippy_runtime::{
 use crate::cli::StageFaParityArgs;
 
 pub fn stage_fa_parity(args: StageFaParityArgs) -> Result<()> {
+    if args.layer_start >= args.layer_end {
+        bail!(
+            "layer_start ({}) must be less than layer_end ({})",
+            args.layer_start,
+            args.layer_end
+        );
+    }
     let enabled = decode_boundary(&args, FlashAttentionType::Enabled)?;
     let disabled = decode_boundary(&args, FlashAttentionType::Disabled)?;
     if enabled.desc != disabled.desc {
@@ -26,6 +33,13 @@ pub fn stage_fa_parity(args: StageFaParityArgs) -> Result<()> {
     }
     let enabled_values = payload_f32(&enabled.payload)?;
     let disabled_values = payload_f32(&disabled.payload)?;
+    if enabled_values.is_empty() || enabled_values.len() != disabled_values.len() {
+        bail!(
+            "activation payload length mismatch or empty: enabled={} disabled={}",
+            enabled_values.len(),
+            disabled_values.len()
+        );
+    }
     let mut max_abs = 0.0_f32;
     let mut sum_sq = 0.0_f64;
     for (lhs, rhs) in enabled_values.iter().zip(&disabled_values) {

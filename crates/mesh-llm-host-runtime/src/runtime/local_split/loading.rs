@@ -186,8 +186,9 @@ pub(super) async fn load_split_runtime_generation_inner(
             .config
             .projector_path
             .as_deref()
-            .map(std::path::Path::new),
-    );
+            .map(std::path::PathBuf::from),
+    )
+    .await;
     let node_for_hook = spec.node.clone();
     let model_ref = spec.model_ref.to_string();
     let reporter_model_ref = model_ref.clone();

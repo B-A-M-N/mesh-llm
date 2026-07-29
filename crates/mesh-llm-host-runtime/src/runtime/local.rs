@@ -619,8 +619,13 @@ async fn start_runtime_skippy_model(
         &model_name,
         spec.model_path,
         models::runtime_media_capability_evidence(
-            resolved.hardware.projector_path.as_deref().map(Path::new),
-        ),
+            resolved
+                .hardware
+                .projector_path
+                .as_deref()
+                .map(PathBuf::from),
+        )
+        .await,
     );
     let embedded_openai = resolved.to_embedded_openai_args(0, false)?;
     let mut options = resolved
@@ -705,8 +710,13 @@ async fn start_runtime_layer_package_model(
         &model_name,
         spec.model_path,
         models::runtime_media_capability_evidence(
-            resolved.hardware.projector_path.as_deref().map(Path::new),
-        ),
+            resolved
+                .hardware
+                .projector_path
+                .as_deref()
+                .map(PathBuf::from),
+        )
+        .await,
     );
     let activation_width = skippy_stage_activation_width(package.activation_width, &model_name)?;
     let run_id = format!("mesh-skippy-{}", now_unix_nanos());

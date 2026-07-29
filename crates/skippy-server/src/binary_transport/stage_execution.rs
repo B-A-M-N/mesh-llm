@@ -53,7 +53,7 @@ fn warm_downstream_preconnect_enabled_from(value: Option<&str>) -> bool {
 pub(in crate::binary_transport) fn take_warm_or_connect_downstream(
     config: &StageConfig,
     warm_downstream: &Arc<Mutex<Option<TcpStream>>>,
-    timeout_secs: u64,
+    timeout: Duration,
 ) -> Result<Option<TcpStream>> {
     if config.downstream.is_none() {
         return Ok(None);
@@ -64,7 +64,7 @@ pub(in crate::binary_transport) fn take_warm_or_connect_downstream(
         .take();
     match warm {
         Some(stream) if warm_downstream_is_healthy(&stream)? => Ok(Some(stream)),
-        Some(_) | None => connect_binary_downstream(config, timeout_secs),
+        Some(_) | None => connect_binary_downstream(config, timeout),
     }
 }
 
@@ -83,10 +83,17 @@ pub(in crate::binary_transport) fn take_ready_downstream(
         if remaining.is_zero() {
             break;
         }
-        match take_warm_or_connect_downstream(config, warm_downstream, 1) {
+        match take_warm_or_connect_downstream(config, warm_downstream, remaining) {
             Ok(Some(mut stream)) => {
-                match complete_downstream_ready(&mut stream, remaining.min(Duration::from_secs(10)))
-                {
+                let handshake_remaining = deadline.saturating_duration_since(Instant::now());
+                if handshake_remaining.is_zero() {
+                    last_error = Some(anyhow!("downstream ready deadline expired after connect"));
+                    continue;
+                }
+                match complete_downstream_ready(
+                    &mut stream,
+                    handshake_remaining.min(Duration::from_secs(10)),
+                ) {
                     Ok(()) => return Ok(Some(stream)),
                     Err(error) => last_error = Some(error),
                 }
@@ -94,7 +101,12 @@ pub(in crate::binary_transport) fn take_ready_downstream(
             Ok(None) => return Ok(None),
             Err(error) => last_error = Some(error),
         }
-        thread::sleep(Duration::from_millis(100));
+        let retry_sleep = deadline
+            .saturating_duration_since(Instant::now())
+            .min(Duration::from_millis(100));
+        if !retry_sleep.is_zero() {
+            thread::sleep(retry_sleep);
+        }
     }
     Err(last_error
         .unwrap_or_else(|| anyhow!("downstream ready deadline expired"))
@@ -414,7 +426,7 @@ pub(in crate::binary_transport) fn binary_message_request_id(message: &StageWire
 }
 pub(crate) fn connect_binary_downstream(
     config: &StageConfig,
-    timeout_secs: u64,
+    timeout: Duration,
 ) -> Result<Option<TcpStream>> {
     let Some(peer) = config.downstream.as_ref() else {
         return Ok(None);
@@ -425,17 +437,30 @@ pub(crate) fn connect_binary_downstream(
         .unwrap_or(&peer.endpoint);
     let downstream_addr = resolve_downstream_endpoint(endpoint)?;
     let source_ip = downstream_source_ip(config)?;
-    let attempts = timeout_secs.saturating_mul(2).max(1);
+    let deadline = Instant::now() + timeout.max(Duration::from_millis(1));
     let mut last_error = None;
-    for _ in 0..attempts {
-        match connect_downstream_socket(downstream_addr, source_ip, Duration::from_secs(2)) {
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match connect_downstream_socket(
+            downstream_addr,
+            source_ip,
+            remaining.min(Duration::from_secs(2)),
+        ) {
             Ok(stream) => {
                 stream.set_nodelay(true).ok();
                 return Ok(Some(stream));
             }
             Err(error) => {
                 last_error = Some(anyhow!(error));
-                thread::sleep(Duration::from_millis(500));
+                let retry_sleep = deadline
+                    .saturating_duration_since(Instant::now())
+                    .min(Duration::from_millis(500));
+                if !retry_sleep.is_zero() {
+                    thread::sleep(retry_sleep);
+                }
             }
         }
     }
@@ -855,7 +880,7 @@ mod tests {
         net::{Shutdown, TcpListener, TcpStream},
         os::fd::AsRawFd,
         thread,
-        time::Duration,
+        time::{Duration, Instant},
     };
 
     #[test]
@@ -898,9 +923,13 @@ mod tests {
         let (server, _) = listener.accept().unwrap();
         let warm = std::sync::Arc::new(std::sync::Mutex::new(Some(server)));
 
-        let result = take_warm_or_connect_downstream(&prefix_cache_test_config(), &warm, 1)
-            .unwrap()
-            .unwrap();
+        let result = take_warm_or_connect_downstream(
+            &prefix_cache_test_config(),
+            &warm,
+            Duration::from_secs(1),
+        )
+        .unwrap()
+        .unwrap();
 
         assert_eq!(result.peer_addr().unwrap(), client.local_addr().unwrap());
         assert!(warm.lock().unwrap().is_none());
@@ -925,7 +954,7 @@ mod tests {
         let mut config = prefix_cache_test_config();
         config.downstream.as_mut().unwrap().endpoint = endpoint;
         let warm = std::sync::Arc::new(std::sync::Mutex::new(Some(stale_server)));
-        let replacement = take_warm_or_connect_downstream(&config, &warm, 1)
+        let replacement = take_warm_or_connect_downstream(&config, &warm, Duration::from_secs(1))
             .unwrap()
             .unwrap();
         let (accepted, _) = listener.accept().unwrap();
@@ -955,6 +984,28 @@ mod tests {
             .expect("downstream should be present");
 
         assert!(ready.peer_addr().is_ok());
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn downstream_ready_honors_absolute_deadline() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = listener.local_addr().unwrap().to_string();
+        let server = thread::spawn(move || {
+            let (_stream, _) = listener.accept().unwrap();
+            thread::sleep(Duration::from_secs(2));
+        });
+        let mut config = prefix_cache_test_config();
+        config.downstream.as_mut().unwrap().endpoint = endpoint;
+        let warm = std::sync::Arc::new(std::sync::Mutex::new(None));
+
+        let started = Instant::now();
+        let error = take_ready_downstream(&config, &warm, 1).unwrap_err();
+        let elapsed = started.elapsed();
+
+        assert!(error.to_string().contains("did not become ready"));
+        assert!(elapsed >= Duration::from_millis(800));
+        assert!(elapsed < Duration::from_millis(1500));
         server.join().unwrap();
     }
 

@@ -285,10 +285,13 @@ fn push_special_token_ids(
         .and_then(Value::as_str)
         .unwrap_or_default();
     if model_type == "inkling_mm_model" {
-        let eos = config
+        let mut eos = config
             .get("eos_token_id")
             .and_then(u32_value)
             .unwrap_or(200006);
+        if eos < 199998 {
+            eos = 200006;
+        }
         metadata.push(GgufKv::u32("tokenizer.ggml.eos_token_id", eos));
         metadata.push(GgufKv::u32("tokenizer.ggml.bos_token_id", eos));
         metadata.push(GgufKv::bool("tokenizer.ggml.add_bos_token", false));

@@ -309,7 +309,7 @@ impl PersistentStageLanePool {
         connect_timeout: Duration,
         ready_timeout: Duration,
     ) -> Result<TcpStream> {
-        let mut stream = connect_binary_downstream(&self.config, connect_timeout.as_secs().max(1))?
+        let mut stream = connect_binary_downstream(&self.config, connect_timeout)?
             .ok_or_else(|| anyhow!("embedded stage0 has no downstream"))?;
         let local_addr = stream.local_addr().ok();
         let peer_addr = stream.peer_addr().ok();
