@@ -1,7 +1,7 @@
-From da2d781f9418be7b90f4885c25d71da497b8d93f Mon Sep 17 00:00:00 2001
+From 8bd27d799ab7231e2b276645dbc6286a0fdd705e Mon Sep 17 00:00:00 2001
 From: Mesh-LLM CI <ci@mesh-llm.local>
 Date: Mon, 27 Jul 2026 12:01:26 +1000
-Subject: [PATCH 12/12] Complete Inkling and GLM metadata integration
+Subject: [PATCH 59/60] Complete Inkling and GLM metadata integration
 
 ---
  common/stage-chat.cpp  |  6 ++++++
@@ -12,7 +12,7 @@ Subject: [PATCH 12/12] Complete Inkling and GLM metadata integration
  5 files changed, 50 insertions(+), 7 deletions(-)
 
 diff --git a/common/stage-chat.cpp b/common/stage-chat.cpp
-index 3298ed669..16ce255af 100644
+index 3298ed66..16ce255a 100644
 --- a/common/stage-chat.cpp
 +++ b/common/stage-chat.cpp
 @@ -178,6 +178,9 @@ enum skippy_status skippy_apply_chat_template(
@@ -36,36 +36,36 @@ index 3298ed669..16ce255af 100644
          if (reasoning_format_name != nullptr && reasoning_format_name[0] != '\0') {
              inputs.reasoning_format = common_reasoning_format_from_name(reasoning_format_name);
 diff --git a/src/llama-arch.cpp b/src/llama-arch.cpp
-index 9f15b096c..10be867b5 100644
+index a489e1ad..836df068 100644
 --- a/src/llama-arch.cpp
 +++ b/src/llama-arch.cpp
-@@ -254,6 +254,8 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
+@@ -258,6 +258,8 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
      { LLM_KV_ATTENTION_INDEXER_HEAD_COUNT,           "%s.attention.indexer.head_count"           },
      { LLM_KV_ATTENTION_INDEXER_KEY_LENGTH,           "%s.attention.indexer.key_length"           },
      { LLM_KV_ATTENTION_INDEXER_TOP_K,                "%s.attention.indexer.top_k"                },
 +    { LLM_KV_ATTENTION_INDEXER_TOP_K_FREQUENCY,      "%s.attention.indexer.top_k_frequency"      },
 +    { LLM_KV_ATTENTION_INDEXER_SKIP_TOP_K_OFFSET,    "%s.attention.indexer.skip_top_k_offset"    },
+     { LLM_KV_ATTENTION_INDEXER_BLOCK_SIZE,           "%s.attention.indexer.block_size"           },
+     { LLM_KV_ATTENTION_INDEXER_LOCAL_BLOCKS,         "%s.attention.indexer.local_blocks"         },
      { LLM_KV_ATTENTION_INDEXER_TYPES,                "%s.attention.indexer.types"                },
-     { LLM_KV_ATTENTION_OUTPUT_GROUP_COUNT,           "%s.attention.output_group_count"           },
-     { LLM_KV_ATTENTION_OUTPUT_LORA_RANK,             "%s.attention.output_lora_rank"             },
 diff --git a/src/llama-arch.h b/src/llama-arch.h
-index b5ee26abb..eec925f75 100644
+index 74446fda..0033c761 100644
 --- a/src/llama-arch.h
 +++ b/src/llama-arch.h
-@@ -259,6 +259,8 @@ enum llm_kv {
+@@ -263,6 +263,8 @@ enum llm_kv {
      LLM_KV_ATTENTION_INDEXER_HEAD_COUNT,
      LLM_KV_ATTENTION_INDEXER_KEY_LENGTH,
      LLM_KV_ATTENTION_INDEXER_TOP_K,
 +    LLM_KV_ATTENTION_INDEXER_TOP_K_FREQUENCY,
 +    LLM_KV_ATTENTION_INDEXER_SKIP_TOP_K_OFFSET,
+     LLM_KV_ATTENTION_INDEXER_BLOCK_SIZE,
+     LLM_KV_ATTENTION_INDEXER_LOCAL_BLOCKS,
      LLM_KV_ATTENTION_INDEXER_TYPES,
-     LLM_KV_ATTENTION_OUTPUT_GROUP_COUNT,
-     LLM_KV_ATTENTION_OUTPUT_LORA_RANK,
 diff --git a/src/llama-model.cpp b/src/llama-model.cpp
-index 275c9ba5e..d79913df9 100644
+index 527b52b8..8c0589da 100644
 --- a/src/llama-model.cpp
 +++ b/src/llama-model.cpp
-@@ -1133,6 +1133,7 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
+@@ -1138,6 +1138,7 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
      std::fill(hparams.is_swa_impl.begin(),   hparams.is_swa_impl.end(), 0);
      std::fill(hparams.is_recr_impl.begin(),  hparams.is_recr_impl.end(),  llm_arch_is_recurrent(ml.get_arch()) ? 1 : 0);
      std::fill(hparams.is_indexer_full_impl.begin(), hparams.is_indexer_full_impl.end(), 0);
@@ -74,7 +74,7 @@ index 275c9ba5e..d79913df9 100644
      std::fill(hparams.xielu_alpha_n.begin(), hparams.xielu_alpha_n.end(), 0.0f);
      std::fill(hparams.xielu_alpha_p.begin(), hparams.xielu_alpha_p.end(), 0.0f);
 diff --git a/src/models/glm-dsa.cpp b/src/models/glm-dsa.cpp
-index 2ddbfbe13..417b0cf12 100644
+index a88aae2c..57c45772 100644
 --- a/src/models/glm-dsa.cpp
 +++ b/src/models/glm-dsa.cpp
 @@ -52,6 +52,36 @@ void llama_model_glm_dsa::load_arch_hparams(llama_model_loader & ml) {
@@ -139,5 +139,5 @@ index 2ddbfbe13..417b0cf12 100644
      switch (hparams.n_layer()) {
          case 78: type = LLM_TYPE_744B_A40B; break;
 -- 
-2.54.0
+2.50.1 (Apple Git-155)
 

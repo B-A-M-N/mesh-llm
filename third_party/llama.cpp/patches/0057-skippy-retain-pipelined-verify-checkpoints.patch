@@ -1,7 +1,7 @@
-From 10cfaccb0e17ed81a0365a5beb05354427656f4c Mon Sep 17 00:00:00 2001
+From cbb9ce751bc15c3895e262f5b73812368526b42c Mon Sep 17 00:00:00 2001
 From: Mesh-LLM CI <ci@mesh-llm.local>
 Date: Fri, 24 Jul 2026 14:54:57 +1000
-Subject: [PATCH 10/12] skippy: retain pipelined verify checkpoints
+Subject: [PATCH 57/60] skippy: retain pipelined verify checkpoints
 
 Assisted-by: goose
 ---
@@ -9,7 +9,7 @@ Assisted-by: goose
  1 file changed, 37 insertions(+), 24 deletions(-)
 
 diff --git a/src/skippy.cpp b/src/skippy.cpp
-index 1f8ca66f9..3016cc915 100644
+index fd1fd472..886efbcc 100644
 --- a/src/skippy.cpp
 +++ b/src/skippy.cpp
 @@ -162,7 +162,7 @@ struct skippy_session {
@@ -21,7 +21,7 @@ index 1f8ca66f9..3016cc915 100644
  };
  
  static thread_local skippy_session * g_skippy_external_decode_session = nullptr;
-@@ -1550,7 +1550,6 @@ static enum skippy_status skippy_checkpoint_verify_window(
+@@ -1616,7 +1616,6 @@ static enum skippy_status skippy_checkpoint_verify_window(
          const skippy_activation_desc * input_desc,
          const void * input_payload,
          skippy_error ** out_error) {
@@ -29,7 +29,7 @@ index 1f8ca66f9..3016cc915 100644
      llama_memory_t memory = session->ctx->get_memory();
      if (!skippy_memory_needs_verify_checkpoint(memory)) {
          return skippy_success(out_error);
-@@ -1587,7 +1586,16 @@ static enum skippy_status skippy_checkpoint_verify_window(
+@@ -1653,7 +1652,16 @@ static enum skippy_status skippy_checkpoint_verify_window(
          const uint8_t * bytes = static_cast<const uint8_t *>(input_payload);
          checkpoint.input_payload.assign(bytes, bytes + input_desc->payload_bytes);
      }
@@ -47,7 +47,7 @@ index 1f8ca66f9..3016cc915 100644
      return skippy_success(out_error);
  }
  
-@@ -4382,35 +4390,40 @@ static enum skippy_status skippy_restore_verify_prefix(
+@@ -4461,35 +4469,40 @@ static enum skippy_status skippy_restore_verify_prefix(
          bool * out_restored,
          skippy_error ** out_error) {
      *out_restored = false;
@@ -102,7 +102,7 @@ index 1f8ca66f9..3016cc915 100644
          status = skippy_decode_activation_frame(
                  session,
                  &input_desc,
-@@ -4424,7 +4437,7 @@ static enum skippy_status skippy_restore_verify_prefix(
+@@ -4503,7 +4516,7 @@ static enum skippy_status skippy_restore_verify_prefix(
      } else if (accepted_count > 0) {
          status = skippy_decode_tokens(
                  session,
@@ -111,7 +111,7 @@ index 1f8ca66f9..3016cc915 100644
                  accepted_count,
                  false,
                  out_error);
-@@ -5213,7 +5226,7 @@ enum skippy_status skippy_session_set_position(
+@@ -5292,7 +5305,7 @@ enum skippy_status skippy_session_set_position(
          session->signal_history.resize(static_cast<size_t>(n_past));
      }
      skippy_mtp_clear_session_state(session);
@@ -120,7 +120,7 @@ index 1f8ca66f9..3016cc915 100644
      return skippy_success(out_error);
  }
  
-@@ -5307,7 +5320,7 @@ enum skippy_status skippy_session_reset(
+@@ -5386,7 +5399,7 @@ enum skippy_status skippy_session_reset(
      session->signal_history.clear();
      skippy_clear_chat_sampling(session);
      skippy_mtp_clear_session_state(session);
@@ -129,7 +129,7 @@ index 1f8ca66f9..3016cc915 100644
      session->ctx->synchronize();
      return skippy_success(out_error);
  }
-@@ -6478,7 +6491,7 @@ static void skippy_update_session_state_after_import(
+@@ -6559,7 +6572,7 @@ static void skippy_update_session_state_after_import(
          session->signal_history.resize(static_cast<size_t>(session->n_past));
      }
      skippy_mtp_clear_session_state(session);
@@ -138,7 +138,7 @@ index 1f8ca66f9..3016cc915 100644
  }
  
  enum skippy_status skippy_export_state(
-@@ -6897,7 +6910,7 @@ enum skippy_status skippy_import_kv_page(
+@@ -6978,7 +6991,7 @@ enum skippy_status skippy_import_kv_page(
                      desc->token_start + desc->token_count,
                      static_cast<uint64_t>(std::numeric_limits<int32_t>::max()))));
      skippy_mtp_clear_session_state(session);
@@ -147,7 +147,7 @@ index 1f8ca66f9..3016cc915 100644
      session->ctx->synchronize();
  
      return skippy_success(out_error);
-@@ -6978,7 +6991,7 @@ enum skippy_status skippy_trim_session(
+@@ -7059,7 +7072,7 @@ enum skippy_status skippy_trim_session(
          session->signal_history.resize(static_cast<size_t>(token_count));
      }
      skippy_mtp_clear_session_state(session);
@@ -156,7 +156,7 @@ index 1f8ca66f9..3016cc915 100644
      session->ctx->synchronize();
  
      return skippy_success(out_error);
-@@ -7131,7 +7144,7 @@ enum skippy_status skippy_session_restore_prefix(
+@@ -7212,7 +7225,7 @@ enum skippy_status skippy_session_restore_prefix(
      }
      session->signal_history.clear();
      skippy_mtp_clear_session_state(session);
@@ -166,5 +166,5 @@ index 1f8ca66f9..3016cc915 100644
      return skippy_success(out_error);
  }
 -- 
-2.54.0
+2.50.1 (Apple Git-155)
 

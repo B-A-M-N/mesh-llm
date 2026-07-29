@@ -1,7 +1,7 @@
-From 80938333e080a08549a6d725d598b25c99338436 Mon Sep 17 00:00:00 2001
+From 33aa6b672f3d6ed994ed819636ed08fcab18cfa7 Mon Sep 17 00:00:00 2001
 From: Mesh-LLM CI <ci@mesh-llm.local>
 Date: Fri, 24 Jul 2026 03:57:28 +1000
-Subject: [PATCH 08/12] Restore recurrent verify-window state
+Subject: [PATCH 55/60] Restore recurrent verify-window state
 
 Assisted-by: codex
 ---
@@ -9,7 +9,7 @@ Assisted-by: codex
  1 file changed, 218 insertions(+), 23 deletions(-)
 
 diff --git a/src/skippy.cpp b/src/skippy.cpp
-index b3d427af2..ec8fcfde7 100644
+index c76d3fbb..08bb41e9 100644
 --- a/src/skippy.cpp
 +++ b/src/skippy.cpp
 @@ -124,6 +124,17 @@ struct skippy_model {
@@ -38,7 +38,7 @@ index b3d427af2..ec8fcfde7 100644
  };
  
  static thread_local skippy_session * g_skippy_external_decode_session = nullptr;
-@@ -1524,7 +1536,63 @@ static bool skippy_has_activation_payload(const skippy_activation_desc * desc, c
+@@ -1590,7 +1602,63 @@ static bool skippy_has_activation_payload(const skippy_activation_desc * desc, c
      return desc != nullptr && desc->payload_bytes > 0 && payload != nullptr;
  }
  
@@ -102,7 +102,7 @@ index b3d427af2..ec8fcfde7 100644
          skippy_session * session,
          const skippy_activation_desc * input_desc,
          const void * input_payload,
-@@ -2793,6 +2861,7 @@ static void skippy_mtp_clear_session_state(skippy_session * session) {
+@@ -2859,6 +2927,7 @@ static void skippy_mtp_clear_session_state(skippy_session * session) {
      if (session == nullptr) {
          return;
      }
@@ -110,7 +110,7 @@ index b3d427af2..ec8fcfde7 100644
      session->mtp_next_pos = session->n_past;
      session->mtp_prefix_valid = session->n_past == 0;
      session->mtp_has_pending_h = false;
-@@ -4274,6 +4343,97 @@ static enum skippy_status skippy_verify_activation_frame(
+@@ -4353,6 +4422,97 @@ static enum skippy_status skippy_verify_activation_frame(
      return status;
  }
  
@@ -208,7 +208,7 @@ index b3d427af2..ec8fcfde7 100644
  extern "C" {
  
  struct skippy_abi_version skippy_abi_version(void) {
-@@ -5473,7 +5633,12 @@ enum skippy_status skippy_verify_tokens(
+@@ -5551,7 +5711,12 @@ enum skippy_status skippy_verify_tokens(
          return SKIPPY_STATUS_INVALID_ARGUMENT;
      }
  
@@ -222,7 +222,7 @@ index b3d427af2..ec8fcfde7 100644
      if (status == SKIPPY_STATUS_OK) {
          const int32_t n_tokens = static_cast<int32_t>(token_count);
          for (int32_t i = 0; i < n_tokens; ++i) {
-@@ -6170,7 +6335,19 @@ enum skippy_status skippy_verify_tokens_frame_sampled(
+@@ -6260,7 +6425,19 @@ enum skippy_status skippy_verify_tokens_frame_sampled(
          }
      }
  
@@ -243,7 +243,7 @@ index b3d427af2..ec8fcfde7 100644
          status = session->stage_model->config.include_output ?
                  skippy_verify_activation_frame(session, input_desc, input_payload, token_ids, token_count, out_error) :
                  skippy_decode_activation_frame(
-@@ -6745,29 +6922,47 @@ enum skippy_status skippy_trim_session(
+@@ -6826,29 +7003,47 @@ enum skippy_status skippy_trim_session(
          return SKIPPY_STATUS_RUNTIME_ERROR;
      }
      const llama_pos p0 = static_cast<llama_pos>(token_count);
@@ -313,5 +313,5 @@ index b3d427af2..ec8fcfde7 100644
      session->n_past = static_cast<int32_t>(token_count);
      if (session->token_history.size() > token_count) {
 -- 
-2.54.0
+2.50.1 (Apple Git-155)
 

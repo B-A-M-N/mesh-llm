@@ -1,7 +1,7 @@
-From e1f1140fc85f440fce8d7dcb845f60c7af359bb5 Mon Sep 17 00:00:00 2001
+From 06bac0e35ea1d224100e57af5d5ad1cf04495557 Mon Sep 17 00:00:00 2001
 From: Mesh-LLM CI <ci@mesh-llm.local>
 Date: Fri, 17 Jul 2026 15:09:39 +1000
-Subject: [PATCH 05/12] Add Inkling multi-depth MTP sidecars
+Subject: [PATCH 52/60] Add Inkling multi-depth MTP sidecars
 
 ---
  conversion/inkling.py  |  78 ++++++++++++++++-
@@ -12,7 +12,7 @@ Subject: [PATCH 05/12] Add Inkling multi-depth MTP sidecars
  5 files changed, 247 insertions(+), 54 deletions(-)
 
 diff --git a/conversion/inkling.py b/conversion/inkling.py
-index 90ef65c3b..079842903 100644
+index 90ef65c3..07984290 100644
 --- a/conversion/inkling.py
 +++ b/conversion/inkling.py
 @@ -1,5 +1,7 @@
@@ -152,7 +152,7 @@ index 90ef65c3b..079842903 100644
  @ModelBase.register("InklingForConditionalGeneration")
  class InklingMmprojModel(MmprojModel):
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index 4342e96eb..8b2a65d67 100644
+index c4e057ae..4b47903d 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -158,6 +158,12 @@ llama_context::llama_context(
@@ -169,10 +169,10 @@ index 4342e96eb..8b2a65d67 100644
      // before the reserve passes run later in this function. This avoids a later
      // re-reserve when graph nodes change.
 diff --git a/src/llama-model.cpp b/src/llama-model.cpp
-index 6af59acb0..9b1444874 100644
+index 3621b047..be5cfb88 100644
 --- a/src/llama-model.cpp
 +++ b/src/llama-model.cpp
-@@ -2110,10 +2110,20 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
+@@ -2115,10 +2115,20 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
                      // layer filters, so pick the right one here
                      llama_memory_hybrid::layer_filter_cb filter_attn = nullptr;
                      llama_memory_hybrid::layer_filter_cb filter_recr = nullptr;
@@ -195,10 +195,10 @@ index 6af59acb0..9b1444874 100644
                          filter_attn = [&](uint32_t il) {
                              return !hparams.is_recr(il) && hparams.n_ff(il) == 0;
 diff --git a/src/models/inkling.cpp b/src/models/inkling.cpp
-index 8e5c7bb29..5f9baaa33 100644
+index 3d5f8ab5..d435a1f5 100644
 --- a/src/models/inkling.cpp
 +++ b/src/models/inkling.cpp
-@@ -12,6 +12,9 @@
+@@ -13,6 +13,9 @@
  void llama_model_inkling::load_arch_hparams(llama_model_loader & ml) {
      ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
  
@@ -208,7 +208,7 @@ index 8e5c7bb29..5f9baaa33 100644
      ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH, hparams.n_ff_exp);
      ml.get_key(LLM_KV_EXPERT_SHARED_COUNT,        hparams.n_expert_shared);
      ml.get_key(LLM_KV_EXPERT_WEIGHTS_SCALE,       hparams.expert_weights_scale);
-@@ -19,9 +22,9 @@ void llama_model_inkling::load_arch_hparams(llama_model_loader & ml) {
+@@ -20,9 +23,9 @@ void llama_model_inkling::load_arch_hparams(llama_model_loader & ml) {
  
      ml.get_key(LLM_KV_ATTENTION_SLIDING_WINDOW, hparams.n_swa);
      hparams.swa_type = LLAMA_SWA_TYPE_STANDARD; // visible iff pos_q - pos_k < n_swa (includes self)
@@ -220,7 +220,7 @@ index 8e5c7bb29..5f9baaa33 100644
          hparams.is_recr_impl[il] = 1;
      }
  
-@@ -51,71 +54,91 @@ void llama_model_inkling::load_arch_hparams(llama_model_loader & ml) {
+@@ -52,71 +55,91 @@ void llama_model_inkling::load_arch_hparams(llama_model_loader & ml) {
      type = LLM_TYPE_UNKNOWN;
  }
  
@@ -345,7 +345,7 @@ index 8e5c7bb29..5f9baaa33 100644
      }
  }
  
-@@ -197,8 +220,12 @@ llama_model_inkling::graph::graph(const llama_model & model, const llm_graph_par
+@@ -198,8 +221,12 @@ llama_model_inkling::graph::graph(const llama_model & model, const llm_graph_par
  
      const skippy_graph_filter & stage_filter = skippy_graph_get_filter();
      const bool stage_filtered = stage_filter.enabled;
@@ -360,7 +360,7 @@ index 8e5c7bb29..5f9baaa33 100644
  
      const int64_t head_dim = hparams.n_embd_head_k();
      const int64_t d_rel    = hparams.inkling_d_rel;
-@@ -293,7 +320,7 @@ llama_model_inkling::graph::graph(const llama_model & model, const llm_graph_par
+@@ -322,7 +349,7 @@ llama_model_inkling::graph::graph(const llama_model & model, const llm_graph_par
      }
  
      // shared experts go through mul_mat_id: 2D views into a repacked/quantized 3D bank are invalid
@@ -369,7 +369,7 @@ index 8e5c7bb29..5f9baaa33 100644
          inp->shexp_idx = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, hparams.n_expert_shared, n_tokens);
          ggml_set_input(inp->shexp_idx);
          ggml_set_name(inp->shexp_idx, "inkling_shexp_idx");
-@@ -609,18 +636,52 @@ llama_model_inkling::graph::graph(const llama_model & model, const llm_graph_par
+@@ -638,18 +665,52 @@ llama_model_inkling::graph::graph(const llama_model & model, const llm_graph_par
          return moe_out;
      };
  
@@ -428,7 +428,7 @@ index 8e5c7bb29..5f9baaa33 100644
          conv_rs_cur = build_rs(inp_hybrid->get_recr(), mctx_recr->get_r_l(il), n_embd_r, n_seqs);
  
          // h += attn_sconv(attn(attn_norm(h)))
-@@ -635,7 +696,7 @@ llama_model_inkling::graph::graph(const llama_model & model, const llm_graph_par
+@@ -664,7 +725,7 @@ llama_model_inkling::graph::graph(const llama_model & model, const llm_graph_par
          // h += mlp_sconv(mlp(mlp_norm(h)))
          ggml_tensor * ffn_in  = build_norm(cur, model.layers[il].ffn_norm, NULL, LLM_NORM_RMS, il);
          cb(ffn_in, "inkling_ffn_norm", il);
@@ -437,7 +437,7 @@ index 8e5c7bb29..5f9baaa33 100644
              build_dense_ffn(ffn_in, il) : build_moe(ffn_in, il);
          ffn_out = build_sconv(ffn_out, model.layers[il].shortconv_mlp, off_mlp, il);
          cb(ffn_out, "inkling_ffn_sconv", il);
-@@ -646,6 +707,31 @@ llama_model_inkling::graph::graph(const llama_model & model, const llm_graph_par
+@@ -675,6 +736,31 @@ llama_model_inkling::graph::graph(const llama_model & model, const llm_graph_par
          cb(cur, "l_out", il);
      }
  
@@ -469,7 +469,7 @@ index 8e5c7bb29..5f9baaa33 100644
      if (stage_filtered && !stage_filter.include_output) {
          cb(cur, "stage_boundary", il_end - 1);
          res->t_embd = cur;
-@@ -656,11 +742,19 @@ llama_model_inkling::graph::graph(const llama_model & model, const llm_graph_par
+@@ -685,11 +771,19 @@ llama_model_inkling::graph::graph(const llama_model & model, const llm_graph_par
      // Conv states need every layer to see all tokens. Intermediate stages hand off the full
      // activation sequence, and the final stage trims outputs only after its last local layer.
      ggml_tensor * inp_out_ids = build_inp_out_ids();
@@ -492,10 +492,10 @@ index 8e5c7bb29..5f9baaa33 100644
      res->t_embd = cur;
  
 diff --git a/src/skippy.cpp b/src/skippy.cpp
-index 0d0051b72..9b93acd94 100644
+index 5d221cda..61f9c508 100644
 --- a/src/skippy.cpp
 +++ b/src/skippy.cpp
-@@ -1757,7 +1757,7 @@ struct skippy_mtp_depth_scope {
+@@ -1823,7 +1823,7 @@ struct skippy_mtp_depth_scope {
      }
  
      bool chains_heads() const {
@@ -504,7 +504,7 @@ index 0d0051b72..9b93acd94 100644
      }
  
      bool chains_at_same_position() const {
-@@ -2778,6 +2778,17 @@ static llama_token skippy_greedy_sample_context(
+@@ -2844,6 +2844,17 @@ static llama_token skippy_greedy_sample_context(
          llama_context * ctx,
          int32_t index);
  
@@ -522,7 +522,7 @@ index 0d0051b72..9b93acd94 100644
  static enum skippy_status skippy_mtp_sync_target_tokens(
          skippy_session * session,
          const llama_token * token_ids,
-@@ -2794,7 +2805,7 @@ static enum skippy_status skippy_mtp_sync_target_tokens(
+@@ -2860,7 +2871,7 @@ static enum skippy_status skippy_mtp_sync_target_tokens(
  
      llama_context * mtp_ctx = session->stage_model->mtp_ctx;
      skippy_mtp_depth_scope mtp_depth_scope(mtp_ctx);
@@ -531,7 +531,7 @@ index 0d0051b72..9b93acd94 100644
      const bool chain_heads = mtp_depth_scope.chains_heads();
      const bool chain_at_same_position = mtp_depth_scope.chains_at_same_position();
      const int32_t n_embd = llama_model_n_embd(session->stage_model->model);
-@@ -3622,7 +3633,7 @@ static enum skippy_status skippy_mtp_propose_next(
+@@ -3688,7 +3699,7 @@ static enum skippy_status skippy_mtp_propose_next(
  
      llama_context * mtp_ctx = session->stage_model->mtp_ctx;
      skippy_mtp_depth_scope mtp_depth_scope(mtp_ctx);
@@ -541,5 +541,5 @@ index 0d0051b72..9b93acd94 100644
      if (session->mtp_pending_h.size() != static_cast<size_t>(n_embd)) {
          return skippy_success(out_error);
 -- 
-2.54.0
+2.50.1 (Apple Git-155)
 
