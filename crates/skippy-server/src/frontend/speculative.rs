@@ -235,7 +235,9 @@ mod standalone_speculative_config_tests {
             .validate()
             .expect_err("depth above native retention must fail");
 
-        assert!(error.to_string().contains("pipeline_depth <= 64"));
+        assert!(error.to_string().contains(&format!(
+            "pipeline_depth <= {MAX_VERIFY_WINDOW_PIPELINE_DEPTH}"
+        )));
     }
 
     #[test]

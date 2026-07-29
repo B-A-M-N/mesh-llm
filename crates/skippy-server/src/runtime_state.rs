@@ -518,7 +518,7 @@ impl RuntimeState {
         token_start: u64,
         token_count: u64,
     ) -> Result<()> {
-        self.session(session_id)?
+        self.active_session(session_id)?
             .retire_verify_checkpoint(token_start, token_count)
     }
 

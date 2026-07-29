@@ -1,4 +1,4 @@
-From 3bf6e4d1ebf275eab8901d9fe907c6d584769cd2 Mon Sep 17 00:00:00 2001
+From 1f12cf3984b66dde5c5340d1d54614856fb123af Mon Sep 17 00:00:00 2001
 From: Mesh-LLM CI <ci@mesh-llm.local>
 Date: Wed, 29 Jul 2026 11:12:07 +1000
 Subject: [PATCH 49/49] skippy: retire accepted verify checkpoints exactly
@@ -75,7 +75,7 @@ index 000000000..8793000c1
 +    return true;
 +}
 diff --git a/src/skippy.cpp b/src/skippy.cpp
-index b8aef2b02..66eca4bba 100644
+index f42731cb6..a22f0dde6 100644
 --- a/src/skippy.cpp
 +++ b/src/skippy.cpp
 @@ -1,4 +1,5 @@
@@ -84,7 +84,7 @@ index b8aef2b02..66eca4bba 100644
  #include "skippy/devices.h"
  #include "skippy-signals.h"
  
-@@ -6714,6 +6715,26 @@ enum skippy_status skippy_import_kv_page(
+@@ -6758,6 +6759,26 @@ enum skippy_status skippy_import_kv_page(
      return skippy_success(out_error);
  }
  
