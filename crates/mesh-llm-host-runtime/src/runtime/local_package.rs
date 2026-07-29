@@ -82,7 +82,7 @@ pub(super) fn split_runtime_kv_bytes_per_token(
 
 /// Resolve the K/V cache types that split stages will actually load with.
 ///
-/// Stage loading applies the family default (for example Inkling's F16 K/V)
+/// Stage loading applies the family default (for example Inkling's Q4_0 K/V)
 /// ahead of the size-tiered `KvCachePolicy`. Planning must resolve K/V the same
 /// way, or it budgets for a cheaper cache than the stages allocate and
 /// over-packs the topology into an out-of-memory load.

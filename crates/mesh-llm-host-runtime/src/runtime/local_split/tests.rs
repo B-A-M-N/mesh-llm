@@ -1583,30 +1583,29 @@ fn split_planning_uses_family_kv_defaults_for_inkling() {
     };
     meta.kv_head_counts = vec![8; 66];
 
-    // A >=50GB package would otherwise be planned with the size-tiered Q4_0
-    // policy, but Inkling stages load F16 K/V. Planning has to agree with the
-    // loader or it under-budgets the KV cache and over-packs the topology.
+    // Inkling's reviewed family default keeps both planning and stage loading
+    // on quantized Q4_0 K/V rather than silently expanding to F16.
     let mut identity = package(66);
     identity.source_model_bytes = 318 * 1024 * 1024 * 1024;
 
     let planned =
         split_runtime_kv_bytes_per_token(&identity, &meta, "tml/inkling-q2", None, None).unwrap();
-    let expected_f16 = crate::models::gguf::GgufKvCacheQuant::from_llama_args("f16", "f16")
+    let expected_q4 = crate::models::gguf::GgufKvCacheQuant::from_llama_args("q4_0", "q4_0")
         .unwrap()
         .kv_cache_bytes_per_token(&meta)
         .unwrap();
-    assert_eq!(planned, expected_f16);
+    assert_eq!(planned, expected_q4);
 
     // Explicit user overrides still win over the family default.
     let overridden = split_runtime_kv_bytes_per_token(
         &identity,
         &meta,
         "tml/inkling-q2",
-        Some("q8_0"),
-        Some("q8_0"),
+        Some("f16"),
+        Some("f16"),
     )
     .unwrap();
-    assert!(overridden < planned);
+    assert!(overridden > planned);
 }
 
 /// Validates the finding-#1 fix against a real Inkling layer package.
@@ -1662,11 +1661,11 @@ fn real_inkling_metadata_plans_family_kv_not_size_tiered() {
 
     assert_eq!(
         policy.default_kv_cache_type,
-        Some("f16"),
-        "inkling must resolve an f16 family K/V default"
+        Some("q4_0"),
+        "inkling must resolve a q4_0 family K/V default"
     );
-    assert!(
-        planned > size_tiered,
-        "family-aware planning must budget more than the size-tiered guess"
+    assert_eq!(
+        planned, size_tiered,
+        "family-aware planning and the large-model policy must agree on Q4_0"
     );
 }

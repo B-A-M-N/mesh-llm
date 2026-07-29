@@ -184,7 +184,7 @@ fn family_policy_for_capability(capability: &FamilyCapabilityRecord) -> FamilyPo
         wire_dtype_from_capability(capability.default_wire_dtype),
     );
     if capability.family_id == "inkling" {
-        policy.default_kv_cache_type = Some("f16");
+        policy.default_kv_cache_type = Some("q4_0");
     }
     policy
 }

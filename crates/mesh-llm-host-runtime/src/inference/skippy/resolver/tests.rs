@@ -715,7 +715,7 @@ fn family_policy_beats_builtin_wire_dtype_when_config_is_unset() {
 }
 
 #[test]
-fn inkling_family_defaults_to_f32_wire_and_f16_kv() {
+fn inkling_family_defaults_to_f32_wire_and_q4_kv() {
     let resolved = resolve_skippy_config(SkippyConfigResolveRequest {
         mesh_config: &MeshConfig::default(),
         model_id: "meshllm/inkling-UD-Q2_K_XL-layers",
@@ -728,8 +728,8 @@ fn inkling_family_defaults_to_f32_wire_and_f16_kv() {
     .unwrap();
 
     assert_eq!(resolved.skippy.activation_wire_dtype, StageWireDType::F32);
-    assert_eq!(resolved.model_fit.cache_type_k, "f16");
-    assert_eq!(resolved.model_fit.cache_type_v, "f16");
+    assert_eq!(resolved.model_fit.cache_type_k, "q4_0");
+    assert_eq!(resolved.model_fit.cache_type_v, "q4_0");
 }
 
 #[test]
@@ -754,8 +754,8 @@ kv_cache_policy = "saver"
     })
     .unwrap();
 
-    assert_eq!(resolved.model_fit.cache_type_k, "f16");
-    assert_eq!(resolved.model_fit.cache_type_v, "f16");
+    assert_eq!(resolved.model_fit.cache_type_k, "q4_0");
+    assert_eq!(resolved.model_fit.cache_type_v, "q4_0");
 }
 
 #[test]
