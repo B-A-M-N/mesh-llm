@@ -107,7 +107,7 @@ class WindowsNativeRuntimeDepsTests(unittest.TestCase):
                 "runtime": {
                     "id": artifact.name,
                     "mesh_version": "0.72.1",
-                    "skippy_abi": "0.1.32",
+                    "skippy_abi": "0.1.34",
                     "platform": {"os": "windows", "arch": "x86_64"},
                     "backend": {"kind": "vulkan"},
                     "libraries": [

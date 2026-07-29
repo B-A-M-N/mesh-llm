@@ -198,7 +198,7 @@ fn handle_binary_connection_messages(
         session_tracker.touch(&session_key);
         if message.kind == WireMessageKind::VerifyWindow && !positional_speculation_supported {
             bail!(
-                "stage-state v10 positional speculation requires an attention-only stage; {} contains recurrent state",
+                "stage-state v11 positional speculation requires an attention-only stage; {} contains recurrent state",
                 config.stage_id
             );
         }
@@ -332,6 +332,34 @@ fn handle_binary_connection_messages(
             prediction_return_streams.remove(&(message.request_id, message.session_id));
             prediction_return_sinks.remove(message.request_id, message.session_id);
             send_reply_ack_with_stats(&mut *upstream, stop_stats).context("send stop ACK")?;
+            continue;
+        }
+
+        if message.kind.is_verify_retirement() {
+            if let Some(forwarder) = async_forwarder.as_mut() {
+                forwarder
+                    .flush()
+                    .context("flush async forwards before verify retirement")?;
+            }
+            let token_start = u64::try_from(message.pos_start)
+                .context("verify retirement position must be non-negative")?;
+            let token_count = u64::try_from(message.token_count)
+                .context("verify retirement count must be non-negative")?;
+            {
+                let mut runtime = runtime.lock().expect("runtime lock poisoned");
+                runtime
+                    .retire_verify_checkpoint(&session_key, token_start, token_count)
+                    .context("retire binary stage verify checkpoint")?;
+            }
+            if let Some(downstream) = downstream.as_mut() {
+                write_stage_message_conditioned(
+                    &mut *downstream,
+                    &message,
+                    wire_dtype,
+                    downstream_wire_condition,
+                )
+                .context("forward verify retirement")?;
+            }
             continue;
         }
 
