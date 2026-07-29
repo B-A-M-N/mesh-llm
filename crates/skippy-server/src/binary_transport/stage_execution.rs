@@ -245,7 +245,6 @@ pub(in crate::binary_transport) fn split_native_mtp_reply(
         | WireMessageKind::DecodeLightCtx
         | WireMessageKind::DecodeReplayEmbd
         | WireMessageKind::DecodeReplayFinalEmbd => 1,
-        WireMessageKind::VerifyWindow => message.tokens.len(),
         _ => return Ok(None),
     };
     if prediction_tokens.len() <= sideband_offset {
@@ -482,7 +481,7 @@ pub(crate) fn run_binary_stage_message(
     token_ids: &[i32],
     input: Option<&ActivationFrame>,
     options: BinaryStageExecutionOptions,
-) -> Result<(i32, Vec<i32>, ActivationFrame)> {
+) -> Result<(i32, Vec<i32>, ActivationFrame, Option<StageNativeMtpDraft>)> {
     match message.kind {
         WireMessageKind::PrefillEmbd => {
             let output = runtime.prefill_frame_with_positions(
@@ -491,7 +490,7 @@ pub(crate) fn run_binary_stage_message(
                 &message.positions,
                 input,
             )?;
-            Ok((message.state.current_token, Vec::new(), output))
+            Ok((message.state.current_token, Vec::new(), output, None))
         }
         WireMessageKind::PrefillFinalEmbd if options.sample_final_prefill => {
             let sampling = runtime_sampling_config(message.sampling.as_ref());
@@ -502,7 +501,7 @@ pub(crate) fn run_binary_stage_message(
                 sampling.as_ref(),
                 input,
             )?;
-            Ok((predicted, Vec::new(), output))
+            Ok((predicted, Vec::new(), output, None))
         }
         WireMessageKind::PrefillFinalEmbd => {
             let output = runtime.prefill_frame_with_positions(
@@ -511,7 +510,7 @@ pub(crate) fn run_binary_stage_message(
                 &message.positions,
                 input,
             )?;
-            Ok((message.state.current_token, Vec::new(), output))
+            Ok((message.state.current_token, Vec::new(), output, None))
         }
         WireMessageKind::DecodeEmbd
         | WireMessageKind::DecodeReadout
@@ -531,7 +530,7 @@ pub(crate) fn run_binary_stage_message(
                     input,
                     options.output_capacity,
                 )?;
-                return Ok((predicted, vec![predicted], output));
+                return Ok((predicted, vec![predicted], output, None));
             }
             let (predicted, native_mtp, output) = runtime.decode_frame_sampled_mtp(
                 session_id,
@@ -545,19 +544,26 @@ pub(crate) fn run_binary_stage_message(
                 predicted,
                 native_mtp_prediction_tokens(predicted, native_mtp),
                 output,
+                None,
             ))
         }
         WireMessageKind::VerifyWindow => {
             let sampling = runtime_sampling_config(message.sampling.as_ref());
-            let (predicted_tokens, output) = runtime.verify_frame_sampled(
+            let (predicted_tokens, native_mtp, output) = runtime.verify_frame_sampled(
                 session_id,
                 token_ids,
                 sampling.as_ref(),
                 input,
                 options.output_capacity,
+                options.native_mtp_max_tokens,
             )?;
             let predicted = predicted_tokens.first().copied().unwrap_or(0);
-            Ok((predicted, predicted_tokens, output))
+            Ok((
+                predicted,
+                predicted_tokens,
+                output,
+                native_mtp.map(stage_native_mtp_draft),
+            ))
         }
         WireMessageKind::Stop
         | WireMessageKind::StateImport
@@ -571,6 +577,13 @@ pub(crate) fn run_binary_stage_message(
         | WireMessageKind::PredictionReturnOpen => {
             bail!("message kind is not executable")
         }
+    }
+}
+
+fn stage_native_mtp_draft(draft: NativeMtpDraft) -> StageNativeMtpDraft {
+    StageNativeMtpDraft {
+        token_ids: draft.token_ids,
+        proposal_compute_us: draft.proposal_compute_us,
     }
 }
 
@@ -971,14 +984,13 @@ mod tests {
     }
 
     #[test]
-    fn native_mtp_sideband_is_removed_from_verify_predictions() {
-        let mut message = test_message(WireMessageKind::VerifyWindow, 3);
-        message.tokens = vec![10, 11, 12];
-        let mut predictions = vec![11, 12, 13, 2, 14, 15, 123];
+    fn native_mtp_sideband_is_removed_from_decode_predictions() {
+        let message = test_message(WireMessageKind::DecodeEmbd, 1);
+        let mut predictions = vec![11, 2, 14, 15, 123];
 
         let draft = split_native_mtp_reply(&message, &mut predictions).unwrap();
 
-        assert_eq!(predictions, vec![11, 12, 13]);
+        assert_eq!(predictions, vec![11]);
         assert_eq!(
             draft,
             Some(skippy_protocol::binary::StageNativeMtpDraft {
@@ -986,6 +998,18 @@ mod tests {
                 proposal_compute_us: 123,
             })
         );
+    }
+
+    #[test]
+    fn native_mtp_sideband_is_not_read_from_verify_predictions() {
+        let mut message = test_message(WireMessageKind::VerifyWindow, 3);
+        message.tokens = vec![10, 11, 12];
+        let mut predictions = vec![11, 12, 13, 2, 14, 15, 123];
+
+        let draft = split_native_mtp_reply(&message, &mut predictions).unwrap();
+
+        assert_eq!(predictions, vec![11, 12, 13, 2, 14, 15, 123]);
+        assert_eq!(draft, None);
     }
 
     #[test]
