@@ -303,6 +303,11 @@ update the skill resources in the same change.
   image. CUDA/ROCm/Vulkan device absence is not a skip condition for
   `--version`, runtime discovery/listing, or client startup. Hardware-qualified
   serving tests are additional coverage.
+- The hermetic readiness smoke starts its client as a noninteractive background
+  service. Use bounded SIGTERM shutdown on Unix and CTRL_BREAK_EVENT on Windows;
+  do not use Unix SIGINT for this service probe because asynchronous
+  noninteractive shell children may inherit it as ignored. Keep interactive
+  Ctrl-C behavior covered by runtime and console tests instead.
 - Namespace cache keys and include every compatibility boundary that can make
   reuse unsafe: OS, architecture, backend/toolchain, relevant lockfiles,
   `.github/cache-version.txt`, and build inputs. Do not broaden restore keys
@@ -324,6 +329,13 @@ update the skill resources in the same change.
   `mozilla-actions/sccache-action` users through
   `.github/actions/configure-sccache-gha`; do not let a reusable workflow
   silently restore read-write PR publication.
+- Keep GitHub-hosted main `rust_crate_tests` shards on writable job-local
+  sccache. Their distinct bulk Cargo target caches own cross-run reuse; four
+  concurrent per-object GHA writers caused repository-wide write contention
+  without improving the two worst shards. Do not extend this opt-out to
+  producer or grouped-test jobs without measured evidence. The configure
+  action evaluates an explicitly authorized Depot WebDAV cache before the GHA
+  opt-out, so a future trusted Depot rollout may still use `disk,webdav`.
 - Depot's GitHub cache namespace is repository-scoped and has no branch
   isolation. With automatic Depot Cache enabled, its authority is injected into
   the whole runner job and cannot be contained by sccache disk-only mode or

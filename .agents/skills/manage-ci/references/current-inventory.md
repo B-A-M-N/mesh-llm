@@ -48,7 +48,9 @@ The host producer attests the binary, writes `host-imports.json`, and publishes
 its checksum. Product consumers verify that immutable input before composition;
 they must not re-stamp or otherwise mutate the host per backend alias. Release
 CPU and backend product consumers also perform a noninteractive JSON client
-readiness smoke from the verified host/runtime inputs before publication; CI
+readiness smoke from the verified host/runtime inputs before publication. The
+background client must exit cleanly after bounded SIGTERM on Unix or
+CTRL_BREAK_EVENT on Windows; interactive Ctrl-C coverage remains separate. CI
 and packaging consumers must not rebuild either input. Portable bundles
 place runtimes at `mesh-bundle/native-runtimes/<runtime-id>`; Debian/Arch
 packages use `/usr/local/lib/mesh-llm/<version>/native-runtimes`; Homebrew uses
@@ -361,7 +363,12 @@ sccache server a credential-free environment and uses job-local disk only.
 GitHub-hosted trusted jobs retain `disk,gha` or explicit disk-only mode. PR
 events use job-local disk only, including direct sccache-action users routed
 through the configure action, while trusted main, release, warmer, and dispatch
-paths may seed the GHA tier. Swift restores a
+paths may seed the GHA tier. The high-fanout main `rust_crate_tests` matrix is
+explicitly disk-only on GitHub-hosted runners because its four concurrent
+per-object writers caused 94% of cold-control GHA write errors; its distinct
+bulk Cargo target caches retain cross-run reuse. Other producer and grouped-test
+jobs remain remote-enabled. An explicitly authorized Depot call selects
+`disk,webdav` before that GHA opt-out. Swift restores a
 mode-independent Rust dependency cache that only trusted main pushes save.
 Persistent Cargo target and ABI reuse remains owned by
 `Swatinem/rust-cache` and `actions/cache`. Current PR jobs use the normal
