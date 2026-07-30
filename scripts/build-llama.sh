@@ -3,6 +3,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
+# shellcheck disable=SC1091
 source "$ROOT/scripts/lib/cuda-toolkit.sh"
 
 LLAMA_WORKDIR="${LLAMA_WORKDIR:-$ROOT/.deps/llama.cpp}"
@@ -10,11 +11,23 @@ LLAMA_BUILD_ROOT="${MESH_LLM_LLAMA_BUILD_ROOT:-$ROOT/.deps/llama-build}"
 LLAMA_BACKEND="${LLAMA_STAGE_BACKEND:-${SKIPPY_LLAMA_BACKEND:-${LLAMA_BACKEND:-cpu}}}"
 LLAMA_LINK_MODE="${LLAMA_STAGE_LINK_MODE:-${SKIPPY_LLAMA_LINK_MODE:-static}}"
 PRINT_BUILD_DIR=0
+REQUIRE_EXISTING=0
 
-if [[ "${1:-}" == "--print-build-dir" ]]; then
-  PRINT_BUILD_DIR=1
-  shift
-fi
+while [[ "$#" -gt 0 ]]; do
+  case "$1" in
+    --print-build-dir)
+      PRINT_BUILD_DIR=1
+      shift
+      ;;
+    --require-existing)
+      REQUIRE_EXISTING=1
+      shift
+      ;;
+    *)
+      break
+      ;;
+  esac
+done
 
 case "$LLAMA_BACKEND" in
   cpu|cuda|rocm|hip|vulkan|metal) ;;
@@ -68,27 +81,38 @@ detect_jobs() {
   fi
 }
 
-required_archives() {
+required_static_archives() {
   printf '%s\n' \
     "$LLAMA_BUILD_DIR/src/libllama.a" \
     "$LLAMA_BUILD_DIR/common/libllama-common.a" \
+    "$LLAMA_BUILD_DIR/common/libllama-common-base.a" \
+    "$LLAMA_BUILD_DIR/ggml/src/libggml.a" \
+    "$LLAMA_BUILD_DIR/ggml/src/libggml-base.a" \
     "$LLAMA_BUILD_DIR/tools/mtmd/libmtmd.a"
 }
 
-required_archives_exist() {
+required_static_archives_exist() {
   local archive
   while IFS= read -r archive; do
     [[ -f "$archive" ]] || return 1
-  done < <(required_archives)
+  done < <(required_static_archives)
+  [[ -f "$LLAMA_BUILD_DIR/ggml/src/libggml-cpu.a" ||
+     -f "$LLAMA_BUILD_DIR/ggml/src/ggml-cpu/libggml-cpu.a" ]]
 }
 
-dynamic_library_names() {
+dynamic_library_name_groups() {
   case "$(uname -s)" in
     Darwin)
       printf '%s\n' libllama.dylib libllama-common.dylib libmtmd.dylib
       ;;
     MINGW*|MSYS*|CYGWIN*)
-      printf '%s\n' llama.dll llama-common.dll mtmd.dll
+      # CMake's MinGW generator normally prefixes these DLLs with "lib";
+      # retain the unprefixed MSVC-compatible spelling as an accepted
+      # alternative because both are valid runtime package inputs.
+      printf '%s\n' \
+        'libllama.dll|llama.dll' \
+        'libllama-common.dll|llama-common.dll' \
+        'libmtmd.dll|mtmd.dll'
       ;;
     *)
       printf '%s\n' libllama.so libllama-common.so libmtmd.so
@@ -97,17 +121,24 @@ dynamic_library_names() {
 }
 
 required_dynamic_libraries_exist() {
-  local name
-  while IFS= read -r name; do
-    find "$LLAMA_BUILD_DIR" -type f -name "$name" -print -quit | grep -q .
-  done < <(dynamic_library_names)
+  local candidates name found
+  local -a names
+  while IFS= read -r candidates; do
+    IFS='|' read -r -a names <<< "$candidates"
+    found=""
+    for name in "${names[@]}"; do
+      found="$(find "$LLAMA_BUILD_DIR" -name "$name" -print -quit)"
+      [[ -z "$found" ]] || break
+    done
+    [[ -n "$found" && -e "$found" ]] || return 1
+  done < <(dynamic_library_name_groups)
 }
 
 required_outputs_exist() {
   if [[ "$LLAMA_LINK_MODE" == "dynamic" ]]; then
     required_dynamic_libraries_exist
   else
-    required_archives_exist
+    required_static_archives_exist
   fi
 }
 
@@ -174,6 +205,17 @@ CMAKE_ARGS=(
   -DMTMD_VIDEO=OFF
 )
 
+# Static ABI inputs cross job and runner boundaries. Normalize compiler-
+# embedded source/build paths so the archived link closure does not retain a
+# producer-local workspace path.
+if [[ "$LLAMA_LINK_MODE" == "static" ]]; then
+  PREFIX_MAP_FLAGS="-ffile-prefix-map=$ROOT=/mesh-llm -fdebug-prefix-map=$ROOT=/mesh-llm -fmacro-prefix-map=$ROOT=/mesh-llm"
+  CMAKE_ARGS+=(
+    "-DCMAKE_C_FLAGS=$PREFIX_MAP_FLAGS"
+    "-DCMAKE_CXX_FLAGS=$PREFIX_MAP_FLAGS"
+  )
+fi
+
 if command -v ninja >/dev/null 2>&1; then
   CMAKE_ARGS=(-G Ninja "${CMAKE_ARGS[@]}")
   echo "using CMake generator: Ninja"
@@ -214,9 +256,16 @@ esac
 
 USE_SCCACHE="${LLAMA_STAGE_USE_SCCACHE:-${SKIPPY_USE_SCCACHE:-1}}"
 if [[ "$USE_SCCACHE" != "0" && -n "$SCCACHE_BIN" ]] &&
-   ! "$SCCACHE_BIN" --start-server >/dev/null 2>&1; then
-  echo "sccache failed to start; llama.cpp build will run without compiler caching" >&2
-  USE_SCCACHE=0
+   ! "$SCCACHE_BIN" --show-stats >/dev/null 2>&1; then
+  if ! "$SCCACHE_BIN" --start-server >/dev/null 2>&1 ||
+     ! "$SCCACHE_BIN" --show-stats >/dev/null 2>&1; then
+    if [[ "${MESH_LLM_REQUIRE_SCCACHE:-0}" == "1" ]]; then
+      echo "sccache is unavailable and MESH_LLM_REQUIRE_SCCACHE=1" >&2
+      exit 1
+    fi
+    echo "sccache is unavailable; llama.cpp build will run without compiler caching" >&2
+    USE_SCCACHE=0
+  fi
 fi
 
 if [[ "$USE_SCCACHE" != "0" && -n "$SCCACHE_BIN" ]]; then
@@ -234,6 +283,10 @@ if [[ "$USE_SCCACHE" != "0" && -n "$SCCACHE_BIN" ]]; then
   esac
   echo "using sccache for llama.cpp C/C++ compilation: $SCCACHE_BIN"
 elif [[ "$USE_SCCACHE" != "0" ]]; then
+  if [[ "${MESH_LLM_REQUIRE_SCCACHE:-0}" == "1" ]]; then
+    echo "sccache is required but was not found" >&2
+    exit 1
+  fi
   echo "sccache not found; llama.cpp build will run without compiler caching" >&2
 else
   CMAKE_ARGS+=(-DGGML_CCACHE=OFF)
@@ -245,11 +298,24 @@ fi
 
 PATCHED_SHA="$(tr -d '[:space:]' < "$LLAMA_WORKDIR/.mesh-llm-patched-sha" 2>/dev/null || git -C "$LLAMA_WORKDIR" rev-parse HEAD)"
 BUILD_STAMP="$LLAMA_BUILD_DIR/.mesh-llm-build-stamp"
+
+normalize_build_stamp_arg() {
+  local value="$1"
+  value="${value//"$LLAMA_BUILD_DIR"/@LLAMA_BUILD_DIR@}"
+  value="${value//"$LLAMA_WORKDIR"/@LLAMA_WORKDIR@}"
+  value="${value//"$ROOT"/@MESH_LLM_ROOT@}"
+  if [[ -n "$SCCACHE_BIN" ]]; then
+    value="${value//"$SCCACHE_BIN"/@SCCACHE@}"
+  fi
+  printf '%s\n' "$value"
+}
+
 CURRENT_BUILD_STAMP="$(
-  printf 'stamp-version=1\n'
+  printf 'stamp-version=3\n'
   printf 'patched-sha=%s\n' "$PATCHED_SHA"
   printf 'backend=%s\n' "$LLAMA_BACKEND"
   printf 'link-mode=%s\n' "$LLAMA_LINK_MODE"
+  printf 'toolchain-epoch=%s\n' "${MESH_LLM_LLAMA_TOOLCHAIN_EPOCH:-local}"
   printf 'build-type=%s\n' "${CMAKE_BUILD_TYPE:-Release}"
   printf 'ggml-native=%s\n' "${LLAMA_STAGE_GGML_NATIVE:-${SKIPPY_GGML_NATIVE:-OFF}}"
   printf 'cuda-architectures=%s\n' "${LLAMA_STAGE_CUDA_ARCHITECTURES:-${SKIPPY_CUDA_ARCHITECTURES:-}}"
@@ -257,7 +323,7 @@ CURRENT_BUILD_STAMP="$(
   printf 'cuda-no-vmm=%s\n' "${GGML_CUDA_NO_VMM:-}"
   printf 'use-sccache=%s\n' "$USE_SCCACHE"
   for arg in "${CMAKE_ARGS[@]}"; do
-    printf 'cmake-arg=%s\n' "$arg"
+    printf 'cmake-arg=%s\n' "$(normalize_build_stamp_arg "$arg")"
   done
 )"
 
@@ -272,11 +338,25 @@ if [[ "${LLAMA_STAGE_FORCE_BUILD:-${SKIPPY_FORCE_LLAMA_BUILD:-0}}" != "1" &&
   exit 0
 fi
 
+if [[ "$REQUIRE_EXISTING" == "1" ]]; then
+  echo "prebuilt patched llama.cpp ABI did not match the requested build contract" >&2
+  echo "  backend:         $LLAMA_BACKEND" >&2
+  echo "  link mode:       $LLAMA_LINK_MODE" >&2
+  echo "  toolchain epoch: ${MESH_LLM_LLAMA_TOOLCHAIN_EPOCH:-local}" >&2
+  echo "  build dir:       $LLAMA_BUILD_DIR" >&2
+  echo "refusing to rebuild because --require-existing was set" >&2
+  exit 1
+fi
+
 cmake "${CMAKE_ARGS[@]}"
 
 cmake --build "$LLAMA_BUILD_DIR" --config "${CMAKE_BUILD_TYPE:-Release}" --parallel "$(detect_jobs)" --target llama llama-common mtmd
 
 printf '%s\n' "$CURRENT_BUILD_STAMP" > "$BUILD_STAMP"
+if ! required_outputs_exist; then
+  echo "patched llama.cpp build completed without the full link closure" >&2
+  exit 1
+fi
 
 echo "built patched llama.cpp"
 echo "  backend:   $LLAMA_BACKEND"

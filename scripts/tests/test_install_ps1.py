@@ -64,6 +64,13 @@ class InstallPs1StaticTests(unittest.TestCase):
         self.assertIn("Installing supported legacy MeshLLM", contents)
         self.assertIn("requires product-manifest.json and native-runtimes", contents)
 
+    def test_tree_digest_normalizes_platform_path_separators(self) -> None:
+        contents = SCRIPT.read_text(encoding="utf-8")
+
+        self.assertIn("[System.IO.Path]::DirectorySeparatorChar", contents)
+        self.assertIn("[System.IO.Path]::AltDirectorySeparatorChar", contents)
+        self.assertIn("TrimStart($pathSeparators)", contents)
+
     def test_script_stages_replacement_and_removes_stale_host_imports(self) -> None:
         contents = SCRIPT.read_text(encoding="utf-8")
 
@@ -111,7 +118,7 @@ class InstallPs1BehaviorTests(unittest.TestCase):
 
             self.assertEqual(result.returncode, 0, self._combined_output(result))
             self.assertEqual(self._read_calls(calls), ["--version", "setup"])
-            self.assertIn("Installing Windows x64 host binary", result.stdout)
+            self.assertIn("Installing Windows x64 MeshLLM product bundle", result.stdout)
             self.assertIn("Ignoring legacy -Flavor 'cuda'", self._combined_output(result))
 
     def test_noninteractive_install_prints_setup_command(self) -> None:

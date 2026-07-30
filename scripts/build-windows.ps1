@@ -60,8 +60,39 @@ function Prepare-Llama {
         Invoke-NativeCommand "git" @("clean", "-fdx", "-e", "build/")
 
         $patches = Get-ChildItem -Path $patchDir -Filter "*.patch" | Sort-Object Name
-        foreach ($patch in $patches) {
-            Invoke-NativeCommand "git" @("am", "--3way", $patch.FullName)
+        $gitIdentityVariables = @(
+            "GIT_AUTHOR_DATE",
+            "GIT_AUTHOR_EMAIL",
+            "GIT_AUTHOR_NAME",
+            "GIT_COMMITTER_DATE",
+            "GIT_COMMITTER_EMAIL",
+            "GIT_COMMITTER_NAME"
+        )
+        $savedGitIdentity = @{}
+        foreach ($variable in $gitIdentityVariables) {
+            if (Test-Path "Env:$variable") {
+                $savedGitIdentity[$variable] = (Get-Item "Env:$variable").Value
+            }
+            Remove-Item "Env:$variable" -ErrorAction SilentlyContinue
+        }
+        try {
+            foreach ($patch in $patches) {
+                Invoke-NativeCommand "git" @(
+                    "am",
+                    "--3way",
+                    "--committer-date-is-author-date",
+                    "--no-gpg-sign",
+                    "--no-verify",
+                    $patch.FullName
+                )
+            }
+        } finally {
+            foreach ($variable in $gitIdentityVariables) {
+                Remove-Item "Env:$variable" -ErrorAction SilentlyContinue
+            }
+            foreach ($entry in $savedGitIdentity.GetEnumerator()) {
+                Set-Item "Env:$($entry.Key)" $entry.Value
+            }
         }
 
         $patchedSha = (& git rev-parse HEAD).Trim()
@@ -1023,11 +1054,17 @@ if ($HostOnly) {
             }
         }
         Set-BuildVersionStamp
-        $hostArgs = @("build", "--release", "--locked", "-p", "mesh-llm", "--bin", "mesh-llm", "--no-default-features", "--features", "web-ui,dynamic-native-runtime")
+        $hostArgs = @("build")
+        $hostOutputProfile = "debug"
+        if ($buildProfile -eq "release") {
+            $hostArgs += "--release"
+            $hostOutputProfile = "release"
+        }
+        $hostArgs += @("--locked", "-p", "mesh-llm", "--bin", "mesh-llm", "--no-default-features", "--features", "web-ui,dynamic-native-runtime")
         Invoke-NativeCommand "cargo" $hostArgs
-        Write-Host "Mesh backend-neutral host: target\\release\\mesh-llm.exe"
+        Write-Host "Mesh backend-neutral host: target\\$hostOutputProfile\\mesh-llm.exe"
     }
-    exit 0
+    return
 }
 
 switch ($backendName) {
@@ -1170,7 +1207,10 @@ Invoke-InRepo {
         $env:LLAMA_STAGE_AMDGPU_TARGETS = $RocmArch
     }
     $profileDir = if ($buildProfile -eq "release") { "release" } else { "debug" }
-    $runtimeOut = Join-Path (Join-Path (Join-Path $repoRoot "target") $profileDir) "native-runtimes"
+    # Invoke-InRepo makes this shell-relative path portable across Git Bash and
+    # WSL. Passing a native `D:\...` path to GNU tar makes it parse `D:` as a
+    # remote host and fail after the expensive ABI build has already completed.
+    $runtimeOut = "target/$profileDir/native-runtimes"
     Invoke-NativeCommand "bash" @(
         (Join-Path $scriptDir "package-native-runtime.sh"),
         "--backend", $backendName,

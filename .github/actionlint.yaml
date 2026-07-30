@@ -3,7 +3,6 @@ self-hosted-runner:
     - self-hosted
     - Linux
     - X64
-    - ARM64
     - amd64
     - gpu-nvidia
     - mesh-llm-amd64

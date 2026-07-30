@@ -13,6 +13,12 @@ pub(crate) fn check_docs_and_workflow_invariants(repo_root: &Path) -> DynResult<
     let release = fs::read_to_string(repo_root.join("RELEASE.md"))?;
     let justfile = fs::read_to_string(repo_root.join("Justfile"))?;
     let release_workflow = fs::read_to_string(repo_root.join(".github/workflows/release.yml"))?;
+    let native_sdk_artifact_workflow =
+        fs::read_to_string(repo_root.join(".github/workflows/native-sdk-artifact.yml"))?;
+    let static_abi_artifact_workflow =
+        fs::read_to_string(repo_root.join(".github/workflows/static-abi-artifact.yml"))?;
+    let swift_sdk_artifact_workflow =
+        fs::read_to_string(repo_root.join(".github/workflows/swift-sdk-artifact.yml"))?;
     let ci_workflow = fs::read_to_string(repo_root.join(".github/workflows/ci.yml"))?;
     let pr_builds_workflow = fs::read_to_string(repo_root.join(".github/workflows/pr_builds.yml"))?;
     let pr_quality_workflow =
@@ -25,6 +31,14 @@ pub(crate) fn check_docs_and_workflow_invariants(repo_root: &Path) -> DynResult<
         fs::read_to_string(repo_root.join(".github/actions/compute-changes/action.yml"))?;
     let configure_sccache_action =
         fs::read_to_string(repo_root.join(".github/actions/configure-sccache-gha/action.yml"))?;
+    let prepare_windows_host_action = fs::read_to_string(
+        repo_root.join(".github/actions/prepare-windows-host-input/action.yml"),
+    )?;
+    let prepare_native_runtime_action = fs::read_to_string(
+        repo_root.join(".github/actions/prepare-native-runtime-input/action.yml"),
+    )?;
+    let compose_product_action =
+        fs::read_to_string(repo_root.join(".github/actions/compose-product-input/action.yml"))?;
     let affected_crates_script = fs::read_to_string(repo_root.join("scripts/affected-crates.sh"))?;
     let ci_docs = fs::read_to_string(repo_root.join("ci/ci.md"))?;
     let pr_cleanup_workflow =
@@ -77,28 +91,28 @@ pub(crate) fn check_docs_and_workflow_invariants(repo_root: &Path) -> DynResult<
     )?;
     ensure_contains(
         &release_workflow,
-        "- build_linux_aarch64_cuda",
+        "- compose_linux_aarch64_cuda",
         "release workflow aarch64 CUDA publish need",
     )?;
     ensure_contains(
         &release_workflow,
-        "build_windows_cpu:",
-        "release workflow Windows CPU build",
+        "windows_host_input:",
+        "release workflow immutable Windows host build",
     )?;
     ensure_contains(
         &release_workflow,
-        "build_windows_gpu:",
-        "release workflow Windows GPU build",
+        "compose_windows_gpu:",
+        "release workflow Windows GPU composition",
     )?;
     ensure_contains(
         &release_workflow,
-        "- build_windows_cpu",
-        "release workflow Windows CPU publish need",
+        "- windows_host_input",
+        "release workflow immutable Windows host publish need",
     )?;
     ensure_contains(
         &release_workflow,
-        "- build_windows_gpu",
-        "release workflow Windows GPU publish need",
+        "- compose_windows_gpu",
+        "release workflow Windows GPU composition publish need",
     )?;
     ensure_contains(
         &justfile,
@@ -192,6 +206,11 @@ pub(crate) fn check_docs_and_workflow_invariants(repo_root: &Path) -> DynResult<
     )?;
     ensure_contains(
         &compute_changes_action,
+        "runner_contract_required",
+        "compute-changes runner contract output",
+    )?;
+    ensure_contains(
+        &compute_changes_action,
         "build-linux-rocm",
         "compute-changes Linux ROCm build script route",
     )?;
@@ -266,6 +285,11 @@ pub(crate) fn check_docs_and_workflow_invariants(repo_root: &Path) -> DynResult<
         "PR Builds Windows GPU compute route",
     )?;
     ensure_contains(
+        &pr_builds_workflow,
+        "steps.compute.outputs.runner_contract_required",
+        "PR Builds runner contract route",
+    )?;
+    ensure_contains(
         &ci_docs,
         "website_changed?",
         "CI topology public website route",
@@ -333,12 +357,12 @@ pub(crate) fn check_docs_and_workflow_invariants(repo_root: &Path) -> DynResult<
     )?;
     ensure_contains(
         &website_pages_workflow,
-        "actions/upload-pages-artifact@v3",
+        "actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa",
         "public website Pages artifact upload",
     )?;
     ensure_contains(
         &website_pages_workflow,
-        "actions/deploy-pages@v4",
+        "actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e",
         "public website Pages deploy action",
     )?;
     ensure_contains(
@@ -371,26 +395,172 @@ pub(crate) fn check_docs_and_workflow_invariants(repo_root: &Path) -> DynResult<
         "push:\n    branches: [main]",
         "main CI push trigger",
     )?;
-    check_windows_dynamic_runtime_contract(&ci_workflow, &pr_builds_workflow)?;
-    check_release_dispatch_version_preparation(&release_workflow)?;
+    check_windows_dynamic_runtime_contract(
+        &ci_workflow,
+        &pr_builds_workflow,
+        &prepare_windows_host_action,
+        &prepare_native_runtime_action,
+        &compose_product_action,
+    )?;
+    for (workflow, context) in [
+        (&ci_workflow, "main shared static ABI producer"),
+        (&pr_builds_workflow, "PR shared static ABI producer"),
+    ] {
+        ensure_contains(
+            workflow,
+            "uses: ./.github/workflows/static-abi-artifact.yml",
+            context,
+        )?;
+        ensure_contains(
+            workflow,
+            "scripts/restore-static-abi-input.sh",
+            &format!("{context} consumer restore"),
+        )?;
+        let static_abi_caller = workflow_job_section(workflow, "linux_static_abi_input")
+            .ok_or_else(|| format!("{context}: missing `linux_static_abi_input` job"))?;
+        ensure_contains(
+            static_abi_caller,
+            "runner_size: '8'",
+            &format!("{context} bounded runner size"),
+        )?;
+        ensure_not_contains(
+            static_abi_caller,
+            "runs_on:",
+            &format!("{context} must not supply a runner label"),
+        )?;
+        ensure_not_contains(
+            static_abi_caller,
+            "allow_depot_remote_cache:",
+            &format!("{context} must not supply Depot cache authority"),
+        )?;
+
+        let native_sdk_caller = workflow_job_section(workflow, "kotlin_sdk_input")
+            .ok_or_else(|| format!("{context}: missing `kotlin_sdk_input` job"))?;
+        ensure_contains(
+            native_sdk_caller,
+            "runner_size: '8'",
+            &format!("{context} native SDK bounded runner size"),
+        )?;
+        ensure_not_contains(
+            native_sdk_caller,
+            "runs_on:",
+            &format!("{context} native SDK must not supply a runner label"),
+        )?;
+        ensure_not_contains(
+            native_sdk_caller,
+            "allow_depot_remote_cache:",
+            &format!("{context} native SDK must not supply Depot cache authority"),
+        )?;
+    }
+    check_protected_reusable_runner_policy(
+        &native_sdk_artifact_workflow,
+        "native SDK reusable workflow",
+    )?;
+    check_protected_reusable_runner_policy(
+        &static_abi_artifact_workflow,
+        "static ABI reusable workflow",
+    )?;
+    ensure_contains(
+        &native_sdk_artifact_workflow,
+        "uses: ./.github/workflows/static-abi-artifact.yml",
+        "native SDK nested release static ABI producer",
+    )?;
+    ensure_contains(
+        &native_sdk_artifact_workflow,
+        "scripts/restore-static-abi-input.sh",
+        "native SDK static ABI consumer restore",
+    )?;
+    ensure_contains(
+        &static_abi_artifact_workflow,
+        "CACHE_NAMESPACE: mesh-llm",
+        "static ABI reusable cache namespace",
+    )?;
+    check_release_dispatch_version_preparation(
+        &release_workflow,
+        &native_sdk_artifact_workflow,
+        &swift_sdk_artifact_workflow,
+    )?;
     check_release_container_contracts(&release_workflow, &configure_sccache_action)?;
     check_ci_crate_test_coverage(&ci_workflow, &pr_builds_workflow, &compute_changes_action)?;
 
     Ok(())
 }
 
-fn check_release_dispatch_version_preparation(release_workflow: &str) -> DynResult<()> {
+fn check_protected_reusable_runner_policy(workflow: &str, context: &str) -> DynResult<()> {
+    for (required, contract) in [
+        ("runner_size:", "bounded runner-size input"),
+        ("default: '8'", "bounded runner-size default"),
+        ("runner_policy:", "protected runner policy job"),
+        ("runs-on: ubuntu-24.04", "fixed hosted policy runner"),
+        (
+            "POLICY_REPOSITORY: ${{ github.repository }}",
+            "immutable repository context",
+        ),
+        ("POLICY_REF: ${{ github.ref }}", "immutable ref context"),
+        (
+            "POLICY_EVENT_NAME: ${{ github.event_name }}",
+            "immutable event context",
+        ),
+        (
+            "POLICY_DEPOT_ENABLED: ${{ vars.DEPOT_RUNNERS_ENABLED == 'true' }}",
+            "repository Depot gate",
+        ),
+        (
+            "POLICY_MANUAL_USE_DEPOT: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.use_depot == 'true' }}",
+            "immutable main-dispatch canary flag",
+        ),
+        (
+            r#"POLICY_REPOSITORY" == "Mesh-LLM/mesh-llm""#,
+            "exact repository guard",
+        ),
+        (
+            r#"POLICY_REF" == "refs/heads/main""#,
+            "exact main-ref guard",
+        ),
+        (
+            r#"POLICY_MANUAL_USE_DEPOT" == "true""#,
+            "main-dispatch canary decision",
+        ),
+        ("default|4|8|16", "bounded runner-size validation"),
+        ("depot-ubuntu-24.04", "allowlisted Depot AMD64 label"),
+        ("depot-ubuntu-24.04-arm", "allowlisted Depot ARM64 label"),
+        (
+            "runs-on: ${{ needs.runner_policy.outputs.runner }}",
+            "derived producer runner",
+        ),
+        (
+            "allow_depot_remote_cache: ${{ needs.runner_policy.outputs.allow_depot_remote_cache }}",
+            "derived Depot cache authority",
+        ),
+    ] {
+        ensure_contains(workflow, required, &format!("{context} {contract}"))?;
+    }
+    for (forbidden, contract) in [
+        ("inputs.runs_on", "caller-controlled runner label"),
+        (
+            "inputs.allow_depot_remote_cache",
+            "caller-controlled Depot cache authority",
+        ),
+        ("fromJson(inputs.runs_on)", "caller-controlled runner JSON"),
+    ] {
+        ensure_not_contains(workflow, forbidden, &format!("{context} {contract}"))?;
+    }
+    Ok(())
+}
+
+fn check_release_dispatch_version_preparation(
+    release_workflow: &str,
+    native_sdk_artifact_workflow: &str,
+    swift_sdk_artifact_workflow: &str,
+) -> DynResult<()> {
     const DISPATCH_RELEASE_JOBS: &[&str] = &[
         "build",
-        "build_native_sdk_runtime",
-        "build_swift_sdk_artifact",
         "build_linux_arm64",
-        "build_linux_aarch64_cuda",
-        "build_linux_cuda",
-        "build_linux_rocm",
-        "build_linux_vulkan",
-        "build_windows_cpu",
-        "build_windows_gpu",
+        "compose_linux_aarch64_cuda",
+        "compose_linux_cuda",
+        "compose_linux_rocm",
+        "compose_linux_vulkan",
+        "windows_host_input",
     ];
     const REQUIRED_STEP: &str = "Prepare dispatched release version";
     const REQUIRED_COMMAND: &str = "scripts/release-version.sh \"$RELEASE_TAG\"";
@@ -416,6 +586,103 @@ fn check_release_dispatch_version_preparation(release_workflow: &str) -> DynResu
         )?;
     }
 
+    let native_sdk_caller = workflow_job_section(release_workflow, "build_native_sdk_runtime")
+        .ok_or("release workflow: missing `build_native_sdk_runtime` job")?;
+    for (required, context) in [
+        (
+            "uses: ./.github/workflows/native-sdk-artifact.yml",
+            "release native SDK shared producer call",
+        ),
+        ("profile: release", "release native SDK producer profile"),
+        (
+            "artifact_name: release-native-sdk-${{ matrix.artifact_suffix }}",
+            "release native SDK artifact name",
+        ),
+        (
+            "include_runtime_crate: true",
+            "release native SDK runtime crate staging",
+        ),
+        (
+            "static_abi_artifact_name: ci-release-native-sdk-static-abi-${{ matrix.artifact_suffix }}",
+            "release native SDK static ABI artifact",
+        ),
+        (
+            "produce_static_abi: ${{ endsWith(matrix.target, '-unknown-linux-gnu') }}",
+            "release native SDK per-target static ABI producer",
+        ),
+        ("runner_size: '8'", "release native SDK bounded runner size"),
+        (
+            "release_tag: ${{ needs.metadata.outputs.tag }}",
+            "release native SDK producer tag input",
+        ),
+        (
+            "prepare_release_version: ${{ github.event_name == 'workflow_dispatch' }}",
+            "release native SDK dispatch version input",
+        ),
+    ] {
+        ensure_contains(native_sdk_caller, required, context)?;
+    }
+    ensure_not_contains(
+        native_sdk_caller,
+        "runs_on:",
+        "release native SDK must not supply a runner label",
+    )?;
+    ensure_not_contains(
+        native_sdk_caller,
+        "allow_depot_remote_cache:",
+        "release native SDK must not supply Depot cache authority",
+    )?;
+    ensure_contains(
+        native_sdk_artifact_workflow,
+        REQUIRED_STEP,
+        "shared native SDK producer dispatch version step",
+    )?;
+    ensure_contains(
+        native_sdk_artifact_workflow,
+        "if: ${{ inputs.prepare_release_version }}",
+        "shared native SDK producer dispatch version condition",
+    )?;
+    ensure_contains(
+        native_sdk_artifact_workflow,
+        REQUIRED_COMMAND,
+        "shared native SDK producer dispatch version command",
+    )?;
+
+    let swift_caller = workflow_job_section(release_workflow, "build_swift_sdk_artifact")
+        .ok_or("release workflow: missing `build_swift_sdk_artifact` job")?;
+    for (required, context) in [
+        (
+            "uses: ./.github/workflows/swift-sdk-artifact.yml",
+            "release Swift shared producer call",
+        ),
+        ("mode: full", "release Swift exhaustive producer mode"),
+        (
+            "release_tag: ${{ needs.metadata.outputs.tag }}",
+            "release Swift producer tag input",
+        ),
+        (
+            "prepare_release_version: ${{ github.event_name == 'workflow_dispatch' }}",
+            "release Swift dispatch version input",
+        ),
+    ] {
+        ensure_contains(swift_caller, required, context)?;
+    }
+    ensure_contains(
+        swift_sdk_artifact_workflow,
+        REQUIRED_STEP,
+        "shared Swift producer dispatch version step",
+    )?;
+    ensure_contains(
+        swift_sdk_artifact_workflow,
+        "if: ${{ inputs.prepare_release_version }}",
+        "shared Swift producer dispatch version condition",
+    )?;
+    ensure_contains(
+        swift_sdk_artifact_workflow,
+        REQUIRED_COMMAND,
+        "shared Swift producer dispatch version command",
+    )?;
+
     Ok(())
 }
 
@@ -427,6 +694,8 @@ fn check_release_container_contracts(
     const REQUIRED_COMMAND: &str = "git config --global --add safe.directory \"$GITHUB_WORKSPACE\"";
     const LOCAL_SCCACHE_ENV: &str = "      SCCACHE_GHA_ENABLED: \"false\"";
     const CONFIGURE_SCCACHE_ACTION: &str = "      - uses: ./.github/actions/configure-sccache-gha";
+    const COMPOSE_PRODUCT_ACTION: &str = "uses: ./.github/actions/compose-product-input";
+    const PREPARE_RUNTIME_ACTION: &str = "uses: ./.github/actions/prepare-native-runtime-input";
     const PINNED_GITHUB_SCRIPT: &str =
         "uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd";
 
@@ -487,12 +756,21 @@ fn check_release_container_contracts(
             "sccache GHA action cache chain",
         ),
         (
+            "process.env.SCCACHE_WEBDAV_ENDPOINT",
+            "sccache Depot WebDAV endpoint",
+        ),
+        ("process.env.DEPOT_CACHE_TOKEN", "sccache Depot job token"),
+        (
+            "core.exportVariable('SCCACHE_MULTILEVEL_CHAIN', 'disk,webdav')",
+            "sccache Depot cache chain",
+        ),
+        (
             "core.exportVariable('SCCACHE_MULTILEVEL_CHAIN', 'disk')",
             "sccache GHA action disk-only fallback",
         ),
         (
-            "core.exportVariable('SCCACHE_MULTILEVEL_WRITE_ERROR_POLICY', 'ignore')",
-            "sccache GHA action write fallback",
+            "core.exportVariable('SCCACHE_MULTILEVEL_WRITE_ERROR_POLICY', 'all')",
+            "sccache GHA action synchronous remote writes",
         ),
         ("['--start-server']", "sccache GHA action server start"),
         ("['--stop-server']", "sccache GHA action server stop"),
@@ -519,6 +797,25 @@ fn check_release_container_contracts(
             REQUIRED_COMMAND,
             &format!("release workflow `{job_name}` safe-directory command"),
         )?;
+        let composition_only =
+            job.contains(COMPOSE_PRODUCT_ACTION) && !job.contains(PREPARE_RUNTIME_ACTION);
+        if composition_only {
+            ensure_not_contains(
+                job,
+                CONFIGURE_SCCACHE_ACTION.trim(),
+                &format!(
+                    "release workflow `{job_name}` composition must not configure a compiler cache"
+                ),
+            )?;
+            ensure_not_contains(
+                job,
+                "uses: actions/cache@",
+                &format!(
+                    "release workflow `{job_name}` composition must not restore a compiler cache"
+                ),
+            )?;
+            continue;
+        }
         if !job.lines().any(|line| line == LOCAL_SCCACHE_ENV) {
             return Err(format!(
                 "release workflow `{job_name}`: missing job-level `{}`",
@@ -557,67 +854,119 @@ fn release_container_job_names(release_workflow: &str) -> Vec<&str> {
 fn check_windows_dynamic_runtime_contract(
     ci_workflow: &str,
     pr_builds_workflow: &str,
+    prepare_windows_host_action: &str,
+    prepare_native_runtime_action: &str,
+    compose_product_action: &str,
 ) -> DynResult<()> {
-    let ci_windows_cpu = workflow_job_section(ci_workflow, "windows_cpu")
-        .ok_or("main CI workflow: missing `windows_cpu` job")?;
-    let ci_windows_gpu = workflow_job_section(ci_workflow, "windows_gpu")
-        .ok_or("main CI workflow: missing `windows_gpu` job")?;
-    let pr_windows_targets = workflow_job_section(pr_builds_workflow, "windows_targets")
-        .ok_or("PR Builds workflow: missing `windows_targets` job")?;
+    ensure_contains(
+        prepare_windows_host_action,
+        r"& .\scripts\build-windows.ps1 -BuildProfile $profile -HostOnly",
+        "shared Windows host action canonical host-only build",
+    )?;
+    ensure_contains(
+        prepare_windows_host_action,
+        r"scripts\verify-host-dependencies.py",
+        "shared Windows host action import-policy verification",
+    )?;
+    ensure_not_contains(
+        prepare_windows_host_action,
+        "package-native-runtime.sh",
+        "shared Windows host action must not build a native runtime",
+    )?;
+    ensure_contains(
+        prepare_native_runtime_action,
+        r#"scripts/package-native-runtime.sh "${args[@]}""#,
+        "shared native-runtime action canonical runtime builder",
+    )?;
+    ensure_not_contains(
+        prepare_native_runtime_action,
+        "build-windows.ps1",
+        "shared native-runtime action must not build the Windows host",
+    )?;
+    ensure_contains(
+        compose_product_action,
+        "scripts/ci-compose-product-input.sh",
+        "shared product action canonical composition script",
+    )?;
 
-    for (workflow, context) in [
-        (ci_windows_cpu, "main CI Windows CPU"),
-        (ci_windows_gpu, "main CI Windows GPU"),
-        (pr_windows_targets, "PR Builds Windows targets"),
-    ] {
+    for (workflow, workflow_name) in [(ci_workflow, "main CI"), (pr_builds_workflow, "PR Builds")] {
+        let host = workflow_job_section(workflow, "windows_host_input")
+            .ok_or_else(|| format!("{workflow_name}: missing `windows_host_input` job"))?;
+        let cpu_runtime = workflow_job_section(workflow, "windows_cpu_runtime_input")
+            .ok_or_else(|| format!("{workflow_name}: missing `windows_cpu_runtime_input` job"))?;
+        let gpu_runtimes = workflow_job_section(workflow, "windows_gpu_runtime_inputs")
+            .ok_or_else(|| format!("{workflow_name}: missing `windows_gpu_runtime_inputs` job"))?;
+        let cpu_product = workflow_job_section(workflow, "windows_cpu_product")
+            .ok_or_else(|| format!("{workflow_name}: missing `windows_cpu_product` job"))?;
+        let gpu_products = workflow_job_section(workflow, "windows_gpu_products")
+            .ok_or_else(|| format!("{workflow_name}: missing `windows_gpu_products` job"))?;
+
         ensure_contains(
-            workflow,
+            host,
             "uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756",
-            &format!("{context} persistent MSVC environment"),
+            &format!("{workflow_name} persistent MSVC host environment"),
         )?;
+        ensure_contains(
+            host,
+            "uses: ./.github/actions/prepare-windows-host-input",
+            &format!("{workflow_name} shared immutable Windows host producer"),
+        )?;
+
+        for (runtime, runtime_name) in [
+            (cpu_runtime, "CPU runtime"),
+            (gpu_runtimes, "GPU runtime matrix"),
+        ] {
+            ensure_contains(
+                runtime,
+                "uses: ./.github/actions/prepare-native-runtime-input",
+                &format!("{workflow_name} shared Windows {runtime_name} producer"),
+            )?;
+            ensure_contains(
+                runtime,
+                "target: x86_64-pc-windows-msvc",
+                &format!("{workflow_name} Windows {runtime_name} target"),
+            )?;
+        }
+
+        for (product, product_name) in [
+            (cpu_product, "CPU product"),
+            (gpu_products, "GPU product matrix"),
+        ] {
+            ensure_contains(
+                product,
+                "uses: ./.github/actions/compose-product-input",
+                &format!("{workflow_name} shared Windows {product_name} composer"),
+            )?;
+            ensure_contains(
+                product,
+                "binary_name: mesh-llm.exe",
+                &format!("{workflow_name} Windows {product_name} executable"),
+            )?;
+            ensure_contains(
+                product,
+                "readiness_smoke: \"true\"",
+                &format!("{workflow_name} Windows {product_name} readiness"),
+            )?;
+
+            for forbidden in [
+                "cargo ",
+                "dtolnay/rust-toolchain",
+                "Swatinem/rust-cache",
+                "mozilla-actions/sccache-action",
+                "scripts/build-windows.ps1",
+                "scripts/package-native-runtime.sh",
+                "prepare-windows-host-input",
+                "prepare-native-runtime-input",
+            ] {
+                ensure_not_contains(
+                    product,
+                    forbidden,
+                    &format!("{workflow_name} Windows {product_name} composition-only contract"),
+                )?;
+            }
+        }
     }
 
-    for (workflow, context) in [
-        (ci_workflow, "main CI"),
-        (pr_windows_targets, "PR Builds Windows targets"),
-    ] {
-        ensure_contains(
-            workflow,
-            "build-windows.ps1 -BuildProfile release -HostOnly",
-            &format!("{context} backend-neutral Windows host build"),
-        )?;
-        ensure_contains(
-            workflow,
-            "scripts/package-native-runtime.sh \\",
-            &format!("{context} packaged Windows native runtime"),
-        )?;
-        ensure_contains(
-            workflow,
-            "--target x86_64-pc-windows-msvc",
-            &format!("{context} Windows runtime target"),
-        )?;
-        ensure_contains(
-            workflow,
-            "MESH_LLM_NATIVE_RUNTIME_BUNDLE_DIR",
-            &format!("{context} composed Windows runtime discovery"),
-        )?;
-        ensure_contains(
-            workflow,
-            "scripts/ci-client-readiness-smoke.sh target/release/mesh-llm.exe target/release/native-runtimes",
-            &format!("{context} Windows client readiness smoke"),
-        )?;
-    }
-
-    ensure_not_contains(
-        pr_windows_targets,
-        "steps.llama_cache.outputs.cache-hit",
-        "PR Builds Windows target must not skip composition or startup on ABI-cache hits",
-    )?;
-    ensure_not_contains(
-        pr_windows_targets,
-        "Skipping Windows ${{ matrix.name }} launch smoke",
-        "PR Builds Windows target must not skip GPU client readiness",
-    )?;
     Ok(())
 }
 
@@ -742,8 +1091,11 @@ core.exportVariable('SCCACHE_GHA_ENABLED', 'true')
 core.exportVariable('SCCACHE_GHA_ENABLED', 'false')
 core.exportVariable('SCCACHE_IGNORE_SERVER_IO_ERROR', '1')
 core.exportVariable('SCCACHE_MULTILEVEL_CHAIN', 'disk,gha')
+process.env.SCCACHE_WEBDAV_ENDPOINT
+process.env.DEPOT_CACHE_TOKEN
+core.exportVariable('SCCACHE_MULTILEVEL_CHAIN', 'disk,webdav')
 core.exportVariable('SCCACHE_MULTILEVEL_CHAIN', 'disk')
-core.exportVariable('SCCACHE_MULTILEVEL_WRITE_ERROR_POLICY', 'ignore')
+core.exportVariable('SCCACHE_MULTILEVEL_WRITE_ERROR_POLICY', 'all')
 ['--start-server']
 ['--stop-server']
 "#;
@@ -768,9 +1120,36 @@ jobs:
     runs-on: ubuntu-24.04
 "#;
 
+    const VALID_COMPOSITION_CONTAINER_WORKFLOW: &str = r#"env:
+  SCCACHE_DIR: ${{ github.workspace }}/../.sccache
+  SCCACHE_IGNORE_SERVER_IO_ERROR: "1"
+  SCCACHE_MULTILEVEL_CHAIN: disk,gha
+  SCCACHE_MULTILEVEL_WRITE_ERROR_POLICY: ignore
+jobs:
+  compose_linux_cuda:
+    container:
+      image: example.invalid/runner@sha256:digest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Trust checkout directory
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      - uses: ./.github/actions/compose-product-input
+  publish:
+    runs-on: ubuntu-24.04
+"#;
+
     #[test]
     fn release_container_contract_accepts_remote_sccache_with_local_fallback() {
         check_release_container_contracts(VALID_CONTAINER_WORKFLOW, VALID_SCCACHE_ACTION).unwrap();
+    }
+
+    #[test]
+    fn release_container_contract_accepts_cache_free_product_composition() {
+        check_release_container_contracts(
+            VALID_COMPOSITION_CONTAINER_WORKFLOW,
+            VALID_SCCACHE_ACTION,
+        )
+        .unwrap();
     }
 
     #[test]

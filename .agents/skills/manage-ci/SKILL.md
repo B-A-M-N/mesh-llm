@@ -81,12 +81,18 @@ update the skill resources in the same change.
   that ignore applicable `docs_only`, `rust_changed`, `backend_changed`,
   `inference_artifact_required`, `windows_*_build_required`,
   `sdk_smoke_required`, `ui_changed`, or `website_changed` outputs.
-- Keep Linux, macOS, and Windows as top-level target matrices in
-  `pr_builds.yml`. Linux/macOS CPU rows produce downstream smoke artifacts.
-  Keep macOS CUDA, ROCm, and Vulkan rows as explicit unsupported skips.
+- Model Linux, macOS, and Windows executable products as independent
+  backend-neutral host and native-runtime producers followed by
+  composition-only product jobs. A platform/backend matrix belongs on the
+  runtime and product layers, never on a host producer. Do not add no-op macOS
+  CUDA, ROCm, or Vulkan rows for unsupported combinations.
 - Gate native backend lanes on backend inputs, not on every Rust change.
   Workflow-only and docs-only changes must not fan out into build, GPU,
   benchmark, or SDK smoke lanes without a matching product input.
+- Gate public/ARC runner-image contract jobs on runner workflow, cache
+  integration, or cache-version changes (plus manual dispatch). Do not make
+  ordinary source/docs PRs pay an infrastructure canary that validates no
+  changed contract.
 - Keep Clippy sharding driven by `scripts/plan-clippy-batches.sh`; do not add
   hand-maintained static batches.
 - Keep crate-test sharding driven by `scripts/plan-test-batches.sh`. It derives
@@ -100,8 +106,17 @@ update the skill resources in the same change.
   expectations together. Do not add new crates to `plan-test-batches.sh`; its
   metadata-derived membership and default weight handle them automatically.
 - If a consumer downloads an artifact, its producer must be reachable in the
-  same workflow graph under every matching condition. Use `needs` and explicit
-  result checks; do not rely on job ordering by file position.
+  same workflow graph under every matching condition. Use `needs` with normal
+  dependency-success semantics, or an explicit result check when status-aware
+  continuation is intentional; do not rely on job ordering by file position.
+- Give each PR entry workflow one stable, non-matrix summary job suitable for
+  branch protection. Conditional top-level jobs and the summary must consume
+  the same checked-in required-job plan so route conditions cannot drift. The
+  summary must directly need every other top-level job, use
+  `if: ${{ !cancelled() }}` rather than `always()`, require unconditional
+  routing/planning jobs to succeed, and permit `skipped` only when that job is
+  absent from the plan. Reject required skips, failure, cancellation, unknown
+  results, duplicate plan entries, and required IDs outside the needs graph.
 - Set `strategy.fail-fast: false` when every platform/backend result is useful.
   Use fail-fast only when later matrix results would be redundant or unsafe.
 
@@ -163,6 +178,38 @@ update the skill resources in the same change.
   names, node selectors, resource requests, or worker counts in only one side
   of the contract. Update workflow routing, runner/GitOps configuration,
   inventory, and verification together.
+- Route trusted main/release Depot jobs through the repository-wide
+  `DEPOT_RUNNERS_ENABLED` exact-string gate, with a typed manual canary input
+  accepted only when `github.ref == 'refs/heads/main'` and a GitHub-hosted
+  fallback for tags and every other ref. Current
+  `pull_request` workflows must always select GitHub-hosted runners;
+  `DEPOT_PR_RUNNERS_ENABLED` is ignored.
+- A default-branch-pinned reusable workflow that directly allocates Depot must
+  not accept a caller-supplied runner label or Depot-cache permission. Derive
+  both inside the protected workflow from the exact repository, event, main
+  ref, `DEPOT_RUNNERS_ENABLED` gate or event-owned main-dispatch canary flag,
+  target architecture, and a validated bounded runner-size input. Pull
+  requests, tags, feature refs, external repositories, and unsupported targets
+  must never resolve to a Depot label; the cache permission must be the output
+  of the same decision.
+- Reusable smoke workflows that receive `HF_TOKEN` must remain fixed to
+  GitHub-hosted runners during the Depot rollout. They must not accept raw
+  `runs_on` JSON or any other caller-provided label that can resolve to Depot or
+  a dedicated runner group. Multi-platform smoke/producer APIs may expose only
+  bounded GitHub-hosted labels and must fail closed before running checked-out
+  source. Pull-request callers must not pass `HF_TOKEN`; use public fixtures and
+  merge-ref-scoped caches for untrusted PR validation.
+- Treat a checked-out repository-local selector as defense in depth, never as
+  the PR runner trust boundary: pull requests can modify both their workflow and
+  local action code. Before any PR uses Depot, automatic cache authority must be
+  disabled and isolated, then a default-branch-pinned, narrowly typed reusable
+  workflow must be restricted to its exact `@refs/heads/main` workflow ref with
+  `restricted_to_workflows=true`. Do not use `pull_request_target` to build or
+  execute PR content.
+- Confirm the Depot GitHub App, public-repository runner-group access,
+  selected-workflow restriction, and every selected runner label before
+  enabling Depot. Hardware-qualified GPU execution remains on a restricted
+  device runner.
 
 ## Dependencies and runner setup
 
@@ -230,6 +277,14 @@ update the skill resources in the same change.
   MeshLLM version, platform, and backend compatibility. Product artifacts must
   record the exact host and runtime digests and preserve the
   `mesh-bundle/native-runtimes/<runtime-id>` layout.
+- Use `.github/actions/prepare-host-input`,
+  `.github/actions/prepare-windows-host-input`,
+  `.github/actions/prepare-native-runtime-input`, and
+  `.github/actions/compose-product-input` for PR/main/release producers.
+  `prepare-host-input` owns Unix hosts and `prepare-windows-host-input` owns
+  Windows hosts. Add release-only signing/publishing around those actions; do
+  not fork their build/package/compose commands into workflow-local shell
+  blocks.
 - Keep host, runtime, and product matrices separate in release workflows.
   Product jobs download producer artifacts and verify compatibility and digest
   metadata before composition. Never satisfy a missing producer by rebuilding
@@ -252,17 +307,73 @@ update the skill resources in the same change.
   reuse unsafe: OS, architecture, backend/toolchain, relevant lockfiles,
   `.github/cache-version.txt`, and build inputs. Do not broaden restore keys
   across incompatible or untrusted contexts.
+- Windows native-runtime producers and the trusted warmer must use
+  `.github/actions/restore-windows-abi-cache`. Keep CPU, CUDA, ROCm, and Vulkan
+  architecture/toolchain identities exact; do not duplicate its key expression
+  in individual workflows or add broad restore prefixes.
+- GitHub-hosted PR jobs may share the normal key namespace with main because
+  GitHub scopes PR writes to the merge ref and trusted main does not restore
+  them. Do not assume that isolation applies to another cache provider.
+- Keep sccache disk-only for `pull_request` and `pull_request_target` events.
+  The pinned sccache treats a mixed `disk,gha` chain as wholly read-only when
+  the GHA tier is read-only, so every miss records a rejected cache write and
+  cannot populate L0. PR jobs therefore use a writable job-local disk tier plus
+  bulk Rust and exact native `actions/cache` restores. Only trusted main,
+  release, scheduled warmer, or explicitly authorized dispatch paths may
+  publish shared sccache entries. Apply the same event-derived policy to direct
+  `mozilla-actions/sccache-action` users through
+  `.github/actions/configure-sccache-gha`; do not let a reusable workflow
+  silently restore read-write PR publication.
+- Depot's GitHub cache namespace is repository-scoped and has no branch
+  isolation. With automatic Depot Cache enabled, its authority is injected into
+  the whole runner job and cannot be contained by sccache disk-only mode or
+  cache-key conventions. Current PR workflows must not use Depot, including
+  through a trusted reusable caller, until automatic injection is disabled and
+  complete token/API isolation is proven.
 - Do not save large shared Rust caches from PR merge refs. Shared caches are
   written from trusted main/release/cache-warming paths. PR cleanup may delete
   positively matched PR caches/artifacts but must not delete workflow runs or
   logs.
 - Use `retention-days: 1` for PR and smoke-only artifacts unless a documented
   debugging or release requirement needs longer retention. Release evidence
-  follows the release policy, not the PR default.
+  follows the release policy, not the PR default. Sccache migration evidence is
+  retained for 14 days so cold/warm samples cover the configured Depot
+  cache-retention window.
 - Restore producer artifacts through `.github/actions/restore-smoke-inputs`.
   Reuse `smoke.yml`, `scripted-binary-smoke.yml`, `sdk-smoke.yml`, and
-  `hf-download-smoke.yml`; do not rebuild MeshLLM or duplicate model/artifact
-  restore blocks in consumers.
+  `hf-download-smoke.yml`; do not rebuild MeshLLM, native runtimes, or duplicate
+  model/artifact restore blocks in consumers. SDK smokes consume the runtime
+  adjacent to their staged producer binary and must fail rather than silently
+  compiling a replacement in CI.
+- Build Swift XCFramework inputs through the typed
+  `swift-sdk-artifact.yml` reusable producer. Pull-request validation uses its
+  `host-only` mode, while main and release use `full`; Swift smoke consumers
+  download and verify both the immutable XCFramework and generated
+  `mesh_ffi.swift` artifacts and must not invoke Cargo, llama.cpp builds,
+  native-SDK packaging, or either XCFramework build script. Producer and smoke
+  are fixed to `macos-15`; the native cache includes an explicit macOS/Xcode
+  epoch, Rust uses `RUSTC_WRAPPER=sccache`, and the producer retains
+  mode/run-attempt-unique sccache evidence. Main and tag producers must fail on
+  tracked-binding drift, while a dispatched release must copy the producer
+  binding into its tag commit.
+- Build native SDK runtime inputs through the typed
+  `native-sdk-artifact.yml` reusable producer. Pull-request, main, and release
+  callers select an explicit target, backend, and Cargo profile; Kotlin smoke
+  downloads and verifies that immutable producer artifact and must not invoke
+  Cargo, llama.cpp preparation/builds, or native-SDK packaging. Release callers
+  use the same producer with release-asset staging enabled so archive, checksum,
+  and native runtime crate names remain identical to the published contract.
+- Build Linux static llama ABI inputs through the typed
+  `static-abi-artifact.yml` reusable producer. Its artifact must carry an exact
+  target/backend manifest, pinned build-image/toolchain epoch, build-stamp
+  checksum, archive checksum, the full llama/common/mtmd/ggml static link
+  closure, and only the canonical minimal `build-stage-abi-static` link tree.
+  Cache and artifact payloads must contain the same path-normalized archive,
+  not CMake's producer-local build graph. Crate tests and native SDK producers
+  restore it with `restore-static-abi-input.sh`;
+  never extract it with raw `tar`, relabel it across architectures, or rebuild
+  the same CPU ABI in a downstream consumer. Native SDK reuse must call the
+  verification-only prebuilt path with build.rs auto-build disabled.
 - Never put credentials, local absolute paths, private endpoints, or secret
   material into cache/artifact content or workflow summaries.
 

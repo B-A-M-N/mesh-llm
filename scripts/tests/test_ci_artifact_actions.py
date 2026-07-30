@@ -1,0 +1,1766 @@
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import tarfile
+import tempfile
+import tomllib
+import unittest
+
+
+ROOT = Path(__file__).resolve().parents[2]
+ACTIONS = ROOT / ".github" / "actions"
+COMPOSE_SCRIPT = ROOT / "scripts" / "ci-compose-product-input.sh"
+RELEASE_FOOTER_MANIFEST = ROOT / "crates" / "mesh-llm-release-footer" / "Cargo.toml"
+XTASK_MANIFEST = ROOT / "tools" / "xtask" / "Cargo.toml"
+
+
+class CiArtifactActionTests(unittest.TestCase):
+    def read_action(self, name: str) -> str:
+        return (ACTIONS / name / "action.yml").read_text(encoding="utf-8")
+
+    def test_external_actions_have_sha_and_release_provenance(self) -> None:
+        action_files = sorted(ACTIONS.glob("*/action.yml"))
+        workflow_files = sorted(
+            (ROOT / ".github" / "workflows").glob("*.yml"),
+        )
+        exact_pin = re.compile(
+            r"^[^@\s]+@[0-9a-f]{40}\s+#\s+\S",
+        )
+
+        for path in (*action_files, *workflow_files):
+            for line_number, line in enumerate(
+                path.read_text(encoding="utf-8").splitlines(),
+                start=1,
+            ):
+                if "uses:" not in line:
+                    continue
+                value = line.split("uses:", maxsplit=1)[1].strip()
+                if value.startswith("./"):
+                    continue
+                with self.subTest(
+                    path=path.relative_to(ROOT),
+                    line=line_number,
+                ):
+                    self.assertRegex(value, exact_pin)
+
+    def test_workflow_status_gates_do_not_resist_cancellation(self) -> None:
+        workflow_files = sorted(
+            (ROOT / ".github" / "workflows").glob("*.yml"),
+        )
+
+        for path in workflow_files:
+            with self.subTest(path=path.relative_to(ROOT)):
+                self.assertNotIn(
+                    "always()",
+                    path.read_text(encoding="utf-8"),
+                )
+
+    def test_pr_quality_requires_ci_contract_validation(self) -> None:
+        workflow = (
+            ROOT / ".github" / "workflows" / "pr_quality.yml"
+        ).read_text(encoding="utf-8")
+        contract_start = workflow.index("  ci-contract:")
+        contract_end = workflow.index("\n  rust-fmt:", contract_start)
+        contract = workflow[contract_start:contract_end]
+        summary = workflow[workflow.index("  summary:") :]
+
+        self.assertIn(
+            "uses: ./.github/actions/install-actionlint",
+            contract,
+        )
+        self.assertNotIn("tool: actionlint@", contract)
+        self.assertIn(
+            "actionlint -config-file .github/actionlint.yaml",
+            contract,
+        )
+        self.assertIn(
+            "python3 -m unittest discover -s scripts/tests -p 'test_*.py'",
+            contract,
+        )
+        self.assertIn("ci-contract", summary)
+        self.assertIn("needs.ci-contract.result", summary)
+
+    def test_actionlint_installer_verifies_pinned_release_archives(
+        self,
+    ) -> None:
+        action = self.read_action("install-actionlint")
+
+        self.assertIn('ACTIONLINT_VERSION: "1.7.12"', action)
+        self.assertIn(
+            "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8",
+            action,
+        )
+        self.assertIn(
+            "325e971b6ba9bfa504672e29be93c24981eeb1c07576d730e9f7c8805afff0c6",
+            action,
+        )
+        self.assertIn("actionlint archive checksum mismatch", action)
+        self.assertIn("scripts/safe-extract-tar.py", action)
+        self.assertNotIn("tar -x", action)
+
+    def write_fake_product_inputs(
+        self,
+        workspace: Path,
+        *,
+        host_version: str = "1.2.3",
+    ) -> tuple[Path, Path]:
+        host_input = workspace / "host-input"
+        runtime_input = workspace / "runtime-input"
+        host_input.mkdir()
+        runtime_input.mkdir()
+
+        host = host_input / "mesh-llm"
+        host.write_text(
+            "#!/usr/bin/env bash\n"
+            f"printf 'mesh-llm {host_version}\\n'\n",
+            encoding="utf-8",
+        )
+        host.chmod(0o755)
+        host_digest = hashlib.sha256(host.read_bytes()).hexdigest()
+        (host_input / "mesh-llm.sha256").write_text(
+            f"{host_digest}  mesh-llm\n",
+            encoding="utf-8",
+        )
+        (host_input / "host-imports.json").write_text(
+            "{}\n",
+            encoding="utf-8",
+        )
+
+        runtime_id = "meshllm-native-runtime-darwin-x86_64-cpu"
+        runtime = runtime_input / runtime_id
+        (runtime / "lib").mkdir(parents=True)
+        (runtime / "tools").mkdir()
+        library = runtime / "lib" / "libmesh_fake.a"
+        library.write_bytes(b"fake static library")
+        tool = runtime / "tools" / "mesh-runtime-bench"
+        tool.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+        tool.chmod(0o755)
+        library_digest = hashlib.sha256(library.read_bytes()).hexdigest()
+        tool_digest = hashlib.sha256(tool.read_bytes()).hexdigest()
+        manifest = {
+            "runtime": {
+                "id": runtime_id,
+                "mesh_version": "1.2.3",
+                "skippy_abi": "1.0.0",
+                "platform": {
+                    "os": "macos",
+                    "arch": "x86_64",
+                    "target": "x86_64-apple-darwin",
+                },
+                "backend": {"kind": "cpu"},
+                "libraries": ["lib/libmesh_fake.a"],
+                "files": {
+                    "lib/libmesh_fake.a": library_digest,
+                },
+                "tools": {"tools/mesh-runtime-bench": tool_digest},
+            },
+            "build": {
+                "backend": "cpu",
+                "primary_library": "lib/libmesh_fake.a",
+                "library_sha256": library_digest,
+            },
+        }
+        (runtime / "manifest.json").write_text(
+            json.dumps(manifest) + "\n",
+            encoding="utf-8",
+        )
+        return host_input, runtime_input
+
+    def write_noncanonical_sidecar(
+        self,
+        artifact: Path,
+        mode: str,
+    ) -> None:
+        digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
+        if mode == "wrong-name":
+            contents = f"{digest}  unexpected-name\n"
+        elif mode == "multiline":
+            contents = (
+                f"{digest}  {artifact.name}\n"
+                f"{digest}  {artifact.name}\n"
+            )
+        else:
+            raise ValueError(f"unsupported sidecar mode: {mode}")
+        artifact.with_name(f"{artifact.name}.sha256").write_text(
+            contents,
+            encoding="utf-8",
+        )
+
+    def run_product_composer(
+        self,
+        workspace: Path,
+        *,
+        host_version: str = "1.2.3",
+        runtime_archive: str | None = None,
+        host_sidecar: str | None = None,
+        attestation_sidecar: str | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        host_input, runtime_input = self.write_fake_product_inputs(
+            workspace,
+            host_version=host_version,
+        )
+        if host_sidecar is not None:
+            self.write_noncanonical_sidecar(
+                host_input / "mesh-llm",
+                host_sidecar,
+            )
+        if runtime_archive is not None:
+            runtime_dir = next(
+                path
+                for path in runtime_input.iterdir()
+                if path.is_dir()
+            )
+            archive = runtime_input / f"{runtime_dir.name}.tar.gz"
+            with tarfile.open(archive, "w:gz") as bundle:
+                bundle.add(runtime_dir, arcname=runtime_dir.name)
+            shutil.rmtree(runtime_dir)
+            digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+            if runtime_archive != "missing":
+                sidecar_digest = (
+                    "0" * 64
+                    if runtime_archive == "corrupt"
+                    else digest
+                )
+                archive.with_name(f"{archive.name}.sha256").write_text(
+                    f"{sidecar_digest}  {archive.name}\n",
+                    encoding="utf-8",
+                )
+            if runtime_archive == "duplicate":
+                (runtime_input / "unrelated.tar.gz.sha256").write_text(
+                    f"{digest}  unrelated.tar.gz\n",
+                    encoding="utf-8",
+                )
+        environment = {
+            **os.environ,
+            "GITHUB_WORKSPACE": str(workspace),
+            "GITHUB_OUTPUT": str(workspace / "github-output"),
+            "INPUT_HOST_INPUT_DIR": str(host_input),
+            "INPUT_RUNTIME_INPUT_DIR": str(runtime_input),
+            "INPUT_OUTPUT_DIR": str(workspace / "product-input"),
+            "INPUT_BACKEND": "cpu",
+            "INPUT_VERSION": "1.2.3",
+            "INPUT_BINARY_NAME": "mesh-llm",
+            "INPUT_READINESS_SMOKE": "false",
+        }
+        if attestation_sidecar is not None:
+            verifier = host_input / "release-attestation-verifier"
+            verifier.write_bytes(b"test verifier")
+            self.write_noncanonical_sidecar(
+                verifier,
+                attestation_sidecar,
+            )
+            public_key = workspace / "release-attestation-public-key.json"
+            public_key.write_text("{}\n", encoding="utf-8")
+            environment["INPUT_ATTESTATION_PUBLIC_KEY_FILE"] = str(
+                public_key,
+            )
+        return subprocess.run(
+            [str(COMPOSE_SCRIPT)],
+            cwd=ROOT,
+            env=environment,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+    def run_runner_selector(
+        self,
+        *,
+        event_name: str,
+        ref: str,
+        main_enabled: str,
+        manual_enabled: str,
+    ) -> dict[str, str]:
+        action = self.read_action("select-ci-runners")
+        run_block = action.split("      run: |\n", maxsplit=1)[1]
+        script = "\n".join(
+            line[8:] if line.startswith("        ") else line
+            for line in run_block.splitlines()
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output = Path(temp_dir) / "github-output"
+            result = subprocess.run(
+                ["bash", "-c", script],
+                cwd=ROOT,
+                env={
+                    **os.environ,
+                    "GITHUB_OUTPUT": str(output),
+                    "INPUT_EVENT_NAME": event_name,
+                    "INPUT_REF": ref,
+                    "INPUT_DEPOT_MAIN_ENABLED": main_enabled,
+                    "INPUT_MANUAL_USE_DEPOT": manual_enabled,
+                },
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            return dict(
+                line.split("=", maxsplit=1)
+                for line in output.read_text(encoding="utf-8").splitlines()
+            )
+
+    def run_reusable_runner_policy(
+        self,
+        workflow_name: str,
+        *,
+        repository: str,
+        event_name: str,
+        ref: str,
+        depot_enabled: str,
+        target: str,
+        runner_size: str,
+        manual_use_depot: str = "false",
+    ) -> tuple[subprocess.CompletedProcess[str], dict[str, str]]:
+        workflow = (
+            ROOT / ".github" / "workflows" / workflow_name
+        ).read_text(encoding="utf-8")
+        policy = workflow.split(
+            "      - name: Derive protected runner policy\n",
+            maxsplit=1,
+        )[1]
+        run_block = policy.split("        run: |\n", maxsplit=1)[1]
+        script_lines: list[str] = []
+        for line in run_block.splitlines():
+            if line.startswith("          "):
+                script_lines.append(line[10:])
+            elif not line:
+                script_lines.append("")
+            else:
+                break
+        script = "\n".join(script_lines)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output = Path(temp_dir) / "github-output"
+            result = subprocess.run(
+                ["bash", "-c", script],
+                cwd=ROOT,
+                env={
+                    **os.environ,
+                    "GITHUB_OUTPUT": str(output),
+                    "POLICY_REPOSITORY": repository,
+                    "POLICY_REF": ref,
+                    "POLICY_EVENT_NAME": event_name,
+                    "POLICY_DEPOT_ENABLED": depot_enabled,
+                    "POLICY_MANUAL_USE_DEPOT": manual_use_depot,
+                    "POLICY_TARGET": target,
+                    "POLICY_RUNNER_SIZE": runner_size,
+                },
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            outputs = {}
+            if output.exists():
+                outputs = dict(
+                    line.split("=", maxsplit=1)
+                    for line in output.read_text(
+                        encoding="utf-8",
+                    ).splitlines()
+                )
+            return result, outputs
+
+    def test_host_action_uses_canonical_dynamic_host_builder(self) -> None:
+        action = self.read_action("prepare-host-input")
+
+        self.assertIn('scripts/build-host.sh --profile "$INPUT_PROFILE"', action)
+        self.assertIn("scripts/verify-host-dependencies.py", action)
+        self.assertNotIn("package-native-runtime.sh", action)
+
+    def test_windows_host_action_owns_the_neutral_host_integrity_contract(
+        self,
+    ) -> None:
+        action = self.read_action("prepare-windows-host-input")
+
+        self.assertIn(
+            "& .\\scripts\\build-windows.ps1 -BuildProfile $profile -HostOnly",
+            action,
+        )
+        self.assertIn("scripts\\verify-host-dependencies.py", action)
+        self.assertIn("mesh-llm.exe.sha256", action)
+        self.assertIn("cargo build -q -p xtask --bin xtask", action)
+        self.assertIn("release-attestation stamp", action)
+        self.assertIn("release-attestation inspect", action)
+        self.assertIn('"$attestationVerifierPath.sha256"', action)
+        self.assertIn(
+            '"$verifierHash  release-attestation-verifier.exe"',
+            action,
+        )
+        self.assertNotIn("package-native-runtime.sh", action)
+        self.assertNotIn("compose-product", action)
+
+    def test_windows_attestation_verifier_stays_native_abi_free(self) -> None:
+        xtask = tomllib.loads(XTASK_MANIFEST.read_text(encoding="utf-8"))
+        xtask_dependencies = xtask["dependencies"]
+        self.assertEqual(
+            xtask_dependencies["mesh-llm-release-footer"],
+            {"workspace": True},
+        )
+        self.assertNotIn("mesh-llm-system", xtask_dependencies)
+        self.assertNotIn("skippy-ffi", xtask_dependencies)
+
+        footer = tomllib.loads(RELEASE_FOOTER_MANIFEST.read_text(encoding="utf-8"))
+        self.assertEqual(set(footer["dependencies"]), {"hex", "sha2"})
+
+    def test_windows_debug_host_uses_the_package_version_for_composition(
+        self,
+    ) -> None:
+        action = self.read_action("prepare-windows-host-input")
+
+        debug = action[
+            action.index('if ($profile -eq "debug")')
+            : action.index('if ($env:INPUT_SKIP_UI -eq "true")')
+        ]
+        self.assertIn("cargo pkgid -p mesh-llm", debug)
+        self.assertIn("$env:MESH_LLM_BUILD_VERSION", debug)
+        self.assertNotIn("git ", debug)
+
+    def test_windows_routes_cover_every_shared_product_primitive(self) -> None:
+        action = self.read_action("compute-changes")
+        routing = action[
+            action.index("WINDOWS_CPU_INPUTS=")
+            : action.index("# SDK smokes are consumer tests")
+        ]
+        cpu_routing = routing[: routing.index("WINDOWS_GPU_INPUTS=")]
+        gpu_routing = routing[routing.index("WINDOWS_GPU_INPUTS=") :]
+
+        self.assertIn("^crates/mesh-llm-release-footer/", cpu_routing)
+        self.assertNotIn("^crates/mesh-llm-release-footer/", gpu_routing)
+        self.assertIn("package-release", cpu_routing)
+        self.assertIn("package-release", gpu_routing)
+        for workflow in (
+            "ci",
+            "pr_builds",
+            "release",
+            "windows-warm-caches",
+        ):
+            with self.subTest(workflow=workflow):
+                self.assertIn(workflow, cpu_routing)
+                self.assertIn(workflow, gpu_routing)
+
+        for primitive in (
+            "prepare-windows-host-input",
+            "prepare-native-runtime-input",
+            "compose-product-input",
+            "package-native-runtime",
+            "verify-native-runtime-package",
+            "verify-checksum-sidecar",
+            "safe-extract-tar",
+            "compose-product-bundle",
+            "ci-compose-product-input",
+            "ci-client-readiness-smoke",
+        ):
+            with self.subTest(primitive=primitive):
+                self.assertIn(primitive, routing)
+
+    def test_windows_abi_cache_action_keys_every_compatibility_boundary(
+        self,
+    ) -> None:
+        action = self.read_action("restore-windows-abi-cache")
+
+        for action_input in (
+            "backend:",
+            "build_dir:",
+            "toolchain_epoch:",
+            "architecture_set:",
+            "cuda_toolchain_version:",
+            "vulkan_toolchain_version:",
+            "rocm_toolchain_version:",
+        ):
+            with self.subTest(action_input=action_input):
+                self.assertIn(action_input, action)
+
+        self.assertIn(
+            '$backend -notin @("cpu", "cuda", "rocm", "vulkan")',
+            action,
+        )
+        self.assertIn(
+            '$backend -in @("cuda", "rocm") -and -not $architectureSet',
+            action,
+        )
+        self.assertIn(
+            "build_dir must resolve inside GITHUB_WORKSPACE",
+            action,
+        )
+        self.assertIn(
+            "build_dir must remain outside the replaceable llama.cpp ",
+            action,
+        )
+        self.assertIn(
+            "worktree: $resolvedBuildDir",
+            action,
+        )
+        for toolchain_boundary in (
+            "cuda-$version-Jimver-v0.2.35",
+            "vulkan-$version-jakoch-v1.5.2",
+            "rocm-$version",
+        ):
+            with self.subTest(toolchain_boundary=toolchain_boundary):
+                self.assertIn(toolchain_boundary, action)
+
+        expected_hash = (
+            "${{ hashFiles("
+            "'.github/actions/restore-windows-abi-cache/action.yml', "
+            "'.github/actions/resolve-native-toolchain-epoch/action.yml', "
+            "'.github/actions/prepare-native-runtime-input/action.yml', "
+            "'.github/actions/setup-windows-rocm-sdk/action.yml', "
+            "'scripts/build-llama.sh', 'scripts/prepare-llama.sh', "
+            "'scripts/package-native-runtime.sh', "
+            "'third_party/llama.cpp/upstream.txt', "
+            "'third_party/llama.cpp/patches/**', "
+            "'.github/cache-version.txt') }}"
+        )
+        self.assertIn(expected_hash, action)
+        self.assertIn(
+            '"mesh-llm-windows-2022-skippy-abi-'
+            '$backend-$architectureSet-$toolchain-$toolchainEpoch-$inputHash"',
+            action,
+        )
+        self.assertIn(
+            "toolchain_epoch must match MESH_LLM_LLAMA_TOOLCHAIN_EPOCH",
+            action,
+        )
+        self.assertIn(
+            "actions/cache/restore@"
+            "caa296126883cff596d87d8935842f9db880ef25 # v5.1.0",
+            action,
+        )
+        self.assertNotIn("restore-keys:", action)
+        self.assertIn(
+            "value: ${{ steps.restore.outputs.cache-hit }}",
+            action,
+        )
+        self.assertIn(
+            "value: ${{ steps.restore.outputs.cache-primary-key }}",
+            action,
+        )
+
+    def test_native_toolchain_epoch_is_exact_and_shared_with_build_stamp(
+        self,
+    ) -> None:
+        resolver = self.read_action("resolve-native-toolchain-epoch")
+        pr_workflow = (
+            ROOT / ".github" / "workflows" / "pr_builds.yml"
+        ).read_text(encoding="utf-8")
+        main_workflow = (
+            ROOT / ".github" / "workflows" / "ci.yml"
+        ).read_text(encoding="utf-8")
+        release_workflow = (
+            ROOT / ".github" / "workflows" / "release.yml"
+        ).read_text(encoding="utf-8")
+        warmer = (
+            ROOT / ".github" / "workflows" / "windows-warm-caches.yml"
+        ).read_text(encoding="utf-8")
+
+        for contract in (
+            'image_os="${ImageOS:-}"',
+            'image_version="${ImageVersion:-}"',
+            'INPUT_PINNED_EPOCH: ${{ inputs.pinned_epoch }}',
+            'echo "epoch=$epoch" >> "$GITHUB_OUTPUT"',
+            'echo "MESH_LLM_LLAMA_TOOLCHAIN_EPOCH=$epoch" >> "$GITHUB_ENV"',
+            "xcodebuild -version",
+            "cmake --version",
+            "ninja --version",
+        ):
+            with self.subTest(contract=contract):
+                self.assertIn(contract, resolver)
+
+        for workflow in (
+            pr_workflow,
+            main_workflow,
+            release_workflow,
+            warmer,
+        ):
+            self.assertIn(
+                "uses: ./.github/actions/resolve-native-toolchain-epoch",
+                workflow,
+            )
+        for workflow in (pr_workflow, main_workflow):
+            global_env = workflow.split("\npermissions:", maxsplit=1)[0]
+            self.assertNotIn("MESH_LLM_LLAMA_TOOLCHAIN_EPOCH:", global_env)
+
+        for workflow in (pr_workflow, main_workflow, release_workflow):
+            for cache_block in re.findall(
+                r"uses: actions/cache@[^\n]+\n"
+                r"(?:[ \t]+[^\n]*\n){1,8}",
+                workflow,
+            ):
+                if "LLAMA_STAGE_BUILD_DIR" in cache_block:
+                    self.assertIn(
+                        "native_toolchain.outputs.epoch",
+                        cache_block,
+                    )
+
+    def test_push_routing_diffs_the_complete_event_range(self) -> None:
+        action = self.read_action("compute-changes")
+        push_start = action.index(
+            'elif [[ "${{ inputs.event_name }}" == "push" ]]',
+        )
+        push_end = action.index(
+            'elif [[ "${{ inputs.event_name }}" == "workflow_dispatch" ]]',
+            push_start,
+        )
+        push = action[push_start:push_end]
+
+        self.assertIn('base_sha="${{ inputs.base_sha }}"', push)
+        self.assertIn('head_sha="${{ inputs.head_sha }}"', push)
+        self.assertIn('git diff --name-only "$base_sha" "$head_sha"', push)
+        self.assertIn('"$base_sha" =~ ^0+$', push)
+        self.assertIn('"__force_all__"', push)
+        self.assertNotIn("HEAD^", action)
+        self.assertIn('if [[ "$FORCE_ALL" == "true" ]]', action)
+        force_windows = action[
+            action.index('if [[ "$FORCE_ALL" == "true" ]]')
+            : action.index(
+                "# SDK smokes are consumer tests",
+            )
+        ]
+        self.assertIn('WINDOWS_CPU_BUILD_REQUIRED="true"', force_windows)
+        self.assertIn('WINDOWS_GPU_BUILD_REQUIRED="true"', force_windows)
+
+    def test_runner_contract_routing_covers_cache_evidence_actions(
+        self,
+    ) -> None:
+        action = self.read_action("compute-changes")
+        routing = action[
+            action.index("RUNNER_CONTRACT_INPUTS=")
+            : action.index("# Determine docs_only")
+        ]
+
+        for local_action in (
+            "capture-sccache-stats",
+            "configure-sccache-gha",
+            "resolve-native-toolchain-epoch",
+            "select-ci-runners",
+        ):
+            with self.subTest(local_action=local_action):
+                self.assertIn(local_action, routing)
+
+        epoch_resolver = "resolve-native-toolchain-epoch"
+        for route_start, route_end in (
+            ("BACKEND_INPUTS=", "WINDOWS_CPU_BUILD_REQUIRED="),
+            ("WINDOWS_CPU_INPUTS=", "# SDK smokes are consumer tests"),
+            ("DIRECT_SDK_INPUTS=", "# Inference artifacts are needed"),
+        ):
+            with self.subTest(route=route_start):
+                route = action[
+                    action.index(route_start) : action.index(
+                        route_end,
+                        action.index(route_start),
+                    )
+                ]
+                self.assertIn(epoch_resolver, route)
+
+    def test_justfile_release_primitives_route_backend_builds(self) -> None:
+        action = self.read_action("compute-changes")
+        match = re.search(
+            r"function is_backend_recipe\(name\).*?"
+            r"return name ~ /\^\((.*?)\)\$/",
+            action,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(match)
+        recipe_names = set(match.group(1).split("|"))
+
+        for recipe in (
+            "release-host-build",
+            "release-runtime-build",
+            "release-host-build-windows",
+        ):
+            with self.subTest(recipe=recipe):
+                self.assertIn(recipe, recipe_names)
+
+    def test_sdk_routing_covers_every_direct_smoke_script(self) -> None:
+        action = self.read_action("compute-changes")
+        match = re.search(
+            r"DIRECT_SDK_INPUTS=.*?grep -E '([^']+)'",
+            action,
+        )
+        self.assertIsNotNone(match)
+        direct_sdk_pattern = re.compile(match.group(1))
+        self.assertRegex(
+            ".github/actions/restore-smoke-inputs/action.yml",
+            direct_sdk_pattern,
+        )
+        smoke_scripts = (
+            ROOT / "scripts" / "ci-rust-sdk-smoke.sh",
+            ROOT / "scripts" / "ci-kotlin-sdk-smoke.sh",
+            ROOT / "scripts" / "ci-swift-sdk-smoke.sh",
+        )
+
+        direct_calls: set[str] = set()
+        for smoke_script in smoke_scripts:
+            direct_calls.update(
+                f"scripts/{name}"
+                for name in re.findall(
+                    r"(?m)^\s*(?:retry_transient\s+)?"
+                    r"scripts/([A-Za-z0-9_.-]+\.sh)",
+                    smoke_script.read_text(encoding="utf-8"),
+                )
+            )
+
+        for script in sorted(direct_calls):
+            with self.subTest(script=script):
+                self.assertRegex(script, direct_sdk_pattern)
+
+    def test_native_sdk_build_is_a_shared_immutable_producer(self) -> None:
+        producer = (
+            ROOT / ".github" / "workflows" / "native-sdk-artifact.yml"
+        ).read_text(encoding="utf-8")
+        producer_action = self.read_action("prepare-native-sdk-input")
+        consumer_workflow = (
+            ROOT / ".github" / "workflows" / "sdk-smoke.yml"
+        ).read_text(encoding="utf-8")
+        consumer_script = (
+            ROOT / "scripts" / "ci-kotlin-sdk-smoke.sh"
+        ).read_text(encoding="utf-8")
+        restore_script = (
+            ROOT / "scripts" / "restore-native-sdk-input.sh"
+        ).read_text(encoding="utf-8")
+        routing = self.read_action("compute-changes")
+
+        self.assertIn(
+            "uses: ./.github/actions/prepare-native-sdk-input",
+            producer,
+        )
+        self.assertIn(
+            "uses: ./.github/workflows/static-abi-artifact.yml",
+            producer,
+        )
+        self.assertIn(
+            "scripts/restore-static-abi-input.sh",
+            producer,
+        )
+        self.assertIn(
+            "LLAMA_STAGE_BUILD_DIR: "
+            ".deps/llama.cpp/build-stage-abi-static",
+            producer,
+        )
+        self.assertIn("persist-credentials: false", producer)
+        self.assertIn("actions/upload-artifact@", producer)
+        self.assertIn("inputs.include_runtime_crate", producer)
+        self.assertIn("RUSTC_WRAPPER: sccache", producer)
+        self.assertEqual(
+            producer.count(
+                "uses: ./.github/actions/capture-sccache-stats",
+            ),
+            2,
+        )
+        self.assertIn(
+            "sccache-native-sdk-${{ inputs.target }}-"
+            "${{ inputs.backend }}-${{ inputs.profile }}-"
+            "${{ github.run_attempt }}",
+            producer,
+        )
+        self.assertIn(
+            "require_prebuilt_static_abi: "
+            "${{ inputs.static_abi_artifact_name != '' }}",
+            producer,
+        )
+        self.assertIn("scripts/package-native-sdk.sh", producer_action)
+        self.assertIn("--build", producer_action)
+        self.assertIn("--require-prebuilt-llama", producer_action)
+        self.assertIn(
+            "scripts/verify-native-sdk-package.sh",
+            producer_action,
+        )
+        self.assertIn(
+            "scripts/package-native-sdk-crate.sh",
+            producer_action,
+        )
+        self.assertIn(
+            "native SDK release asset basename collision",
+            producer_action,
+        )
+
+        self.assertIn(
+            "name: ${{ inputs.kotlin_artifact_name }}",
+            consumer_workflow,
+        )
+        self.assertIn(
+            "actions/download-artifact@"
+            "37930b1c2abaa49bbe596cd826c3c89aef350131",
+            consumer_workflow,
+        )
+        self.assertIn(
+            "scripts/restore-native-sdk-input.sh",
+            consumer_script,
+        )
+        for forbidden in (
+            "cargo ",
+            "prepare-llama.sh",
+            "build-llama.sh",
+            "package-native-sdk.sh",
+        ):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, consumer_script)
+        self.assertIn("scripts/safe-extract-tar.py", restore_script)
+        self.assertIn("prepare-native-sdk-input", routing)
+        self.assertIn("native-sdk-artifact", routing)
+        self.assertIn("restore-native-sdk-input", routing)
+
+    def test_static_abi_artifact_is_typed_and_safely_reused(self) -> None:
+        producer = (
+            ROOT / ".github" / "workflows" / "static-abi-artifact.yml"
+        ).read_text(encoding="utf-8")
+        producer_action = self.read_action("prepare-static-abi-input")
+        restore_script = (
+            ROOT / "scripts" / "restore-static-abi-input.sh"
+        ).read_text(encoding="utf-8")
+        native_sdk_producer = (
+            ROOT / ".github" / "workflows" / "native-sdk-artifact.yml"
+        ).read_text(encoding="utf-8")
+        pr_workflow = (
+            ROOT / ".github" / "workflows" / "pr_builds.yml"
+        ).read_text(encoding="utf-8")
+        main_workflow = (
+            ROOT / ".github" / "workflows" / "ci.yml"
+        ).read_text(encoding="utf-8")
+        routing = self.read_action("compute-changes")
+
+        self.assertIn("CACHE_NAMESPACE: mesh-llm", producer)
+        self.assertIn(
+            "inputs.backend, inputs.target, "
+            "steps.native_toolchain.outputs.epoch, hashFiles(",
+            producer,
+        )
+        self.assertIn(
+            "uses: ./.github/actions/resolve-native-toolchain-epoch",
+            producer,
+        )
+        self.assertIn(
+            "uses: ./.github/actions/resolve-native-toolchain-epoch",
+            native_sdk_producer,
+        )
+        self.assertIn(
+            'include_tool_versions: "true"',
+            native_sdk_producer,
+        )
+        self.assertIn("path: static-abi-artifact-output", producer)
+        self.assertNotIn(
+            "path: .deps/llama.cpp/build-stage-abi-static",
+            producer,
+        )
+        self.assertIn(
+            "mesh-llm-cuda-runner-sha256-"
+            "8d93de6ba30173e825a16fdecf011f9c632edc6e1259df7289e491b0a05f829d",
+            producer,
+        )
+        epoch = (
+            "mesh-llm-cuda-runner-sha256-"
+            "8d93de6ba30173e825a16fdecf011f9c632edc6e1259df7289e491b0a05f829d"
+        )
+        for consumer in (native_sdk_producer, pr_workflow, main_workflow):
+            self.assertIn(epoch, consumer)
+        for workflow in (pr_workflow, main_workflow):
+            self.assertNotIn(
+                f"env:\n  MESH_LLM_LLAMA_TOOLCHAIN_EPOCH: {epoch}",
+                workflow,
+            )
+            self.assertIn(
+                "uses: ./.github/actions/resolve-native-toolchain-epoch",
+                workflow,
+            )
+        self.assertIn(
+            "uses: ./.github/actions/prepare-static-abi-input",
+            producer,
+        )
+        prepare_index = producer.index(
+            "name: Prepare patched llama.cpp checkout",
+        )
+        cache_index = producer.index(
+            "name: Cache portable static ABI input",
+        )
+        self.assertLess(prepare_index, cache_index)
+        for cache_input in (
+            "scripts/prepare-llama.sh",
+            "scripts/restore-static-abi-input.sh",
+            "scripts/safe-extract-tar.py",
+            "scripts/verify-checksum-sidecar.py",
+            "scripts/verify-static-abi-build-stamp.py",
+            ".github/actions/prepare-static-abi-input/action.yml",
+        ):
+            self.assertIn(cache_input, producer)
+        self.assertIn("name: ${{ inputs.artifact_name }}", producer)
+        self.assertIn(
+            "scripts/restore-static-abi-input.sh",
+            producer,
+        )
+        self.assertIn(
+            "artifact_name: sccache-static-abi-"
+            "${{ inputs.target }}-${{ inputs.backend }}-"
+            "${{ github.run_attempt }}",
+            producer,
+        )
+        self.assertIn("target/runner architecture mismatch", producer_action)
+        self.assertIn("verify-static-abi-build-stamp.py", producer_action)
+        self.assertIn("--patched-sha", producer_action)
+        self.assertIn("Portable MeshLLM static ABI link metadata", producer_action)
+        self.assertIn("retained producer-local path", producer_action)
+        self.assertNotIn(
+            'tar -C "$(dirname "$LLAMA_STAGE_BUILD_DIR")"',
+            producer_action,
+        )
+        for archive in (
+            "libllama-common-base.a",
+            "libggml.a",
+            "libggml-base.a",
+            "libggml-cpu.a",
+        ):
+            self.assertIn(archive, producer_action)
+        self.assertIn(
+            ".mesh-llm-static-abi-input.json",
+            producer_action,
+        )
+        self.assertIn("verify-checksum-sidecar.py", producer_action)
+
+        self.assertIn("scripts/safe-extract-tar.py", restore_script)
+        self.assertIn("mesh-llm-static-abi-v3", restore_script)
+        self.assertIn("toolchain_epoch", restore_script)
+        self.assertIn("verify-checksum-sidecar.py", restore_script)
+        self.assertIn("verify-static-abi-build-stamp.py", restore_script)
+        self.assertIn("target/runner architecture mismatch", restore_script)
+        self.assertNotIn("tar -x", restore_script)
+        self.assertIn("prepare-static-abi-input", routing)
+        self.assertIn("restore-static-abi-input", routing)
+        self.assertIn("static-abi-artifact", routing)
+
+    def test_protected_reusable_producers_own_runner_and_cache_policy(
+        self,
+    ) -> None:
+        workflow_names = (
+            "native-sdk-artifact.yml",
+            "static-abi-artifact.yml",
+        )
+        for workflow_name in workflow_names:
+            workflow = (
+                ROOT / ".github" / "workflows" / workflow_name
+            ).read_text(encoding="utf-8")
+            inputs = workflow[: workflow.index("\njobs:\n")]
+            with self.subTest(workflow=workflow_name):
+                self.assertIn("runner_size:", inputs)
+                self.assertIn("default: '8'", inputs)
+                self.assertNotIn("runs_on:", inputs)
+                self.assertNotIn("allow_depot_remote_cache:", inputs)
+                self.assertNotIn("inputs.runs_on", workflow)
+                self.assertNotIn(
+                    "inputs.allow_depot_remote_cache",
+                    workflow,
+                )
+                self.assertIn(
+                    "runs-on: ${{ needs.runner_policy.outputs.runner }}",
+                    workflow,
+                )
+                self.assertIn(
+                    "allow_depot_remote_cache: "
+                    "${{ needs.runner_policy.outputs."
+                    "allow_depot_remote_cache }}",
+                    workflow,
+                )
+                self.assertIn(
+                    'POLICY_REPOSITORY" == "Mesh-LLM/mesh-llm"',
+                    workflow,
+                )
+                self.assertIn(
+                    'POLICY_REF" == "refs/heads/main"',
+                    workflow,
+                )
+                self.assertIn(
+                    'POLICY_EVENT_NAME" == "push"',
+                    workflow,
+                )
+                self.assertIn(
+                    'POLICY_EVENT_NAME" == "workflow_dispatch"',
+                    workflow,
+                )
+                self.assertIn(
+                    "POLICY_DEPOT_ENABLED: "
+                    "${{ vars.DEPOT_RUNNERS_ENABLED == 'true' }}",
+                    workflow,
+                )
+                self.assertIn(
+                    "POLICY_MANUAL_USE_DEPOT: "
+                    "${{ github.event_name == 'workflow_dispatch' "
+                    "&& github.event.inputs.use_depot == 'true' }}",
+                    workflow,
+                )
+                self.assertIn("default|4|8|16", workflow)
+                self.assertIn("depot-ubuntu-24.04-arm", workflow)
+
+    def test_protected_reusable_runner_policy_is_fail_closed(self) -> None:
+        hosted_cases = (
+            (
+                "pull_request",
+                "refs/pull/12/merge",
+                "Mesh-LLM/mesh-llm",
+            ),
+            (
+                "pull_request_target",
+                "refs/heads/main",
+                "Mesh-LLM/mesh-llm",
+            ),
+            (
+                "push",
+                "refs/tags/v1.2.3",
+                "Mesh-LLM/mesh-llm",
+            ),
+            (
+                "workflow_dispatch",
+                "refs/heads/feature",
+                "Mesh-LLM/mesh-llm",
+            ),
+            (
+                "push",
+                "refs/heads/main",
+                "attacker/mesh-llm",
+            ),
+        )
+        for workflow_name in (
+            "native-sdk-artifact.yml",
+            "static-abi-artifact.yml",
+        ):
+            for event_name, ref, repository in hosted_cases:
+                with self.subTest(
+                    workflow=workflow_name,
+                    event_name=event_name,
+                    ref=ref,
+                    repository=repository,
+                ):
+                    result, outputs = self.run_reusable_runner_policy(
+                        workflow_name,
+                        repository=repository,
+                        event_name=event_name,
+                        ref=ref,
+                        depot_enabled="true",
+                        target="x86_64-unknown-linux-gnu",
+                        runner_size="16",
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(outputs["runner"], "ubuntu-24.04")
+                    self.assertEqual(
+                        outputs["allow_depot_remote_cache"],
+                        "false",
+                    )
+
+            trusted_cases = (
+                (
+                    "x86_64-unknown-linux-gnu",
+                    "8",
+                    "depot-ubuntu-24.04-8",
+                ),
+                (
+                    "aarch64-unknown-linux-gnu",
+                    "4",
+                    "depot-ubuntu-24.04-arm-4",
+                ),
+                (
+                    "x86_64-unknown-linux-gnu",
+                    "default",
+                    "depot-ubuntu-24.04",
+                ),
+            )
+            for target, size, expected_runner in trusted_cases:
+                with self.subTest(
+                    workflow=workflow_name,
+                    target=target,
+                    size=size,
+                ):
+                    result, outputs = self.run_reusable_runner_policy(
+                        workflow_name,
+                        repository="Mesh-LLM/mesh-llm",
+                        event_name="push",
+                        ref="refs/heads/main",
+                        depot_enabled="true",
+                        target=target,
+                        runner_size=size,
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(outputs["runner"], expected_runner)
+                    self.assertEqual(
+                        outputs["allow_depot_remote_cache"],
+                        "true",
+                    )
+
+            result, outputs = self.run_reusable_runner_policy(
+                workflow_name,
+                repository="Mesh-LLM/mesh-llm",
+                event_name="push",
+                ref="refs/heads/main",
+                depot_enabled="false",
+                target="aarch64-unknown-linux-gnu",
+                runner_size="8",
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(outputs["runner"], "ubuntu-24.04-arm")
+            self.assertEqual(
+                outputs["allow_depot_remote_cache"],
+                "false",
+            )
+
+            result, outputs = self.run_reusable_runner_policy(
+                workflow_name,
+                repository="Mesh-LLM/mesh-llm",
+                event_name="push",
+                ref="refs/heads/main",
+                depot_enabled="true",
+                target="x86_64-unknown-linux-gnu",
+                runner_size="unbounded",
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn(
+                "runner_size must be one of",
+                result.stderr,
+            )
+            self.assertEqual(outputs, {})
+
+            result, outputs = self.run_reusable_runner_policy(
+                workflow_name,
+                repository="Mesh-LLM/mesh-llm",
+                event_name="workflow_dispatch",
+                ref="refs/heads/main",
+                depot_enabled="false",
+                manual_use_depot="true",
+                target="x86_64-unknown-linux-gnu",
+                runner_size="8",
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(
+                outputs["runner"],
+                "depot-ubuntu-24.04-8",
+            )
+            self.assertEqual(
+                outputs["allow_depot_remote_cache"],
+                "true",
+            )
+
+            for event_name, ref, manual_use_depot in (
+                ("workflow_dispatch", "refs/heads/main", "false"),
+                ("workflow_dispatch", "refs/heads/feature", "true"),
+                ("pull_request", "refs/pull/12/merge", "true"),
+                ("push", "refs/heads/main", "true"),
+            ):
+                with self.subTest(
+                    workflow=workflow_name,
+                    event_name=event_name,
+                    ref=ref,
+                    manual_use_depot=manual_use_depot,
+                ):
+                    result, outputs = self.run_reusable_runner_policy(
+                        workflow_name,
+                        repository="Mesh-LLM/mesh-llm",
+                        event_name=event_name,
+                        ref=ref,
+                        depot_enabled="false",
+                        manual_use_depot=manual_use_depot,
+                        target="x86_64-unknown-linux-gnu",
+                        runner_size="8",
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(outputs["runner"], "ubuntu-24.04")
+                    self.assertEqual(
+                        outputs["allow_depot_remote_cache"],
+                        "false",
+                    )
+
+        result, outputs = self.run_reusable_runner_policy(
+            "native-sdk-artifact.yml",
+            repository="Mesh-LLM/mesh-llm",
+            event_name="push",
+            ref="refs/heads/main",
+            depot_enabled="true",
+            target="aarch64-apple-darwin",
+            runner_size="8",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(outputs["runner"], "macos-15")
+        self.assertEqual(
+            outputs["allow_depot_remote_cache"],
+            "false",
+        )
+
+    def test_swift_sdk_build_is_a_shared_immutable_producer(self) -> None:
+        producer = (
+            ROOT / ".github" / "workflows" / "swift-sdk-artifact.yml"
+        ).read_text(encoding="utf-8")
+        consumer_workflow = (
+            ROOT / ".github" / "workflows" / "sdk-smoke.yml"
+        ).read_text(encoding="utf-8")
+        consumer_script = (
+            ROOT / "scripts" / "ci-swift-sdk-smoke.sh"
+        ).read_text(encoding="utf-8")
+        routing = self.read_action("compute-changes")
+
+        self.assertIn("type: string", producer)
+        self.assertIn("host-only|full", producer)
+        self.assertIn(
+            "sdk/swift/scripts/build-host-macos-xcframework.sh",
+            producer,
+        )
+        self.assertIn("sdk/swift/scripts/build-xcframework.sh", producer)
+        self.assertIn(
+            "scripts/verify-swift-release-artifact.sh",
+            producer,
+        )
+        self.assertIn(
+            "scripts/verify-swift-xcframework.py",
+            (
+                ROOT / "scripts" / "verify-swift-release-artifact.sh"
+            ).read_text(encoding="utf-8"),
+        )
+        self.assertIn("persist-credentials: false", producer)
+        self.assertIn("actions/upload-artifact@", producer)
+        self.assertIn("runs-on: macos-15", producer)
+        self.assertIn("RUSTC_WRAPPER: sccache", producer)
+        self.assertIn("SCCACHE_GHA_RW_MODE:", producer)
+        self.assertIn(
+            "uses: ./.github/actions/configure-sccache-gha",
+            producer,
+        )
+        self.assertIn("shared-key: swift-sdk", producer)
+        self.assertIn(
+            "save-if: ${{ github.event_name == 'push' "
+            "&& github.ref == 'refs/heads/main' }}",
+            producer,
+        )
+        self.assertNotIn("macos_runner:", producer)
+        self.assertIn(
+            "name: generated-swift-binding-${{ inputs.artifact_name }}",
+            producer,
+        )
+        self.assertIn(
+            "git diff --exit-code -- \"$generated_binding\"",
+            producer,
+        )
+        self.assertIn(
+            "uses: ./.github/actions/capture-sccache-stats",
+            producer,
+        )
+        self.assertIn("if: ${{ !cancelled() }}", producer)
+        self.assertIn(
+            "artifact_name: sccache-swift-sdk-"
+            "${{ inputs.mode }}-${{ github.run_attempt }}",
+            producer,
+        )
+
+        self.assertIn(
+            "name: ${{ inputs.swift_artifact_name }}",
+            consumer_workflow,
+        )
+        self.assertIn(
+            "name: generated-swift-binding-"
+            "${{ inputs.swift_artifact_name }}",
+            consumer_workflow,
+        )
+        self.assertIn(
+            "actions/download-artifact@"
+            "37930b1c2abaa49bbe596cd826c3c89aef350131",
+            consumer_workflow,
+        )
+        self.assertIn("persist-credentials: false", consumer_workflow)
+        self.assertIn(
+            "if: ${{ inputs.sdk_kind == 'rust' }}",
+            consumer_workflow,
+        )
+
+        for forbidden in (
+            "cargo ",
+            "build-llama.sh",
+            "package-native-sdk.sh",
+            "build-xcframework.sh",
+            "build-host-macos-xcframework.sh",
+        ):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, consumer_script)
+        self.assertIn(
+            'scripts/safe-extract-zip.py "$SWIFT_INPUT_ARCHIVE"',
+            consumer_script,
+        )
+        self.assertIn(
+            'install -m 0644 "$SWIFT_INPUT_BINDING" '
+            '"$SWIFT_TRACKED_BINDING"',
+            consumer_script,
+        )
+        self.assertIn(
+            '[[ -L "$SWIFT_GENERATED_DIR" ]]',
+            consumer_script,
+        )
+        self.assertIn(
+            '[[ -e "$SWIFT_GENERATED_DIR" '
+            '&& ! -d "$SWIFT_GENERATED_DIR" ]]',
+            consumer_script,
+        )
+        mkdir_index = consumer_script.index(
+            'mkdir -p "$SWIFT_GENERATED_DIR"',
+        )
+        move_index = consumer_script.index(
+            'mv "$SWIFT_EXTRACT_DIR/MeshLLMFFI.xcframework" '
+            '"$SWIFT_XCFRAMEWORK"',
+        )
+        self.assertLess(mkdir_index, move_index)
+        self.assertIn("safe-extract-(tar|zip)", routing)
+        self.assertIn("verify-swift-xcframework", routing)
+        self.assertIn(
+            "(native-sdk-artifact|sdk-smoke|static-abi-artifact|"
+            "swift-sdk-artifact)",
+            routing,
+        )
+
+    def test_swift_sdk_cache_is_mode_independent_and_target_specific(
+        self,
+    ) -> None:
+        producer = (
+            ROOT / ".github" / "workflows" / "swift-sdk-artifact.yml"
+        ).read_text(encoding="utf-8")
+        host_builder = (
+            ROOT / "sdk" / "swift" / "scripts"
+            / "build-host-macos-xcframework.sh"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn(
+            "format('mesh-llm-swift-sdk-{0}-{1}-{2}-{3}', "
+            "runner.os, runner.arch, "
+            "steps.native_toolchain.outputs.epoch, hashFiles(",
+            producer,
+        )
+        self.assertNotIn("runner.arch, inputs.mode, hashFiles(", producer)
+        self.assertIn(
+            "uses: ./.github/actions/resolve-native-toolchain-epoch",
+            producer,
+        )
+        self.assertIn('include_tool_versions: "true"', producer)
+        self.assertNotIn("SWIFT_NATIVE_XCODE_CACHE_EPOCH", producer)
+        self.assertIn("trusted main full build", producer)
+        self.assertNotIn("build-stage-abi-host-metal", producer)
+        self.assertIn(
+            ".deps/llama-build/build-stage-abi-$RUST_TARGET-metal",
+            host_builder,
+        )
+
+    def test_runtime_action_never_builds_the_host(self) -> None:
+        action = self.read_action("prepare-native-runtime-input")
+
+        self.assertIn('scripts/package-native-runtime.sh "${args[@]}"', action)
+        self.assertIn("scripts/verify-native-runtime-package.sh", action)
+        self.assertNotIn("build-host.sh", action)
+        self.assertNotIn("build-release.sh", action)
+
+    def test_product_action_only_composes_verified_inputs(self) -> None:
+        action = self.read_action("compose-product-input")
+
+        self.assertIn("scripts/ci-compose-product-input.sh", action)
+        self.assertNotIn("cargo build", action)
+        self.assertNotIn("package-native-runtime.sh", action)
+        script = COMPOSE_SCRIPT.read_text(encoding="utf-8")
+        self.assertIn("scripts/compose-product-bundle.py", script)
+        self.assertIn("scripts/verify-native-runtime-package.sh", script)
+        self.assertIn("scripts/verify-checksum-sidecar.py", script)
+        self.assertIn("scripts/safe-extract-tar.py", script)
+        self.assertIn("scripts/ci-client-readiness-smoke.sh", script)
+        self.assertIn('archive_path="$product_dir.tar.gz"', script)
+        self.assertIn('tar -C "$product_dir" -czf "$archive_path" .', script)
+
+    def test_product_composer_normalizes_windows_shell_boundaries(self) -> None:
+        script = COMPOSE_SCRIPT.read_text(encoding="utf-8")
+
+        self.assertIn("local path=\"${1%$'\\r'}\"", script)
+        self.assertIn('cygpath -u "$path"', script)
+        self.assertIn('cygpath -m "$path"', script)
+        self.assertIn(
+            'canonical_paths+=("$(to_shell_path "$path")")',
+            script,
+        )
+        self.assertIn(
+            'GITHUB_OUTPUT="$(to_shell_path "$GITHUB_OUTPUT")"',
+            script,
+        )
+        self.assertIn('require_file "immutable host" "$host"', script)
+        self.assertNotIn('test -f "$host"', script)
+
+    def test_product_archive_preserves_verified_executable_modes(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workspace = Path(temp_dir)
+            result = self.run_product_composer(workspace)
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            archive = workspace / "product-input.tar.gz"
+            self.assertTrue(archive.is_file())
+            with tarfile.open(archive, "r:gz") as bundle:
+                host = next(
+                    member
+                    for member in bundle.getmembers()
+                    if member.name.endswith("/mesh-llm")
+                )
+                tool = next(
+                    member
+                    for member in bundle.getmembers()
+                    if member.name.endswith(
+                        "/tools/mesh-runtime-bench"
+                    )
+                )
+                self.assertNotEqual(host.mode & 0o111, 0)
+                self.assertNotEqual(tool.mode & 0o111, 0)
+            output = (workspace / "github-output").read_text(encoding="utf-8")
+            self.assertIn(f"archive_path={archive.resolve()}", output)
+
+    def test_product_composer_rejects_host_version_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            result = self.run_product_composer(
+                Path(temp_dir),
+                host_version="9.9.9",
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("composed host version mismatch", result.stderr)
+
+    def test_product_composer_accepts_one_checksums_runtime_archive(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            result = self.run_product_composer(
+                Path(temp_dir),
+                runtime_archive="valid",
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_product_composer_requires_exact_runtime_archive_sidecar(
+        self,
+    ) -> None:
+        for mode in ("missing", "duplicate"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as temp_dir:
+                result = self.run_product_composer(
+                    Path(temp_dir),
+                    runtime_archive=mode,
+                )
+
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("expected exactly one checksum sidecar", result.stderr)
+
+    def test_product_composer_rejects_corrupt_runtime_archive_sidecar(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            result = self.run_product_composer(
+                Path(temp_dir),
+                runtime_archive="corrupt",
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("archive checksum mismatch", result.stderr)
+
+    def test_product_composer_rejects_noncanonical_host_sidecar(self) -> None:
+        expected_errors = {
+            "wrong-name": "checksum sidecar names",
+            "multiline": "exactly one canonical line",
+        }
+        for mode, expected_error in expected_errors.items():
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as temp_dir:
+                result = self.run_product_composer(
+                    Path(temp_dir),
+                    host_sidecar=mode,
+                )
+
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(expected_error, result.stderr)
+
+    def test_product_composer_rejects_noncanonical_verifier_sidecar(
+        self,
+    ) -> None:
+        expected_errors = {
+            "wrong-name": "checksum sidecar names",
+            "multiline": "exactly one canonical line",
+        }
+        for mode, expected_error in expected_errors.items():
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as temp_dir:
+                result = self.run_product_composer(
+                    Path(temp_dir),
+                    attestation_sidecar=mode,
+                )
+
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(expected_error, result.stderr)
+
+    def test_release_attestation_is_verified_without_compiling_in_composer(
+        self,
+    ) -> None:
+        host_action = self.read_action("prepare-host-input")
+        product_action = self.read_action("compose-product-input")
+        product_script = COMPOSE_SCRIPT.read_text(encoding="utf-8")
+
+        self.assertIn("cargo build -q -p xtask --bin xtask", host_action)
+        self.assertIn("release-attestation-verifier.sha256", host_action)
+        self.assertNotIn("cargo ", product_action)
+        self.assertIn(
+            '"$attestation_verifier" release-attestation inspect',
+            product_script,
+        )
+        self.assertIn(
+            '"$python_bin" scripts/verify-checksum-sidecar.py \\\n'
+            '        "$attestation_verifier"',
+            product_script,
+        )
+
+    def test_smoke_restore_rechecks_the_archived_product(self) -> None:
+        action = self.read_action("restore-smoke-inputs")
+
+        self.assertIn("expected exactly one composed product archive", action)
+        self.assertIn("scripts/safe-extract-tar.py", action)
+        self.assertNotIn("tar -xzf", action)
+        self.assertIn("product host path must be", action)
+        self.assertIn(
+            "product runtime must be one direct child of native-runtimes",
+            action,
+        )
+        self.assertIn("product top-level contents are not canonical", action)
+        self.assertIn(
+            "product must contain exactly its manifest-selected runtime",
+            action,
+        )
+        self.assertIn("scripts/verify-native-runtime-package.sh", action)
+        self.assertIn("--check", action)
+
+    def test_smoke_restore_model_is_optional(self) -> None:
+        action = self.read_action("restore-smoke-inputs")
+        model_inputs_present = (
+            "inputs.model_url != '' && inputs.model_file != ''"
+        )
+
+        self.assertEqual(action.count(model_inputs_present), 4)
+        self.assertIn(
+            f"if: ${{{{ {model_inputs_present} }}}}\n"
+            "      id: cache-model",
+            action,
+        )
+        self.assertIn(
+            f"if: ${{{{ {model_inputs_present} }}}}\n"
+            "      id: model-file",
+            action,
+        )
+
+    def test_product_action_rejects_destructive_output_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workspace = Path(temp_dir)
+            host_input = workspace / "inputs" / "host"
+            runtime_input = workspace / "inputs" / "runtime"
+            host_input.mkdir(parents=True)
+            runtime_input.mkdir(parents=True)
+            sentinel = workspace / "sentinel"
+            sentinel.write_text("keep", encoding="utf-8")
+            outside = workspace.parent / f"{workspace.name}-outside"
+            dangerous_outputs = (
+                ".",
+                "./",
+                "product/..",
+                str(workspace),
+                str(outside),
+                str(host_input),
+                str(host_input / "product"),
+                str(workspace / "inputs"),
+            )
+
+            for output in dangerous_outputs:
+                with self.subTest(output=output):
+                    result = subprocess.run(
+                        [str(COMPOSE_SCRIPT)],
+                        cwd=workspace,
+                        env={
+                            **os.environ,
+                            "GITHUB_WORKSPACE": str(workspace),
+                            "GITHUB_OUTPUT": str(workspace / "github-output"),
+                            "INPUT_HOST_INPUT_DIR": str(host_input),
+                            "INPUT_RUNTIME_INPUT_DIR": str(runtime_input),
+                            "INPUT_OUTPUT_DIR": output,
+                            "INPUT_BACKEND": "cpu",
+                            "INPUT_VERSION": "",
+                            "INPUT_BINARY_NAME": "mesh-llm",
+                            "INPUT_READINESS_SMOKE": "false",
+                        },
+                        check=False,
+                        capture_output=True,
+                        text=True,
+                    )
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertEqual(sentinel.read_text(encoding="utf-8"), "keep")
+
+    def test_sccache_prefers_depot_webdav_with_disk_fallback(self) -> None:
+        action = self.read_action("configure-sccache-gha")
+
+        self.assertIn("allow_depot_remote_cache", action)
+        self.assertIn('default: "false"', action)
+        self.assertIn("SCCACHE_WEBDAV_ENDPOINT", action)
+        self.assertIn("DEPOT_CACHE_TOKEN", action)
+        self.assertIn("process.env.SCCACHE_DIR", action)
+        self.assertIn("process.env.RUNNER_TEMP", action)
+        self.assertIn("await io.mkdirP(diskCacheDirectory)", action)
+        self.assertIn(
+            "core.exportVariable('SCCACHE_DIR', diskCacheDirectory)",
+            action,
+        )
+        self.assertIn("SCCACHE_DIR: diskCacheDirectory", action)
+        self.assertIn("'disk,webdav'", action)
+        self.assertIn("'disk'", action)
+        self.assertIn(
+            "Depot cache is present but disabled for this trust context",
+            action,
+        )
+        self.assertIn(
+            "'Unable to start baked sccache with its trust-isolated disk cache.'",
+            action,
+        )
+        self.assertIn("env: diskOnlyEnvironment()", action)
+        self.assertNotIn(
+            "core.exportVariable('ACTIONS_RUNTIME_TOKEN', '')",
+            action,
+        )
+
+    def test_runner_selection_never_routes_pull_requests_to_depot(self) -> None:
+        action = self.read_action("select-ci-runners")
+
+        self.assertIn("depot_main_enabled", action)
+        self.assertNotIn("depot_pr_enabled", action)
+        self.assertNotIn("head_repository", action)
+        self.assertNotIn("\n  repository:", action)
+        self.assertIn("\n  ref:", action)
+
+        runtime = action.split("runs:", maxsplit=1)[1]
+        pull_request_case = runtime.split(
+            "pull_request|pull_request_target)",
+            maxsplit=1,
+        )[1].split(";;", maxsplit=1)[0]
+        self.assertIn("depot_enabled=false", pull_request_case)
+        self.assertNotIn("depot_enabled=true", pull_request_case)
+        self.assertNotIn("INPUT_DEPOT_PR_ENABLED", runtime)
+        self.assertNotIn("INPUT_HEAD_REPOSITORY", runtime)
+        self.assertNotIn("INPUT_REPOSITORY", runtime)
+
+        dispatch_case = runtime.split(
+            "workflow_dispatch)",
+            maxsplit=1,
+        )[1].split(";;", maxsplit=1)[0]
+        self.assertIn("INPUT_DEPOT_MAIN_ENABLED", dispatch_case)
+        self.assertIn("INPUT_MANUAL_USE_DEPOT", dispatch_case)
+        self.assertIn('INPUT_REF" == "refs/heads/main"', dispatch_case)
+        self.assertIn("depot_enabled=true", dispatch_case)
+
+        push_case = runtime.split(
+            "push)",
+            maxsplit=1,
+        )[1].split(";;", maxsplit=1)[0]
+        self.assertIn("INPUT_DEPOT_MAIN_ENABLED", push_case)
+        self.assertIn('INPUT_REF" == "refs/heads/main"', push_case)
+        self.assertIn("depot_enabled=true", push_case)
+
+        default_case = runtime.split(
+            "*)",
+            maxsplit=1,
+        )[1].split(";;", maxsplit=1)[0]
+        self.assertIn("depot_enabled=false", default_case)
+        self.assertNotIn("depot_enabled=true", default_case)
+        self.assertIn("depot-ubuntu-24.04-16", action)
+        self.assertIn("depot-ubuntu-24.04-arm-16", action)
+
+        cases = (
+            ("pull_request", "refs/pull/12/merge", "true", "true", "false", "ubuntu-24.04"),
+            ("pull_request_target", "refs/heads/main", "true", "true", "false", "ubuntu-24.04"),
+            ("workflow_dispatch", "refs/heads/main", "false", "true", "true", "depot-ubuntu-24.04"),
+            ("workflow_dispatch", "refs/heads/feature", "true", "true", "false", "ubuntu-24.04"),
+            ("push", "refs/heads/main", "true", "false", "true", "depot-ubuntu-24.04"),
+            ("push", "refs/heads/feature", "true", "false", "false", "ubuntu-24.04"),
+            ("push", "refs/tags/v1.2.3", "true", "false", "false", "ubuntu-24.04"),
+            ("push", "refs/heads/main", "false", "false", "false", "ubuntu-24.04"),
+            ("schedule", "refs/heads/main", "true", "true", "false", "ubuntu-24.04"),
+        )
+        for event_name, ref, main, manual, enabled, runner in cases:
+            with self.subTest(event_name=event_name, ref=ref):
+                outputs = self.run_runner_selector(
+                    event_name=event_name,
+                    ref=ref,
+                    main_enabled=main,
+                    manual_enabled=manual,
+                )
+                self.assertEqual(outputs["depot_enabled"], enabled)
+                self.assertEqual(outputs["allow_depot_remote_cache"], enabled)
+                self.assertEqual(outputs["runner"], runner)
+                expected_arm = (
+                    "depot-ubuntu-24.04-arm"
+                    if enabled == "true"
+                    else "ubuntu-24.04-arm"
+                )
+                self.assertEqual(outputs["runner_arm"], expected_arm)
+                for size in ("4", "8", "16"):
+                    expected_sized_arm = (
+                        f"depot-ubuntu-24.04-arm-{size}"
+                        if enabled == "true"
+                        else "ubuntu-24.04-arm"
+                    )
+                    self.assertEqual(
+                        outputs[f"runner_arm_{size}"],
+                        expected_sized_arm,
+                    )
+
+    def test_pr_caches_rely_on_github_ref_scoping_while_depot_is_blocked(
+        self,
+    ) -> None:
+        for workflow_name in ("pr_builds.yml", "pr_quality.yml"):
+            workflow = (
+                ROOT / ".github" / "workflows" / workflow_name
+            ).read_text(encoding="utf-8")
+            with self.subTest(workflow=workflow_name):
+                self.assertIn("CACHE_NAMESPACE: mesh-llm", workflow)
+                self.assertNotIn("CACHE_NAMESPACE: mesh-llm-pr", workflow)
+                self.assertNotIn("'mesh-llm-pr'", workflow)
+                self.assertNotIn(
+                    'SCCACHE_GHA_ENABLED: "false"',
+                    workflow,
+                )
+                self.assertIn(
+                    "save-if: ${{ github.ref == 'refs/heads/main' }}",
+                    workflow,
+                )
+
+        builds = (
+            ROOT / ".github" / "workflows" / "pr_builds.yml"
+        ).read_text(encoding="utf-8")
+        self.assertIn(
+            "SCCACHE_GHA_RW_MODE: "
+            "${{ github.event_name == 'pull_request' "
+            "&& 'READ_ONLY' || 'READ_WRITE' }}",
+            builds,
+        )
+
+        main = (
+            ROOT / ".github" / "workflows" / "ci.yml"
+        ).read_text(encoding="utf-8")
+        self.assertNotIn('SCCACHE_GHA_ENABLED: "false"', main)
+
+        quality = (
+            ROOT / ".github" / "workflows" / "pr_quality.yml"
+        ).read_text(encoding="utf-8")
+        self.assertIn(
+            "shared-key: main-rust-crate-tests-${{ matrix.batch.idx }}",
+            builds,
+        )
+        self.assertIn(
+            "shared-key: main-rust-crate-tests-${{ matrix.batch.idx }}",
+            main,
+        )
+        self.assertIn(
+            "allow_depot_remote_cache: "
+            "${{ needs.changes.outputs.allow_depot_remote_cache }}",
+            builds,
+        )
+        self.assertIn(
+            "allow_depot_remote_cache: "
+            "${{ needs.changes.outputs.allow_depot_remote_cache }}",
+            quality,
+        )
+        self.assertIn("${{ env.CACHE_NAMESPACE }}-pnpm-", quality)
+        self.assertNotIn("cache: pnpm", quality)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -8,84 +8,573 @@ ROOT = Path(__file__).resolve().parents[2]
 RELEASE_WORKFLOW = ROOT / ".github" / "workflows" / "release.yml"
 
 
+def job_block(workflow: str, job_name: str, next_job_name: str) -> str:
+    start = workflow.index(f"  {job_name}:")
+    end = workflow.index(f"  {next_job_name}:", start)
+    return workflow[start:end]
+
+
 class ReleaseWorkflowArtifactTests(unittest.TestCase):
-    def test_macos_cpu_composer_installs_attestation_linker(self) -> None:
+    def test_release_entrypoint_rejects_untrusted_refs(self) -> None:
         workflow = RELEASE_WORKFLOW.read_text(encoding="utf-8")
-        composer = self.job_block(workflow, "compose_cpu_products", "inference_smoke_tests")
+        metadata = job_block(workflow, "metadata", "build")
 
-        self.assertIn("Install macOS attestation verifier linker", composer)
-        self.assertIn("if: runner.os == 'macOS'", composer)
-        self.assertIn("run: brew install lld", composer)
-
-    def test_container_product_composers_run_bash(self) -> None:
-        workflow = RELEASE_WORKFLOW.read_text(encoding="utf-8")
-
-        for step_name in (
-            "Compose aarch64 CUDA release bundle from producer inputs",
-            "Compose CUDA release bundle from producer inputs",
-            "Compose ROCm release bundle from producer inputs",
-            "Compose Vulkan release bundle from producer inputs",
-        ):
-            step_start = workflow.index(f"- name: {step_name}")
-            env_start = workflow.index("        env:", step_start)
-            self.assertIn("        shell: bash", workflow[step_start:env_start])
-
-    def test_windows_composers_reuse_checksum_verified_host_verifier(self) -> None:
-        workflow = RELEASE_WORKFLOW.read_text(encoding="utf-8")
-
+        manual_guard = metadata.index("Require the trusted release ref")
+        checkout = metadata.index("uses: actions/checkout@")
+        selector = metadata.index(
+            "uses: ./.github/actions/select-ci-runners",
+        )
+        self.assertLess(manual_guard, checkout)
+        self.assertLess(checkout, selector)
         self.assertIn(
-            "Copy-Item target\\debug\\xtask.exe "
-            "host-input\\release-attestation-verifier.exe -Force",
-            workflow,
+            '"$GITHUB_EVENT_NAME" == "workflow_dispatch"',
+            metadata,
         )
         self.assertIn(
-            "host-input\\release-attestation-verifier.exe.sha256",
-            workflow,
+            '"$GITHUB_REF" != "refs/heads/main"',
+            metadata,
         )
-        self.assertEqual(
-            workflow.count("MESH_RELEASE_ATTESTATION_VERIFIER:"),
-            2,
+        self.assertIn(
+            'git merge-base --is-ancestor "$GITHUB_SHA" '
+            "refs/remotes/origin/main",
+            metadata,
+        )
+        self.assertIn("Reject an existing manual release tag", metadata)
+        self.assertIn(
+            "Manual release tag already exists and is immutable",
+            metadata,
         )
 
-    def test_unix_composition_restores_downloaded_host_executable_bit(self) -> None:
+    def test_release_depot_policy_is_main_ref_only_and_selected_once(
+        self,
+    ) -> None:
         workflow = RELEASE_WORKFLOW.read_text(encoding="utf-8")
-        readiness_command = (
-            "scripts/ci-client-readiness-smoke.sh "
-            "host-input/mesh-llm runtime-root"
+        metadata = job_block(workflow, "metadata", "build")
+
+        self.assertIn("use_depot:", workflow[: workflow.index("\njobs:\n")])
+        self.assertIn(
+            "uses: ./.github/actions/select-ci-runners",
+            metadata,
+        )
+        self.assertIn("ref: ${{ github.ref }}", metadata)
+        self.assertIn(
+            "depot_main_enabled: ${{ vars.DEPOT_RUNNERS_ENABLED == 'true' }}",
+            metadata,
+        )
+        self.assertIn(
+            "manual_use_depot: ${{ inputs.use_depot == true }}",
+            metadata,
+        )
+        self.assertEqual(
+            workflow.count("uses: ./.github/actions/select-ci-runners"),
+            1,
         )
 
-        self.assertEqual(workflow.count(readiness_command), 6)
-        self.assertEqual(
-            workflow.count("chmod +x host-input/mesh-llm"),
-            workflow.count(readiness_command),
+    def test_release_routes_only_initial_non_secret_linux_lanes(
+        self,
+    ) -> None:
+        workflow = RELEASE_WORKFLOW.read_text(encoding="utf-8")
+        host = job_block(workflow, "build", "compose_cpu_products")
+        sdk_runtime = job_block(
+            workflow,
+            "build_native_sdk_runtime",
+            "build_native_runtime",
         )
+        native_runtime = job_block(
+            workflow,
+            "build_native_runtime",
+            "build_native_runtime_linux_aarch64_cuda",
+        )
+        arm_host = job_block(
+            workflow,
+            "build_linux_arm64",
+            "compose_linux_arm64_cpu",
+        )
+        arm_compose = job_block(
+            workflow,
+            "compose_linux_arm64_cpu",
+            "smoke_linux_arm64_artifact",
+        )
+        arm_smoke = job_block(
+            workflow,
+            "smoke_linux_arm64_artifact",
+            "compose_linux_aarch64_cuda",
+        )
+        rocm = job_block(
+            workflow,
+            "build_native_runtime_linux_x86_64_rocm",
+            "build_native_runtime_linux_x86_64_vulkan",
+        )
+        vulkan = job_block(
+            workflow,
+            "build_native_runtime_linux_x86_64_vulkan",
+            "build_swift_sdk_artifact",
+        )
+        publish = job_block(
+            workflow,
+            "publish",
+            "dispatch_packaging_release",
+        )
+
+        self.assertIn("runs-on: ${{ matrix.os }}", host)
+        self.assertIn("RELEASE_ATTESTATION_SIGNING_KEY", host)
+        self.assertIn("runner_size: '8'", sdk_runtime)
+        self.assertNotIn("runs_on:", sdk_runtime)
+        self.assertNotIn("allow_depot_remote_cache:", sdk_runtime)
+        self.assertNotIn("needs.metadata.outputs.runner", sdk_runtime)
+        for producer in (native_runtime,):
+            self.assertIn(
+                "matrix.target == 'x86_64-unknown-linux-gnu'",
+                producer,
+            )
+            self.assertIn(
+                "needs.metadata.outputs.runner_8",
+                producer,
+            )
+            self.assertIn(
+                "needs.metadata.outputs.runner_arm_8",
+                producer,
+            )
+        for producer in (rocm, vulkan):
+            self.assertIn(
+                "runs-on: ${{ needs.metadata.outputs.runner_16 }}",
+                producer,
+            )
+            self.assertIn(
+                "allow_depot_remote_cache: "
+                "${{ needs.metadata.outputs.allow_depot_remote_cache }}",
+                producer,
+            )
+        self.assertIn("runs-on: ubuntu-24.04", publish)
+        self.assertNotIn("needs.metadata.outputs.runner", publish)
+        self.assertIn("RELEASE_ATTESTATION_SIGNING_KEY", arm_host)
+        self.assertIn("runs-on: ubuntu-24.04-arm", arm_host)
+        self.assertNotIn("needs.metadata.outputs.runner_arm", arm_host)
+        self.assertIn(
+            "runs-on: ${{ needs.metadata.outputs.runner_arm_4 }}",
+            arm_compose,
+        )
+        self.assertIn(
+            "runs-on: ${{ needs.metadata.outputs.runner_arm }}",
+            arm_smoke,
+        )
+        self.assertNotIn("USE_SELF_HOSTED", arm_smoke)
 
     def test_inference_smoke_consumes_composed_product(self) -> None:
         workflow = RELEASE_WORKFLOW.read_text(encoding="utf-8")
 
         self.assertEqual(
-            workflow.count("release-linux-inference-product"),
+            workflow.count("ci-release-linux-inference-product"),
             2,
         )
         self.assertNotIn("release-linux-inference-binary", workflow)
-        for required_path in (
-            "smoke-input/mesh-llm",
-            "smoke-input/host-imports.json",
-            'smoke-input/native-runtimes/$runtime_name',
-            "smoke-input/product-manifest.json",
-        ):
-            self.assertIn(required_path, workflow)
+        self.assertIn(
+            "uses: ./.github/actions/compose-product-input",
+            workflow,
+        )
+        self.assertIn("output_dir: product-input", workflow)
+        self.assertIn(
+            "path: ${{ steps.compose.outputs.archive_path }}",
+            workflow,
+        )
+        inference = job_block(
+            workflow,
+            "inference_smoke_tests",
+            "build_native_sdk_runtime",
+        )
+        self.assertNotIn("runs_on:", inference)
+        smoke = (
+            ROOT / ".github" / "workflows" / "smoke.yml"
+        ).read_text(encoding="utf-8")
+        self.assertIn("runs-on: ubuntu-24.04", smoke)
+
+    def test_swift_release_reuses_full_typed_producer(self) -> None:
+        workflow = RELEASE_WORKFLOW.read_text(encoding="utf-8")
+        reusable = (
+            ROOT / ".github" / "workflows" / "swift-sdk-artifact.yml"
+        ).read_text(encoding="utf-8")
+        producer = job_block(
+            workflow,
+            "build_swift_sdk_artifact",
+            "build_linux_arm64",
+        )
 
         self.assertIn(
-            "python3 scripts/compose-product-bundle.py",
+            "uses: ./.github/workflows/swift-sdk-artifact.yml",
+            producer,
+        )
+        self.assertIn("mode: full", producer)
+        self.assertIn("artifact_name: release-swift-sdk", producer)
+        self.assertNotIn("macos_runner:", producer)
+        self.assertIn(
+            "release_tag: ${{ needs.metadata.outputs.tag }}",
+            producer,
+        )
+        self.assertIn(
+            "prepare_release_version: "
+            "${{ github.event_name == 'workflow_dispatch' }}",
+            producer,
+        )
+        self.assertNotIn("build-xcframework.sh", producer)
+        self.assertNotIn("cargo ", producer)
+        self.assertIn("name: swift-package-manifest", reusable)
+        self.assertIn(
+            "name: generated-swift-binding-${{ inputs.artifact_name }}",
+            reusable,
+        )
+        self.assertIn("name: ${{ inputs.artifact_name }}", reusable)
+        publish = job_block(
+            workflow,
+            "publish",
+            "dispatch_packaging_release",
+        )
+        self.assertIn(
+            "name: generated-swift-binding-release-swift-sdk",
+            publish,
+        )
+        self.assertIn(
+            'install -m 0644 "$generated_binding" "$tracked_binding"',
+            publish,
+        )
+
+    def test_release_permissions_are_least_privilege(self) -> None:
+        workflow = RELEASE_WORKFLOW.read_text(encoding="utf-8")
+        header = workflow[: workflow.index("\njobs:\n")]
+        publish = job_block(
+            workflow,
+            "publish",
+            "dispatch_packaging_release",
+        )
+
+        self.assertIn(
+            "permissions:\n  contents: read\n  packages: read",
+            header,
+        )
+        self.assertNotIn("contents: write", header)
+        self.assertNotIn("packages: write", header)
+        self.assertIn(
+            "    permissions:\n      contents: write",
+            publish,
+        )
+        self.assertNotIn("packages: write", publish)
+
+    def test_publish_fan_in_stops_when_release_is_cancelled(self) -> None:
+        workflow = RELEASE_WORKFLOW.read_text(encoding="utf-8")
+        publish = job_block(
+            workflow,
+            "publish",
+            "dispatch_packaging_release",
+        )
+
+        self.assertIn("if: ${{ !cancelled()", publish)
+        self.assertNotIn("always()", publish)
+
+    def test_release_assets_and_manual_tags_are_immutable(self) -> None:
+        workflow = RELEASE_WORKFLOW.read_text(encoding="utf-8")
+        publish = job_block(
+            workflow,
+            "publish",
+            "dispatch_packaging_release",
+        )
+
+        self.assertIn("Release tag already exists and cannot be reused", publish)
+        self.assertNotIn("reusing it", publish)
+        self.assertIn("overwrite_files: false", publish)
+        self.assertIn("persist-credentials: false", publish)
+        self.assertNotIn("persist-credentials: true", publish)
+        self.assertIn(
+            'git push "$release_remote" "refs/tags/$RELEASE_TAG"',
+            publish,
+        )
+        self.assertNotIn(
+            'git push origin "refs/tags/$RELEASE_TAG"',
+            publish,
+        )
+
+    def test_release_push_token_is_isolated_to_the_push_step(self) -> None:
+        workflow = RELEASE_WORKFLOW.read_text(encoding="utf-8")
+        publish = job_block(
+            workflow,
+            "publish",
+            "dispatch_packaging_release",
+        )
+        generate_start = publish.index(
+            "- name: Generate native runtime release manifest",
+        )
+        prepare_start = publish.index(
+            "- name: Prepare dispatched release tag",
+        )
+        push_start = publish.index(
+            "- name: Push dispatched release tag",
+        )
+        release_start = publish.index(
+            "- name: Publish GitHub release",
+        )
+        generate = publish[generate_start:prepare_start]
+        prepare = publish[prepare_start:push_start]
+        push = publish[push_start:release_start]
+
+        token_binding = "GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}"
+        self.assertNotIn(token_binding, generate)
+        self.assertNotIn(token_binding, prepare)
+        self.assertIn(token_binding, push)
+        self.assertEqual(publish.count(token_binding), 1)
+        self.assertNotIn("release_remote=", prepare)
+        self.assertNotIn("git push", prepare)
+        self.assertIn(
+            'git push "$release_remote" "refs/tags/$RELEASE_TAG"',
+            push,
+        )
+
+    def test_arm64_smoke_requires_integrity_and_safe_extraction(self) -> None:
+        workflow = RELEASE_WORKFLOW.read_text(encoding="utf-8")
+        smoke = job_block(
+            workflow,
+            "smoke_linux_arm64_artifact",
+            "compose_linux_aarch64_cuda",
+        )
+
+        self.assertIn("scripts/verify-checksum-sidecar.py", smoke)
+        self.assertIn("scripts/safe-extract-tar.py", smoke)
+        self.assertNotIn("tar -xzf", smoke)
+        self.assertNotIn("command -v sha256sum", smoke)
+
+    def test_native_sdk_assets_are_staged_flat_for_publishing(self) -> None:
+        workflow = RELEASE_WORKFLOW.read_text(encoding="utf-8")
+        reusable = (
+            ROOT / ".github" / "workflows" / "native-sdk-artifact.yml"
+        ).read_text(encoding="utf-8")
+        producer_action = (
+            ROOT / ".github" / "actions"
+            / "prepare-native-sdk-input" / "action.yml"
+        ).read_text(encoding="utf-8")
+        caller = job_block(
+            workflow,
+            "build_native_sdk_runtime",
+            "build_native_runtime",
+        )
+        publish = job_block(
+            workflow,
+            "publish",
+            "dispatch_packaging_release",
+        )
+
+        self.assertIn(
+            "uses: ./.github/workflows/native-sdk-artifact.yml",
+            caller,
+        )
+        self.assertIn("profile: release", caller)
+        self.assertIn("include_runtime_crate: true", caller)
+        self.assertIn(
+            "static_abi_artifact_name: "
+            "ci-release-native-sdk-static-abi-${{ matrix.artifact_suffix }}",
+            caller,
+        )
+        self.assertIn(
+            "produce_static_abi: "
+            "${{ endsWith(matrix.target, '-unknown-linux-gnu') }}",
+            caller,
+        )
+        self.assertIn(
+            "artifact_name: "
+            "release-native-sdk-${{ matrix.artifact_suffix }}",
+            caller,
+        )
+        self.assertIn("runner_size: '8'", caller)
+        self.assertNotIn("runs_on:", caller)
+        self.assertNotIn("allow_depot_remote_cache:", caller)
+        self.assertNotIn("scripts/package-native-sdk.sh", caller)
+        self.assertIn(
+            "uses: ./.github/actions/prepare-native-sdk-input",
+            reusable,
+        )
+        self.assertIn(
+            "uses: ./.github/workflows/static-abi-artifact.yml",
+            reusable,
+        )
+        self.assertIn(
+            "scripts/restore-static-abi-input.sh",
+            reusable,
+        )
+        self.assertIn("name: ${{ inputs.artifact_name }}", reusable)
+        self.assertIn(
+            "path: ${{ steps.native-sdk.outputs.upload_path }}",
+            reusable,
+        )
+        self.assertIn(
+            "scripts/package-native-sdk-crate.sh",
+            producer_action,
+        )
+        self.assertIn(
+            "native SDK release asset basename collision",
+            producer_action,
+        )
+        self.assertIn('upload_sources=("$archive_path" "$checksum_path")', producer_action)
+        self.assertIn('upload_sources+=("${runtime_crates[0]}")', producer_action)
+        self.assertIn("files: release-artifacts/*", publish)
+
+    def test_windows_host_publishes_prebuilt_attestation_verifier(self) -> None:
+        workflow = RELEASE_WORKFLOW.read_text(encoding="utf-8")
+        producer = job_block(
+            workflow,
+            "windows_host_input",
+            "compose_windows_gpu",
+        )
+
+        self.assertIn(
+            "uses: ./.github/actions/prepare-windows-host-input",
+            producer,
+        )
+        self.assertIn("profile: release", producer)
+        self.assertIn(
+            "attestation_signing_key_file:",
+            producer,
+        )
+        self.assertIn(
+            "attestation_public_key_file:",
+            producer,
+        )
+        self.assertIn("path: host-input/*", producer)
+        self.assertNotIn("prepare-native-runtime-input", producer)
+        self.assertNotIn("compose-product-input", producer)
+
+    def test_windows_composers_use_shared_verified_product_action(self) -> None:
+        workflow = RELEASE_WORKFLOW.read_text(encoding="utf-8")
+        jobs = (
+            ("compose_windows_gpu", "compose_windows_cpu"),
+            ("compose_windows_cpu", "build_native_runtime_windows_cpu"),
+        )
+
+        for job_name, next_job_name in jobs:
+            with self.subTest(job=job_name):
+                job = job_block(workflow, job_name, next_job_name)
+                composition = job.index(
+                    "uses: ./.github/actions/compose-product-input",
+                )
+                packaging = job.index(
+                    "- name: Package verified Windows",
+                )
+                self.assertLess(composition, packaging)
+                self.assertIn(
+                    "binary_name: mesh-llm.exe",
+                    job,
+                )
+                self.assertIn(
+                    "attestation_verifier: host-input/release-attestation-verifier.exe",
+                    job,
+                )
+                self.assertIn(
+                    "version: ${{ needs.metadata.outputs.tag }}",
+                    job,
+                )
+                expected_backend = (
+                    "backend: ${{ matrix.backend }}"
+                    if job_name == "compose_windows_gpu"
+                    else "backend: cpu"
+                )
+                self.assertIn(expected_backend, job)
+                self.assertIn('readiness_smoke: "true"', job)
+                self.assertIn(
+                    "MESH_LLM_PRECOMPOSED_PRODUCT_DIR: ${{ steps.compose.outputs.product_dir }}",
+                    job,
+                )
+                self.assertIn(
+                    'MESH_RELEASE_ATTESTATION_PREVERIFIED: "1"',
+                    job,
+                )
+                self.assertNotIn("Verify immutable runtime archive", job)
+                self.assertNotIn("tar -xzf", job)
+                self.assertNotIn("ci-client-readiness-smoke.sh", job)
+                self.assertNotIn("cargo run", job)
+                self.assertNotIn("dtolnay/rust-toolchain", job)
+                self.assertNotIn("sccache-action", job)
+
+    def test_windows_cuda12_label_rejects_other_toolkit_majors(self) -> None:
+        workflow = RELEASE_WORKFLOW.read_text(encoding="utf-8")
+        producer = job_block(
+            workflow,
+            "build_native_runtime_windows_gpu",
+            "publish",
+        )
+
+        validation = producer.index("- name: Validate CUDA 12 artifact contract")
+        installation = producer.index("- name: Install CUDA toolkit")
+        self.assertLess(validation, installation)
+        self.assertIn("$cudaMajor -ne '12'", producer)
+        self.assertIn(
+            "release-native-runtime-windows-x86_64-cuda12",
+            producer,
+        )
+
+    def test_linux_cuda_composition_uses_hosted_runner(self) -> None:
+        workflow = RELEASE_WORKFLOW.read_text(encoding="utf-8")
+        composer = job_block(
+            workflow,
+            "compose_linux_cuda",
+            "compose_linux_rocm",
+        )
+        job_header = composer[: composer.index("    steps:")]
+
+        self.assertIn(
+            "    runs-on: ${{ needs.metadata.outputs.runner_4 }}",
+            job_header,
+        )
+        self.assertNotIn("self-hosted", job_header)
+        self.assertNotIn("USE_SELF_HOSTED", job_header)
+
+    def test_release_uses_shared_host_and_runtime_producers(self) -> None:
+        workflow = RELEASE_WORKFLOW.read_text(encoding="utf-8")
+
+        self.assertEqual(
+            workflow.count("uses: ./.github/actions/prepare-host-input"),
+            2,
+        )
+        self.assertEqual(
+            workflow.count(
+                "uses: ./.github/actions/prepare-windows-host-input",
+            ),
+            1,
+        )
+        self.assertGreaterEqual(
+            workflow.count("uses: ./.github/actions/prepare-native-runtime-input"),
+            5,
+        )
+        self.assertEqual(
+            workflow.count("uses: ./.github/actions/compose-product-input"),
+            8,
+        )
+        self.assertNotIn(
+            "scripts/ci-client-readiness-smoke.sh host-input/mesh-llm runtime-root",
             workflow,
         )
 
-    @staticmethod
-    def job_block(workflow: str, start_job: str, next_job: str) -> str:
-        start = workflow.index(f"  {start_job}:")
-        end = workflow.index(f"  {next_job}:", start)
-        return workflow[start:end]
+    def test_release_product_jobs_do_not_restore_compiler_caches(self) -> None:
+        workflow = RELEASE_WORKFLOW.read_text(encoding="utf-8")
+        product_jobs = (
+            "compose_linux_aarch64_cuda",
+            "compose_linux_cuda",
+            "compose_linux_rocm",
+            "compose_linux_vulkan",
+        )
+
+        for index, job_name in enumerate(product_jobs):
+            start = workflow.index(f"  {job_name}:")
+            next_starts = [
+                workflow.find(f"  {other_job}:", start + 1)
+                for other_job in product_jobs[index + 1 :]
+            ]
+            next_starts = [position for position in next_starts if position >= 0]
+            end = min(next_starts) if next_starts else len(workflow)
+            job = workflow[start:end]
+            self.assertIn(
+                "uses: ./.github/actions/compose-product-input",
+                job,
+            )
+            self.assertNotIn(
+                "uses: ./.github/actions/configure-sccache-gha",
+                job,
+            )
+            self.assertNotIn("uses: actions/cache@", job)
 
 
 if __name__ == "__main__":

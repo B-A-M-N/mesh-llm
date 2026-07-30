@@ -1,13 +1,182 @@
-name: Configure baked sccache GHA backend
-description: Use job-local disk plus best-effort Actions cache from the baked sccache binary.
+name: Configure baked sccache remote backend
+description: Prefer Depot WebDAV, then Actions cache, with a job-local disk fallback.
+
+inputs:
+  allow_depot_remote_cache:
+    description: Allow this trusted job to read and write Depot's repository-scoped WebDAV cache.
+    required: false
+    default: "false"
 
 runs:
   using: composite
   steps:
     - name: Export cache credentials and start sccache
-      uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+      uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
+      env:
+        INPUT_ALLOW_DEPOT_REMOTE_CACHE: ${{ inputs.allow_depot_remote_cache }}
       with:
         script: |
+          const allowDepotRemoteCache =
+            (process.env.INPUT_ALLOW_DEPOT_REMOTE_CACHE || '').toLowerCase();
+          if (
+            allowDepotRemoteCache !== 'true' &&
+            allowDepotRemoteCache !== 'false'
+          ) {
+            core.setFailed(
+              'allow_depot_remote_cache must be the string true or false.',
+            );
+            return;
+          }
+
+          const eventName = process.env.GITHUB_EVENT_NAME || '';
+          const ghaRemoteMode =
+            eventName === 'pull_request' || eventName === 'pull_request_target'
+              ? 'READ_ONLY'
+              : 'READ_WRITE';
+          core.exportVariable('SCCACHE_GHA_RW_MODE', ghaRemoteMode);
+
+          const webdavEndpoint = process.env.SCCACHE_WEBDAV_ENDPOINT || '';
+          const webdavToken =
+            process.env.SCCACHE_WEBDAV_TOKEN ||
+            process.env.DEPOT_CACHE_TOKEN ||
+            '';
+          const diskCacheDirectory =
+            process.env.SCCACHE_DIR ||
+            (process.env.RUNNER_TEMP
+              ? `${process.env.RUNNER_TEMP}/mesh-llm-sccache`
+              : '');
+          if (!diskCacheDirectory) {
+            core.setFailed(
+              'SCCACHE_DIR or RUNNER_TEMP is required for the job-local disk cache.',
+            );
+            return;
+          }
+          await io.mkdirP(diskCacheDirectory);
+          core.exportVariable('SCCACHE_DIR', diskCacheDirectory);
+          const diskOnlyEnvironment = () => ({
+            ...process.env,
+            ACTIONS_CACHE_URL: '',
+            ACTIONS_RESULTS_URL: '',
+            ACTIONS_RUNTIME_TOKEN: '',
+            SCCACHE_WEBDAV_ENDPOINT: '',
+            SCCACHE_WEBDAV_TOKEN: '',
+            SCCACHE_WEBDAV_USERNAME: '',
+            SCCACHE_WEBDAV_PASSWORD: '',
+            SCCACHE_DIR: diskCacheDirectory,
+          });
+          const resetStatistics = async (environment = process.env) => {
+            const resetExitCode = await exec.exec(
+              'sccache',
+              ['--zero-stats'],
+              {
+                env: environment,
+                ignoreReturnCode: true,
+              },
+            );
+            if (resetExitCode !== 0) {
+              core.setFailed(
+                'Unable to reset sccache statistics after configuring the server.',
+              );
+              return false;
+            }
+            return true;
+          };
+
+          if (
+            allowDepotRemoteCache === 'true' &&
+            webdavEndpoint &&
+            webdavToken
+          ) {
+            core.setSecret(webdavToken);
+            core.exportVariable('SCCACHE_WEBDAV_ENDPOINT', webdavEndpoint);
+            core.exportVariable('SCCACHE_WEBDAV_TOKEN', webdavToken);
+            core.exportVariable('SCCACHE_GHA_ENABLED', 'false');
+            core.exportVariable('SCCACHE_MULTILEVEL_CHAIN', 'disk,webdav');
+            core.exportVariable('SCCACHE_IGNORE_SERVER_IO_ERROR', '1');
+            // sccache's ignore/l0 policies dispatch slower-level writes in the
+            // background. Ephemeral CI jobs can exit before those uploads
+            // finish, leaving a permanently partial remote cache. The all
+            // policy waits for every configured level before the compiler
+            // request completes; cache failures remain visible in the
+            // captured counters.
+            core.exportVariable('SCCACHE_MULTILEVEL_WRITE_ERROR_POLICY', 'all');
+            await exec.exec('sccache', ['--stop-server'], {
+              ignoreReturnCode: true,
+            });
+            const depotExitCode = await exec.exec('sccache', ['--start-server'], {
+              ignoreReturnCode: true,
+            });
+            if (depotExitCode === 0) {
+              if (!(await resetStatistics())) {
+                return;
+              }
+              core.info(
+                'Baked sccache is using job-local disk with Depot WebDAV cache.',
+              );
+              return;
+            }
+            core.warning(
+              'Depot WebDAV cache is unavailable; restarting baked sccache with job-local disk.',
+            );
+            await exec.exec('sccache', ['--stop-server'], {
+              ignoreReturnCode: true,
+            });
+            core.exportVariable('SCCACHE_MULTILEVEL_CHAIN', 'disk');
+            const depotFallbackExitCode = await exec.exec(
+              'sccache',
+              ['--start-server'],
+              {
+                env: diskOnlyEnvironment(),
+                ignoreReturnCode: true,
+              },
+            );
+            if (depotFallbackExitCode !== 0) {
+              core.setFailed('Unable to start baked sccache with Depot or job-local storage.');
+              return;
+            }
+            if (!(await resetStatistics(diskOnlyEnvironment()))) {
+              return;
+            }
+            return;
+          }
+
+          if (
+            allowDepotRemoteCache === 'false' &&
+            (webdavEndpoint || webdavToken)
+          ) {
+            core.info(
+              'Depot cache is present but disabled for this trust context; using job-local disk only.',
+            );
+            core.exportVariable('SCCACHE_WEBDAV_ENDPOINT', '');
+            core.exportVariable('SCCACHE_WEBDAV_TOKEN', '');
+            core.exportVariable('SCCACHE_WEBDAV_USERNAME', '');
+            core.exportVariable('SCCACHE_WEBDAV_PASSWORD', '');
+            core.exportVariable('SCCACHE_GHA_ENABLED', 'false');
+            core.exportVariable('SCCACHE_MULTILEVEL_CHAIN', 'disk');
+            core.exportVariable('SCCACHE_IGNORE_SERVER_IO_ERROR', '1');
+            await exec.exec('sccache', ['--stop-server'], {
+              ignoreReturnCode: true,
+            });
+            const untrustedDiskOnlyExitCode = await exec.exec(
+              'sccache',
+              ['--start-server'],
+              {
+                env: diskOnlyEnvironment(),
+                ignoreReturnCode: true,
+              },
+            );
+            if (untrustedDiskOnlyExitCode !== 0) {
+              core.setFailed(
+                'Unable to start baked sccache with its trust-isolated disk cache.',
+              );
+              return;
+            }
+            if (!(await resetStatistics(diskOnlyEnvironment()))) {
+              return;
+            }
+            return;
+          }
+
           // Honor an explicit job-level opt-out of the GitHub Actions cache
           // backend. Long-running lanes (CUDA/ROCm/Vulkan release builds that
           // exceed the ephemeral Actions cache token lifetime) set
@@ -15,25 +184,71 @@ runs:
           // server started after the token expires probes the gha tier at
           // startup, and that storage read fails permanently (HTTP 400),
           // aborting the build before any fail-open policy applies. Clearing the
-          // cache URL/token as well prevents any residual gha configuration
-          // from re-enabling the remote tier.
+          // cache URL/token for the server process as well prevents any
+          // residual gha configuration from re-enabling the remote tier. Do
+          // not clear them job-wide: later actions/cache consumers still need
+          // their credentials.
           if ((process.env.SCCACHE_GHA_ENABLED || '').toLowerCase() === 'false') {
             core.info(
               'SCCACHE_GHA_ENABLED=false is set; using baked sccache with disk-only cache.',
             );
             core.exportVariable('SCCACHE_MULTILEVEL_CHAIN', 'disk');
             core.exportVariable('SCCACHE_IGNORE_SERVER_IO_ERROR', '1');
-            core.exportVariable('ACTIONS_CACHE_URL', '');
-            core.exportVariable('ACTIONS_RESULTS_URL', '');
-            core.exportVariable('ACTIONS_RUNTIME_TOKEN', '');
             await exec.exec('sccache', ['--stop-server'], {
               ignoreReturnCode: true,
             });
-            const diskOnlyExitCode = await exec.exec('sccache', ['--start-server'], {
-              ignoreReturnCode: true,
-            });
+            const diskOnlyExitCode = await exec.exec(
+              'sccache',
+              ['--start-server'],
+              {
+                env: diskOnlyEnvironment(),
+                ignoreReturnCode: true,
+              },
+            );
             if (diskOnlyExitCode !== 0) {
               core.setFailed('Unable to start baked sccache with its disk-only cache.');
+              return;
+            }
+            if (!(await resetStatistics(diskOnlyEnvironment()))) {
+              return;
+            }
+            return;
+          }
+
+          // The runner image's pinned sccache treats a mixed disk,gha chain as
+          // wholly read-only when the GHA tier is read-only. Each miss then
+          // records a rejected cache write and cannot populate L0. Pull
+          // requests therefore use the writable job-local disk tier only.
+          // Cross-run PR reuse remains covered by the bulk Rust and exact
+          // native actions/cache entries, while trusted main, release, warmer,
+          // and authorized dispatch jobs populate the remote compiler cache
+          // without exposing a repository-scoped write path to PR code.
+          if (ghaRemoteMode === 'READ_ONLY') {
+            core.info(
+              'Pull-request trust context detected; using baked sccache with job-local disk only.',
+            );
+            core.exportVariable('SCCACHE_GHA_ENABLED', 'false');
+            core.exportVariable('SCCACHE_MULTILEVEL_CHAIN', 'disk');
+            core.exportVariable('SCCACHE_IGNORE_SERVER_IO_ERROR', '1');
+            await exec.exec('sccache', ['--stop-server'], {
+              ignoreReturnCode: true,
+            });
+            const pullRequestDiskExitCode = await exec.exec(
+              'sccache',
+              ['--start-server'],
+              {
+                env: diskOnlyEnvironment(),
+                ignoreReturnCode: true,
+              },
+            );
+            if (pullRequestDiskExitCode !== 0) {
+              core.setFailed(
+                'Unable to start baked sccache with its pull-request-local disk cache.',
+              );
+              return;
+            }
+            if (!(await resetStatistics(diskOnlyEnvironment()))) {
+              return;
             }
             return;
           }
@@ -51,7 +266,11 @@ runs:
           core.exportVariable('ACTIONS_RUNTIME_TOKEN', runtimeToken);
           core.exportVariable('SCCACHE_IGNORE_SERVER_IO_ERROR', '1');
           core.exportVariable('SCCACHE_MULTILEVEL_CHAIN', 'disk,gha');
-          core.exportVariable('SCCACHE_MULTILEVEL_WRITE_ERROR_POLICY', 'ignore');
+          // Wait for the GitHub Actions tier to finish each write. With the
+          // asynchronous policies, the runner can terminate while L1 uploads
+          // are still pending and the next identical run observes avoidable
+          // misses.
+          core.exportVariable('SCCACHE_MULTILEVEL_WRITE_ERROR_POLICY', 'all');
 
           await exec.exec('sccache', ['--stop-server'], {
             ignoreReturnCode: true,
@@ -62,8 +281,11 @@ runs:
             ignoreReturnCode: true,
           });
           if (remoteExitCode === 0) {
+            if (!(await resetStatistics())) {
+              return;
+            }
             core.info(
-              'Baked sccache is using job-local disk with a best-effort GitHub Actions cache.',
+              `Baked sccache is using job-local disk with a ${ghaRemoteMode.toLowerCase()} GitHub Actions cache.`,
             );
             return;
           }
@@ -77,9 +299,16 @@ runs:
           core.exportVariable('SCCACHE_GHA_ENABLED', 'false');
           core.exportVariable('SCCACHE_MULTILEVEL_CHAIN', 'disk');
 
-          const localExitCode = await exec.exec('sccache', ['--start-server'], {
-            ignoreReturnCode: true,
-          });
+          const localExitCode = await exec.exec(
+            'sccache',
+            ['--start-server'],
+            {
+              env: diskOnlyEnvironment(),
+              ignoreReturnCode: true,
+            },
+          );
           if (localExitCode !== 0) {
             core.setFailed('Unable to start baked sccache with either remote or job-local storage.');
+            return;
           }
+          await resetStatistics(diskOnlyEnvironment());

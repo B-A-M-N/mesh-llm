@@ -9,7 +9,7 @@ the commands at the end before operational changes.
 | Workflow | Trigger | Ownership |
 | --- | --- | --- |
 | `pr_quality.yml` | PR, main push, dispatch | Formatting, affected-crate Clippy, UI quality, CLI/docs synchronization, quality summary |
-| `pr_builds.yml` | PR, dispatch | Cross-platform build/test matrices, native backends, artifact producers, integration/smoke consumers |
+| `pr_builds.yml` | PR, dispatch | Cross-platform build/test matrices, native backends, artifact producers, integration/smoke consumers, stable aggregate summary |
 | `pr_website.yml` | PR, dispatch | Public website build canary and summary |
 | `pr_cleanup.yml` | PR close via `pull_request_target`, dispatch | Positively matched PR cache/artifact cleanup only; never executes PR code |
 | `pr_auto_assign.yml` | PR lifecycle via `pull_request_target` | PR metadata assignment only; never executes PR code |
@@ -18,7 +18,11 @@ the commands at the end before operational changes.
 | `docker-precheck.yml` | Reusable call | Shared Docker validation precheck |
 | `smoke.yml` | Reusable call | Artifact-based inference/OpenAI/split smoke |
 | `scripted-binary-smoke.yml` | Reusable call | Artifact-based scripted/two-node smoke |
-| `sdk-smoke.yml` | Reusable call | Native, Kotlin, and Swift SDK smoke |
+| `sdk-smoke.yml` | Reusable call | Artifact-based Rust, Kotlin, and Swift SDK smoke |
+| `native-sdk-artifact.yml` | Reusable call | Typed target/backend/profile native SDK producer with protected runner/cache policy |
+| `static-abi-artifact.yml` | Reusable call | Typed target/backend static llama ABI producer with protected runner/cache policy |
+| `swift-sdk-artifact.yml` | Reusable call | Typed host-only/full Swift XCFramework producer |
+| `node-sdk-addon-artifact.yml` | Reusable call | Five-target Node native-addon producer with fresh-install smoke, manifest, and checksum |
 | `hf-download-smoke.yml` | Reusable call | Hugging Face download smoke |
 | `nightly-stability.yml` | Schedule, dispatch | Nightly operator entry point |
 | `nightly-stability-run.yml` | Reusable call | Stability probes and evidence |
@@ -50,33 +54,115 @@ place runtimes at `mesh-bundle/native-runtimes/<runtime-id>`; Debian/Arch
 packages use `/usr/local/lib/mesh-llm/<version>/native-runtimes`; Homebrew uses
 formula-owned `libexec/native-runtimes`.
 
+Release also fans out `node-sdk-addon-artifact.yml` across Darwin ARM64/x64,
+Linux ARM64/x64, and Windows x64. Each producer compiles once on its matching
+GitHub-hosted platform, packs and fresh-installs the SDK, verifies
+`currentMeshVersion()`, and emits a versioned addon archive with a strict
+manifest and SHA-256 sidecar. The release publisher requires all five producers
+and attaches those exact artifacts; downstream packaging verifies and assembles
+them without recompiling native source.
+
 The Windows host input also carries the checksum-protected `xtask` executable
 that performed producer-side attestation. Windows product composers invoke that
 prebuilt verifier for the immutable host instead of compiling workspace code.
 
-`ci.yml` applies the same executable-product rule to trusted main validation:
-Linux and macOS debug artifact producers upload both the backend-neutral host
-and its adjacent runtime; their consumer reruns JSON client readiness from those
-exact bytes. Linux and Windows backend rows build a release host separately,
-package exactly one selected runtime, and require `runtime list` plus no-driver
-client readiness. They never invoke a backend-linked host, inject a CUDA driver
-stub, or skip client startup merely because a hosted runner has no GPU.
+`ci.yml` applies the same executable-product rule to trusted main validation.
+Linux and macOS build immutable release-profile hosts and separately packaged
+CPU or Metal runtimes, then upload complete product-v2 trees from
+composition-only jobs. Linux CUDA, ROCm, and Vulkan each use an independent
+runtime producer plus a thin composer that downloads the same immutable Linux
+host; no backend waits on a matrix-wide fan-in. SDK consumers reuse the
+producer's adjacent runtime and fail if CI would silently rebuild it. Kotlin
+additionally downloads the verified native SDK runtime built by
+`native-sdk-artifact.yml` after that producer restores the shared
+`linux_static_abi_input`; it runs in parallel with the Linux product (debug on
+PR, release on main). Release nests one `static-abi-artifact.yml` producer per
+Linux native target through the same native-SDK workflow. Swift downloads an
+immutable XCFramework and exact generated `mesh_ffi.swift` from the shared
+`swift-sdk-artifact.yml` producer: PR uses `host-only`, while main and release
+use exhaustive `full` mode, all on `macos-15`. Windows likewise builds one
+immutable release-profile host, independent CPU/CUDA/ROCm/Vulkan runtime
+inputs, and composition-only products. Broad main Rust changes exercise the
+Windows CPU product; Windows GPU products remain limited to GPU/backend inputs
+or manual dispatch. Every composed backend product requires `runtime list`
+plus no-driver client readiness; hosted GPU rows neither inject a driver stub
+nor skip startup because no device is present.
+
+`pr_builds.yml` uses the same split producer/composer shape for Linux CPU/GPU
+and macOS Metal products while retaining debug-profile hosts for lightweight
+PR iteration. Windows broad-Rust validation stays at lightweight Cargo checks;
+the debug host plus CPU or GPU runtime/product graph runs only for its
+platform/backend input or manual dispatch. Unsupported macOS CUDA, ROCm, and
+Vulkan combinations are omitted rather than emitted as no-op jobs.
+`scripts/plan-pr-build-jobs.py` converts the central change signals into one
+ordered `required_jobs_json` list. Every conditional PR Builds job routes on
+membership in that list and retains normal dependency-success behavior through
+`needs`. Its static `PR Builds Summary` job directly needs every other
+top-level job and consumes the same plan. It accepts a skipped result only for
+an unplanned job and rejects required skips, failures, cancellations, unknown
+results, duplicate plan entries, and required IDs outside its needs graph,
+making that one non-matrix check the workflow's stable branch-protection
+target.
 
 Local actions:
 
 - `.github/actions/compute-changes` owns path, crate, backend, SDK, UI, website,
   Windows, and docs-only routing outputs.
+- `.github/actions/select-ci-runners` routes trusted push/dispatch jobs through
+  the Depot gate only for `refs/heads/main`, returns GitHub-hosted labels for
+  tags and every other ref, and unconditionally returns GitHub-hosted labels
+  for `pull_request` events. Repository ownership and the deprecated
+  `DEPOT_PR_RUNNERS_ENABLED` variable do not alter that decision. Its cache
+  permission is derived from the same typed trust decision.
 - `.github/actions/configure-sccache-gha` exports ephemeral Actions cache
-  credentials to the baked `sccache`, configures job-local disk storage ahead
-  of GHA in a fail-open multi-level cache, and restarts the server with disk-only
-  storage when the remote probe fails.
+  credentials to the baked `sccache`, permits Depot WebDAV only for an explicit
+  trusted call, uses writable job-local disk only for PR events because the
+  pinned sccache makes a mixed chain wholly read-only and records rejected
+  writes after misses, uses disk-only
+  storage if a future pull-request trust context is ever evaluated on Depot,
+  and resets counters after configuring the server.
+- `.github/actions/capture-sccache-stats` validates and uploads one
+  machine-readable sccache evidence artifact per instrumented job or matrix
+  row. Evidence is retained for 14 days so cold/warm samples span the configured
+  Depot cache-retention window.
+- `.github/actions/prepare-host-input` owns Unix neutral-host build, optional
+  release attestation, import-policy verification, and checksumming.
+- `.github/actions/prepare-windows-host-input` owns the equivalent Windows
+  debug/release neutral-host build, optional release attestation, import-policy
+  verification, checksum, and verifier artifact.
+- `.github/actions/prepare-native-runtime-input` owns runtime build/package
+  invocation and the release-grade artifact verifier.
+- `.github/actions/prepare-native-sdk-input` owns the native SDK
+  prepare-llama/build-llama/mesh-llm-ffi/package chain, verifies the exact
+  target/backend/profile manifest, and stages a flat immutable upload. Release
+  mode adds the native runtime crate through the same path.
+- `.github/actions/prepare-static-abi-input` owns the shared Linux static llama
+  ABI build/stamp validation and emits a checksummed, target-described ABI v3
+  archive containing only the path-normalized static link closure and portable
+  OpenMP metadata. The reusable workflow caches that archive, not the local
+  CMake build graph; crate tests and native SDK producers consume it.
+- `.github/actions/resolve-native-toolchain-epoch` exports one cache-safe
+  identity to both native build stamps and cache keys. Digest-pinned Linux
+  containers use their immutable image digest; hosted macOS and Windows jobs
+  use the exact runner image revision, with compiler/CMake/Ninja versions added
+  where hosted or Depot Linux/macOS toolchains are not otherwise pinned.
+- `.github/actions/compose-product-input` verifies producer inputs, creates one
+  product-v2 tree without compiling, and runs CLI/client readiness.
 - `.github/actions/restore-smoke-inputs` owns producer artifact staging and
   model restoration for smoke consumers.
+- `.github/actions/restore-windows-abi-cache` owns the exact Windows CPU,
+  CUDA, ROCm, and Vulkan ABI cache identity shared by the trusted warmer and
+  PR/main/release runtime producers. The hosted-image epoch, architecture sets,
+  and toolchain versions are compatibility boundaries; the action requires the
+  key epoch to equal the build-stamp epoch and never uses restore prefixes.
 - `.github/actions/setup-windows-rocm-sdk` owns reusable Windows ROCm setup.
 
 Routing and test-planning scripts:
 
 - `scripts/affected-crates.sh` computes affected crates and reverse dependents.
+- `scripts/plan-pr-build-jobs.py` maps PR change signals to the single ordered
+  top-level job plan consumed by both conditional PR Builds jobs and its stable
+  summary gate.
 - `scripts/plan-clippy-batches.sh` owns weighted Clippy sharding and retains a
   checked workspace-member list for fail-open/all-rust planning.
 - `scripts/plan-test-batches.sh` owns weighted crate-test sharding. It derives
@@ -84,6 +170,9 @@ Routing and test-planning scripts:
   workflow-owned test allowlist.
 - `scripts/test-portable.sh` owns the portable non-Cargo test aggregate used by
   the local `test-all` path.
+- `scripts/summarize-sccache-stats.py` aggregates downloaded sccache JSON
+  evidence offline and can enforce the migration hit-rate threshold without
+  GitHub or network access.
 
 ## Runner and image contract
 
@@ -91,8 +180,66 @@ GitHub-hosted labels currently used:
 
 - Linux AMD64: `ubuntu-24.04`
 - Linux ARM64: `ubuntu-24.04-arm`
-- macOS: `macos-15` and legacy `macos-latest`
+- macOS: pinned `macos-15`
 - Windows: `windows-2022`
+
+Depot labels referenced behind the rollout gate:
+
+- routing/summary: `depot-ubuntu-24.04`
+- light build/planning: `depot-ubuntu-24.04-4`
+- Rust/native build: `depot-ubuntu-24.04-8`
+- measured high-parallelism native build: `depot-ubuntu-24.04-16`
+
+Current PR jobs and non-main refs never select these labels. They use the corresponding
+GitHub-hosted label regardless of repository ownership or
+`DEPOT_PR_RUNNERS_ENABLED`; that variable is ignored. Trusted main/release jobs
+use `DEPOT_RUNNERS_ENABLED`; a trusted
+main-ref manual dispatch can set `use_depot=true`. Hardware-qualified GPU
+execution is not part of the gate.
+
+The default-branch-selected `native-sdk-artifact.yml` and
+`static-abi-artifact.yml` workflows do not accept a runner label or Depot-cache
+permission from callers. Each first runs a fixed `ubuntu-24.04` policy job,
+validates `runner_size` as `default`, `4`, `8`, or `16`, maps the declared
+target to the checked-in AMD64/ARM64 hosted and Depot labels, and grants both
+the Depot runner and WebDAV cache only for exact
+`Mesh-LLM/mesh-llm` `push`/`workflow_dispatch` calls on
+`refs/heads/main` when `DEPOT_RUNNERS_ENABLED == 'true'` or when the immutable
+main-dispatch event payload has `use_depot == 'true'`. Pull requests,
+`pull_request_target`, tags, feature refs, external repositories, macOS, and a
+disabled gate without that authorized canary resolve to a GitHub-hosted runner
+with Depot cache permission false. The event-owned manual canary is evaluated
+only under the same exact repository/main/dispatch guard and is not a
+reusable-workflow input.
+
+The Depot dashboard reports the `Mesh-LLM` GitHub connection active, and
+GitHub lists both `depot-managed-runners` and `depot-code-access` installations
+for all organization repositories. GitHub's organization settings show the
+Depot-managed `Default` group currently allows all workflows but excludes
+public repositories, while the separate `mesh-llm` group owns the two dedicated
+GPU scale sets. Before a canary, protect `main` with an enforceable
+review/status gate, restrict `Default` to this repository and exact
+default-branch workflow refs, then enable public-repository access. The
+`mesh-llm` GPU group also permits all workflows in a public repository and must
+be restricted to protected runner-owning entry points before it is considered a
+trusted-only pool.
+
+The checked-out local selector is not the security boundary because PRs can
+modify workflow and local-action files. The Depot runner group must use
+`restricted_to_workflows=true` and exact default-branch selected-workflow refs.
+The initial selected set includes `native-sdk-artifact.yml@refs/heads/main` and
+`static-abi-artifact.yml@refs/heads/main` because those reusable workflows
+directly allocate eligible Linux runners; a caller-only `ci.yml` entry is not
+sufficient.
+Credential-bearing `hf-download-smoke.yml`, `smoke.yml`,
+`scripted-binary-smoke.yml`, and `sdk-smoke.yml` are deliberately excluded and
+fixed to bounded GitHub-hosted labels. `swift-sdk-artifact.yml` is fixed to
+GitHub-hosted `macos-15`. No reusable workflow passes caller-provided
+runner JSON directly to `runs-on`. PR callers pass no `HF_TOKEN`; trusted
+main/release callers may pass it only on the fixed hosted smoke lanes.
+Automatic Depot Cache still grants repository-scoped cache authority to the
+whole job, so even a trusted reusable caller cannot safely execute untrusted PR
+code while that injection is enabled. PRs remain GitHub-hosted.
 
 Legacy/dedicated self-hosted label arrays currently referenced:
 
@@ -104,12 +251,13 @@ ARC scale-set labels for the prebuilt runner rollout:
 - `mesh-llm-amd64`
 - `mesh-llm-arm64`
 
-`pr_builds.yml` runs `public_runner_image_contract` in the public image and
-`arc_runner_image_contract` on both ARC labels for every pull request. The ARC
-job executes directly in each ephemeral runner pod, verifies the self-hosted
-image contract and native architecture, and runs a small Rust check. It
-intentionally has no hosted fallback because its purpose is to detect an ARC,
-K3s scheduling, architecture, or runner-image regression before merge.
+`pr_builds.yml` runs `public_runner_image_contract` in the public image when
+the runner workflow, cache integration, or cache version changes, plus manual
+dispatches. Trusted main `ci.yml` owns `arc_runner_image_contract` on both ARC
+labels for the same change class. Untrusted PR-event jobs never request those
+labels. The ARC job executes directly in each ephemeral runner pod, verifies
+the self-hosted image contract and native architecture, and runs a small Rust
+check. It intentionally has no hosted fallback.
 
 Runner images are published from
 [`Mesh-LLM/mesh-llm-runner-images`](https://github.com/Mesh-LLM/mesh-llm-runner-images)
@@ -126,6 +274,23 @@ as `ghcr.io/mesh-llm/mesh-llm-cuda-runner`. The source repository owns:
 
 Production consumers must use the multi-architecture manifest digest. Tags are
 discovery inputs and are mutable absent separately verified registry controls.
+
+Draft runner-images PR
+[`#9`](https://github.com/Mesh-LLM/mesh-llm-runner-images/pull/9) changes the
+publication control plane without changing those production digests. PRs route
+affected families plus a mandatory public CPU AMD64 contract, use BuildKit
+cache read-only, and cannot stage or promote. Main pushes stage verified
+candidate digests; weekly or explicit manual runs promote a retained cohort.
+The reusable family workflow independently derives trusted runner/cache
+authority, verifies the requested MeshLLM source revision, uses content-digest
+immutable tags, and feeds one serial `latest` cohort reconciliation. Deleted
+files are included in affected-family routing.
+
+Its exhaustive Dockerfile-change PR
+[run 30504335079](https://github.com/Mesh-LLM/mesh-llm-runner-images/actions/runs/30504335079)
+completed all 20 platform rows in 6m 22s wall / 1h 13m 07s aggregate with no
+Depot jobs and no PR cache export. Treat that as validation-path evidence, not
+as proof of the trusted stage/promotion path.
 
 The public repository and its GHCR package have independent visibility. Until
 anonymous pull of the package succeeds, GitHub-hosted container jobs must grant
@@ -157,17 +322,29 @@ MeshLLM workflows pin the public digest. The Flux repository must independently
 roll the ARC HelmReleases to the paired self-hosted digest; that cross-repository
 change cannot be delivered by a MeshLLM pull request.
 
-Public-image Rust jobs use the baked `sccache` binary and start with
-`SCCACHE_GHA_ENABLED=false`. The local `configure-sccache-gha` action exports
-the ephemeral Actions cache URL/token, enables a `disk,gha` cache chain, ignores
-cache write errors, and probes it by starting the server. The disk tier uses a
-job-local directory beside, rather than inside, the checkout. Cache read
-failures degrade to misses, cache write failures are warnings, and compiler
-invocations fall back locally if the server becomes unavailable. If the
-initial remote probe fails, the action stops the remote-configured server and
-restarts `sccache` with disk-only storage. Persistent Cargo target and ABI reuse
-remains owned by `Swatinem/rust-cache` and `actions/cache`. Do not reintroduce
-the sccache download action merely to export credentials.
+Public-image Rust jobs use the baked `sccache` binary. Trusted calls to
+`configure-sccache-gha` may use Depot's `SCCACHE_WEBDAV_ENDPOINT` plus
+`SCCACHE_WEBDAV_TOKEN`/`DEPOT_CACHE_TOKEN` in a fail-open `disk,webdav` chain.
+When that permission is false and Depot is detected, the action gives the
+sccache server a credential-free environment and uses job-local disk only.
+GitHub-hosted trusted jobs retain `disk,gha` or explicit disk-only mode. PR
+events use job-local disk only, including direct sccache-action users routed
+through the configure action, while trusted main, release, warmer, and dispatch
+paths may seed the GHA tier. Swift restores a
+mode-independent Rust dependency cache that only trusted main pushes save.
+Persistent Cargo target and ABI reuse remains owned by
+`Swatinem/rust-cache` and `actions/cache`. Current PR jobs use the normal
+`mesh-llm` key namespace; native `actions/cache` writes remain merge-ref scoped,
+and trusted main does not restore PR-written entries.
+Raw native ABI caches also include the exact native toolchain epoch used by the
+build stamp. Linux container jobs use the pinned OCI digest, macOS keys include
+the hosted image revision and native-tool fingerprint, and Windows warmer,
+PR, main, and release jobs share the same hosted image revision. A reported
+cache hit is verified against the current build contract before reuse.
+A future Depot PR entrypoint must instead use keys that trusted main/release
+jobs never restore because Depot cache entries are repository-scoped. Key
+separation alone is not a security boundary while the job receives Depot cache
+authority, so no such entrypoint is currently eligible.
 
 `USE_SELF_HOSTED` currently controls selected GPU/release routes. Unset or a
 value other than the exact string `true` selects the hosted fallback. Any new
@@ -180,6 +357,8 @@ All GitHub Actions variables are strings.
 | Variable | Purpose and fallback |
 | --- | --- |
 | `USE_SELF_HOSTED` | Exact `true` selects supported self-hosted GPU/release lanes; otherwise hosted |
+| `DEPOT_PR_RUNNERS_ENABLED` | Deprecated compatibility variable; the current selector ignores it and all PR jobs remain GitHub-hosted |
+| `DEPOT_RUNNERS_ENABLED` | Exact `true` routes eligible trusted main/release Linux jobs to Depot; otherwise GitHub-hosted |
 | `CUDA_VERSION` | Windows CUDA toolkit selection; Linux CUDA lanes use digest-pinned backend images |
 | `VULKAN_SDK_VERSION` | Windows Vulkan SDK; fallback `1.4.328.1` |
 | `LLAMA_UPSTREAM_CANARY_SMOKE` | Enables canary smoke; fallback `1` |
@@ -199,7 +378,6 @@ All GitHub Actions variables are strings.
 | `MESH_NIGHTLY_STABILITY_ATTEMPTS` | Attempts per model; fallback `5` |
 | `MESH_NIGHTLY_STABILITY_AGENT_SMOKES` | Optional agent CLI smoke list |
 | `MESH_NIGHTLY_STABILITY_TIMEOUT` | Per-probe seconds; fallback `180` |
-| `MESH_NIGHTLY_STABILITY_RUNS_ON` | JSON runner label string/array; fallback `"ubuntu-24.04"` |
 
 ## Secret names referenced by workflows
 
