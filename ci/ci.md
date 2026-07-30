@@ -189,7 +189,9 @@ flowchart TD
   smokes consume the staged runtime instead of compiling a private replacement.
   The Swift XCFramework is also built by the same typed producer used by PR and
   release: main requests exhaustive `full` mode and its smoke only verifies and
-  consumes that immutable artifact.
+  consumes that immutable artifact. Main and release give the seven-target
+  full producer a 180-minute cold-start ceiling; PR host-only validation keeps
+  its shorter iteration budget.
 - Main builds immutable Linux, macOS, and Windows release hosts independently
   from their CPU, Metal, CUDA, ROCm, and Vulkan runtimes. Composition-only jobs
   verify and combine those exact producer inputs. Each Linux GPU backend has
@@ -205,6 +207,9 @@ flowchart TD
   manifest-bound, checksummed archive. Release publication requires all five
   artifacts, and `mesh-packaging` consumes those exact release assets instead
   of compiling addon source again.
+- Release publication dispatches downstream package/image/npm promotion only
+  for stable versions. Prereleases retain the complete immutable GitHub Release
+  artifact graph for validation but never invoke `mesh-packaging`.
 - `.github/actions/prepare-host-input`,
   `.github/actions/prepare-windows-host-input`,
   `.github/actions/prepare-native-runtime-input`,
@@ -222,7 +227,10 @@ flowchart TD
   afterward, then performs a lookup-only restore with the same path and key to
   prove the current cache version exists. A cache-service reservation warning
   therefore cannot leave the warmer green without publishing a reusable ABI
-  input.
+  input. The restore action exports the normalized absolute cache path used by
+  the save action, and publication-action changes participate in the exact key,
+  preventing an incompatible opaque cache version from blocking its
+  replacement under the same key.
 
 ### Current PR Builds contract
 
@@ -331,8 +339,10 @@ flowchart TD
   re-stamping them. The Windows host input includes a checksum-protected
   producer-built attestation verifier so Windows composers do not compile
   workspace code. Product consumers never rebuild a missing producer. It
-  dispatches the completed release to `Mesh-LLM/mesh-packaging`,
-  which owns package, GHCR, and npm publication.
+  dispatches a completed stable release with the full GPU matrix to
+  `Mesh-LLM/mesh-packaging`, which owns package, GHCR, and npm publication.
+  Prereleases publish immutable GitHub Release inputs but never dispatch
+  downstream publication.
 - `fly-deploy-console.yml` is a manual (`workflow_dispatch`) deploy of the
   `mesh-llm-console` Fly app. It builds the image on Fly's remote builders from
   `fly/Dockerfile` and authenticates with the app-scoped `FLY_API_TOKEN` repo

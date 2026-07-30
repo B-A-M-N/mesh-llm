@@ -31,7 +31,7 @@ the commands at the end before operational changes.
 | `windows-warm-caches.yml` | Main path push, dispatch | Trusted Windows ABI cache warming |
 | `website-pages.yml` | Main website path push, dispatch | Public website Pages build/deploy |
 | `fly-deploy-console.yml` | Dispatch | `fly-console` environment deployment |
-| `release.yml` | `v*` tag, dispatch | Release builds, attestations, publishing, downstream package/image/npm dispatch |
+| `release.yml` | `v*` tag, dispatch | Release builds, attestations, publishing, stable-only downstream package/image/npm dispatch |
 | `reset-caches.yml` | Confirmed dispatch | Destructive repository cache reset |
 | `stale-prs.yml` | Schedule, dispatch | PR warning/closure maintenance |
 
@@ -62,6 +62,12 @@ manifest and SHA-256 sidecar. The release publisher requires all five producers
 and attaches those exact artifacts; downstream packaging verifies and assembles
 them without recompiling native source.
 
+Only a successful, complete stable release dispatches downstream package,
+image, and npm publication. Prereleases publish their immutable GitHub Release
+inputs but never invoke `mesh-packaging`; this provides a safe artifact
+validation boundary without exposing prerelease inputs to production
+promotion.
+
 The Windows host input also carries the checksum-protected `xtask` executable
 that performed producer-side attestation. Windows product composers invoke that
 prebuilt verifier for the immutable host instead of compiling workspace code.
@@ -87,6 +93,12 @@ Windows CPU product; Windows GPU products remain limited to GPU/backend inputs
 or manual dispatch. Every composed backend product requires `runtime list`
 plus no-driver client readiness; hosted GPU rows neither inject a driver stub
 nor skip startup because no device is present.
+
+The exhaustive Swift producer has a 180-minute main/release cold-start budget
+because it serially builds seven Apple target ABIs. PR host-only calls retain
+their shorter budget. Exact native ABI and compiler caches remain responsible
+for reducing the warm path; the timeout is only the reliability ceiling for an
+unseeded cache.
 
 `pr_builds.yml` uses the same split producer/composer shape for Linux CPU/GPU
 and macOS Metal products while retaining debug-profile hosts for lightweight
@@ -154,7 +166,9 @@ Local actions:
   CUDA, ROCm, and Vulkan ABI cache identity shared by the trusted warmer and
   PR/main/release runtime producers. The hosted-image epoch, architecture sets,
   and toolchain versions are compatibility boundaries; the action requires the
-  key epoch to equal the build-stamp epoch and never uses restore prefixes.
+  key epoch to equal the build-stamp epoch, includes the publication action in
+  the key hash, exports one validated absolute path for both restore and save,
+  and never uses restore prefixes.
 - `.github/actions/save-and-verify-actions-cache` snapshots existing exact
   key/ref cache entries before saving a trusted miss, then requires a new,
   non-empty entry to appear and performs a lookup-only restore with the same
