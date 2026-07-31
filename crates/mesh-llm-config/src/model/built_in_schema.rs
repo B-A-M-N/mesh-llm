@@ -204,6 +204,8 @@ fn build_built_in_config_schema() -> ConfigSchema {
         ),
     ];
 
+    settings.extend(logging_settings());
+
     settings.extend(model_defaults_settings());
     settings.extend(model_entry_settings());
     settings.extend(plugin_entry_settings());
@@ -1038,6 +1040,49 @@ fn plugin_setting(path: &str, value_schema: ConfigValueSchema) -> ConfigSettingS
     ];
     setting.restart_scope = ConfigRestartScope::ProcessRestart;
     setting
+}
+
+fn logging_setting(path: &str, value_schema: ConfigValueSchema) -> ConfigSettingSchema {
+    let mut setting = basic_setting(path, value_schema);
+    setting.control_surfaces = vec![ConfigControlSurface::ConfigFile];
+    // All logging settings require process restart (no atomic hot-reload path exists).
+    setting.restart_scope = ConfigRestartScope::ProcessRestart;
+    setting.visibility = ConfigVisibility::Advanced;
+    setting
+}
+
+fn logging_settings() -> Vec<ConfigSettingSchema> {
+    vec![
+        logging_setting("logging.enabled", ConfigValueSchema::Boolean),
+        logging_setting("logging.application_state_root", ConfigValueSchema::Path),
+        logging_setting("logging.summary_line_limit", ConfigValueSchema::Integer),
+        logging_setting("logging.event_buffer_size", ConfigValueSchema::Integer),
+        logging_setting("logging.retention_ttl_secs", ConfigValueSchema::Integer),
+        logging_setting("logging.replay_capacity", ConfigValueSchema::Integer),
+        logging_setting("logging.queue_capacity", ConfigValueSchema::Integer),
+        logging_setting(
+            "logging.artifact.capture_mode",
+            string_enum(["metadata_only", "redacted_artifacts"]),
+        ),
+        logging_setting(
+            "logging.artifact.byte_limit_bytes",
+            ConfigValueSchema::Integer,
+        ),
+        logging_setting(
+            "logging.artifact.aggregate_limit_bytes",
+            ConfigValueSchema::Integer,
+        ),
+        logging_setting("logging.export_limit_bytes", ConfigValueSchema::Integer),
+        logging_setting("logging.cleanup_cadence_secs", ConfigValueSchema::Integer),
+        logging_setting("logging.webhook.enabled", ConfigValueSchema::Boolean),
+        logging_setting("logging.webhook.url", ConfigValueSchema::Url),
+        logging_setting("logging.webhook.max_attempts", ConfigValueSchema::Integer),
+        logging_setting("logging.webhook.timeout_secs", ConfigValueSchema::Integer),
+        logging_setting(
+            "logging.webhook.dead_letter_retention_secs",
+            ConfigValueSchema::Integer,
+        ),
+    ]
 }
 
 fn basic_setting(path: &str, value_schema: ConfigValueSchema) -> ConfigSettingSchema {

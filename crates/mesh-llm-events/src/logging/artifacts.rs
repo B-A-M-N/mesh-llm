@@ -135,7 +135,7 @@ mod tests {
     #[test]
     fn test_defaults_for_boolean_flags() {
         // Deserialize from minimal JSON — boolean defaults should be false.
-        let json = r#"{"artifact_id":"00000000-0000-4000-a000-00000000001","kind":"chunk","bytes":128,"checksum":"","version":1}"#;
+        let _json = r#"{"artifact_id":"00000000-0000-4000-a000-00000000001","kind":"chunk","bytes":128,"checksum":"","version":1}"#;
         // This would fail if the artifact_id format is invalid UUID. Let's test with a valid one.
         let meta = ArtifactMetadata::new(ArtifactKind::Chunk, 128);
 

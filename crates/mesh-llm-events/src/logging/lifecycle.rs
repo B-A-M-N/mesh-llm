@@ -164,7 +164,7 @@ mod tests {
         let mut guard1 = LifecycleGuard::active();
         guard1.transition(LifecycleState::Failed).unwrap();
 
-        let mut guard2 = guard1.clone();
+        let guard2 = guard1.clone();
         assert_eq!(guard2.state(), LifecycleState::Failed);
     }
 

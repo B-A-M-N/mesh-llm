@@ -12,6 +12,12 @@ macro_rules! define_branded_id {
         #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
         pub struct $name(Uuid);
 
+        impl Default for $name {
+            fn default() -> Self {
+                Self::new()
+            }
+        }
+
         impl $name {
             /// Generate a new random identifier.
             pub fn new() -> Self {
