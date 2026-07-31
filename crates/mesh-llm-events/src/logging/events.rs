@@ -71,9 +71,7 @@ pub enum LifecycleEvent {
         duration_ms: Option<u64>,
     },
     /// Request failed.
-    Failed {
-        error: String,
-    },
+    Failed { error: String },
     /// Request rejected before processing.
     Rejected {
         #[serde(skip_serializing_if = "Option::is_none")]

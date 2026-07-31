@@ -20,7 +20,12 @@ pub struct ProxyRecord {
 
 impl ProxyRecord {
     /// Create a new attempt record.
-    pub fn new(attempt_id: AttemptId, request_id: RequestId, target: String, started_at: String) -> Self {
+    pub fn new(
+        attempt_id: AttemptId,
+        request_id: RequestId,
+        target: String,
+        started_at: String,
+    ) -> Self {
         Self {
             attempt_id,
             request_id,

@@ -41,6 +41,22 @@ pub use mesh::requirements::{
 
 use anyhow::Result;
 use std::path::Path;
+use std::sync::{Arc, OnceLock};
+
+use logging::foundation::LoggingFoundation;
+
+static LOGGING_FOUNDATION: OnceLock<Arc<LoggingFoundation>> = OnceLock::new();
+
+pub fn logging_foundation() -> Option<Arc<LoggingFoundation>> {
+    LOGGING_FOUNDATION.get().cloned()
+}
+
+pub fn logging_health_summary() -> String {
+    match LOGGING_FOUNDATION.get() {
+        Some(f) => f.health_summary(),
+        None => "logging not initialized".to_string(),
+    }
+}
 
 pub const BUILD_VERSION: &str = mesh_llm_build_info::BUILD_VERSION;
 pub const RELEASE_VERSION: &str = mesh_llm_build_info::RELEASE_VERSION;
@@ -119,6 +135,18 @@ pub async fn initialize_host_runtime_with_config(config_path: Option<&Path>) -> 
     {
         let _ = config_path;
     }
+
+    // Initialize logging foundation (fail-open: serving never blocked by logging failure).
+    // Config-driven enabled/root are deferred to a later refinement.
+    let foundation = LoggingFoundation::init(true, None);
+    if !foundation.is_healthy() {
+        tracing::warn!(
+            summary = %foundation.health_summary(),
+            "Logging foundation initialized unhealthy (fail-open)"
+        );
+    }
+    LOGGING_FOUNDATION.set(Arc::new(foundation)).ok();
+
     Ok(())
 }
 

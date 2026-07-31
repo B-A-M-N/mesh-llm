@@ -28,7 +28,10 @@ fn test_serde_roundtrip_preserves_fields() {
         ReplayChannel::Requests,
         7,
         "2025-01-01T00:00:00Z".into(),
-        LifecycleEvent::Admitted { model: Some("llama-3".into()), method: Some("POST".into()) },
+        LifecycleEvent::Admitted {
+            model: Some("llama-3".into()),
+            method: Some("POST".into()),
+        },
     );
     let json = serde_json::to_string(&env).unwrap();
     let parsed: CanonicalEnvelope = serde_json::from_str(&json).unwrap();
@@ -46,7 +49,10 @@ fn test_absent_identity_fields_omitted() {
         ReplayChannel::System,
         0,
         "2025-01-01T00:00:00Z".into(),
-        LifecycleEvent::Completed { status_code: Some(200), duration_ms: None },
+        LifecycleEvent::Completed {
+            status_code: Some(200),
+            duration_ms: None,
+        },
     );
     let json = serde_json::to_string(&env).unwrap();
     assert!(!json.contains("tenant_id"));
@@ -66,7 +72,9 @@ fn test_no_raw_invite_token_in_serialized_events() {
         ReplayChannel::Requests,
         1,
         "2025-01-01T00:00:00Z".into(),
-        LifecycleEvent::Failed { error: "upstream rejected the request".into() },
+        LifecycleEvent::Failed {
+            error: "upstream rejected the request".into(),
+        },
     );
     let json = serde_json::to_string(&env).unwrap();
     let parsed: CanonicalEnvelope = serde_json::from_str(&json).unwrap();
