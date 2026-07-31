@@ -4033,6 +4033,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "mesh-llm-log-store"
+version = "0.72.1"
+dependencies = [
+ "chrono",
+ "data-encoding",
+ "mesh-llm-events",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "uuid",
+]
+
+[[package]]
 name = "mesh-llm-native-runtime"
 version = "0.72.1"
 dependencies = [
