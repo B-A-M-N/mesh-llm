@@ -30,6 +30,25 @@ pub enum LogStoreError {
 
     /// I/O error on the store path.
     IoError(std::io::Error),
+
+    /// Artifact write rejected: content exceeds byte_limit or aggregate limit for request.
+    ArtifactLimitExceeded {
+        artifact_id: String,
+        limit_bytes: usize,
+        kind: String, // "byte" or "aggregate"
+    },
+
+    /// Artifact file on disk has a checksum mismatch with the DB row — corrupt.
+    ArtifactCorrupt { artifact_id: String },
+
+    /// Artifact pointer exists in DB but the backing file is missing from disk.
+    ArtifactMissing { artifact_id: String },
+
+    /// Caller-supplied ID contains path-traversal characters (/ \ .. NUL).
+    PathUnsafe { segment: String },
+
+    /// Platform privacy cannot be guaranteed (e.g., Windows ACL not enforceable via std).
+    PrivacyNotGuaranteed,
 }
 
 impl fmt::Display for LogStoreError {
@@ -52,6 +71,40 @@ impl fmt::Display for LogStoreError {
             Self::AlreadyExists { entity } => write!(f, "{} already exists", entity),
             Self::QueryFailed(msg) => write!(f, "query failed: {}", msg),
             Self::IoError(e) => write!(f, "io error: {}", e),
+            Self::ArtifactLimitExceeded {
+                artifact_id,
+                limit_bytes,
+                kind,
+            } => {
+                write!(
+                    f,
+                    "artifact {} exceeds {} limit of {} bytes",
+                    artifact_id, kind, limit_bytes
+                )
+            }
+            Self::ArtifactCorrupt { artifact_id } => {
+                write!(
+                    f,
+                    "artifact {} checksum mismatch — file corrupt",
+                    artifact_id
+                )
+            }
+            Self::ArtifactMissing { artifact_id } => {
+                write!(
+                    f,
+                    "artifact {} pointer exists but backing file is missing",
+                    artifact_id
+                )
+            }
+            Self::PathUnsafe { segment } => {
+                write!(f, "unsafe path segment: {:?}", segment)
+            }
+            Self::PrivacyNotGuaranteed => {
+                write!(
+                    f,
+                    "platform privacy cannot be guaranteed for artifact storage"
+                )
+            }
         }
     }
 }

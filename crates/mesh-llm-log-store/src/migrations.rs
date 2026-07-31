@@ -3,7 +3,7 @@
 use rusqlite::Connection;
 
 /// Current schema version (incremented with each migration).
-pub const CURRENT_VERSION: u32 = 1;
+pub const CURRENT_VERSION: u32 = 2;
 
 const MIGRATIONS_V1: &str = r#"
 CREATE TABLE IF NOT EXISTS summaries (
@@ -113,6 +113,18 @@ CREATE TABLE IF NOT EXISTS cleanup_runs (
 CREATE INDEX IF NOT EXISTS idx_cleanup_runs_occurred ON cleanup_runs (occurred_at DESC, run_id DESC);
 "#;
 
+const MIGRATIONS_V2: &str = r#"
+ALTER TABLE artifact_pointers ADD COLUMN media_kind TEXT;
+ALTER TABLE artifact_pointers ADD COLUMN checksum TEXT;
+ALTER TABLE artifact_pointers ADD COLUMN bytes INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE artifact_pointers ADD COLUMN version INTEGER NOT NULL DEFAULT 1;
+ALTER TABLE artifact_pointers ADD COLUMN redacted INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE artifact_pointers ADD COLUMN truncated INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE artifact_pointers ADD COLUMN stored_at TEXT;
+ALTER TABLE artifact_pointers ADD COLUMN missing INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE artifact_pointers ADD COLUMN corrupt INTEGER NOT NULL DEFAULT 0;
+"#;
+
 /// Apply all pending migrations. Uses execute_batch which handles multi-statement strings in SQLite.
 pub fn apply_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
     let current_ver: i32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
@@ -121,8 +133,14 @@ pub fn apply_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
         return Ok(()); // already up-to-date
     }
 
-    // execute_batch can handle semicolon-separated statements in one call.
-    conn.execute_batch(MIGRATIONS_V1)?;
+    if current_ver < 1 {
+        conn.execute_batch(MIGRATIONS_V1)?;
+    }
+
+    if current_ver < 2 {
+        conn.execute_batch(MIGRATIONS_V2)?;
+    }
+
     conn.execute_batch(&format!("PRAGMA user_version = {}", CURRENT_VERSION))?;
 
     Ok(())

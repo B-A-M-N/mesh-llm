@@ -3,6 +3,7 @@
 use crate::cursor::{decode_cursor, encode_cursor};
 use crate::error::LogStoreError;
 use crate::store::LogStore;
+use rusqlite::Transaction;
 
 // ─── Row types returned by queries ──────────────────────
 
@@ -49,6 +50,18 @@ pub struct ArtifactPointerRow {
     pub occurred_at: String,
     #[allow(dead_code)]
     pub kind: String,
+    #[allow(dead_code)]
+    pub media_kind: Option<String>,
+    #[allow(dead_code)]
+    pub checksum: Option<String>,
+    #[allow(dead_code)]
+    pub bytes: i64,
+    #[allow(dead_code)]
+    pub version: i32,
+    #[allow(dead_code)]
+    pub redacted: bool,
+    #[allow(dead_code)]
+    pub truncated: bool,
 }
 
 /// Paginated query result with an optional cursor for the next page.
@@ -553,6 +566,152 @@ impl LogStore {
         }
     }
 
+    /// Update storage fields on an existing pointer row after file write.
+    #[allow(clippy::too_many_arguments)] // mirrors DB columns; grouping into a struct adds no clarity for single caller
+    pub fn update_artifact_pointer_storage(
+        &self,
+        artifact_id: &str,
+        media_kind: Option<&str>,
+        checksum: &str,
+        bytes: i64,
+        version: i32,
+        redacted: bool,
+        truncated: bool,
+    ) -> Result<usize, LogStoreError> {
+        let conn = self.conn();
+        conn.execute(
+            "UPDATE artifact_pointers \
+             SET media_kind = ?, checksum = ?, bytes = ?, version = ?, \
+                 redacted = ?, truncated = ? \
+             WHERE artifact_id = ?",
+            rusqlite::params![
+                media_kind,
+                checksum,
+                bytes,
+                version,
+                redacted as i32,
+                truncated as i32,
+                artifact_id
+            ],
+        )
+        .map_err(LogStoreError::Sqlite)
+    }
+
+    /// Get a single artifact pointer row by artifact_id. Returns None if not found.
+    pub fn get_artifact_pointer(
+        &self,
+        artifact_id: &str,
+    ) -> Result<Option<ArtifactPointerRow>, LogStoreError> {
+        let conn = self.conn();
+        let mut stmt = conn
+            .prepare(
+                "SELECT artifact_id, request_id, occurred_at, kind, media_kind, checksum, bytes, \
+             version, redacted, truncated \
+             FROM artifact_pointers WHERE artifact_id = ?",
+            )
+            .map_err(LogStoreError::Sqlite)?;
+
+        let row_fn = |row: &rusqlite::Row<'_>| -> rusqlite::Result<ArtifactPointerRow> {
+            Ok(ArtifactPointerRow {
+                artifact_id: row.get(0)?,
+                request_id: row.get(1)?,
+                occurred_at: row.get(2)?,
+                kind: row.get(3)?,
+                media_kind: row.get(4).ok(),
+                checksum: row.get(5).ok(),
+                bytes: row.get::<_, i64>(6)?,
+                version: row.get::<_, i32>(7)?,
+                redacted: row.get::<_, i32>(8)? != 0,
+                truncated: row.get::<_, i32>(9)? != 0,
+            })
+        };
+
+        match stmt.query_row(rusqlite::params![artifact_id], row_fn) {
+            Ok(row) => Ok(Some(row)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(LogStoreError::QueryFailed(e.to_string())),
+        }
+    }
+
+    /// List artifact pointers for a request_id. Returns rows in occurred_at ASC order.
+    pub fn list_artifact_pointers_for_request(
+        &self,
+        request_id: &str,
+    ) -> Result<Vec<ArtifactPointerRow>, LogStoreError> {
+        let conn = self.conn();
+        let mut stmt = conn
+            .prepare(
+                "SELECT artifact_id, request_id, occurred_at, kind, media_kind, checksum, bytes, \
+             version, redacted, truncated \
+             FROM artifact_pointers WHERE request_id = ? ORDER BY occurred_at ASC",
+            )
+            .map_err(LogStoreError::Sqlite)?;
+
+        let row_fn = |row: &rusqlite::Row<'_>| -> rusqlite::Result<ArtifactPointerRow> {
+            Ok(ArtifactPointerRow {
+                artifact_id: row.get(0)?,
+                request_id: row.get(1)?,
+                occurred_at: row.get(2)?,
+                kind: row.get(3)?,
+                media_kind: row.get(4).ok(),
+                checksum: row.get(5).ok(),
+                bytes: row.get::<_, i64>(6)?,
+                version: row.get::<_, i32>(7)?,
+                redacted: row.get::<_, i32>(8)? != 0,
+                truncated: row.get::<_, i32>(9)? != 0,
+            })
+        };
+
+        let rows_iter = stmt
+            .query_map(rusqlite::params![request_id], &row_fn)
+            .map_err(LogStoreError::Sqlite)?;
+
+        let mut items = Vec::new();
+        for result in rows_iter {
+            match result {
+                Ok(item) => items.push(item),
+                Err(e) => return Err(LogStoreError::QueryFailed(e.to_string())),
+            }
+        }
+        Ok(items)
+    }
+
+    /// Sum of bytes column for all artifact pointers belonging to a request. Returns 0 if none.
+    pub fn sum_artifact_bytes_for_request(&self, request_id: &str) -> Result<i64, LogStoreError> {
+        let conn = self.conn();
+        let total: i64 = conn
+            .query_row(
+                "SELECT COALESCE(SUM(bytes), 0) FROM artifact_pointers WHERE request_id = ?",
+                rusqlite::params![request_id],
+                |row| row.get(0),
+            )
+            .map_err(LogStoreError::Sqlite)?;
+        Ok(total)
+    }
+
+    /// Delete a single artifact pointer row by ID. Returns rows affected (0 or 1).
+    pub fn delete_artifact_pointer_row(&self, artifact_id: &str) -> Result<usize, LogStoreError> {
+        let conn = self.conn();
+        conn.execute(
+            "DELETE FROM artifact_pointers WHERE artifact_id = ?",
+            rusqlite::params![artifact_id],
+        )
+        .map_err(LogStoreError::Sqlite)
+    }
+
+    /// Delete all artifact pointer rows for a request. Returns count of deleted rows.
+    pub fn delete_artifact_pointer_rows_for_request(
+        &self,
+        request_id: &str,
+    ) -> Result<usize, LogStoreError> {
+        let conn = self.conn();
+        conn.execute(
+            "DELETE FROM artifact_pointers WHERE request_id = ?",
+            rusqlite::params![request_id],
+        )
+        .map_err(LogStoreError::Sqlite)
+    }
+
     /// Paginated listing keyed on (occurred_at, artifact_id).
     pub fn list_artifact_pointers(
         &self,
@@ -567,17 +726,26 @@ impl LogStore {
                 request_id: row.get(1)?,
                 occurred_at: row.get(2)?,
                 kind: row.get(3)?,
+                media_kind: row.get(4).ok(),
+                checksum: row.get(5).ok(),
+                bytes: row.get::<_, i64>(6)?,
+                version: row.get::<_, i32>(7)?,
+                redacted: row.get::<_, i32>(8)? != 0,
+                truncated: row.get::<_, i32>(9)? != 0,
             })
         };
+
+        let cols = "artifact_id, request_id, occurred_at, kind, media_kind, checksum, bytes, \
+                    version, redacted, truncated";
 
         if let Some(cursor_str) = after_cursor {
             let (ts, id) = decode_cursor(cursor_str)?;
 
             // Fetch exactly `limit` rows with cursor boundary.
             let sql = format!(
-                "SELECT artifact_id, request_id, occurred_at, kind FROM artifact_pointers \
+                "SELECT {} FROM artifact_pointers \
                  WHERE (occurred_at, artifact_id) < (?, ?) ORDER BY occurred_at DESC, artifact_id DESC LIMIT {}",
-                limit
+                cols, limit
             );
             let mut stmt = conn.prepare(&sql).map_err(LogStoreError::Sqlite)?;
 
@@ -618,9 +786,9 @@ impl LogStore {
         } else {
             // No cursor: fetch first page of exactly `limit` rows, then probe.
             let sql = format!(
-                "SELECT artifact_id, request_id, occurred_at, kind FROM artifact_pointers \
+                "SELECT {} FROM artifact_pointers \
                  ORDER BY occurred_at DESC, artifact_id DESC LIMIT {}",
-                limit
+                cols, limit
             );
             let mut stmt = conn.prepare(&sql).map_err(LogStoreError::Sqlite)?;
 
@@ -779,12 +947,20 @@ impl LogStore {
     // ════════════════════════════
 
     /// Single-transaction cascade cleanup before a cutoff timestamp.
-    pub fn cascade_cleanup_before(&self, cutoff_occurred_at: &str) -> Result<i64, LogStoreError> {
+    /// Returns (total_deleted_count, artifact_ids_to_delete_from_disk).
+    pub fn cascade_cleanup_before(
+        &self,
+        cutoff_occurred_at: &str,
+    ) -> Result<(i64, Vec<String>), LogStoreError> {
         self.txn(|tx| {
             let mut total = 0i64;
 
-            // Delete child rows by occurred_at cutoff.
-            for table in ["lifecycle_events", "artifact_pointers", "proxy_records"] {
+            // Collect artifact IDs before deleting rows (for file cleanup post-txn).
+            let artifact_ids = Self::cascade_cleanup_artifact_rows_inner(tx, cutoff_occurred_at)?;
+            total += artifact_ids.len() as i64;
+
+            // Delete other child tables by occurred_at cutoff.
+            for table in ["lifecycle_events", "proxy_records"] {
                 let n: usize = tx
                     .execute(
                         &format!("DELETE FROM {} WHERE occurred_at < ?", table),
@@ -805,8 +981,33 @@ impl LogStore {
                 .map_err(LogStoreError::Sqlite)?;
             total += orphans as i64;
 
-            Ok(total) as Result<i64, LogStoreError>
+            Ok((total, artifact_ids)) as Result<(i64, Vec<String>), LogStoreError>
         })
+    }
+
+    fn cascade_cleanup_artifact_rows_inner(
+        tx: &Transaction,
+        cutoff_occurred_at: &str,
+    ) -> Result<Vec<String>, LogStoreError> {
+        let mut stmt = tx
+            .prepare("SELECT artifact_id FROM artifact_pointers WHERE occurred_at < ?")
+            .map_err(LogStoreError::Sqlite)?;
+
+        let ids: Vec<String> = stmt
+            .query_map(rusqlite::params![cutoff_occurred_at], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(LogStoreError::Sqlite)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| LogStoreError::QueryFailed(e.to_string()))?;
+
+        tx.execute(
+            "DELETE FROM artifact_pointers WHERE occurred_at < ?",
+            rusqlite::params![cutoff_occurred_at],
+        )
+        .map_err(LogStoreError::Sqlite)?;
+
+        Ok(ids)
     }
 
     // ════════════════════════════
@@ -834,6 +1035,36 @@ impl LogStore {
             }
         }
         Ok(items)
+    }
+
+    // ════════════════════════════
+    //  Artifact Pointer Status Updates
+    // ════════════════════════════
+
+    /// Mark an artifact pointer as missing (file gone from disk).
+    pub fn update_artifact_pointer_missing(
+        &self,
+        artifact_id: &str,
+    ) -> Result<usize, LogStoreError> {
+        let conn = self.conn();
+        conn.execute(
+            "UPDATE artifact_pointers SET missing = 1 WHERE artifact_id = ?",
+            rusqlite::params![artifact_id],
+        )
+        .map_err(LogStoreError::Sqlite)
+    }
+
+    /// Mark an artifact pointer as corrupt (checksum mismatch).
+    pub fn update_artifact_pointer_corrupt(
+        &self,
+        artifact_id: &str,
+    ) -> Result<usize, LogStoreError> {
+        let conn = self.conn();
+        conn.execute(
+            "UPDATE artifact_pointers SET corrupt = 1 WHERE artifact_id = ?",
+            rusqlite::params![artifact_id],
+        )
+        .map_err(LogStoreError::Sqlite)
     }
 
     // ════════════════════════════

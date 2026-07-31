@@ -46,7 +46,7 @@ fn open_store() -> (LogStore, Arc<dyn ClockTrait>, tempfile::TempDir) {
 #[test]
 fn fresh_db_migrates_to_latest() {
     let (store, _, _tmp) = open_store();
-    assert_eq!(store.schema_version(), 1);
+    assert_eq!(store.schema_version(), 2);
 }
 
 #[test]
@@ -77,7 +77,7 @@ fn reopen_preserves_data_and_skips_migrations() {
         (s, clock.clone(), tmp)
     };
 
-    assert_eq!(store2.schema_version(), 1);
+    assert_eq!(store2.schema_version(), 2);
     let row = store2
         .get_summary("s-001")
         .unwrap()
@@ -92,7 +92,7 @@ fn migrations_are_idempotent_on_reopen() {
 
     for _ in 0..3 {
         let s = LogStore::open(tmp.path(), clock.clone()).expect("open");
-        assert_eq!(s.schema_version(), 1);
+        assert_eq!(s.schema_version(), 2);
         drop(s);
     }
 }
