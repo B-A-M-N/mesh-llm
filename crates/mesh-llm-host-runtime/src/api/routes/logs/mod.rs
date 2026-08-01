@@ -3,6 +3,7 @@ mod error;
 mod parse;
 mod related;
 mod requests;
+mod websocket;
 
 use std::sync::Arc;
 
@@ -23,6 +24,9 @@ pub(super) async fn handle(
     state: &MeshApi,
     request: LogsRequest<'_>,
 ) -> anyhow::Result<()> {
+    if request.path.split('?').next() == Some(WEBSOCKET_PATH) {
+        return websocket::handle(stream, state, request).await;
+    }
     if request.method != "GET" || !request.body.is_empty() {
         return LogsError::MethodNotAllowed.write(stream).await;
     }

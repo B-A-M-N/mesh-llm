@@ -336,12 +336,27 @@ fn finalize_forwarded_request(
     let method = req.method.unwrap_or("GET");
     let path = rewritten_path.unwrap_or_else(|| req.path.unwrap_or("/"));
     let version = req.version.unwrap_or(1);
+    let websocket_upgrade = method == "GET"
+        && path == "/api/logs/stream"
+        && req.headers.iter().any(|header| {
+            header.name.eq_ignore_ascii_case("upgrade")
+                && std::str::from_utf8(header.value)
+                    .is_ok_and(|value| value.eq_ignore_ascii_case("websocket"))
+        })
+        && req.headers.iter().any(|header| {
+            header.name.eq_ignore_ascii_case("connection")
+                && std::str::from_utf8(header.value).is_ok_and(|value| {
+                    value
+                        .split(',')
+                        .any(|token| token.trim().eq_ignore_ascii_case("upgrade"))
+                })
+        });
 
     let mut rebuilt = format!("{method} {path} HTTP/1.{version}\r\n");
 
     for header in req.headers.iter() {
         let name = header.name;
-        if name.eq_ignore_ascii_case("connection") {
+        if !websocket_upgrade && name.eq_ignore_ascii_case("connection") {
             continue;
         }
         if strip_expect && name.eq_ignore_ascii_case("expect") {
@@ -360,9 +375,13 @@ fn finalize_forwarded_request(
         rebuilt.push_str(&format!("Content-Length: {}\r\n", body.len()));
     }
 
-    // The proxy buffers exactly one request for routing, so force a single-request
-    // connection contract upstream instead of reusing the client connection blindly.
-    rebuilt.push_str("Connection: close\r\n\r\n");
+    if websocket_upgrade {
+        rebuilt.push_str("\r\n");
+    } else {
+        // The proxy buffers exactly one request for routing, so force a single-request
+        // connection contract upstream instead of reusing the client connection blindly.
+        rebuilt.push_str("Connection: close\r\n\r\n");
+    }
 
     let mut forwarded = rebuilt.into_bytes();
     forwarded.extend_from_slice(rewritten_body.unwrap_or(&original_body));
