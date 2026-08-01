@@ -755,8 +755,7 @@ impl ArtifactFileStore {
         &self.root
     }
 
-    /// Get the LogStore reference (for test access).
-    #[cfg(test)]
+    /// Get the LogStore reference for repository operations (production sinks, tests).
     pub fn store_ref(&self) -> &LogStore {
         &self.store
     }

@@ -9,6 +9,7 @@
 mod bus;
 pub mod foundation;
 mod lifecycle;
+mod persistence;
 pub mod policy;
 mod registry;
 mod sequences;
@@ -24,3 +25,5 @@ pub use registry::{RegistryConfig, RequestRegistry, RequestSummaryEntry};
 pub use sequences::SequenceGenerators;
 pub use service::{Clock, LoggingService, PersistSink, ServiceConfig, SystemClock};
 pub use writer::{FailOpenWriter, RecursionGuard};
+
+pub use persistence::StoreBackedSink;
