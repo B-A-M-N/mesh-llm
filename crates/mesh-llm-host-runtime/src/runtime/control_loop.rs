@@ -297,6 +297,11 @@ pub(super) async fn run_auto_runtime_loop_and_shutdown(ctx: RunAutoRuntimeLifecy
             .await;
     }
 
+    // Shutdown logging service (bounded drain of pending events).
+    if let Some(logging_service) = runtime_state.logging_service.take() {
+        let _ = logging_service.shutdown().await;
+    }
+
     shutdown_run_auto_runtime(RunAutoShutdownContext {
         options,
         node,
