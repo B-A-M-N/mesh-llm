@@ -224,7 +224,7 @@ fn make_service() -> LoggingService {
             max_recent: 100,
         },
     };
-    LoggingService::new(config, sink, clock)
+    LoggingService::new(config, sink, None, clock)
 }
 
 // ---------------------------------------------------------------------------
@@ -509,6 +509,7 @@ fn test_no_registry_leak() {
     let svc = LoggingService::new(
         config.clone(),
         Arc::new(TestSink::new()),
+        None,
         Box::new(TestClock::new()),
     );
 
@@ -547,6 +548,7 @@ fn test_registry_eviction_counters_increment() {
     let svc = LoggingService::new(
         config.clone(),
         Arc::new(TestSink::new()),
+        None,
         Box::new(TestClock::new()),
     );
 
@@ -610,6 +612,7 @@ fn test_spawn_then_shutdown() {
         let svc = Arc::new(std::sync::Mutex::new(LoggingService::new(
             ServiceConfig::default(),
             sink,
+            None,
             Box::<SystemClock>::default(),
         )));
 
@@ -669,6 +672,7 @@ fn test_restart_safe_shutdown() {
             let svc1 = Arc::new(std::sync::Mutex::new(LoggingService::new(
                 config.clone(),
                 sink.clone(),
+                None,
                 Box::<SystemClock>::default(),
             )));
 
@@ -693,7 +697,7 @@ fn test_restart_safe_shutdown() {
         } // Drop the service — worker task should clean up.
 
         // Re-create a new service (restart-safe: old one dropped).
-        let svc2 = LoggingService::new(config, sink, Box::<SystemClock>::default());
+        let svc2 = LoggingService::new(config, sink, None, Box::<SystemClock>::default());
         assert!(!svc2.is_spawned(), "fresh service should not be spawned");
     });
 }
@@ -712,6 +716,7 @@ fn test_request_path_completion_despite_full_queue() {
     let svc = LoggingService::new(
         config,
         Arc::new(TestSink::new()),
+        None,
         Box::new(TestClock::new()),
     );
 
@@ -759,6 +764,7 @@ async fn test_request_path_completion_despite_sink_failure() {
     let svc = LoggingService::new(
         ServiceConfig::default(),
         sink.clone(),
+        None,
         Box::new(TestClock::new()),
     );
 
@@ -789,7 +795,12 @@ fn test_writer_fail_open_no_panic_on_sink_error() {
     let sink = Arc::new(TestSink::new());
     sink.set_failing();
 
-    let svc = LoggingService::new(ServiceConfig::default(), sink, Box::new(TestClock::new()));
+    let svc = LoggingService::new(
+        ServiceConfig::default(),
+        sink,
+        None,
+        Box::new(TestClock::new()),
+    );
 
     // Error audit write should not panic even when the underlying operations fail.
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
