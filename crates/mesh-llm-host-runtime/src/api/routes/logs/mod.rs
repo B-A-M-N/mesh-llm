@@ -3,6 +3,7 @@ mod error;
 mod parse;
 mod related;
 mod requests;
+mod websocket;
 
 use std::sync::Arc;
 
