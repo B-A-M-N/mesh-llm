@@ -36,6 +36,20 @@ pub(super) const DISPATCH_REQUEST: DispatchRequestFn =
     |stream, state, method, path, path_only, body, req, raw_request| {
         Box::pin(async move {
             match (method, path_only) {
+                (method, route_path) if logs::is_route(route_path) => {
+                    logs::handle(
+                        stream,
+                        state,
+                        logs::LogsRequest {
+                            method,
+                            path,
+                            body,
+                            raw_request,
+                        },
+                    )
+                    .await?;
+                    Ok(true)
+                }
                 ("GET", "/api/discover") => {
                     discover::handle(stream, state).await?;
                     Ok(true)

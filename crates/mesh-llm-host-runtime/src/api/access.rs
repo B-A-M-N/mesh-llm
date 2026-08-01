@@ -3,6 +3,8 @@ use std::net::{IpAddr, SocketAddr};
 pub(crate) fn requires_trusted_local_access(method: &str, path: &str) -> bool {
     if path == "/mcp"
         || path.starts_with("/api/plugins")
+        || path.starts_with("/api/logs")
+        || path.starts_with("/proxy-log")
         || (method == "POST"
             && (path == "/mesh/hook"
                 || path == "/api/objects"
@@ -198,6 +200,23 @@ mod tests {
     fn malformed_security_header_is_rejected() {
         let request = b"POST /mcp HTTP/1.1\r\nHost: localhost\r\nOrigin: https://local\xff\r\n\r\n";
         assert_eq!(request_origin(request), Err(()));
+    }
+
+    #[test]
+    fn log_query_routes_require_trusted_local_access() {
+        for (method, path) in [
+            ("GET", "/api/logs/requests"),
+            ("GET", "/api/logs/requests/some-id-123"),
+            ("GET", "/api/logs/requests/some-id-456/events"),
+            ("GET", "/api/logs/requests/some-id-789/artifacts"),
+            ("GET", "/api/logs/artifacts/artifact-uuid-here"),
+            ("GET", "/api/logs/proxy"),
+        ] {
+            assert!(
+                requires_trusted_local_access(method, path),
+                "{method} {path} must be local-only"
+            );
+        }
     }
 
     #[test]
