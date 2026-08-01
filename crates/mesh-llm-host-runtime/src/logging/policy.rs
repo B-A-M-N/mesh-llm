@@ -633,14 +633,11 @@ mod redaction_corpus_tests {
 
     #[test]
     fn path_sanitization_hides_home_dir() {
-        use std::env;
-        let test_path = "/Users/testuser/some/deep/path/file.log";
-        unsafe {
-            env::set_var("HOME", "/Users/testuser");
-        }
-        let sanitized = sanitize_path(std::path::Path::new(test_path));
+        let home = dirs::home_dir().expect("test runner has a home directory");
+        let test_path = home.join("some/deep/path/file.log");
+        let sanitized = sanitize_path(&test_path);
         assert!(sanitized.starts_with("~/"));
-        assert!(!sanitized.contains("/Users/testuser/"));
+        assert!(!sanitized.contains(&home.display().to_string()));
     }
 
     #[test]
@@ -653,12 +650,9 @@ mod redaction_corpus_tests {
 
     #[test]
     fn sanitize_paths_in_text_replaces_home() {
-        use std::env;
-        unsafe {
-            env::set_var("HOME", "/Users/testuser");
-        }
-        let text = "Error in /Users/testuser/mesh-llm/logs/app.log";
-        let sanitized = sanitize_paths_in_text(text);
+        let home = dirs::home_dir().expect("test runner has a home directory");
+        let text = format!("Error in {}", home.join("mesh-llm/logs/app.log").display());
+        let sanitized = sanitize_paths_in_text(&text);
         assert!(sanitized.contains("~/mesh-llm"));
     }
 
@@ -783,14 +777,13 @@ mod redaction_corpus_tests {
         let policy = build_policy(&config);
 
         // Test the full pipeline: path sanitization + credential redaction.
-        use std::env;
-        unsafe {
-            env::set_var("HOME", "/Users/testuser");
-        }
-
-        let input = "Error in /Users/testuser/data with token Bearer secret123";
-        let sanitized = policy.sanitize_value(input);
+        let home = dirs::home_dir().expect("test runner has a home directory");
+        let input = format!(
+            "Error in {} with token Bearer secret123",
+            home.join("data").display()
+        );
+        let sanitized = policy.sanitize_value(&input);
         // Path sanitization replaces HOME prefix. Full redaction may or may not trigger depending on content.
-        assert!(!sanitized.contains("/Users/testuser"));
+        assert!(!sanitized.contains(&home.display().to_string()));
     }
 }
