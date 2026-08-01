@@ -398,6 +398,7 @@ unpublished_registry_deps() {
                 mesh-llm-events \
                 mesh-llm-guardrails \
                 mesh-llm-identity \
+                mesh-llm-log-store \
                 mesh-llm-native-runtime \
                 mesh-llm-node \
                 mesh-llm-plugin \
@@ -482,6 +483,7 @@ publish_crates=(
     mesh-llm-client
     mesh-llm-api-client
     mesh-llm-events
+    mesh-llm-log-store
     mesh-llm-build-info
     mesh-llm-release-footer
     mesh-llm-config
