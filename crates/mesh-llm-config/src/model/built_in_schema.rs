@@ -1411,7 +1411,11 @@ mod tests {
         ] {
             let setting = schema_setting(path);
 
-            assert_eq!(setting.control_surfaces, vec![ConfigControlSurface::ConfigFile], "{path}");
+            assert_eq!(
+                setting.control_surfaces,
+                vec![ConfigControlSurface::ConfigFile],
+                "{path}"
+            );
             assert_eq!(setting.apply_mode, ConfigApplyMode::DynamicApply, "{path}");
             assert_eq!(setting.restart_scope, ConfigRestartScope::None, "{path}");
         }
@@ -1434,7 +1438,11 @@ mod tests {
         ] {
             let setting = schema_setting(path);
 
-            assert_eq!(setting.control_surfaces, vec![ConfigControlSurface::ConfigFile], "{path}");
+            assert_eq!(
+                setting.control_surfaces,
+                vec![ConfigControlSurface::ConfigFile],
+                "{path}"
+            );
             assert_eq!(setting.apply_mode, ConfigApplyMode::StaticOnLoad, "{path}");
             assert_eq!(
                 setting.restart_scope,
