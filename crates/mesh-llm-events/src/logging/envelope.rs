@@ -108,7 +108,10 @@ mod tests {
             ReplayChannel::Requests,
             0,
             "2025-01-01T00:00:00Z".into(),
-            LifecycleEvent::Admitted { model: None, method: None },
+            LifecycleEvent::Admitted {
+                model: None,
+                method: None,
+            },
         );
 
         assert_eq!(env.schema_version, SCHEMA_VERSION);
@@ -123,7 +126,10 @@ mod tests {
             ReplayChannel::Operations,
             1,
             "2025-06-15T12:30:00Z".into(),
-            LifecycleEvent::Completed { status_code: Some(200), duration_ms: None },
+            LifecycleEvent::Completed {
+                status_code: Some(200),
+                duration_ms: None,
+            },
         )
         .with_tenant("t-abc".into())
         .with_account("a-def".into());
@@ -140,7 +146,9 @@ mod tests {
             ReplayChannel::System,
             42,
             "2025-07-01T10:00:00Z".into(),
-            LifecycleEvent::Failed { error: "timeout".into() },
+            LifecycleEvent::Failed {
+                error: "timeout".into(),
+            },
         );
 
         let json = serde_json::to_string(&env).unwrap();
@@ -156,7 +164,10 @@ mod tests {
             ReplayChannel::Requests,
             0,
             "2025-01-01T00:00:00Z".into(),
-            LifecycleEvent::Admitted { model: None, method: None },
+            LifecycleEvent::Admitted {
+                model: None,
+                method: None,
+            },
         );
 
         let json = serde_json::to_string(&env).unwrap();
@@ -174,7 +185,10 @@ mod tests {
             ReplayChannel::Requests,
             0,
             "2025-01-01T00:00:00Z".into(),
-            LifecycleEvent::Admitted { model: None, method: None },
+            LifecycleEvent::Admitted {
+                model: None,
+                method: None,
+            },
         )
         .with_user("u-xyz".into())
         .with_role("admin".into());

@@ -44,7 +44,12 @@ pub struct LifecycleTransitionError {
 
 impl fmt::Display for LifecycleTransitionError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "invalid transition {} → {}", self.from.as_str(), self.to.as_str())
+        write!(
+            f,
+            "invalid transition {} → {}",
+            self.from.as_str(),
+            self.to.as_str()
+        )
     }
 }
 
@@ -82,7 +87,10 @@ impl LifecycleGuard {
     /// - Attempting the same non-terminal transition twice where idempotency does not apply.
     ///
     /// Note: transitioning from `Active` → `Active` is allowed (idempotent no-op).
-    pub fn transition(&mut self, new_state: LifecycleState) -> Result<(), LifecycleTransitionError> {
+    pub fn transition(
+        &mut self,
+        new_state: LifecycleState,
+    ) -> Result<(), LifecycleTransitionError> {
         // Allow idempotent non-terminal transitions (e.g., Active → Active)
         if self.current == new_state && !self.current.is_terminal() {
             return Ok(());
@@ -90,7 +98,10 @@ impl LifecycleGuard {
 
         // Reject any transition once terminal
         if self.current.is_terminal() {
-            return Err(LifecycleTransitionError { from: self.current, to: new_state });
+            return Err(LifecycleTransitionError {
+                from: self.current,
+                to: new_state,
+            });
         }
 
         self.current = new_state;
@@ -135,8 +146,12 @@ mod tests {
 
     #[test]
     fn test_terminal_states_are_terminal() {
-        for state in [LifecycleState::Completed, LifecycleState::Failed,
-                      LifecycleState::Rejected, LifecycleState::Cancelled] {
+        for state in [
+            LifecycleState::Completed,
+            LifecycleState::Failed,
+            LifecycleState::Rejected,
+            LifecycleState::Cancelled,
+        ] {
             assert!(state.is_terminal(), "{:?} should be terminal", state);
         }
         assert!(!LifecycleState::Active.is_terminal());
@@ -144,16 +159,27 @@ mod tests {
 
     #[test]
     fn test_active_to_all_terminals_work() {
-        for target in [LifecycleState::Completed, LifecycleState::Failed,
-                       LifecycleState::Rejected, LifecycleState::Cancelled] {
+        for target in [
+            LifecycleState::Completed,
+            LifecycleState::Failed,
+            LifecycleState::Rejected,
+            LifecycleState::Cancelled,
+        ] {
             let mut guard = LifecycleGuard::active();
-            assert!(guard.transition(target).is_ok(), "Active→{:?} should work", target);
+            assert!(
+                guard.transition(target).is_ok(),
+                "Active→{:?} should work",
+                target
+            );
         }
     }
 
     #[test]
     fn test_lifecycle_transition_error_display() {
-        let err = LifecycleTransitionError { from: LifecycleState::Completed, to: LifecycleState::Failed };
+        let err = LifecycleTransitionError {
+            from: LifecycleState::Completed,
+            to: LifecycleState::Failed,
+        };
         let msg = format!("{}", err);
         assert!(msg.contains("completed"));
         assert!(msg.contains("failed"));

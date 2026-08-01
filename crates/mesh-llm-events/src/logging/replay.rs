@@ -25,7 +25,10 @@ impl ReplaySequence {
     /// Create a new sequence entry for the given channel.
     #[allow(dead_code)]
     pub fn next(channel: ReplayChannel, seq: u64) -> Self {
-        Self { channel, sequence: seq }
+        Self {
+            channel,
+            sequence: seq,
+        }
     }
 }
 
@@ -44,7 +47,10 @@ mod tests {
 
     #[test]
     fn test_sequence_roundtrip() {
-        let seq = ReplaySequence { channel: ReplayChannel::Operations, sequence: 42 };
+        let seq = ReplaySequence {
+            channel: ReplayChannel::Operations,
+            sequence: 42,
+        };
         let json = serde_json::to_string(&seq).unwrap();
         let parsed: ReplaySequence = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.channel, ReplayChannel::Operations);
@@ -53,7 +59,11 @@ mod tests {
 
     #[test]
     fn test_all_channel_variants() {
-        for ch in [ReplayChannel::Requests, ReplayChannel::Operations, ReplayChannel::System] {
+        for ch in [
+            ReplayChannel::Requests,
+            ReplayChannel::Operations,
+            ReplayChannel::System,
+        ] {
             let json = serde_json::to_string(&ch).unwrap();
             let parsed: ReplayChannel = serde_json::from_str(&json).unwrap();
             assert_eq!(parsed, ch);

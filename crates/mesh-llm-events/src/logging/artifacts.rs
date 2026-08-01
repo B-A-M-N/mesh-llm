@@ -122,8 +122,8 @@ mod tests {
 
     #[test]
     fn test_artifact_serde_roundtrip() {
-        let meta = ArtifactMetadata::new(ArtifactKind::Trace, 1024)
-            .with_checksum("sha256-abc".into());
+        let meta =
+            ArtifactMetadata::new(ArtifactKind::Trace, 1024).with_checksum("sha256-abc".into());
 
         let json = serde_json::to_string(&meta).unwrap();
         assert!(json.contains("\"kind\":\"trace\""));
@@ -158,8 +158,13 @@ mod tests {
 
     #[test]
     fn test_all_kinds_serialize() {
-        for kind in [ArtifactKind::Request, ArtifactKind::Response, ArtifactKind::Trace,
-                      ArtifactKind::Chunk, ArtifactKind::Error] {
+        for kind in [
+            ArtifactKind::Request,
+            ArtifactKind::Response,
+            ArtifactKind::Trace,
+            ArtifactKind::Chunk,
+            ArtifactKind::Error,
+        ] {
             let meta = ArtifactMetadata::new(kind, 1);
             let json = serde_json::to_string(&meta).unwrap();
             assert!(json.contains("\"kind\":"));
@@ -187,8 +192,7 @@ mod tests {
 
     #[test]
     fn test_artifact_clone() {
-        let a = ArtifactMetadata::new(ArtifactKind::Request, 42)
-            .with_checksum("abc".into());
+        let a = ArtifactMetadata::new(ArtifactKind::Request, 42).with_checksum("abc".into());
 
         let b = a.clone();
         assert_eq!(b.bytes, 42);
