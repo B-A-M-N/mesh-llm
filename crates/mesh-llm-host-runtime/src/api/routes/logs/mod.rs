@@ -17,11 +17,16 @@ pub(super) fn is_route(path: &str) -> bool {
     path == "/api/logs" || path.starts_with("/api/logs/")
 }
 
+pub(super) const WEBSOCKET_PATH: &str = "/api/logs/stream";
+
 pub(super) async fn handle(
     stream: &mut TcpStream,
     state: &MeshApi,
     request: LogsRequest<'_>,
 ) -> anyhow::Result<()> {
+    if request.path.split('?').next() == Some(WEBSOCKET_PATH) {
+        return websocket::handle(stream, state, request).await;
+    }
     if request.method != "GET" || !request.body.is_empty() {
         return LogsError::MethodNotAllowed.write(stream).await;
     }
@@ -44,7 +49,9 @@ pub(super) async fn handle(
             )
             .await
         }
-        Route::Artifact(artifact_id) => related::artifact_content(stream, state, &artifact_id).await,
+        Route::Artifact(artifact_id) => {
+            related::artifact_content(stream, state, &artifact_id).await
+        }
         Route::Proxy => related::proxy(stream, state, request.path).await,
         Route::Unknown => Err(LogsError::NotFound),
     };
