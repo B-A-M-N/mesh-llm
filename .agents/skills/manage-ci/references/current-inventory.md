@@ -205,7 +205,7 @@ Local actions:
 
 Routing and test-planning scripts:
 
-- `scripts/affected-crates.sh` computes affected crates and reverse dependents.
+- `scripts/affected-crates.sh` computes affected crates and reverse dependents; its fail-open workspace list includes `mesh-llm-log-store`.
 - `scripts/plan-pr-build-jobs.py` maps PR change signals to the single ordered
   top-level job plan consumed by both conditional PR Builds jobs and its stable
   summary gate.

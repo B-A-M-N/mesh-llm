@@ -302,6 +302,8 @@ flowchart TD
 - Pull requests test affected crates plus their reverse dependents. Main pushes
   and manual dispatches assign every Cargo workspace member to the matrix, so a
   targeted-routing mistake cannot permanently hide a crate suite.
+- The affected-crate fail-open list includes `mesh-llm-log-store`, so SQLite
+  logging-store changes route its own suite and reverse dependents.
 - `rust_changed` is not an artifact-build signal. Rust tooling changes such as
   `tools/xtask/**` still run PR Quality formatting/clippy, but PR Builds only
   builds `mesh-llm` artifacts when `inference_artifact_required` is true: a
