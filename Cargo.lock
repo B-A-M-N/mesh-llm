@@ -3953,6 +3953,7 @@ dependencies = [
  "mesh-llm-guardrails",
  "mesh-llm-hf-hub",
  "mesh-llm-identity",
+ "mesh-llm-log-store",
  "mesh-llm-native-runtime",
  "mesh-llm-node",
  "mesh-llm-plugin",
@@ -4006,6 +4007,7 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "urlencoding",
+ "uuid",
  "zeroize",
  "zip",
 ]

@@ -24,6 +24,7 @@ use super::{
 };
 use crate::api;
 use crate::inference::{election, skippy};
+use crate::logging::{LoggingService, ServiceConfig, StoreBackedSink, SystemClock};
 use crate::mesh::{self, NodeRole};
 use crate::models;
 use crate::network::{
@@ -42,6 +43,8 @@ use skippy_protocol::FlashAttentionType;
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
+
 use std::sync::{
     Arc,
     atomic::{AtomicBool, AtomicU16},
@@ -899,6 +902,9 @@ pub(super) struct RunAutoRuntimeState {
     pub(super) dashboard_context_usage: DashboardContextUsage,
     pub(super) input_handler_enabled: bool,
     pub(super) openai_guardrail_policy: OpenAiGuardrailPolicyHandle,
+
+    /// Logging service for persistence, cleanup, and lifecycle management.
+    pub(super) logging_service: Option<Arc<LoggingService>>,
 }
 
 pub(super) struct RunAutoStartupTasksContext<'a> {
@@ -945,6 +951,7 @@ pub(super) fn initialize_run_auto_runtime_state(options: &RuntimeOptions) -> Run
         openai_guardrail_policy: openai_guardrail_policy_handle(mesh_guardrail_mode_to_openai(
             options.mesh_guardrails,
         )),
+        logging_service: None,
     }
 }
 
@@ -1242,6 +1249,17 @@ pub(super) async fn run_auto(ctx: RunAutoContext) -> Result<()> {
         tokio::sync::mpsc::unbounded_channel::<RuntimeEvent>();
     let mut runtime_state = initialize_run_auto_runtime_state(&options);
 
+    // Initialize logging service with StoreBackedSink if logging foundation is healthy.
+    let logging_pair = create_logging_service().await;
+    runtime_state
+        .logging_service
+        .clone_from(&logging_pair.as_ref().map(|(s, _)| s.clone()));
+
+    // Spawn scheduled cleanup worker (hourly cascade + disk deletion).
+    if let Some((_, artifact_store)) = &logging_pair {
+        spawn_logging_cleanup_worker(Arc::clone(artifact_store));
+    }
+
     // Model intent channel: owner-control commands send intents here, control loop polls.
     let mut model_intent_rx = install_run_auto_model_intent_channel(node.clone()).await;
 
@@ -1367,4 +1385,74 @@ pub(super) async fn run_auto(ctx: RunAutoContext) -> Result<()> {
         anyhow::bail!("{summary}");
     }
     Ok(())
+}
+
+/// Create the logging service and return both the Arc'd service (for shutdown) and a clone of the artifact store for cleanup workers.
+async fn create_logging_service() -> Option<(
+    Arc<LoggingService>,
+    std::sync::Arc<mesh_llm_log_store::ArtifactFileStore>,
+)> {
+    let foundation = crate::logging_foundation()?;
+    if !foundation.is_healthy() {
+        return None;
+    }
+
+    let store_dir = foundation.store_dir().to_path_buf();
+    let artifact_dir = foundation.artifact_dir().to_path_buf();
+
+    match StoreBackedSink::open(store_dir, artifact_dir) {
+        Ok(sink) => {
+            // Keep a reference to the artifact store for startup recovery and cleanup.
+            let artifact_store: std::sync::Arc<mesh_llm_log_store::ArtifactFileStore> =
+                sink.artifact_store().clone();
+
+            // Run idempotent startup cleanup (orphan temps, unreferenced artifacts).
+            artifact_store.recover_startup();
+
+            let service = LoggingService::new(
+                ServiceConfig::default(),
+                Arc::new(sink),
+                Box::<SystemClock>::default(),
+            );
+
+            // Start persistence worker.
+            service.spawn();
+
+            Some((Arc::new(service), artifact_store))
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "Failed to create logging sink; logging disabled");
+            None
+        }
+    }
+}
+
+fn spawn_logging_cleanup_worker(
+    artifact_store: std::sync::Arc<mesh_llm_log_store::ArtifactFileStore>,
+) {
+    tokio::spawn(async move {
+        // Wait an initial offset before first cleanup to avoid startup burst.
+        tokio::time::sleep(Duration::from_secs(30)).await;
+
+        let mut interval = tokio::time::interval(Duration::from_secs(3600));
+        loop {
+            interval.tick().await;
+
+            // Access the log store through artifact_store for cleanup operations.
+            let cutoff = artifact_store.store_ref().now();
+
+            match artifact_store.store_ref().cascade_cleanup_before(&cutoff) {
+                Ok((deleted_count, artifact_ids)) => {
+                    if !artifact_ids.is_empty() {
+                        artifact_store.delete_artifact_files(&artifact_ids);
+                    }
+
+                    tracing::debug!(count = %deleted_count, artifacts_removed = artifact_ids.len(), "Scheduled logging cleanup completed");
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "Logging scheduled cleanup failed (will retry next cycle)");
+                }
+            }
+        }
+    });
 }
