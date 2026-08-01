@@ -63,6 +63,7 @@ async fn create_service_with_clock(
     let service = LoggingService::new(
         ServiceConfig::default(),
         Arc::new(sink),
+        Some(Arc::clone(&artifact_store)),
         Box::new(TestServiceClock(clock)),
     );
     Ok((Arc::new(tokio::sync::Mutex::new(service)), artifact_store))

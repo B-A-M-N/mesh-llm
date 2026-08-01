@@ -45,6 +45,21 @@ fn test_getters_return_clones_and_missing_is_none() {
 }
 
 #[test]
+fn snapshot_active_returns_only_active_clones() {
+    let registry = RequestRegistry::new(RegistryConfig::default());
+    let active = make_entry("active", 1);
+    let recent = make_entry("recent", 2);
+    registry.register_active(active);
+    registry.register_active(recent.clone());
+    registry.move_to_recent(recent);
+
+    let snapshot = registry.snapshot_active();
+
+    assert_eq!(snapshot.len(), 1);
+    assert_eq!(snapshot[0].request_id, "active");
+}
+
+#[test]
 fn test_active_eviction_when_over_capacity() {
     let registry = RequestRegistry::new(RegistryConfig {
         max_active: 3,

@@ -173,6 +173,8 @@ pub struct MeshApiConfig {
     pub(crate) affinity_router: affinity::AffinityRouter,
     pub(crate) runtime_data_collector: runtime_data::RuntimeDataCollector,
     pub(crate) runtime_data_producer: runtime_data::RuntimeDataProducer,
+    /// Optional logging service reference for log query API routes. None when logging is disabled.
+    pub(crate) logging_service: Option<std::sync::Arc<crate::logging::LoggingService>>,
 }
 
 impl MeshApi {
@@ -187,6 +189,7 @@ impl MeshApi {
             affinity_router,
             runtime_data_collector,
             runtime_data_producer,
+            logging_service,
         } = config;
 
         runtime_data_producer.publish_runtime_status(|runtime_status| {
@@ -262,6 +265,9 @@ impl MeshApi {
                 sse_clients: Vec::new(),
                 model_interests: std::collections::HashMap::new(),
                 wakeable_inventory: crate::runtime::wakeable::WakeableInventory::default(),
+                logging_service,
+                #[cfg(test)]
+                logging_query_accesses: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             })),
         }
     }
