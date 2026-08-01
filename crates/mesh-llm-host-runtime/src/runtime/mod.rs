@@ -16,6 +16,8 @@ mod local_split;
 mod model_lifecycle;
 pub(crate) mod model_reconciliation;
 mod options;
+#[cfg(test)]
+mod process_tests;
 mod proxy;
 mod publication;
 mod release_attestation;
