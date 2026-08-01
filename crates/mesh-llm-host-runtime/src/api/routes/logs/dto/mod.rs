@@ -1,5 +1,9 @@
+mod artifacts;
+mod events;
 mod requests;
 
+pub(super) use artifacts::{ArtifactDto, artifact_state};
+pub(super) use events::EventDto;
 pub(super) use requests::{PageDto, RequestDto};
 
 fn safe_metadata(value: &str) -> String {
