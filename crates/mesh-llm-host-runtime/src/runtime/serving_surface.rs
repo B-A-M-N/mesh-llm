@@ -866,6 +866,8 @@ pub(super) struct RunAutoConsoleStateContext<'a> {
     pub(super) affinity_router: &'a affinity::AffinityRouter,
     pub(super) control_tx: &'a tokio::sync::mpsc::UnboundedSender<api::RuntimeControlRequest>,
     pub(super) owner_key_path: &'a Option<PathBuf>,
+    pub(super) logging_service_ref:
+        std::sync::Arc<std::sync::Mutex<Option<Arc<crate::logging::LoggingService>>>>,
 }
 
 pub(super) struct RunAutoAdditionalModelsContext<'a> {
@@ -941,6 +943,7 @@ pub(super) async fn setup_run_auto_console_state(
         affinity_router: ctx.affinity_router.clone(),
         runtime_data_collector,
         runtime_data_producer,
+        logging_service: ctx.logging_service_ref.lock().unwrap().clone(),
     });
     console_state.set_primary_backend("skippy".into()).await;
     console_state
@@ -1443,6 +1446,7 @@ pub(super) async fn setup_passive_console_runtime(
         affinity_router: affinity_router.clone(),
         runtime_data_collector,
         runtime_data_producer,
+        logging_service: None,
     });
     console_state.set_runtime_control(control_tx.clone()).await;
     console_state
