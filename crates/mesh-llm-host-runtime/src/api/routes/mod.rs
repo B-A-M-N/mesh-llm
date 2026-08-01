@@ -2,6 +2,7 @@ mod chat;
 mod control_apply_diagnostics;
 mod diagnostics;
 mod discover;
+mod logs;
 mod mcp;
 mod mesh_hook;
 mod model_interests;
