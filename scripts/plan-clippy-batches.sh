@@ -17,11 +17,11 @@ WORKSPACE_MEMBERS=(
   "mesh-llm-commands"
   "mesh-llm-config"
   "mesh-llm-events"
+  "mesh-llm-log-store"
   "mesh-llm-gpu-bench"
   "mesh-llm-host-runtime"
   "mesh-llm-hardware-profile"
   "mesh-llm-identity"
-  "mesh-llm-log-store"
   "mesh-llm-native-runtime"
   "mesh-llm-protocol"
   "mesh-llm-release-footer"
@@ -137,7 +137,8 @@ weights = {
     "mesh-llm-build-info": 1,
     "mesh-llm-cli": 1,
     "mesh-llm-commands": 1,
-    "mesh-llm-events": 1,
+"mesh-llm-events": 1,
+"mesh-llm-log-store": 1,
     "mesh-llm-host-runtime": 8,
     "mesh-llm-client": 6,
     "mesh-llm-ffi": 5,
