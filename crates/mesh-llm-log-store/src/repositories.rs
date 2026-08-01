@@ -3,7 +3,6 @@
 use crate::cursor::{decode_cursor, encode_cursor};
 use crate::error::LogStoreError;
 use crate::store::LogStore;
-use rusqlite::Transaction;
 
 // ─── Row types returned by queries ──────────────────────
 
@@ -75,7 +74,7 @@ pub struct Page<T> {
 
 fn is_unique_constraint_error(e: &rusqlite::Error) -> bool {
     if let rusqlite::Error::SqliteFailure(err, _) = e {
-        err.code == rusqlite::ErrorCode::ConstraintViolation
+        matches!(err.extended_code, 1555 | 2067) // UNIQUE or PRIMARYKEY only; not FK (787).
     } else {
         false
     }
@@ -955,11 +954,7 @@ impl LogStore {
         self.txn(|tx| {
             let mut total = 0i64;
 
-            // Collect artifact IDs before deleting rows (for file cleanup post-txn).
-            let artifact_ids = Self::cascade_cleanup_artifact_rows_inner(tx, cutoff_occurred_at)?;
-            total += artifact_ids.len() as i64;
-
-            // Delete other child tables by occurred_at cutoff.
+            // Delete child rows by occurred_at cutoff.
             for table in ["lifecycle_events", "proxy_records"] {
                 let n: usize = tx
                     .execute(
@@ -970,12 +965,30 @@ impl LogStore {
                 total += n as i64;
             }
 
-            // Delete orphaned summaries: no remaining lifecycle_events AND created_at < cutoff.
+            // Collect artifact IDs for requests being orphaned by this pass:
+            // summaries with NO remaining lifecycle_events AND created before cutoff.
+            let mut stmt = tx
+                .prepare(
+                    "SELECT ap.artifact_id FROM artifact_pointers ap \
+                     WHERE ap.request_id IN ( \
+                         SELECT request_id FROM summaries \
+                         WHERE request_id NOT IN (SELECT DISTINCT request_id FROM lifecycle_events) \
+                           AND created_at < ?1 \
+                     )",
+                )
+                .map_err(LogStoreError::Sqlite)?;
+            let artifact_ids: Vec<String> = stmt
+                .query_map(rusqlite::params![cutoff_occurred_at], |row| row.get::<_, String>(0))
+                .map_err(LogStoreError::Sqlite)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| LogStoreError::QueryFailed(e.to_string()))?;
+
+            // Delete orphan summaries (FK CASCADE removes their artifact_pointer rows).
             let orphans: usize = tx
                 .execute(
                     "DELETE FROM summaries \
-                 WHERE request_id NOT IN (SELECT DISTINCT request_id FROM lifecycle_events) \
-                 AND created_at < ?",
+                     WHERE request_id NOT IN (SELECT DISTINCT request_id FROM lifecycle_events) \
+                       AND created_at < ?",
                     rusqlite::params![cutoff_occurred_at],
                 )
                 .map_err(LogStoreError::Sqlite)?;
@@ -983,31 +996,6 @@ impl LogStore {
 
             Ok((total, artifact_ids)) as Result<(i64, Vec<String>), LogStoreError>
         })
-    }
-
-    fn cascade_cleanup_artifact_rows_inner(
-        tx: &Transaction,
-        cutoff_occurred_at: &str,
-    ) -> Result<Vec<String>, LogStoreError> {
-        let mut stmt = tx
-            .prepare("SELECT artifact_id FROM artifact_pointers WHERE occurred_at < ?")
-            .map_err(LogStoreError::Sqlite)?;
-
-        let ids: Vec<String> = stmt
-            .query_map(rusqlite::params![cutoff_occurred_at], |row| {
-                row.get::<_, String>(0)
-            })
-            .map_err(LogStoreError::Sqlite)?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| LogStoreError::QueryFailed(e.to_string()))?;
-
-        tx.execute(
-            "DELETE FROM artifact_pointers WHERE occurred_at < ?",
-            rusqlite::params![cutoff_occurred_at],
-        )
-        .map_err(LogStoreError::Sqlite)?;
-
-        Ok(ids)
     }
 
     // ════════════════════════════
