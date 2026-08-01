@@ -1277,6 +1277,9 @@ pub(super) async fn run_auto(ctx: RunAutoContext) -> Result<()> {
         affinity_router: &affinity_router,
         control_tx: &control_tx,
         owner_key_path: &runtime_owner_key_path,
+        logging_service_ref: std::sync::Arc::new(std::sync::Mutex::new(
+            runtime_state.logging_service.clone(),
+        )),
     })
     .await?;
     publish_initial_openai_guardrails_status(
@@ -1412,6 +1415,7 @@ async fn create_logging_service() -> Option<(
             let service = LoggingService::new(
                 ServiceConfig::default(),
                 Arc::new(sink),
+                Some(Arc::clone(&artifact_store)),
                 Box::<SystemClock>::default(),
             );
 

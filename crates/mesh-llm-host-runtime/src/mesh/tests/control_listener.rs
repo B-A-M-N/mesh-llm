@@ -32,6 +32,7 @@ async fn build_mesh_api_for_control_tests(node: Node) -> api::MeshApi {
         affinity_router: affinity::AffinityRouter::default(),
         runtime_data_collector,
         runtime_data_producer,
+        logging_service: None,
     })
 }
 

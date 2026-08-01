@@ -228,4 +228,7 @@ pub(super) struct ApiInner {
     pub(super) sse_clients: Vec<tokio::sync::mpsc::UnboundedSender<String>>,
     pub(super) model_interests: HashMap<String, LocalModelInterest>,
     pub(super) wakeable_inventory: crate::runtime::wakeable::WakeableInventory,
+    pub(super) logging_service: Option<std::sync::Arc<crate::logging::LoggingService>>,
+    #[cfg(test)]
+    pub(super) logging_query_accesses: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }

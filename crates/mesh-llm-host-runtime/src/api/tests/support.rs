@@ -66,6 +66,7 @@ async fn build_test_mesh_api_with_api_port(api_port: u16) -> MeshApi {
         affinity_router: affinity::AffinityRouter::default(),
         runtime_data_collector,
         runtime_data_producer,
+            logging_service: None,
     })
 }
 
@@ -249,6 +250,7 @@ async fn build_test_mesh_api_with_plugin_manager(
         affinity_router: affinity::AffinityRouter::default(),
         runtime_data_collector,
         runtime_data_producer,
+            logging_service: None,
     })
 }
 

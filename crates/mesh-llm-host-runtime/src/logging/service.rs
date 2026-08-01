@@ -146,6 +146,9 @@ pub struct LoggingService {
     /// Persistence sink (LogStore in production; Vec-backed in tests).
     sink: Option<Arc<dyn PersistSink>>,
 
+    /// Durable log store reference for API query routes (set when using StoreBackedSink).
+    log_store_ref: Option<std::sync::Arc<mesh_llm_log_store::ArtifactFileStore>>,
+
     /// Clock provider for deterministic timestamps.
     clock: Box<dyn Clock>,
 
@@ -165,7 +168,12 @@ pub struct LoggingService {
 
 impl LoggingService {
     /// Create a new logging service with the given sink and clock. In production, `sink` is the real LogStore; in tests, it's a Vec-backed mock.
-    pub fn new(config: ServiceConfig, sink: Arc<dyn PersistSink>, clock: Box<dyn Clock>) -> Self {
+    pub fn new(
+        config: ServiceConfig,
+        sink: Arc<dyn PersistSink>,
+        log_store_ref: Option<std::sync::Arc<mesh_llm_log_store::ArtifactFileStore>>,
+        clock: Box<dyn Clock>,
+    ) -> Self {
         let bus = Arc::new(ReplayBus::new(config.queue_capacity));
 
         Self {
@@ -174,6 +182,7 @@ impl LoggingService {
             registry: Arc::new(RequestRegistry::new(config.registry_config.clone())),
             writer: Arc::new(FailOpenWriter::new()),
             sink: Some(sink),
+            log_store_ref,
             clock,
             worker_handle: TokioMutex::new(None),
             spawned: Arc::new(AtomicBool::new(false)),
@@ -192,6 +201,7 @@ impl LoggingService {
             registry: Arc::new(RequestRegistry::new(config.registry_config.clone())),
             writer: Arc::new(FailOpenWriter::new()),
             sink: None,
+            log_store_ref: None,
             clock: Box::<SystemClock>::default(),
             worker_handle: TokioMutex::new(None),
             spawned: Arc::new(AtomicBool::new(false)),
@@ -274,7 +284,7 @@ impl LoggingService {
         .to_string();
 
         // Nonblocking push — if full, bus applies drop-oldest internally. This never blocks the caller.
-        self.bus.push(entry_payload);
+        self.bus.push_replay(channel, sequence, entry_payload);
 
         Ok(())
     }
@@ -427,6 +437,19 @@ impl LoggingService {
     #[allow(dead_code)]
     pub fn writer_ref(&self) -> Arc<FailOpenWriter> {
         Arc::clone(&self.writer)
+    }
+
+    /// Access the durable artifact file store (containing LogStore + disk artifacts).
+    /// Returns None when using a disabled or test-only service without StoreBackedSink.
+    #[allow(dead_code)]
+    pub fn log_store_ref(&self) -> Option<std::sync::Arc<mesh_llm_log_store::ArtifactFileStore>> {
+        self.log_store_ref.clone()
+    }
+
+    /// Access the durable persistence sink (for write operations).
+    #[allow(dead_code)]
+    pub fn sink_ref(&self) -> Option<Arc<dyn PersistSink>> {
+        self.sink.clone()
     }
 }
 
