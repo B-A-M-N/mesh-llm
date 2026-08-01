@@ -1,7 +1,7 @@
-use mesh_llm_log_store::LogStoreError;
+use mesh_llm_log_store::{LogStoreError, QueryPage};
 use tokio::net::TcpStream;
 
-use super::dto::{ArtifactDto, EventDto, PageDto, artifact_state};
+use super::dto::{ArtifactDto, EventDto, PageDto, ProxyDto, artifact_state};
 use super::error::LogsError;
 use super::parse;
 use super::{run_blocking, service};
@@ -114,6 +114,37 @@ pub(super) async fn artifact_content(
         }
     })
     .await?;
+    respond_json(stream, 200, &response)
+        .await
+        .map_err(|_| LogsError::StoreUnavailable)
+}
+
+pub(super) async fn proxy(
+    stream: &mut TcpStream,
+    state: &MeshApi,
+    path: &str,
+) -> Result<(), LogsError> {
+    let query = parse::proxy_query(path)?;
+    let logging = service(state).await?;
+    let artifact_store = logging.log_store_ref().ok_or(LogsError::StoreUnavailable)?;
+    let page = run_blocking(move || {
+        artifact_store
+            .store_ref()
+            .query_proxy_records(&query)
+            .map_err(Into::into)
+    })
+    .await?;
+    respond_proxy_page(stream, page).await
+}
+
+async fn respond_proxy_page(
+    stream: &mut TcpStream,
+    page: QueryPage<mesh_llm_log_store::ProxyRecord>,
+) -> Result<(), LogsError> {
+    let response = PageDto {
+        items: page.items.into_iter().map(ProxyDto::from).collect(),
+        next_cursor: page.next_cursor,
+    };
     respond_json(stream, 200, &response)
         .await
         .map_err(|_| LogsError::StoreUnavailable)

@@ -44,6 +44,7 @@ pub(super) async fn handle(
             .await
         }
         Route::Artifact(artifact_id) => related::artifact_content(stream, state, &artifact_id).await,
+        Route::Proxy => related::proxy(stream, state, request.path).await,
         Route::Unknown => Err(LogsError::NotFound),
     };
     match result {
@@ -65,6 +66,7 @@ enum Route {
     RequestEvents(String),
     RequestArtifacts(String),
     Artifact(String),
+    Proxy,
     Unknown,
 }
 
@@ -72,6 +74,9 @@ fn classify(path: &str) -> Route {
     let path = path.split('?').next().unwrap_or(path);
     if path == "/api/logs/requests" {
         return Route::Requests;
+    }
+    if path == "/api/logs/proxy" {
+        return Route::Proxy;
     }
     if let Some(artifact_id) = path.strip_prefix("/api/logs/artifacts/") {
         return Route::Artifact(artifact_id.to_string());
