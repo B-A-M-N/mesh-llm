@@ -143,6 +143,15 @@ impl RequestRegistry {
             .cloned()
     }
 
+    pub fn snapshot_active(&self) -> Vec<RequestSummaryEntry> {
+        self.active
+            .lock()
+            .expect("registry mutex poisoned")
+            .values()
+            .cloned()
+            .collect()
+    }
+
     /// Clear both active and recent sets. Used for shutdown or test isolation.
     pub fn clear(&self) {
         let mut map = self.active.lock().expect("registry mutex poisoned");
