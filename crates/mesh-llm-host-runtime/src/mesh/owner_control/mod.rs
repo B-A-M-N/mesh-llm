@@ -810,6 +810,26 @@ impl Node {
                     },
                 )
             }
+            ApplyResult::AppliedWithRestartRequired {
+                revision,
+                hash,
+                diagnostics,
+            } => {
+                let _ = self.config_revision_tx.send(revision);
+                owner_control_response::apply_response_envelope(
+                    request_id,
+                    crate::proto::node::OwnerControlApplyConfigResponse {
+                        success: true,
+                        current_revision: revision,
+                        config_hash: hash.to_vec(),
+                        error: None,
+                        apply_mode: ConfigApplyMode::Staged as i32,
+                        diagnostics: owner_control_response::config_diagnostics_to_proto(
+                            &diagnostics,
+                        ),
+                    },
+                )
+            }
             ApplyResult::RevisionConflict { current_revision } => owner_control_error_envelope(
                 crate::proto::node::OwnerControlErrorCode::RevisionConflict,
                 Some(request_id),

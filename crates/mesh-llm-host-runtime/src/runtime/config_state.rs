@@ -1,5 +1,11 @@
 use anyhow::Result;
-use mesh_llm_config::{ConfigDiagnostic, ConfigDiagnosticSeverity, legacy_validation_error_text};
+use mesh_llm_config::{
+    ConfigDiagnostic, ConfigDiagnosticSeverity, ConfigPath, LoggingConfig,
+    built_in_config_schema_descriptor, legacy_validation_error_text,
+};
+
+// Disambiguate from the local proto-mirror ConfigApplyMode (Staged/Noop).
+use mesh_llm_config::ConfigApplyMode as SchemaApplyMode;
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
@@ -25,6 +31,11 @@ pub(crate) enum ApplyResult {
         revision: u64,
         hash: [u8; 32],
         apply_mode: ConfigApplyMode,
+        diagnostics: Vec<ConfigDiagnostic>,
+    },
+    AppliedWithRestartRequired {
+        revision: u64,
+        hash: [u8; 32],
         diagnostics: Vec<ConfigDiagnostic>,
     },
     RevisionConflict {
@@ -124,6 +135,66 @@ fn local_config_write_hash(config: &MeshConfig) -> [u8; 32] {
     let mut out = [0u8; 32];
     out.copy_from_slice(&digest);
     out
+}
+
+fn field_requires_restart(field_name: &str) -> bool {
+    let path = ConfigPath::from_fields(["logging", field_name]);
+    built_in_config_schema_descriptor(&path)
+        .is_some_and(|schema| schema.apply_mode != SchemaApplyMode::DynamicApply)
+}
+
+fn logging_changes_require_restart(old: &LoggingConfig, new: &LoggingConfig) -> bool {
+    if old.enabled != new.enabled {
+        return field_requires_restart("enabled");
+    }
+    if old.application_state_root != new.application_state_root {
+        return field_requires_restart("application_state_root");
+    }
+    if old.summary_line_limit != new.summary_line_limit {
+        return field_requires_restart("summary_line_limit");
+    }
+    if old.event_buffer_size != new.event_buffer_size {
+        return field_requires_restart("event_buffer_size");
+    }
+    // Dynamic fields: retention/replay limits apply atomically at runtime.
+    if old.retention_ttl_secs != new.retention_ttl_secs {
+        return field_requires_restart("retention_ttl_secs");
+    }
+    if old.replay_capacity != new.replay_capacity {
+        return field_requires_restart("replay_capacity");
+    }
+    if old.queue_capacity != new.queue_capacity {
+        return field_requires_restart("queue_capacity");
+    }
+    if old.artifact != new.artifact {
+        return field_requires_restart("artifact.capture_mode")
+            || field_requires_restart("artifact.byte_limit_bytes")
+            || field_requires_restart("artifact.aggregate_limit_bytes");
+    }
+    if old.export_limit_bytes != new.export_limit_bytes {
+        return field_requires_restart("export_limit_bytes");
+    }
+    if old.cleanup_cadence_secs != new.cleanup_cadence_secs {
+        return field_requires_restart("cleanup_cadence_secs");
+    }
+    // Webhook settings.
+    if old.webhook.enabled != new.webhook.enabled {
+        return field_requires_restart("webhook.enabled");
+    }
+    if old.webhook.url != new.webhook.url {
+        return field_requires_restart("webhook.url");
+    }
+    if old.webhook.max_attempts != new.webhook.max_attempts {
+        return field_requires_restart("webhook.max_attempts");
+    }
+    if old.webhook.timeout_secs != new.webhook.timeout_secs {
+        return field_requires_restart("webhook.timeout_secs");
+    }
+    if old.webhook.dead_letter_retention_secs != new.webhook.dead_letter_retention_secs {
+        return field_requires_restart("webhook.dead_letter_retention_secs");
+    }
+
+    false
 }
 
 impl Default for ConfigState {
@@ -229,16 +300,25 @@ impl ConfigState {
             };
         }
 
+        let old_logging = self.config.logging.clone();
         self.config = new_config;
         self.config_hash = new_hash;
         self.last_write_config_hash = new_write_hash;
         self.revision = new_revision;
 
-        ApplyResult::Applied {
-            revision: self.revision,
-            hash: self.config_hash,
-            apply_mode: ConfigApplyMode::Staged,
-            diagnostics,
+        if logging_changes_require_restart(&old_logging, &self.config.logging) {
+            ApplyResult::AppliedWithRestartRequired {
+                revision: self.revision,
+                hash: self.config_hash,
+                diagnostics,
+            }
+        } else {
+            ApplyResult::Applied {
+                revision: self.revision,
+                hash: self.config_hash,
+                apply_mode: ConfigApplyMode::Staged,
+                diagnostics,
+            }
         }
     }
 }
@@ -1415,6 +1495,81 @@ temperature = 0.2
                 assert_ne!(first_hash, hash, "request-default change must update hash");
             }
             other => panic!("expected Applied, got {other:?}"),
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn dynamic_logging_change_returns_applied() {
+        let dir = test_dir();
+        let config_path = dir.join("config.toml");
+        let mut state = ConfigState::load(&config_path).expect("load");
+
+        // Apply baseline config first.
+        let base_config = minimal_valid_config();
+        match state.apply(base_config.clone(), 0) {
+            ApplyResult::Applied {
+                revision,
+                apply_mode,
+                ..
+            } => {
+                assert_eq!(revision, 1);
+                assert_eq!(apply_mode, ConfigApplyMode::Staged);
+            }
+            other => panic!("expected Applied for baseline, got {other:?}"),
+        }
+
+        // When: change only retention_ttl_secs (DynamicApply field).
+        let mut changed = base_config;
+        changed.logging.retention_ttl_secs = 72 * 3600;
+
+        match state.apply(changed, 1) {
+            ApplyResult::Applied {
+                revision,
+                apply_mode,
+                ..
+            } => {
+                assert_eq!(revision, 2);
+                assert_eq!(apply_mode, ConfigApplyMode::Staged);
+            }
+            other => panic!("expected Applied for dynamic change, got {other:?}"),
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn non_dynamic_logging_change_returns_restart_required() {
+        let dir = test_dir();
+        let config_path = dir.join("config.toml");
+        let mut state = ConfigState::load(&config_path).expect("load");
+
+        // Apply baseline config first.
+        let base_config = minimal_valid_config();
+        match state.apply(base_config.clone(), 0) {
+            ApplyResult::Applied {
+                revision,
+                apply_mode,
+                ..
+            } => {
+                assert_eq!(revision, 1);
+                assert_eq!(apply_mode, ConfigApplyMode::Staged);
+            }
+            other => panic!("expected Applied for baseline, got {other:?}"),
+        }
+
+        // When: change only enabled (StaticOnLoad field).
+        let mut changed = base_config;
+        changed.logging.enabled = !changed.logging.enabled;
+
+        match state.apply(changed, 1) {
+            ApplyResult::AppliedWithRestartRequired { revision, .. } => {
+                assert_eq!(revision, 2);
+            }
+            other => {
+                panic!("expected AppliedWithRestartRequired for non-dynamic change, got {other:?}")
+            }
         }
 
         std::fs::remove_dir_all(&dir).ok();
