@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::{borrow::Cow, collections::VecDeque};
 
 use openai_frontend::{OpenAiError, OpenAiResult};
 use serde_json::json;
@@ -13,9 +13,27 @@ use crate::frontend::{
         EmbeddedStageZeroGeneration, GenerationCacheStats, LocalGeneration, PersistentStageLane,
         PersistentStageLanePool, PhaseTimer, StageOpenAiBackend, TokenControl,
     },
-    speculative::OpenAiSpeculativeStats,
+    speculative::{OpenAiSpeculativeStats, SpeculativeDecodeConfig},
     util::openai_io_error,
 };
+
+/// Keeps the configured speculative plan unless a distributed prefix restore
+/// has already populated every stage's session. Pure N-gram verification after
+/// that restore currently races the restored session lifecycle, so only the
+/// history-based N-gram pieces are suppressed for this request.
+pub(super) fn speculation_after_prefix_restore(
+    config: &SpeculativeDecodeConfig,
+    prefix_restored: bool,
+) -> Cow<'_, SpeculativeDecodeConfig> {
+    if !prefix_restored || config.ngram.is_none() {
+        return Cow::Borrowed(config);
+    }
+
+    let mut safe = config.clone();
+    safe.ngram = None;
+    safe.extension = None;
+    Cow::Owned(safe)
+}
 
 pub(super) struct PipelinedCompositeWindow {
     pub(super) epoch: u64,
@@ -100,6 +118,44 @@ pub(super) fn compose_target_predictions(
 pub(super) enum DirectPredictionReturnPath {
     UpstreamOpened,
     ReverseFallback,
+}
+
+pub(super) fn should_open_upstream_prediction_return(
+    native_mtp_enabled: bool,
+    standalone_ngram_pipelining: bool,
+) -> bool {
+    native_mtp_enabled || standalone_ngram_pipelining
+}
+
+pub(super) fn open_upstream_prediction_return(request: &EmbeddedStageZeroGeneration<'_>) -> bool {
+    let standalone_ngram_pipelining = !request.native_mtp_enabled
+        && request.speculative.ngram.is_some()
+        && request.draft.is_none()
+        && request.speculative.verify_window.pipeline_depth > 1;
+    if !should_open_upstream_prediction_return(
+        request.native_mtp_enabled,
+        standalone_ngram_pipelining,
+    ) {
+        return false;
+    }
+    let Some(prediction_return) = request.prediction_return.as_ref() else {
+        return false;
+    };
+    match crate::binary_transport::direct_return::open_downstream_prediction_return_stream(
+        request.config,
+        request.ids.request_id,
+        request.ids.session_id,
+        request.wire_dtype,
+    ) {
+        Ok(stream) => {
+            prediction_return.attach_opened_stream(stream);
+            true
+        }
+        Err(error) => {
+            eprintln!("direct prediction return upstream-opened sink unavailable: {error:#}");
+            false
+        }
+    }
 }
 
 pub(super) fn direct_prediction_return_path(
@@ -340,9 +396,15 @@ impl StageOpenAiBackend {
             // The generation error may be the downstream peer disappearing.
             // A graceful Stop/ACK exchange would then turn the bounded decode
             // failure into an unbounded teardown wait. Retire the suspect lane
-            // immediately; replacement uses its own bounded handshake.
+            // immediately; replacement uses its own bounded handshake. Drop
+            // the old stream before opening its replacement so the remote
+            // connection handler can reclaim the request's execution session
+            // before the replacement admits another request on a one-lane
+            // stage.
             self.drop_embedded_runtime_session(request, session_key);
-            lane_pool.replace_lane(lane.id);
+            let lane_id = lane.id;
+            drop(lane);
+            lane_pool.replace_lane(lane_id);
             return Ok(());
         }
 
@@ -372,7 +434,10 @@ impl StageOpenAiBackend {
         let stop_result = stop_result.map_err(openai_io_error);
         match &stop_result {
             Ok(_) => lane_pool.return_lane(lane),
-            Err(_) => lane_pool.replace_lane(lane_id),
+            Err(_) => {
+                drop(lane);
+                lane_pool.replace_lane(lane_id);
+            }
         }
         stop_result?;
         Ok(())
@@ -433,7 +498,45 @@ pub(super) fn decode_uses_context_sideband(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::frontend::NativeMtpHybridProposal;
+    use crate::frontend::{
+        NativeMtpHybridProposal,
+        speculative::{NgramProposalConfig, NgramProposerKind},
+    };
+
+    fn ngram_config() -> SpeculativeDecodeConfig {
+        SpeculativeDecodeConfig {
+            requested_strategy: "ngram".to_string(),
+            effective_strategy: "ngram-suffix".to_string(),
+            ngram: Some(NgramProposalConfig {
+                kind: NgramProposerKind::Suffix,
+                min_ngram: 2,
+                max_ngram: 16,
+                max_proposal_tokens: 4,
+            }),
+            ..SpeculativeDecodeConfig::default()
+        }
+    }
+
+    #[test]
+    fn restored_prefix_bypasses_history_ngram_for_that_request() {
+        let config = ngram_config();
+
+        let effective = speculation_after_prefix_restore(&config, true);
+
+        assert!(matches!(effective, Cow::Owned(_)));
+        assert!(effective.ngram.is_none());
+        assert!(config.ngram.is_some());
+    }
+
+    #[test]
+    fn cache_miss_preserves_configured_ngram() {
+        let config = ngram_config();
+
+        let effective = speculation_after_prefix_restore(&config, false);
+
+        assert!(matches!(effective, Cow::Borrowed(_)));
+        assert!(effective.ngram.is_some());
+    }
 
     #[test]
     fn direct_return_falls_back_only_with_a_registered_receiver() {
@@ -446,6 +549,13 @@ mod tests {
             direct_prediction_return_path(false, false, false).unwrap(),
             None
         );
+    }
+
+    #[test]
+    fn direct_return_opens_for_native_mtp_or_pipelined_ngram() {
+        assert!(!should_open_upstream_prediction_return(false, false));
+        assert!(should_open_upstream_prediction_return(true, false));
+        assert!(should_open_upstream_prediction_return(false, true));
     }
 
     #[test]

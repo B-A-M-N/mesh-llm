@@ -31,7 +31,7 @@ on:
         required: false
         default: "main"
       quant_preference:
-        description: "Comma-separated 4-bit quant preference"
+        description: "Comma-separated quant preference"
         required: false
         default: "UD-Q4_K_XL,UD-Q4_K_M,Q4_K_XL,Q4_K_M"
       split_candidate_vram_gib:
@@ -64,6 +64,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
 
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable 2026-07-16
 

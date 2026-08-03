@@ -126,6 +126,11 @@ pub const STAGE_RUNTIME_LLAMA_FAMILY_EXPECTATIONS: &[StageRuntimeFamilyExpectati
         recurrent_or_hybrid: false,
     },
     StageRuntimeFamilyExpectation {
+        llama_architecture: "inkling",
+        family_id: "inkling",
+        recurrent_or_hybrid: true,
+    },
+    StageRuntimeFamilyExpectation {
         llama_architecture: "internlm2",
         family_id: "internlm2",
         recurrent_or_hybrid: false,
@@ -144,6 +149,11 @@ pub const STAGE_RUNTIME_LLAMA_FAMILY_EXPECTATIONS: &[StageRuntimeFamilyExpectati
         llama_architecture: "jamba",
         family_id: "jamba",
         recurrent_or_hybrid: true,
+    },
+    StageRuntimeFamilyExpectation {
+        llama_architecture: "laguna",
+        family_id: "laguna",
+        recurrent_or_hybrid: false,
     },
     StageRuntimeFamilyExpectation {
         llama_architecture: "lfm2",
@@ -551,6 +561,16 @@ pub fn qwen3moe_capability(layer_count: u32, activation_width: u32) -> FamilyCap
     )
 }
 
+pub fn laguna_capability(layer_count: u32, activation_width: u32) -> FamilyCapabilityRecord {
+    dense_family_capability(
+        "laguna",
+        layer_count,
+        activation_width,
+        WireValidation::Untested,
+        ExactStateMobility::Untested,
+    )
+}
+
 pub fn dense_family_capability(
     family_id: impl Into<String>,
     layer_count: u32,
@@ -743,6 +763,23 @@ pub fn qwen35_series_capability(
         activation_width,
         default_wire_dtype: WireDType::F16,
         q8_wire_validation: WireValidation::Untested,
+        exact_state_mobility: ExactStateMobility::RejectedTooLarge,
+        recurrent_ranges: vec![LayerRange {
+            start: 0,
+            end: layer_count,
+        }],
+        split_constraints: Vec::new(),
+        sidebands: Vec::new(),
+    }
+}
+
+pub fn inkling_capability(layer_count: u32, activation_width: u32) -> FamilyCapabilityRecord {
+    FamilyCapabilityRecord {
+        family_id: "inkling".to_string(),
+        layer_count,
+        activation_width,
+        default_wire_dtype: WireDType::F32,
+        q8_wire_validation: WireValidation::Rejected,
         exact_state_mobility: ExactStateMobility::RejectedTooLarge,
         recurrent_ranges: vec![LayerRange {
             start: 0,
@@ -1081,6 +1118,9 @@ fn infer_mistral_olmo_llama_capability(
     if compact.contains("olmo") {
         return Some(olmo_capability(layer_count, activation_width));
     }
+    if compact.contains("laguna") {
+        return Some(laguna_capability(layer_count, activation_width));
+    }
     if compact.contains("llama") {
         return Some(llama_capability(layer_count, activation_width));
     }
@@ -1112,6 +1152,9 @@ fn infer_recurrent_capability(
     layer_count: u32,
     activation_width: u32,
 ) -> Option<FamilyCapabilityRecord> {
+    if compact.contains("inkling") {
+        return Some(inkling_capability(layer_count, activation_width));
+    }
     if compact.contains("kimilinear") {
         return Some(kimi_linear_capability(layer_count, activation_width));
     }

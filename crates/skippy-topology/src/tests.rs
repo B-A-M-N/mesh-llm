@@ -921,6 +921,16 @@ fn infers_known_family_capabilities_from_model_identity() {
     assert_eq!(llama.q8_wire_validation, WireValidation::Validated);
     assert_eq!(llama.exact_state_mobility, ExactStateMobility::Accepted);
 
+    let laguna = infer_family_capability(
+        "poolside/Laguna-S-2.1-GGUF@edd093522473dc7313b0738d8b4116b7f8b9745f/laguna-s-2.1-Q4_K_M.gguf",
+        48,
+        3072,
+    )
+    .expect("reviewed Poolside Laguna S 2.1 Q4_K_M");
+    assert_eq!(laguna.family_id, "laguna");
+    assert_eq!(laguna.default_wire_dtype, WireDType::F16);
+    assert_eq!(laguna.q8_wire_validation, WireValidation::Untested);
+
     let gemma4_e4b = infer_family_capability(
             "unsloth/gemma-4-E4B-it-GGUF@315e03409eb1cdde302488d66e586dea1e82aad1/gemma-4-E4B-it-Q4_K_M.gguf",
             42,
@@ -950,6 +960,20 @@ fn infers_known_family_capabilities_from_model_identity() {
             .family_id,
         "qwen3next"
     );
+    let inkling =
+        infer_family_capability("meshllm/inkling-UD-Q2_K_XL-layers", 66, 6144).expect("inkling");
+    assert_eq!(inkling.family_id, "inkling");
+    assert_eq!(inkling.default_wire_dtype, WireDType::F32);
+    assert_eq!(inkling.q8_wire_validation, WireValidation::Rejected);
+    assert_eq!(
+        inkling.exact_state_mobility,
+        ExactStateMobility::RejectedTooLarge
+    );
+    assert_eq!(
+        inkling.recurrent_ranges,
+        vec![LayerRange { start: 0, end: 66 }]
+    );
+
     let rwkv6 =
         infer_family_capability("latestissue/rwkv-6-finch-1b6-gguf:Q4_K", 24, 2048).expect("rwkv6");
     assert_eq!(rwkv6.family_id, "rwkv6");
@@ -1019,6 +1043,20 @@ fn infers_known_family_capabilities_from_model_identity() {
     .expect("qwen3moe");
     assert_eq!(qwen3moe.family_id, "qwen3moe");
     assert_eq!(qwen3moe.q8_wire_validation, WireValidation::Validated);
+    for identity in [
+        "laguna",
+        "poolside/Laguna-XS-2.1-GGUF:Q4_K_M",
+        "poolside/Laguna-S-2.1-GGUF:Q4_K_M",
+        "poolside/Laguna-XS.2-GGUF:Q4_K_M",
+        "poolside/Laguna-M.1-GGUF:Q4_K_M",
+    ] {
+        let laguna = infer_family_capability(identity, 48, 3072)
+            .unwrap_or_else(|| panic!("failed to infer {identity}"));
+        assert_eq!(laguna.family_id, "laguna", "{identity}");
+        assert_eq!(laguna.q8_wire_validation, WireValidation::Untested);
+        assert_eq!(laguna.exact_state_mobility, ExactStateMobility::Untested);
+        assert!(laguna.recurrent_ranges.is_empty());
+    }
     let openai_moe =
         infer_family_capability("ggml-org/gpt-oss-20b-GGUF:gpt-oss-20b-mxfp4", 24, 2880)
             .expect("openai_moe/gpt-oss");

@@ -261,6 +261,139 @@ fn writes_qwen_style_mtp_only_tensors_with_shared_context() {
 }
 
 #[test]
+fn writes_inkling_mtp_streaming_transforms() {
+    let root = unique_temp_dir();
+    fs::create_dir_all(&root).unwrap();
+    let w13 = (1_u32..=8)
+        .flat_map(|value| (value as f32).to_le_bytes())
+        .collect::<Vec<_>>();
+    let bf16_values = [0x80, 0x3f, 0x00, 0x40, 0x40, 0x40, 0x80, 0x40];
+    write_safetensor(
+        &root.join("model.safetensors"),
+        &[
+            ("model.llm.embed.weight", "F32", &[1], &[1, 0, 0, 0]),
+            ("model.llm.embed_norm.weight", "F32", &[1], &[2, 0, 0, 0]),
+            ("model.llm.norm.weight", "F32", &[1], &[3, 0, 0, 0]),
+            ("model.llm.unembed.weight", "F32", &[1], &[4, 0, 0, 0]),
+            (
+                "model.mtp.layers.0.embed_norm.weight",
+                "F32",
+                &[1],
+                &[5, 0, 0, 0],
+            ),
+            (
+                "model.mtp.layers.0.transformer_block.attn.rel_logits_proj.proj",
+                "BF16",
+                &[2, 2],
+                &bf16_values,
+            ),
+            (
+                "model.mtp.layers.0.transformer_block.attn.k_sconv.weight",
+                "BF16",
+                &[2, 1, 2],
+                &bf16_values,
+            ),
+            (
+                "model.mtp.layers.0.transformer_block.mlp.w13_dn.weight",
+                "F32",
+                &[4, 2],
+                &w13,
+            ),
+        ],
+    );
+    let output = root.join("inkling-mtp.gguf");
+
+    write_raw_safetensors_gguf(
+        &root,
+        &output,
+        RawGgufWriteOptions {
+            buffer_size: 9,
+            metadata: None,
+            tensor_name_map: TensorNameMap::HfToGgufWithMtp { layer_start: 66 },
+            split: None,
+            output_type: Some(ConvertOutputType::Bf16),
+            tensor_selection: TensorSelection::MtpOnly { layer_start: 66 },
+        },
+    )
+    .unwrap();
+
+    let bytes = fs::read(&output).unwrap();
+    let parsed = parse_test_gguf(&bytes);
+    assert_eq!(parsed.tensor_count, 9);
+    let shortconv = parsed.tensor("blk.66.shortconv_k.weight");
+    assert_eq!(shortconv.dims, vec![2, 2]);
+    assert_eq!(shortconv.ggml_type, GGML_TYPE_F32);
+    let rel_proj = parsed.tensor("blk.66.attn_rel_proj.weight");
+    assert_eq!(rel_proj.ggml_type, GGML_TYPE_F32);
+    let gate = parsed.tensor("blk.66.ffn_gate.weight");
+    let up = parsed.tensor("blk.66.ffn_up.weight");
+    assert_eq!(gate.dims, vec![2, 2]);
+    assert_eq!(up.dims, vec![2, 2]);
+    assert_eq!(gate.ggml_type, GGML_TYPE_BF16);
+    assert_eq!(up.ggml_type, GGML_TYPE_BF16);
+    let gate_expected = [0x80, 0x3f, 0x00, 0x40, 0xa0, 0x40, 0xc0, 0x40];
+    let up_expected = [0x40, 0x40, 0x80, 0x40, 0xe0, 0x40, 0x00, 0x41];
+    assert_eq!(
+        &bytes[gate.absolute_offset..gate.absolute_offset + gate_expected.len()],
+        gate_expected
+    );
+    assert_eq!(
+        &bytes[up.absolute_offset..up.absolute_offset + up_expected.len()],
+        up_expected
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn writes_inkling_trunk_fused_w13_streaming_transforms() {
+    let root = unique_temp_dir();
+    fs::create_dir_all(&root).unwrap();
+    let w13 = (1_u32..=8)
+        .flat_map(|value| (value as f32).to_le_bytes())
+        .collect::<Vec<_>>();
+    write_safetensor(
+        &root.join("model.safetensors"),
+        &[("model.layers.3.mlp.w13_dn.weight", "F32", &[4, 2], &w13)],
+    );
+    let output = root.join("inkling-trunk.gguf");
+
+    write_raw_safetensors_gguf(
+        &root,
+        &output,
+        RawGgufWriteOptions {
+            buffer_size: 9,
+            metadata: None,
+            tensor_name_map: TensorNameMap::HfToGguf,
+            split: None,
+            output_type: Some(ConvertOutputType::Bf16),
+            tensor_selection: TensorSelection::All,
+        },
+    )
+    .unwrap();
+
+    let bytes = fs::read(&output).unwrap();
+    let parsed = parse_test_gguf(&bytes);
+    assert_eq!(parsed.tensor_count, 2);
+    let gate = parsed.tensor("blk.3.ffn_gate.weight");
+    let up = parsed.tensor("blk.3.ffn_up.weight");
+    assert_eq!(gate.dims, vec![2, 2]);
+    assert_eq!(up.dims, vec![2, 2]);
+    assert_eq!(gate.ggml_type, GGML_TYPE_BF16);
+    assert_eq!(up.ggml_type, GGML_TYPE_BF16);
+    let gate_expected = [0x80, 0x3f, 0x00, 0x40, 0xa0, 0x40, 0xc0, 0x40];
+    let up_expected = [0x40, 0x40, 0x80, 0x40, 0xe0, 0x40, 0x00, 0x41];
+    assert_eq!(
+        &bytes[gate.absolute_offset..gate.absolute_offset + gate_expected.len()],
+        gate_expected
+    );
+    assert_eq!(
+        &bytes[up.absolute_offset..up.absolute_offset + up_expected.len()],
+        up_expected
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn validates_qwen_dense_native_conversion_fixture() {
     let root = unique_temp_dir();
     fs::create_dir_all(&root).unwrap();
@@ -1105,6 +1238,64 @@ fn native_splits_are_byte_balanced_not_tensor_count_balanced() {
 }
 
 #[test]
+fn recommends_enough_byte_balanced_splits_for_the_size_limit() {
+    let root = unique_temp_dir();
+    fs::create_dir_all(&root).unwrap();
+    write_safetensor(
+        &root.join("model.safetensors"),
+        &[
+            ("a.weight", "F32", &[4], &[1; 16]),
+            ("b.weight", "F32", &[4], &[2; 16]),
+            ("c.weight", "F32", &[4], &[3; 16]),
+        ],
+    );
+
+    let split_count = recommended_raw_safetensors_gguf_split_count(
+        &root,
+        RawGgufWriteOptions {
+            buffer_size: 4,
+            metadata: None,
+            tensor_name_map: TensorNameMap::Raw,
+            split: None,
+            output_type: None,
+            tensor_selection: TensorSelection::All,
+        },
+        20,
+    )
+    .unwrap();
+
+    assert_eq!(split_count, 3);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn rejects_a_size_limit_smaller_than_one_selected_tensor() {
+    let root = unique_temp_dir();
+    fs::create_dir_all(&root).unwrap();
+    write_safetensor(
+        &root.join("model.safetensors"),
+        &[("a.weight", "F32", &[4], &[1; 16])],
+    );
+
+    let error = recommended_raw_safetensors_gguf_split_count(
+        &root,
+        RawGgufWriteOptions {
+            buffer_size: 4,
+            metadata: None,
+            tensor_name_map: TensorNameMap::Raw,
+            split: None,
+            output_type: None,
+            tensor_selection: TensorSelection::All,
+        },
+        15,
+    )
+    .unwrap_err();
+
+    assert!(error.to_string().contains("largest selected tensor"));
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn keeps_rank_one_f32_tensor_as_f32_for_bf16_output() {
     let root = unique_temp_dir();
     fs::create_dir_all(&root).unwrap();
@@ -1267,6 +1458,13 @@ fn read_string_array_or_skip(cursor: &mut std::io::Cursor<&[u8]>) -> Option<Vec<
 fn skip_array_items(cursor: &mut std::io::Cursor<&[u8]>, element_type: u32, len: u64) {
     for _ in 0..len {
         match element_type {
+            GGUF_TYPE_BOOL => {
+                let mut value = [0_u8; 1];
+                cursor.read_exact(&mut value).unwrap();
+            }
+            GGUF_TYPE_STRING => {
+                let _ = read_string(cursor);
+            }
             GGUF_TYPE_INT32 | GGUF_TYPE_FLOAT32 | GGUF_TYPE_UINT32 => {
                 let _ = read_u32(cursor);
             }

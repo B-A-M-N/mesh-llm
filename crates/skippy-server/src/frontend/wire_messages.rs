@@ -174,6 +174,32 @@ pub(super) fn embedded_verify_window_message(
     })
 }
 
+pub(super) fn retire_verify_window_message(
+    wire_dtype: WireActivationDType,
+    request_id: u64,
+    session_id: u64,
+    token_start: usize,
+    token_count: usize,
+) -> OpenAiResult<StageWireMessage> {
+    let kind = WireMessageKind::RetireVerifyWindow;
+    Ok(StageWireMessage {
+        kind,
+        pos_start: i32::try_from(token_start)
+            .map_err(|_| OpenAiError::backend("verify retirement position exceeds i32"))?,
+        token_count: i32::try_from(token_count)
+            .map_err(|_| OpenAiError::backend("verify retirement count exceeds i32"))?,
+        state: StageStateHeader::new(kind, wire_dtype),
+        request_id,
+        session_id,
+        sampling: None,
+        chat_sampling_metadata: None,
+        tokens: Vec::new(),
+        positions: Vec::new(),
+        activation: Vec::new(),
+        raw_bytes: Vec::new(),
+    })
+}
+
 pub(super) fn generation_config_message(
     wire_dtype: WireActivationDType,
     request_id: u64,
@@ -322,6 +348,7 @@ pub(super) struct MultimodalPrefillArgs {
     pub(super) prompt_token_count: usize,
     pub(super) pos_start: usize,
     pub(super) token_count: usize,
+    pub(super) tokens: Vec<i32>,
     pub(super) positions: Vec<i32>,
     pub(super) sampling: Option<WireSamplingConfig>,
     pub(super) final_chunk: bool,
@@ -353,7 +380,7 @@ pub(super) fn multimodal_prefill_message(
         session_id: args.session_id,
         sampling: args.sampling,
         chat_sampling_metadata: None,
-        tokens: Vec::new(),
+        tokens: args.tokens,
         positions: args.positions,
         activation: Vec::new(),
         raw_bytes: Vec::new(),

@@ -1,11 +1,21 @@
 use super::async_forwarder::AsyncForwarder;
-use super::reply::drain_deferred_prefill_replies;
+use super::control_messages::{
+    handle_generation_control, handle_prefix_cache_control, handle_session_control, handle_stop,
+    handle_verify_retirement,
+};
+use super::message_receive::{next_connection_session_id, receive_next_message};
+use super::reply::reply_window_for_message;
 use super::reply::send_stage_reply;
-use super::reply::{configure_prediction_return_stream, reply_window_for_message};
+use super::session_lifecycle::align_session_to_message;
+use super::session_tracker::{
+    ConnectionSessionTracker, combine_connection_and_cleanup_results,
+    release_tracked_connection_sessions,
+};
 use super::summary::BinaryMessageObservation;
 use super::summary::BinaryRequestSummary;
 use super::telemetry::UpstreamReplyWriteSpan;
 use super::telemetry::{
+    BinaryMessageTiming, emit_binary_message_received, emit_binary_message_timing,
     emit_upstream_reply_write_span, insert_runtime_session_stats, record_prefill_edge_transport,
     record_verify_window_timing,
 };
@@ -16,23 +26,19 @@ use crate::binary_transport::binary_kv::accumulate_prefill_tokens;
 use crate::binary_transport::binary_kv::add_binary_record_stats;
 use crate::binary_transport::binary_kv::emit_binary_proactive_eviction;
 use crate::binary_transport::binary_kv::maybe_lookup_binary_prefill;
-use crate::binary_transport::binary_kv::maybe_prefix_cache_control;
 use crate::binary_transport::binary_kv::maybe_record_binary_full_prefill;
 use crate::binary_transport::direct_return;
 use crate::binary_transport::direct_return::PredictionReturnSinks;
 use crate::binary_transport::forwarded_stage_message_timed;
 use crate::binary_transport::kv_eviction::binary_proactive_eviction_plan;
 use crate::binary_transport::kv_eviction::evict_binary_resident_prefix_for_decode;
-use crate::binary_transport::restore_prefill_decode::handle_binary_restore_prefill_decode_control;
 use crate::binary_transport::run_binary_stage_message;
-use crate::binary_transport::send_client_ready_hello_if_enabled;
 use crate::binary_transport::stage_execution::binary_message_attrs;
 use crate::binary_transport::stage_execution::binary_message_session_id;
 use crate::binary_transport::stage_execution::decode_record_tokens_sideband;
 use crate::binary_transport::stage_execution::elapsed_ms;
 use crate::binary_transport::stage_execution::empty_activation_frame;
 use crate::binary_transport::stage_execution::input_activation_frame;
-use crate::binary_transport::stage_execution::insert_optional_unix_nanos;
 use crate::binary_transport::stage_execution::is_decode_frame_batch_candidate;
 use crate::binary_transport::stage_execution::nanos_delta_ms;
 use crate::binary_transport::stage_execution::runtime_sampling_config;
@@ -41,39 +47,77 @@ use crate::binary_transport::stage_execution::stage_mask;
 use crate::binary_transport::stage_execution::token_sideband_or_fill;
 use crate::binary_transport::stage_output_activation_capacity;
 use crate::binary_transport::write_stage_message_conditioned;
-use crate::kv_integration::{KvStageIntegration, model_requires_recurrent_state};
+use crate::kv_integration::KvStageIntegration;
 use crate::runtime_state::RuntimeState;
 use crate::telemetry::Telemetry;
 use crate::telemetry::now_unix_nanos;
-use anyhow::Context;
-use anyhow::Result;
-use anyhow::bail;
+use anyhow::{Context, Result, bail};
 use serde_json::json;
-use skippy_protocol::StageConfig;
-use skippy_protocol::StageTopology;
 use skippy_protocol::binary::StageReply;
 use skippy_protocol::binary::StageReplyStats;
 use skippy_protocol::binary::StageWireMessage;
 use skippy_protocol::binary::WireActivationDType;
 use skippy_protocol::binary::WireMessageKind;
 use skippy_protocol::binary::WireReplyKind;
-use skippy_protocol::binary::read_stage_message;
 use skippy_protocol::binary::recv_reply;
 use skippy_protocol::binary::send_reply_ack;
 use skippy_protocol::binary::send_reply_ack_with_stats;
+use skippy_protocol::{StageConfig, StageTopology};
 use std::collections::BTreeMap;
-use std::io;
 use std::net::TcpStream;
-use std::sync::Arc;
-use std::sync::Mutex;
-use std::sync::atomic::AtomicU64;
-use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
-
-static BINARY_SESSION_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn handle_binary_connection(
+    config: &StageConfig,
+    topology: Option<&StageTopology>,
+    runtime: &Arc<Mutex<RuntimeState>>,
+    decode_frame_batcher: &DecodeFrameBatcher,
+    kv: Option<&Arc<KvStageIntegration>>,
+    telemetry: &Telemetry,
+    upstream: &mut TcpStream,
+    downstream: Option<TcpStream>,
+    activation_width: i32,
+    wire_dtype: WireActivationDType,
+    max_inflight: usize,
+    reply_credit_limit: Option<usize>,
+    async_prefill_forward: bool,
+    downstream_wire_condition: WireCondition,
+    downstream_connect_timeout_secs: u64,
+    native_mtp_enabled: bool,
+    prediction_return_sinks: &PredictionReturnSinks,
+    first_message: StageWireMessage,
+) -> Result<()> {
+    let mut session_tracker = ConnectionSessionTracker::default();
+    let result = handle_binary_connection_messages(
+        config,
+        topology,
+        runtime,
+        decode_frame_batcher,
+        kv,
+        telemetry,
+        upstream,
+        downstream,
+        activation_width,
+        wire_dtype,
+        max_inflight,
+        reply_credit_limit,
+        async_prefill_forward,
+        downstream_wire_condition,
+        downstream_connect_timeout_secs,
+        native_mtp_enabled,
+        prediction_return_sinks,
+        first_message,
+        &mut session_tracker,
+    );
+    let cleanup_result =
+        release_tracked_connection_sessions(config, runtime, telemetry, &mut session_tracker);
+    combine_connection_and_cleanup_results(result, cleanup_result)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn handle_binary_connection_messages(
     config: &StageConfig,
     topology: Option<&StageTopology>,
     runtime: &Arc<Mutex<RuntimeState>>,
@@ -92,16 +136,9 @@ pub(super) fn handle_binary_connection(
     native_mtp_enabled: bool,
     prediction_return_sinks: &PredictionReturnSinks,
     first_message: StageWireMessage,
+    session_tracker: &mut ConnectionSessionTracker,
 ) -> Result<()> {
-    if let Some(downstream) = downstream.as_mut() {
-        send_client_ready_hello_if_enabled(&mut *downstream)
-            .context("send downstream client ready hello")?;
-        skippy_protocol::binary::recv_ready(&mut *downstream)
-            .context("downstream binary stage did not become ready")?;
-    }
-
-    let connection_session_id = BINARY_SESSION_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let positional_speculation_supported = !model_requires_recurrent_state(config);
+    let connection_session_id = next_connection_session_id();
     let max_deferred_prefill_replies =
         reply_credit_limit.unwrap_or_else(|| max_inflight.saturating_sub(1));
     let mut pending_prefill_replies = 0usize;
@@ -125,20 +162,15 @@ pub(super) fn handle_binary_connection(
     loop {
         let recv_start_unix_nanos = now_unix_nanos() as u64;
         let recv_started = Instant::now();
-        let mut message = if let Some(message) = next_message.take() {
-            message
-        } else {
-            match read_stage_message(&mut *upstream, activation_width) {
-                Ok(message) => message,
-                Err(error)
-                    if error.kind() == io::ErrorKind::UnexpectedEof
-                        && pending_prefill_replies == 0
-                        && request_summary.message_count == 0 =>
-                {
-                    return Ok(());
-                }
-                Err(error) => return Err(error).context("read binary stage message"),
-            }
+        let Some(mut message) = receive_next_message(
+            upstream,
+            activation_width,
+            next_message.take(),
+            pending_prefill_replies,
+            request_summary.message_count,
+        )?
+        else {
+            return Ok(());
         };
         let recv_end_unix_nanos = now_unix_nanos() as u64;
         let recv_read_ms = elapsed_ms(recv_started);
@@ -146,325 +178,115 @@ pub(super) fn handle_binary_connection(
         let message_started = Instant::now();
         let session_id = binary_message_session_id(connection_session_id, &message);
         let session_key = session_id.to_string();
-        if message.kind == WireMessageKind::VerifyWindow && !positional_speculation_supported {
-            bail!(
-                "stage-state v10 positional speculation requires an attention-only stage; {} contains recurrent state",
-                config.stage_id
-            );
-        }
-        if telemetry.is_debug_enabled() {
-            let mut recv_attrs = binary_message_attrs(config, session_id, &message);
-            recv_attrs.insert(
-                "llama_stage.recv_start_unix_nanos".to_string(),
-                json!(recv_start_unix_nanos),
-            );
-            recv_attrs.insert(
-                "llama_stage.recv_end_unix_nanos".to_string(),
-                json!(recv_end_unix_nanos),
-            );
-            recv_attrs.insert("llama_stage.recv_read_ms".to_string(), json!(recv_read_ms));
-            recv_attrs.insert(
-                "skippy.upstream_message_wait_ms".to_string(),
-                json!(recv_read_ms),
-            );
-            recv_attrs.insert(
-                "llama_stage.source_stage_index".to_string(),
-                json!(message.state.source_stage_index),
-            );
-            recv_attrs.insert(
-                "llama_stage.configured_upstream_stage_index".to_string(),
-                json!(config.upstream.as_ref().map(|peer| peer.stage_index)),
-            );
-            recv_attrs.insert(
-                "llama_stage.message_wire_bytes".to_string(),
-                json!(message.estimated_wire_bytes()),
-            );
-            recv_attrs.insert(
-                "skippy.activation_bytes".to_string(),
-                json!(message.activation.len()),
-            );
-            telemetry.emit_debug_span(
-                "stage.binary_recv",
-                recv_attrs,
-                recv_start_unix_nanos,
-                recv_end_unix_nanos,
-            );
-        }
+        session_tracker.touch(&session_key);
+        emit_binary_message_received(
+            telemetry,
+            config,
+            session_id,
+            &message,
+            recv_start_unix_nanos,
+            recv_end_unix_nanos,
+            recv_read_ms,
+        );
 
         if message.kind == WireMessageKind::Stop {
-            if pending_prefill_replies != 0 {
-                bail!("cannot stop with {pending_prefill_replies} deferred prefill replies");
-            }
-            let mut stop_stats = std::mem::take(&mut pending_reply_stats);
-            request_summary.emit(telemetry, config, session_id);
-            request_summary = BinaryRequestSummary::default();
-            if let Some(downstream) = downstream.as_mut() {
-                if let Some(forwarder) = async_forwarder.as_mut() {
-                    forwarder
-                        .flush()
-                        .context("flush async forwards before stop")?;
-                }
-                write_stage_message_conditioned(
-                    &mut *downstream,
-                    &message,
-                    wire_dtype,
-                    downstream_wire_condition,
-                )
-                .context("forward binary stop")?;
-                let reply = recv_reply(&mut *downstream).context("stop downstream ACK")?;
-                if reply.kind != WireReplyKind::Ack {
-                    bail!("stop expected downstream ACK");
-                }
-                stop_stats.merge(reply.stats);
-            }
-            let reset_start_unix_nanos = now_unix_nanos() as u64;
-            let reset_timer = Instant::now();
-            let lock_timer = Instant::now();
-            let mut runtime = runtime.lock().expect("runtime lock poisoned");
-            let runtime_lock_wait_ms = elapsed_ms(lock_timer);
-            let accumulated = std::mem::take(&mut accumulated_prefill_tokens);
-            for (prefill_session_key, tokens) in accumulated {
-                let record = maybe_record_binary_full_prefill(
-                    config,
-                    &mut runtime,
-                    kv,
-                    telemetry,
-                    &prefill_session_key,
-                    &message,
-                    &tokens,
-                );
-                if record.recorded_pages > 0 {
-                    stop_stats.kv_recorded_pages += record.recorded_pages as i64;
-                    stop_stats.kv_record_stage_mask |= stage_mask(config.stage_index);
-                }
-            }
-            let drop_stats = runtime
-                .drop_session_timed(&session_key)
-                .context("reset binary stage session")?;
-            drop(runtime);
-            let reset_end_unix_nanos = now_unix_nanos() as u64;
-            let mut reset_attrs = binary_message_attrs(config, session_id, &message);
-            reset_attrs.insert(
-                "llama_stage.runtime_lock_wait_ms".to_string(),
-                json!(runtime_lock_wait_ms),
-            );
-            reset_attrs.insert(
-                "llama_stage.session_reset_ms".to_string(),
-                json!(drop_stats.reset_ms),
-            );
-            reset_attrs.insert(
-                "llama_stage.session_reset".to_string(),
-                json!(drop_stats.reset_session),
-            );
-            reset_attrs.insert(
-                "llama_stage.lane_discarded".to_string(),
-                json!(drop_stats.lane_discarded),
-            );
-            if let Some(reason) = drop_stats.lane_discard_reason.as_deref() {
-                reset_attrs.insert("llama_stage.lane_discard_reason".to_string(), json!(reason));
-            }
-            reset_attrs.insert(
-                "llama_stage.elapsed_ms".to_string(),
-                json!(elapsed_ms(reset_timer)),
-            );
-            insert_runtime_session_stats(
-                &mut reset_attrs,
-                "llama_stage.runtime_sessions_after",
-                &drop_stats.stats_after,
-            );
-            telemetry.emit_debug_span(
-                "stage.binary_session_stop",
-                reset_attrs,
-                reset_start_unix_nanos,
-                reset_end_unix_nanos,
-            );
-            prediction_return_streams.remove(&(message.request_id, message.session_id));
-            prediction_return_sinks.remove(message.request_id, message.session_id);
-            send_reply_ack_with_stats(&mut *upstream, stop_stats).context("send stop ACK")?;
-            continue;
-        }
-
-        if message.kind.is_session_control() {
-            let mut control_stats = std::mem::take(&mut pending_reply_stats);
-            if let Some(forwarder) = async_forwarder.as_mut() {
-                forwarder
-                    .flush()
-                    .context("flush async forwards before session control")?;
-            }
-            drain_deferred_prefill_replies(
-                downstream.as_mut(),
-                &mut pending_prefill_replies,
-                &mut control_stats,
-            )
-            .context("drain deferred replies before session control")?;
-            {
-                let mut runtime = runtime.lock().expect("runtime lock poisoned");
-                match message.kind {
-                    WireMessageKind::TrimSession => runtime
-                        .trim_session(&session_key, message.token_count.max(0) as u64)
-                        .context("trim binary stage session")?,
-                    _ => unreachable!("session control checked above"),
-                }
-            }
-            if let Some(downstream) = downstream.as_mut() {
-                write_stage_message_conditioned(
-                    &mut *downstream,
-                    &message,
-                    wire_dtype,
-                    downstream_wire_condition,
-                )
-                .context("forward session control")?;
-                let reply =
-                    recv_reply(&mut *downstream).context("session control downstream ACK")?;
-                if reply.kind != WireReplyKind::Ack {
-                    bail!("session control expected downstream ACK");
-                }
-                control_stats.merge(reply.stats);
-            }
-            send_reply_ack_with_stats(&mut *upstream, control_stats)
-                .context("session control ack")?;
-            continue;
-        }
-
-        if message.kind.is_generation_control() {
-            let mut generation_stats = std::mem::take(&mut pending_reply_stats);
-            if let Some(forwarder) = async_forwarder.as_mut() {
-                forwarder
-                    .flush()
-                    .context("flush async forwards before generation config")?;
-            }
-            drain_deferred_prefill_replies(
-                downstream.as_mut(),
-                &mut pending_prefill_replies,
-                &mut generation_stats,
-            )
-            .context("drain deferred replies before generation config")?;
-            if let Some(downstream) = downstream.as_mut() {
-                write_stage_message_conditioned(
-                    &mut *downstream,
-                    &message,
-                    wire_dtype,
-                    downstream_wire_condition,
-                )
-                .context("forward generation config")?;
-                let reply =
-                    recv_reply(&mut *downstream).context("generation config downstream ACK")?;
-                if reply.kind != WireReplyKind::Ack {
-                    bail!("generation config expected downstream ACK");
-                }
-                generation_stats.merge(reply.stats);
-            } else {
-                if let Some(metadata) = message.chat_sampling_metadata.as_deref() {
-                    let sampling = runtime_sampling_config(message.sampling.as_ref());
-                    let mut runtime = runtime.lock().expect("runtime lock poisoned");
-                    runtime
-                        .configure_chat_sampling(
-                            &session_key,
-                            metadata,
-                            message.state.prompt_token_count.max(0) as u64,
-                            sampling.as_ref(),
-                        )
-                        .context("configure binary stage generation")?;
-                }
-                configure_prediction_return_stream(
-                    config,
-                    topology,
-                    message.request_id,
-                    message.session_id,
-                    wire_dtype,
-                    downstream_connect_timeout_secs,
-                    prediction_return_sinks,
-                    &mut prediction_return_streams,
-                );
-            }
-            send_reply_ack_with_stats(&mut *upstream, generation_stats)
-                .context("generation config ack")?;
-            continue;
-        }
-
-        if message.kind.is_prefix_cache_control() {
-            let control_started = Instant::now();
-            let mut control_stats = std::mem::take(&mut pending_reply_stats);
-            if let Some(forwarder) = async_forwarder.as_mut() {
-                forwarder
-                    .flush()
-                    .context("flush async forwards before prefix cache control")?;
-            }
-            drain_deferred_prefill_replies(
-                downstream.as_mut(),
-                &mut pending_prefill_replies,
-                &mut control_stats,
-            )
-            .context("drain deferred replies before prefix cache control")?;
-            if message.kind == WireMessageKind::TryRestorePrefillDecode {
-                handle_binary_restore_prefill_decode_control(
-                    config,
-                    topology,
-                    runtime,
-                    kv,
-                    telemetry,
-                    &session_key,
-                    session_id,
-                    message,
-                    downstream.as_mut(),
-                    wire_dtype,
-                    downstream_wire_condition,
-                    activation_width,
-                    control_started,
-                    control_stats,
-                    prediction_return_sinks,
-                    &mut prediction_return_streams,
-                    downstream_connect_timeout_secs,
-                    native_mtp_enabled,
-                )
-                .context("handle restore-prefill-decode control")?;
-                continue;
-            }
-            let token_ids = token_sideband_or_fill(&message)
-                .context("read prefix cache control token sideband")?;
-            let local = maybe_prefix_cache_control(
+            handle_stop(
                 config,
                 runtime,
                 kv,
                 telemetry,
-                &session_key,
+                upstream,
+                downstream.as_mut(),
+                wire_dtype,
+                downstream_wire_condition,
                 &message,
-                &token_ids,
-            );
-            control_stats.merge(local.stats);
-            if local.hit
-                && let Some(downstream) = downstream.as_mut()
-            {
-                write_stage_message_conditioned(
-                    &mut *downstream,
-                    &message,
-                    wire_dtype,
-                    downstream_wire_condition,
-                )
-                .context("forward prefix cache control")?;
-                let reply = recv_reply(&mut *downstream).context("prefix cache downstream ACK")?;
-                if reply.kind != WireReplyKind::Ack {
-                    bail!("prefix cache control expected downstream ACK");
-                }
-                let downstream_missed = message.kind == WireMessageKind::TryRestorePrefill
-                    && (reply.stats.kv_lookup_misses > 0
-                        || reply.stats.kv_lookup_errors > 0
-                        || reply.stats.kv_lookup_hits == 0);
-                control_stats.merge(reply.stats);
-                if downstream_missed {
-                    let mut runtime = runtime.lock().expect("runtime lock poisoned");
-                    let _ = runtime.drop_session_timed(&session_key);
-                }
-            }
-            let mut attrs = binary_message_attrs(config, session_id, &message);
-            attrs.insert("skippy.kv.control_hit".to_string(), json!(local.hit));
-            attrs.insert(
-                "llama_stage.elapsed_ms".to_string(),
-                json!(elapsed_ms(control_started)),
-            );
-            telemetry.emit_debug("stage.binary_prefix_cache_control", attrs);
-            send_reply_ack_with_stats(&mut *upstream, control_stats)
-                .context("prefix cache control ack")?;
+                &session_key,
+                session_id,
+                pending_prefill_replies,
+                &mut pending_reply_stats,
+                &mut request_summary,
+                &mut accumulated_prefill_tokens,
+                async_forwarder.as_mut(),
+                session_tracker,
+                &mut prediction_return_streams,
+                prediction_return_sinks,
+            )?;
+            continue;
+        }
+
+        if message.kind.is_verify_retirement() {
+            handle_verify_retirement(
+                runtime,
+                downstream.as_mut(),
+                wire_dtype,
+                downstream_wire_condition,
+                &message,
+                &session_key,
+                async_forwarder.as_mut(),
+            )?;
+            continue;
+        }
+
+        if message.kind.is_session_control() {
+            handle_session_control(
+                runtime,
+                upstream,
+                downstream.as_mut(),
+                wire_dtype,
+                downstream_wire_condition,
+                &message,
+                &session_key,
+                &mut pending_prefill_replies,
+                &mut pending_reply_stats,
+                async_forwarder.as_mut(),
+            )?;
+            continue;
+        }
+
+        if message.kind.is_generation_control() {
+            handle_generation_control(
+                config,
+                topology,
+                runtime,
+                upstream,
+                downstream.as_mut(),
+                wire_dtype,
+                downstream_wire_condition,
+                downstream_connect_timeout_secs,
+                &message,
+                &session_key,
+                &mut pending_prefill_replies,
+                &mut pending_reply_stats,
+                async_forwarder.as_mut(),
+                prediction_return_sinks,
+                &mut prediction_return_streams,
+            )?;
+            continue;
+        }
+
+        if message.kind.is_prefix_cache_control() {
+            handle_prefix_cache_control(
+                config,
+                topology,
+                runtime,
+                kv,
+                telemetry,
+                upstream,
+                downstream.as_mut(),
+                wire_dtype,
+                downstream_wire_condition,
+                downstream_connect_timeout_secs,
+                activation_width,
+                native_mtp_enabled,
+                message,
+                &session_key,
+                session_id,
+                &mut pending_prefill_replies,
+                &mut pending_reply_stats,
+                async_forwarder.as_mut(),
+                prediction_return_sinks,
+                &mut prediction_return_streams,
+            )?;
             continue;
         }
 
@@ -495,37 +317,17 @@ pub(super) fn handle_binary_connection(
         }
 
         let token_ids = token_sideband_or_fill(&message)?;
-        let mut session_auto_align_count = 0usize;
-        let mut session_auto_align_ms = 0.0;
-        let mut session_auto_align_trimmed_tokens = 0u64;
-        if let Some(target_token_count) = message.authoritative_session_position() {
-            let align_started = Instant::now();
-            let align = {
-                let mut runtime = runtime.lock().expect("runtime lock poisoned");
-                runtime
-                    .align_session_to_token_count_if_ahead(&session_key, target_token_count)
-                    .context("auto-align binary stage session")?
-            };
-            if let Some(align) = align {
-                let align_ms = elapsed_ms(align_started);
-                session_auto_align_count = 1;
-                session_auto_align_ms = align_ms;
-                session_auto_align_trimmed_tokens = align
-                    .before_token_count
-                    .saturating_sub(align.after_token_count);
-                let mut attrs = binary_message_attrs(config, session_id, &message);
-                attrs.insert(
-                    "llama_stage.session_auto_align_before_tokens".to_string(),
-                    json!(align.before_token_count),
-                );
-                attrs.insert(
-                    "llama_stage.session_auto_align_after_tokens".to_string(),
-                    json!(align.after_token_count),
-                );
-                attrs.insert("llama_stage.elapsed_ms".to_string(), json!(align_ms));
-                telemetry.emit_debug("stage.binary_session_auto_align", attrs);
-            }
-        }
+        let auto_align = align_session_to_message(
+            config,
+            runtime,
+            telemetry,
+            &session_key,
+            session_id,
+            &message,
+        )?;
+        let session_auto_align_count = auto_align.count;
+        let session_auto_align_ms = auto_align.elapsed_ms;
+        let session_auto_align_trimmed_tokens = auto_align.trimmed_tokens;
         if message.kind.is_prefill() {
             accumulate_prefill_tokens(
                 &mut accumulated_prefill_tokens,
@@ -1149,154 +951,44 @@ pub(super) fn handle_binary_connection(
             upstream_message_wait_ms: recv_read_ms,
         });
 
-        if telemetry.is_debug_enabled() {
-            let mut timing_attrs = binary_message_attrs(config, session_id, &message);
-            timing_attrs.insert(
-                "llama_stage.message_start_unix_nanos".to_string(),
-                json!(message_start_unix_nanos),
-            );
-            timing_attrs.insert(
-                "llama_stage.message_end_unix_nanos".to_string(),
-                json!(message_end_unix_nanos),
-            );
-            timing_attrs.insert(
-                "llama_stage.compute_start_unix_nanos".to_string(),
-                json!(compute_start_unix_nanos),
-            );
-            timing_attrs.insert(
-                "llama_stage.compute_end_unix_nanos".to_string(),
-                json!(compute_end_unix_nanos),
-            );
-            timing_attrs.insert("llama_stage.compute_ms".to_string(), json!(compute_ms));
-            timing_attrs.insert("llama_stage.recv_read_ms".to_string(), json!(recv_read_ms));
-            timing_attrs.insert(
-                "skippy.upstream_message_wait_ms".to_string(),
-                json!(recv_read_ms),
-            );
-            timing_attrs.insert(
-                "llama_stage.input_activation_decode_ms".to_string(),
-                json!(input_activation_decode_ms),
-            );
-            timing_attrs.insert(
-                "llama_stage.runtime_lock_wait_ms".to_string(),
-                json!(runtime_lock_wait_ms),
-            );
-            timing_attrs.insert(
-                "llama_stage.runtime_lock_hold_ms".to_string(),
-                json!(runtime_lock_hold_ms),
-            );
-            timing_attrs.insert(
-                "llama_stage.runtime_lock_acquires".to_string(),
-                json!(runtime_lock_acquires),
-            );
-            if let Some(stats) = runtime_sessions_before.as_ref() {
-                insert_runtime_session_stats(
-                    &mut timing_attrs,
-                    "llama_stage.runtime_sessions_before",
-                    stats,
-                );
-            }
-            if let Some(stats) = runtime_sessions_after.as_ref() {
-                insert_runtime_session_stats(
-                    &mut timing_attrs,
-                    "llama_stage.runtime_sessions_after",
-                    stats,
-                );
-            }
-            timing_attrs.insert(
-                "llama_stage.forward_write_ms".to_string(),
-                json!(forward_write_ms),
-            );
-            timing_attrs.insert(
-                "llama_stage.activation_encode_ms".to_string(),
-                json!(forward_activation_encode_ms),
-            );
-            timing_attrs.insert(
-                "llama_stage.downstream_wait_ms".to_string(),
-                json!(downstream_wait_ms),
-            );
-            timing_attrs.insert("skippy.compute_ms".to_string(), json!(compute_ms));
-            timing_attrs.insert(
-                "skippy.forward_write_ms".to_string(),
-                json!(forward_write_ms),
-            );
-            timing_attrs.insert(
-                "skippy.downstream_wait_ms".to_string(),
-                json!(downstream_wait_ms),
-            );
-            timing_attrs.insert(
-                "skippy.upstream_reply_ms".to_string(),
-                json!(upstream_reply_ms),
-            );
-            timing_attrs.insert("llama_stage.forward_mode".to_string(), json!(forward_mode));
-            insert_optional_unix_nanos(
-                &mut timing_attrs,
-                "llama_stage.forward_write_start_unix_nanos",
-                forward_write_start_unix_nanos,
-            );
-            insert_optional_unix_nanos(
-                &mut timing_attrs,
-                "llama_stage.forward_write_end_unix_nanos",
-                forward_write_end_unix_nanos,
-            );
-            insert_optional_unix_nanos(
-                &mut timing_attrs,
-                "llama_stage.downstream_wait_start_unix_nanos",
-                downstream_wait_start_unix_nanos,
-            );
-            insert_optional_unix_nanos(
-                &mut timing_attrs,
-                "llama_stage.downstream_wait_end_unix_nanos",
-                downstream_wait_end_unix_nanos,
-            );
-            insert_optional_unix_nanos(
-                &mut timing_attrs,
-                "llama_stage.upstream_reply_start_unix_nanos",
-                upstream_reply_start_unix_nanos,
-            );
-            insert_optional_unix_nanos(
-                &mut timing_attrs,
-                "llama_stage.upstream_reply_end_unix_nanos",
-                upstream_reply_end_unix_nanos,
-            );
-            timing_attrs.insert(
-                "skippy.message_elapsed_ms".to_string(),
-                json!(message_elapsed_ms),
-            );
-            timing_attrs.insert(
-                "skippy.input_activation_bytes".to_string(),
-                json!(input_activation_bytes),
-            );
-            timing_attrs.insert(
-                "skippy.output_activation_bytes".to_string(),
-                json!(output.payload.len()),
-            );
-            timing_attrs.insert(
-                "skippy.prefill_credit_limit".to_string(),
-                json!(max_deferred_prefill_replies),
-            );
-            timing_attrs.insert(
-                "skippy.prefill_pending_replies_before".to_string(),
-                json!(pending_prefill_replies_before),
-            );
-            timing_attrs.insert(
-                "skippy.prefill_pending_replies_after".to_string(),
-                json!(pending_prefill_replies),
-            );
-            timing_attrs.insert(
-                "skippy.prefill_credit_wait_count".to_string(),
-                json!(credit_wait_count),
-            );
-            timing_attrs.insert(
-                "skippy.prefill_deferred_replies_drained".to_string(),
-                json!(deferred_prefill_replies_drained),
-            );
-            telemetry.emit_debug_span(
-                "stage.binary_message_timing",
-                timing_attrs,
+        emit_binary_message_timing(
+            telemetry,
+            config,
+            session_id,
+            &message,
+            BinaryMessageTiming {
                 message_start_unix_nanos,
                 message_end_unix_nanos,
-            );
-        }
+                compute_start_unix_nanos,
+                compute_end_unix_nanos,
+                forward_write_start_unix_nanos,
+                forward_write_end_unix_nanos,
+                downstream_wait_start_unix_nanos,
+                downstream_wait_end_unix_nanos,
+                upstream_reply_start_unix_nanos,
+                upstream_reply_end_unix_nanos,
+                compute_ms,
+                recv_read_ms,
+                input_activation_decode_ms,
+                runtime_lock_wait_ms,
+                runtime_lock_hold_ms,
+                runtime_lock_acquires,
+                runtime_sessions_before: runtime_sessions_before.as_ref(),
+                runtime_sessions_after: runtime_sessions_after.as_ref(),
+                forward_write_ms,
+                forward_activation_encode_ms,
+                downstream_wait_ms,
+                upstream_reply_ms,
+                forward_mode,
+                message_elapsed_ms,
+                input_activation_bytes,
+                output_activation_bytes: output.payload.len(),
+                max_deferred_prefill_replies,
+                pending_prefill_replies_before,
+                pending_prefill_replies_after: pending_prefill_replies,
+                credit_wait_count,
+                deferred_prefill_replies_drained,
+            },
+        );
     }
 }

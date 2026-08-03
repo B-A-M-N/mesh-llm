@@ -96,7 +96,8 @@ Minimal GLM-DSA shape:
             "default": "fixed",
             "initial_window": 1,
             "min_window": 1,
-            "max_window": 1
+            "max_window": 1,
+            "pipeline_depth": 1
           }
         }
       }
@@ -112,7 +113,7 @@ Authoring rule of thumb:
 | `generation.policy` | Stable semantic execution choices validated for the package. | `profile`, `decode`, `short_prefill`, `long_prefill`, `verify`, `indexshare` |
 | `generation.policy.experimental` | Named opt-in paths that need package/backend evidence before becoming defaults. | `selected_row_flash`, `moe_weighted_down`, `moe_merged_shared_gate_up` |
 | `generation.thresholds` | Numeric resolver inputs used to accept, reject, or fall back from a policy. | `short_prefill_max_tokens`, `compact_flash_min_kv`, `dense_mask_max_bytes` |
-| `generation.speculative_decoding` | Package-owned native or draft speculation strategy defaults. | `native-mtp-n1`, `prediction_depth`, `layer_indices`, `window_policy` |
+| `generation.speculative_decoding` | Package-owned native, N-gram, or draft speculation strategy defaults. | strategy id, proposer bounds, `window_policy`, optional positive `pipeline_depth` |
 | GGUF metadata | Architecture correctness and tensor layout requirements. | GLM-DSA q/k/v split dimensions, IndexShare roles, MTP tensor presence |
 
 Writers should emit a profile only after the artifact actually matches that
@@ -260,6 +261,8 @@ dry-run by default and must be confirmed explicitly before submitting jobs:
 ```bash
 mesh-llm models package unsloth/Qwen3-8B-GGUF:Q4_K_M --dry-run
 mesh-llm models package unsloth/Qwen3-8B-GGUF:Q4_K_M --confirm --follow
+mesh-llm models package unsloth/inkling-GGUF:UD-Q2_K_XL --dry-run
+mesh-llm models package unsloth/inkling-GGUF:UD-Q2_K_XL --experimental --confirm --follow
 ```
 
 The hidden compatibility alias is `mesh-llm model-package`; prefer
@@ -274,13 +277,26 @@ Important options:
 - `--dry-run`: print the resolved package plan and maximum cost without side effects.
 - `--confirm`: submit the job.
 - `--follow`: wait and stream job progress.
+- `--experimental`: publish the package publicly with an experimental warning
+  and tag, and open an unmerged Hugging Face `meshllm/catalog` PR instead of
+  committing it to the catalog's `main` revision. Mesh discovery does not see
+  the package until that HF PR is reviewed and merged.
 - `--status <job-id>`, `--logs <job-id>`, `--cancel <job-id>`, `--list`: inspect
   or manage submitted jobs.
 - `--update-script`: refresh the bucket script when needed.
 
 The source model should stay in colon-selector form, for example
-`unsloth/Qwen3-8B-GGUF:Q4_K_M`. Do not split the quant into a separate `--quant`
-argument for generated job inputs.
+`unsloth/Qwen3-8B-GGUF:Q4_K_M`. A source revision may be requested as
+`org/repo@revision:quant`. The job resolves that revision to an immutable commit
+SHA before planning and mounts the source model volume at that SHA. Do not split
+the quant into a separate `--quant` argument for generated job inputs.
+
+Repository GGUFs whose basenames start with `mmproj` are discovered as
+multimodal projector sidecars, not model quants. The job passes them to
+`skippy-model-package write-package`, publishes them under `projectors/`, and
+preserves the source pipeline tag in the package model card. This is how a
+combined vision/audio projector such as Inkling's `mmproj-BF16.gguf` travels
+with its Q2 layer package.
 
 ## Publishing flow
 

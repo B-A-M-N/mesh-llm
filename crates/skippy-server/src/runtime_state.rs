@@ -535,6 +535,16 @@ impl RuntimeState {
         ))
     }
 
+    pub fn retire_verify_checkpoint(
+        &mut self,
+        session_id: &str,
+        token_start: u64,
+        token_count: u64,
+    ) -> Result<()> {
+        self.active_session(session_id)?
+            .retire_verify_checkpoint(token_start, token_count)
+    }
+
     pub fn trim_session(&mut self, session_id: &str, token_count: u64) -> Result<()> {
         let session = self.session(session_id)?;
         session.trim_session(token_count)?;
@@ -907,10 +917,11 @@ impl RuntimeState {
         let layer_end = i32::try_from(self.model_layer_end())?;
         let session = self.session(session_id)?;
         session.import_state_for_token_count(layer_start, layer_end, bytes, token_count)?;
-        self.session_token_counts
-            .entry(session_id.to_string())
-            .and_modify(|current| *current = (*current).max(token_count))
-            .or_insert(token_count);
+        record_restored_session_token_count(
+            &mut self.session_token_counts,
+            session_id,
+            token_count,
+        );
         Ok(())
     }
 
@@ -938,10 +949,11 @@ impl RuntimeState {
         let layer_end = i32::try_from(self.model_layer_end())?;
         let session = self.session(session_id)?;
         session.import_full_state_for_token_count(layer_start, layer_end, bytes, token_count)?;
-        self.session_token_counts
-            .entry(session_id.to_string())
-            .and_modify(|current| *current = (*current).max(token_count))
-            .or_insert(token_count);
+        record_restored_session_token_count(
+            &mut self.session_token_counts,
+            session_id,
+            token_count,
+        );
         Ok(())
     }
 
@@ -957,10 +969,11 @@ impl RuntimeState {
     ) -> Result<()> {
         self.session(session_id)?
             .import_recurrent_state_for_token_count(bytes, token_count)?;
-        self.session_token_counts
-            .entry(session_id.to_string())
-            .and_modify(|current| *current = (*current).max(token_count))
-            .or_insert(token_count);
+        record_restored_session_token_count(
+            &mut self.session_token_counts,
+            session_id,
+            token_count,
+        );
         Ok(())
     }
 
@@ -1073,6 +1086,18 @@ impl RuntimeState {
             resident_prefix: None,
         })
     }
+}
+
+fn record_restored_session_token_count(
+    session_token_counts: &mut BTreeMap<String, u64>,
+    session_id: &str,
+    token_count: u64,
+) {
+    // A prefix restore can move an existing lane backwards to a shorter
+    // common prefix. The tracked position must follow the imported native
+    // state exactly; retaining the previous high-water mark submits the next
+    // divergent token at the wrong position and makes llama_decode fail.
+    session_token_counts.insert(session_id.to_string(), token_count);
 }
 
 fn split_activation_frame(
@@ -1390,8 +1415,18 @@ mod tests {
 
     use super::{
         RuntimeLaunchOverrides, create_indexed_lane_resource, load_runtime_with_overrides,
-        runtime_config_from_stage_config, should_attach_package_projector,
+        record_restored_session_token_count, runtime_config_from_stage_config,
+        should_attach_package_projector,
     };
+
+    #[test]
+    fn prefix_restore_moves_tracked_position_backwards() {
+        let mut token_counts = std::collections::BTreeMap::from([("lane-a".to_string(), 3_535)]);
+
+        record_restored_session_token_count(&mut token_counts, "lane-a", 3_530);
+
+        assert_eq!(token_counts.get("lane-a"), Some(&3_530));
+    }
 
     #[test]
     fn create_indexed_lane_resource_keeps_index_available_when_creation_fails() {

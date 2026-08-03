@@ -5,9 +5,10 @@ use super::{
     invalid_data,
 };
 
-// v10 makes the coordinator the sole owner of verify-window acceptance and removes the
-// redundant tail-stage acceptance/correction fields. Stage peers must be upgraded together.
-pub const STAGE_STATE_VERSION: i32 = 10;
+// v11 adds the Inkling MTP embedding sideband and makes the coordinator the sole owner of
+// verify-window acceptance, removing redundant tail-stage acceptance/correction fields. Stage
+// peers must be upgraded together so older readers reject the changed payload contract.
+pub const STAGE_STATE_VERSION: i32 = 11;
 pub const MAX_STAGE_LOGIT_BIAS: usize = 256;
 pub const MAX_STAGE_PREDICTED_TOKENS: usize = 262_144;
 pub const MAX_STAGE_SIDEBAND_VALUES: usize = 1_048_576;
@@ -56,6 +57,7 @@ pub enum WireMessageKind {
     DecodeReadout = 8,
     DecodeLightCtx = 9,
     VerifyWindow = 21,
+    RetireVerifyWindow = 22,
     StateExport = 13,
     ConfigureGeneration = 14,
     ProbePrefill = 15,
@@ -93,6 +95,10 @@ impl WireMessageKind {
 
     pub fn is_session_control(self) -> bool {
         matches!(self, Self::TrimSession)
+    }
+
+    pub fn is_verify_retirement(self) -> bool {
+        matches!(self, Self::RetireVerifyWindow)
     }
 
     pub fn is_generation_control(self) -> bool {
@@ -140,6 +146,7 @@ impl TryFrom<i32> for WireMessageKind {
             19 => Ok(Self::TrimSession),
             20 => Ok(Self::PredictionReturnOpen),
             21 => Ok(Self::VerifyWindow),
+            22 => Ok(Self::RetireVerifyWindow),
             _ => Err(invalid_data("unknown stage message kind")),
         }
     }
@@ -183,10 +190,12 @@ pub mod state_flags {
     pub const CHAT_SAMPLING_METADATA: i32 = 1 << 5;
     pub const RWKV7_V_FIRST_SIDEBAND: i32 = 1 << 6;
     pub const GEMMA3N_ALTUP_SIDEBAND: i32 = 1 << 7;
+    pub const INKLING_MTP_EMBD_SIDEBAND: i32 = 1 << 8;
 }
 
 pub const ACTIVATION_FLAG_RWKV7_V_FIRST: u64 = 1 << 0;
 pub const ACTIVATION_FLAG_GEMMA3N_ALTUP: u64 = 1 << 1;
+pub const ACTIVATION_FLAG_INKLING_MTP_EMBD: u64 = 1 << 2;
 
 pub fn activation_frame_flags_from_state_flags(flags: i32) -> u64 {
     let mut frame_flags = 0;
@@ -195,6 +204,9 @@ pub fn activation_frame_flags_from_state_flags(flags: i32) -> u64 {
     }
     if (flags & state_flags::GEMMA3N_ALTUP_SIDEBAND) != 0 {
         frame_flags |= ACTIVATION_FLAG_GEMMA3N_ALTUP;
+    }
+    if (flags & state_flags::INKLING_MTP_EMBD_SIDEBAND) != 0 {
+        frame_flags |= ACTIVATION_FLAG_INKLING_MTP_EMBD;
     }
     frame_flags
 }
@@ -206,6 +218,9 @@ pub fn activation_state_flags_from_frame_flags(flags: u64) -> i32 {
     }
     if (flags & ACTIVATION_FLAG_GEMMA3N_ALTUP) != 0 {
         state |= state_flags::GEMMA3N_ALTUP_SIDEBAND;
+    }
+    if (flags & ACTIVATION_FLAG_INKLING_MTP_EMBD) != 0 {
+        state |= state_flags::INKLING_MTP_EMBD_SIDEBAND;
     }
     state
 }
@@ -313,6 +328,7 @@ impl StageStateHeader {
             kind,
             WireMessageKind::StateImport | WireMessageKind::StateExport
         ) || kind.is_session_control()
+            || kind.is_verify_retirement()
             || kind.is_generation_control()
         {
             return true;
@@ -391,7 +407,7 @@ pub struct StageWireMessage {
 impl StageWireMessage {
     /// The committed session position that must exist before this message runs.
     ///
-    /// Stage-state v10 makes this absolute position authoritative: a worker whose
+    /// Stage-state v11 makes this absolute position authoritative: a worker whose
     /// speculative KV is ahead must rewind locally before executing the message.
     pub fn authoritative_session_position(&self) -> Option<u64> {
         if !matches!(
@@ -695,6 +711,7 @@ fn expected_phase(kind: WireMessageKind) -> WireStagePhase {
             WireMessageKind::StateImport | WireMessageKind::StateExport
         )
         || kind.is_session_control()
+        || kind.is_verify_retirement()
         || kind.is_generation_control()
         || kind.is_prefix_cache_control()
     {
