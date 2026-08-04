@@ -14,6 +14,7 @@ pub mod kv_integration;
 pub mod kv_proto;
 pub mod package;
 pub mod runtime_state;
+pub mod serving_hooks;
 pub mod telemetry;
 pub mod tokenizer;
 
@@ -28,14 +29,11 @@ pub use embedded::{
 pub use frontend::{
     CONTEXT_BUDGET_MAX_TOKENS, DEFAULT_EMBEDDED_MAX_TOKENS, EmbeddedOpenAiArgs,
     EmbeddedOpenAiBackend, EmbeddedOpenAiRequestDefaults, EmbeddedReasoningBudget,
-    EmbeddedReasoningEnabled, EmbeddedReasoningFormat, GenerationReceipt, GenerationReceiptConfig,
-    GenerationReceiptSink, GenerationStateDigest, GenerationTermination, LinearProposal,
-    LinearProposalDiscardReason, LinearProposalDisposition, LinearProposalIngress,
-    LinearProposalIngressConfig, LinearProposalQuery, LinearProposalReceipt,
+    EmbeddedReasoningEnabled, EmbeddedReasoningFormat, LinearProposal, LinearProposalDiscardReason,
+    LinearProposalDisposition, LinearProposalIngress, LinearProposalQuery, LinearProposalReceipt,
     NativeMtpProposalConfig, NgramExtensionConfig, NgramProposalConfig, NgramProposerKind,
     OpaqueProposalDecisionId, OpenAiGuardrailsConfig, OpenAiGuardrailsStatus,
     OpenAiGuardrailsTarget, SpeculativeDecodeConfig, VerifyWindowConfig, embedded_openai_backend,
-    generation_token_id_digest,
 };
 pub use skippy_protocol::StageConfig;
 pub use tokenizer::{MAX_TOKENIZE_TOKENS, TokenizerCapability, TokenizerCapabilityError};
