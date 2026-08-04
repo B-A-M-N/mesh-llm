@@ -15,6 +15,7 @@ pub mod kv_proto;
 pub mod package;
 pub mod runtime_state;
 pub mod telemetry;
+pub mod tokenizer;
 
 // Re-export key types for consumers
 pub use binary_transport::serve_binary;
@@ -22,7 +23,7 @@ pub use cli::ServeBinaryArgs;
 pub use embedded::{
     EmbeddedRuntimeOptions, EmbeddedRuntimeStatus, EmbeddedServerHandle, EmbeddedServerStatus,
     EmbeddedState, SkippyRuntimeHandle, start_binary_stage, start_embedded_openai,
-    start_openai_backend, start_stage_http,
+    start_openai_backend, start_openai_backend_with_tokenizer, start_stage_http,
 };
 pub use frontend::{
     CONTEXT_BUDGET_MAX_TOKENS, DEFAULT_EMBEDDED_MAX_TOKENS, EmbeddedOpenAiArgs,
@@ -37,3 +38,4 @@ pub use frontend::{
     generation_token_id_digest,
 };
 pub use skippy_protocol::StageConfig;
+pub use tokenizer::{MAX_TOKENIZE_TOKENS, TokenizerCapability, TokenizerCapabilityError};
