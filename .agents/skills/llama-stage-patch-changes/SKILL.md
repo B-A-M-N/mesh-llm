@@ -22,6 +22,12 @@ Use this skill when changing the Skippy staged-runtime ABI carried in
   contiguous.
 - Keep public ABI declarations separate from independently reviewable model
   lifecycle, loading, and package implementation changes.
+- The Skippy native ABI is an internal lockstep boundary, not a stable
+  cross-version compatibility contract. It may change whenever the feature
+  requires it; update the Rust FFI mirror and all callers in the same change.
+- Do not preserve old native ABI signatures for compatibility. Bump the ABI
+  version when the boundary changes so mismatches are diagnosable, and make
+  sure the shipped Rust side and native runtime are built from the same queue.
 - Do not add a terminal source-reorganization patch. A deliberate layout or
   ownership change must be represented in the recreated patches that own the
   affected capabilities.
@@ -40,6 +46,60 @@ Use this skill when changing the Skippy staged-runtime ABI carried in
   Update explicit CMake source lists and installation rules with new modules.
 - Do not preserve retired source include paths unless the task explicitly asks
   for compatibility. Continue to version and mirror any binary ABI change.
+
+## Native API documentation
+
+- Treat Doxygen-style comments in `include/skippy.h` and
+  `include/skippy/*.h` as the source of truth for the public API reference.
+  Every public header and exported `skippy_*` function must have an adjacent
+  `@brief` describing what it is used for.
+- When the public header surface changes, prepare the patched checkout and
+  regenerate the website reference before finishing the change:
+
+  ```bash
+  scripts/prepare-llama.sh pinned
+  python3 scripts/generate-skippy-api-doc.py
+  python3 scripts/generate-skippy-api-doc.py --check
+  ```
+
+- Commit `website/src/docs/pages/skippy-api.md` alongside the native queue
+  change. The generated page must not be hand-edited, and its inventory must
+  include every public header and exported function in the prepared checkout.
+
+## ABI PR documentation requirements
+
+Every pull request that changes the Skippy ABI must include an explicit ABI
+inventory in the PR description. Do not describe a changed function signature
+as a newly added function.
+
+The inventory must state, for each change:
+
+- the exact symbol or declaration name and its complete signature or field
+  change;
+- whether it was added, changed, deprecated, deleted, or removed;
+- the public header containing the declaration;
+- the implementation source and Rust FFI mirror, when applicable;
+- the ABI version before and after the change;
+- why the change is required and what data or behavior it enables;
+- that backward compatibility with older native runtimes is intentionally not
+  required, and that the Rust FFI mirror and callers were updated in lockstep;
+- the tests that exercise the native ABI boundary, including public-header
+  compilation when a header changes.
+
+Use this compact table in the PR description:
+
+| Status | Symbol/declaration | Public header | Implementation / mirror | Reason | Lockstep update |
+|---|---|---|---|---|---|
+| Changed / Added / Removed | exact name and signature | `include/skippy/<capability>.h` | `src/skippy/<capability>.cpp`; Rust FFI path | behavior enabled | Rust mirror/callers updated; old ABI not supported |
+
+For a changed function signature, call out that it is an ABI change even when
+the symbol name is unchanged. List removed declarations explicitly as
+“none” when no functions or fields were deleted; this prevents reviewers from
+having to infer removals from a patch diff. Keep this inventory synchronized
+with the ABI version constants in `include/skippy/common.h` and the mirrors in
+`crates/skippy-ffi/src/lib.rs`. Do not add compatibility shims solely to
+support an older native runtime; the acceptance criterion is a synchronized
+Rust/native build and a clear version mismatch if the pieces are mixed.
 
 ## Local Flow
 
