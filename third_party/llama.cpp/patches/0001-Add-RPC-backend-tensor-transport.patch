@@ -1,24 +1,18 @@
-From 26b46c6ce3a998fdbf2eebb22d04282c5959cb54 Mon Sep 17 00:00:00 2001
+From c561cf7280526c4545955b96df2ea83f69e1ac59 Mon Sep 17 00:00:00 2001
 From: Mesh-LLM CI <ci@mesh-llm.local>
 Date: Sat, 8 Aug 2026 16:02:19 +1000
-Subject: [PATCH 01/12] Add RPC backend tensor transport
+Subject: [PATCH 01/16] Add RPC backend tensor transport
 
----
- ggml/include/ggml-rpc.h        |  4 +-
- ggml/src/ggml-backend-meta.cpp | 13 +++++
- ggml/src/ggml-backend.cpp      | 88 ++++++++++++++++++++++++++++++++++
- ggml/src/ggml-rpc/ggml-rpc.cpp |  1 +
- 4 files changed, 104 insertions(+), 2 deletions(-)
 
 diff --git a/ggml/include/ggml-rpc.h b/ggml/include/ggml-rpc.h
-index 16ca33947..2d103664f 100644
+index 276aea00e..bc9b3771c 100644
 --- a/ggml/include/ggml-rpc.h
 +++ b/ggml/include/ggml-rpc.h
 @@ -8,10 +8,10 @@ extern "C" {
  
- #define RPC_PROTO_MAJOR_VERSION    4
+ #define RPC_PROTO_MAJOR_VERSION    5
  #define RPC_PROTO_MINOR_VERSION    0
--#define RPC_PROTO_PATCH_VERSION    3
+-#define RPC_PROTO_PATCH_VERSION    0
 +#define RPC_PROTO_PATCH_VERSION    5
  
  #ifdef  __cplusplus
@@ -59,10 +53,10 @@ index a5a3a58ad..b397fb6ba 100644
                  split_state = handle_generic(src_ss, /*scalar_only =*/ true);
              } break;
 diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
-index 7f4e252dc..b73cd6de6 100644
+index f6fb91798..fcd92c2ec 100644
 --- a/ggml/src/ggml-backend.cpp
 +++ b/ggml/src/ggml-backend.cpp
-@@ -991,6 +991,93 @@ static void ggml_backend_sched_print_assignments(ggml_backend_sched_t sched, str
+@@ -1023,6 +1023,93 @@ static void ggml_backend_sched_print_assignments(ggml_backend_sched_t sched, str
      }
  }
  
@@ -156,7 +150,7 @@ index 7f4e252dc..b73cd6de6 100644
  static bool ggml_backend_sched_buffer_supported(ggml_backend_sched_t sched, struct ggml_tensor * t, int backend_id) {
      ggml_backend_buffer_t buf = t->view_src ? t->view_src->buffer : t->buffer;
      ggml_backend_buffer_type_t buft = NULL;
-@@ -1387,6 +1474,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
+@@ -1427,6 +1514,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
      if (sched->debug) {
          ggml_backend_sched_print_assignments(sched, graph);
      }
@@ -165,10 +159,10 @@ index 7f4e252dc..b73cd6de6 100644
      // swap node_backend_ids and leaf _backend_ids with prevs
      {
 diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
-index d38057721..1166178b7 100644
+index 17c53a5f0..3a8a1f248 100644
 --- a/ggml/src/ggml-rpc/ggml-rpc.cpp
 +++ b/ggml/src/ggml-rpc/ggml-rpc.cpp
-@@ -600,6 +600,7 @@ static size_t ggml_backend_rpc_buffer_type_get_alloc_size(ggml_backend_buffer_ty
+@@ -621,6 +621,7 @@ static size_t ggml_backend_rpc_buffer_type_get_alloc_size(ggml_backend_buffer_ty
      // ops that require additional memory for fleeting data on certain backends
      // ref: https://github.com/ggml-org/llama.cpp/pull/15966
      rpc_get |= tensor->op == GGML_OP_FLASH_ATTN_EXT;
@@ -176,6 +170,3 @@ index d38057721..1166178b7 100644
      rpc_get |= tensor->op == GGML_OP_MUL_MAT_ID;
  
      if (rpc_get) {
--- 
-2.54.0 (Apple Git-157)
-
