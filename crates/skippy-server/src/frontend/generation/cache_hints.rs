@@ -4,12 +4,15 @@ use crate::frontend::util::stable_wire_id;
 use openai_frontend::ChatCompletionRequest;
 use openai_frontend::CompletionRequest;
 use skippy_protocol::binary::StageReplyStats;
+use std::sync::OnceLock;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
+use uuid::Uuid;
 
 pub(in crate::frontend) static OPENAI_GENERATION_COUNTER: AtomicU64 = AtomicU64::new(1);
+static OPENAI_PROCESS_NONCE: OnceLock<String> = OnceLock::new();
 
 /// Sentinel meaning "no caller-specified max completion length; let the
 /// request consume the entire remaining context window when the client
@@ -58,14 +61,10 @@ impl OpenAiGenerationIds {
         let session_label = agent_session_id
             .map(|id| format!("openai-agent-session-{id}"))
             .unwrap_or_else(|| format!("openai-session-{}-{sequence}", now_unix_millis()));
-        let request_sequence = sequence.to_string();
+        let request_id = request_id(&session_label, sequence, process_nonce());
         Self {
             session_id: stable_wire_id(&[session_label.as_bytes()]),
-            request_id: stable_wire_id(&[
-                session_label.as_bytes(),
-                b"request",
-                request_sequence.as_bytes(),
-            ]),
+            request_id,
             session_label,
             request_started_at,
             agent_session_id: agent_session_id.map(Into::into),
@@ -80,6 +79,20 @@ impl OpenAiGenerationIds {
     pub(in crate::frontend) fn request_id_string(&self) -> String {
         self.request_id.to_string()
     }
+}
+
+fn process_nonce() -> &'static str {
+    OPENAI_PROCESS_NONCE.get_or_init(|| Uuid::new_v4().simple().to_string())
+}
+
+fn request_id(session_label: &str, sequence: u64, process_nonce: &str) -> u64 {
+    let request_sequence = sequence.to_string();
+    stable_wire_id(&[
+        session_label.as_bytes(),
+        b"request",
+        process_nonce.as_bytes(),
+        request_sequence.as_bytes(),
+    ])
 }
 
 #[cfg(test)]
@@ -104,6 +117,14 @@ mod tests {
 
         assert_ne!(first.session_id, second.session_id);
         assert_ne!(first.request_id, second.request_id);
+    }
+
+    #[test]
+    fn request_ids_differ_for_replica_equivalent_sequences() {
+        assert_ne!(
+            request_id("openai-agent-session-agent-42", 7, "process-a"),
+            request_id("openai-agent-session-agent-42", 7, "process-b")
+        );
     }
 }
 
