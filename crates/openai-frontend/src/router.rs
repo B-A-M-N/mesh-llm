@@ -4,7 +4,7 @@ use std::{
     pin::Pin,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     task::{Context, Poll},
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -13,7 +13,7 @@ use std::{
 use axum::{
     Json, Router,
     body::Body,
-    extract::{DefaultBodyLimit, State, rejection::JsonRejection},
+    extract::{DefaultBodyLimit, Extension, State, rejection::JsonRejection},
     http::{HeaderMap, HeaderValue, Method, Request, StatusCode, Uri, header::HeaderName},
     middleware::{self, Next},
     response::{
@@ -31,7 +31,7 @@ use crate::{
         CancellationToken, OpenAiBackend, OpenAiRequestContext, OpenAiResult, SharedBackend,
     },
     chat::{ChatCompletionChunk, ChatCompletionRequest},
-    common::{AgentSessionIdentity, AgentSessionSource},
+    common::{AgentSessionIdentity, AgentSessionSource, Usage},
     completions::CompletionRequest,
     errors::OpenAiError,
     models::ModelsResponse,
@@ -190,17 +190,26 @@ async fn models(State(state): State<FrontendState>) -> Result<Json<ModelsRespons
 async fn chat_completions(
     State(state): State<FrontendState>,
     headers: HeaderMap,
+    Extension(request_id): Extension<RequestId>,
     payload: Result<Json<ChatCompletionRequest>, JsonRejection>,
 ) -> Result<Response, OpenAiError> {
     let Json(mut request) = json_payload(payload)?;
     request.set_agent_session(agent_session_from_header(&state.config, &headers)?);
     request.validate()?;
+    log_request_started(
+        &request_id,
+        "chat_completion",
+        &request.model,
+        request.stream,
+    );
+    let mut observation = RequestObservation::new(request_id.0.clone(), "chat_completion");
     if request.stream {
         let include_usage = request.include_usage();
         let model = request.model.clone();
-        let context = OpenAiRequestContext::new();
+        let context = OpenAiRequestContext::with_request_id(request_id.0.clone());
         let cancellation = context.cancellation_token();
-        let stream = backend_call_with_cancellation(
+        let stream_error = Arc::new(AtomicBool::new(false));
+        let backend_stream = match backend_call_with_cancellation(
             &state,
             "chat_completion_stream",
             &context,
@@ -208,7 +217,20 @@ async fn chat_completions(
                 .backend
                 .chat_completion_stream(request, context.clone()),
         )
-        .await?;
+        .await
+        {
+            Ok(stream) => stream,
+            Err(error) => {
+                observation.finish(request_error_outcome(&error));
+                return Err(error);
+            }
+        };
+        let stream = observe_backend_stream(
+            backend_stream,
+            "chat_completion_stream",
+            &context,
+            stream_error.clone(),
+        );
         let prelude = stream::once(async move { json_event(&ChatCompletionChunk::role(model)) });
         let events = prelude
             .chain(stream.filter_map(move |item| async move {
@@ -219,27 +241,39 @@ async fn chat_completions(
                 }
             }))
             .chain(stream::once(async { done_event() }));
-        Ok(sse_response(events, cancellation))
+        Ok(sse_response(
+            events,
+            cancellation,
+            StreamLifecycle::new(observation, stream_error),
+        ))
     } else {
-        let context = OpenAiRequestContext::new();
-        Ok(Json(
-            backend_call_with_cancellation(
-                &state,
-                "chat_completion",
-                &context,
-                state
-                    .backend
-                    .chat_completion_with_context(request, context.clone()),
-            )
-            .await?,
+        let context = OpenAiRequestContext::with_request_id(request_id.0.clone());
+        let response = match backend_call_with_cancellation(
+            &state,
+            "chat_completion",
+            &context,
+            state
+                .backend
+                .chat_completion_with_context(request, context.clone()),
         )
-        .into_response())
+        .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                observation.finish(request_error_outcome(&error));
+                return Err(error);
+            }
+        };
+        log_response_completed(&context, "chat_completion", &response.usage);
+        observation.finish("success");
+        Ok(Json(response).into_response())
     }
 }
 
 async fn responses(
     State(state): State<FrontendState>,
     headers: HeaderMap,
+    Extension(request_id): Extension<RequestId>,
     payload: Result<Json<Value>, JsonRejection>,
 ) -> Result<Response, OpenAiError> {
     let Json(mut value) = json_payload(payload)?;
@@ -254,12 +288,23 @@ async fn responses(
         .transpose()?;
     request.set_agent_session(resolve_agent_session(header_session, responses_session)?);
     request.validate()?;
+    log_request_started(
+        &request_id,
+        "responses",
+        &request.model,
+        matches!(
+            normalization.response_adapter,
+            ResponseAdapterMode::OpenAiResponsesStream
+        ),
+    );
+    let mut observation = RequestObservation::new(request_id.0.clone(), "responses");
     match normalization.response_adapter {
         ResponseAdapterMode::OpenAiResponsesStream => {
-            let context = OpenAiRequestContext::new();
+            let context = OpenAiRequestContext::with_request_id(request_id.0.clone());
             let cancellation = context.cancellation_token();
+            let stream_error = Arc::new(AtomicBool::new(false));
             let state_machine = Arc::new(Mutex::new(ResponseSseState::new(request.model.clone())));
-            let stream = backend_call_with_cancellation(
+            let backend_stream = match backend_call_with_cancellation(
                 &state,
                 "responses_stream",
                 &context,
@@ -267,7 +312,20 @@ async fn responses(
                     .backend
                     .chat_completion_stream(request, context.clone()),
             )
-            .await?;
+            .await
+            {
+                Ok(stream) => stream,
+                Err(error) => {
+                    observation.finish(request_error_outcome(&error));
+                    return Err(error);
+                }
+            };
+            let stream = observe_backend_stream(
+                backend_stream,
+                "responses_stream",
+                &context,
+                stream_error.clone(),
+            );
             let body_state = state_machine.clone();
             let body_events = stream.flat_map(move |item| {
                 let mut out = Vec::new();
@@ -453,11 +511,15 @@ async fn responses(
             let events = body_events
                 .chain(tail_events)
                 .chain(stream::once(async { done_event() }));
-            Ok(sse_response(events, cancellation))
+            Ok(sse_response(
+                events,
+                cancellation,
+                StreamLifecycle::new(observation, stream_error),
+            ))
         }
         _ => {
-            let context = OpenAiRequestContext::new();
-            let response = backend_call_with_cancellation(
+            let context = OpenAiRequestContext::with_request_id(request_id.0.clone());
+            let response = match backend_call_with_cancellation(
                 &state,
                 "responses",
                 &context,
@@ -465,8 +527,23 @@ async fn responses(
                     .backend
                     .chat_completion_with_context(request, context.clone()),
             )
-            .await?;
-            let translated = translate_chat_completion_response_to_responses(&response)?;
+            .await
+            {
+                Ok(response) => response,
+                Err(error) => {
+                    observation.finish(request_error_outcome(&error));
+                    return Err(error);
+                }
+            };
+            log_response_completed(&context, "responses", &response.usage);
+            let translated = match translate_chat_completion_response_to_responses(&response) {
+                Ok(translated) => translated,
+                Err(error) => {
+                    observation.finish("adapter_error");
+                    return Err(error);
+                }
+            };
+            observation.finish("success");
             Ok(Json(translated).into_response())
         }
     }
@@ -475,22 +552,39 @@ async fn responses(
 async fn completions(
     State(state): State<FrontendState>,
     headers: HeaderMap,
+    Extension(request_id): Extension<RequestId>,
     payload: Result<Json<CompletionRequest>, JsonRejection>,
 ) -> Result<Response, OpenAiError> {
     let Json(mut request) = json_payload(payload)?;
     request.set_agent_session(agent_session_from_header(&state.config, &headers)?);
     request.validate()?;
+    log_request_started(&request_id, "completion", &request.model, request.stream);
+    let mut observation = RequestObservation::new(request_id.0.clone(), "completion");
     if request.stream {
         let include_usage = request.include_usage();
-        let context = OpenAiRequestContext::new();
+        let context = OpenAiRequestContext::with_request_id(request_id.0.clone());
         let cancellation = context.cancellation_token();
-        let stream = backend_call_with_cancellation(
+        let stream_error = Arc::new(AtomicBool::new(false));
+        let backend_stream = match backend_call_with_cancellation(
             &state,
             "completion_stream",
             &context,
             state.backend.completion_stream(request, context.clone()),
         )
-        .await?;
+        .await
+        {
+            Ok(stream) => stream,
+            Err(error) => {
+                observation.finish(request_error_outcome(&error));
+                return Err(error);
+            }
+        };
+        let stream = observe_backend_stream(
+            backend_stream,
+            "completion_stream",
+            &context,
+            stream_error.clone(),
+        );
         let events = stream
             .filter_map(move |item| async move {
                 match item {
@@ -500,21 +594,32 @@ async fn completions(
                 }
             })
             .chain(stream::once(async { done_event() }));
-        Ok(sse_response(events, cancellation))
+        Ok(sse_response(
+            events,
+            cancellation,
+            StreamLifecycle::new(observation, stream_error),
+        ))
     } else {
-        let context = OpenAiRequestContext::new();
-        Ok(Json(
-            backend_call_with_cancellation(
-                &state,
-                "completion",
-                &context,
-                state
-                    .backend
-                    .completion_with_context(request, context.clone()),
-            )
-            .await?,
+        let context = OpenAiRequestContext::with_request_id(request_id.0.clone());
+        let response = match backend_call_with_cancellation(
+            &state,
+            "completion",
+            &context,
+            state
+                .backend
+                .completion_with_context(request, context.clone()),
         )
-        .into_response())
+        .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                observation.finish(request_error_outcome(&error));
+                return Err(error);
+            }
+        };
+        log_response_completed(&context, "completion", &response.usage);
+        observation.finish("success");
+        Ok(Json(response).into_response())
     }
 }
 
@@ -589,11 +694,28 @@ where
     F: Future<Output = OpenAiResult<T>>,
 {
     let mut cancel_on_drop = CancelOnDrop::new(context);
+    let request_id = context.request_id().unwrap_or("unknown");
+    tracing::info!(
+        target: "mesh_openai_observability",
+        event = "backend_started",
+        request_id,
+        operation,
+        "OpenAI backend operation started"
+    );
     let result = match state.config.backend_timeout {
         Some(timeout) => match tokio::time::timeout(timeout, future).await {
             Ok(result) => result,
             Err(_) => {
                 context.cancel();
+                tracing::warn!(
+                    target: "mesh_openai_observability",
+                    event = "backend_timeout",
+                    request_id,
+                    operation,
+                    timeout_ms = timeout.as_millis() as u64,
+                    elapsed_us = context.elapsed().as_micros() as u64,
+                    "OpenAI backend operation timed out"
+                );
                 return Err(OpenAiError::timeout(format!(
                     "{operation} timed out after {} ms",
                     timeout.as_millis()
@@ -602,8 +724,105 @@ where
         },
         None => future.await,
     };
+    match &result {
+        Ok(_) => tracing::info!(
+            target: "mesh_openai_observability",
+            event = "backend_returned",
+            request_id,
+            operation,
+            elapsed_us = context.elapsed().as_micros() as u64,
+            "OpenAI backend operation returned"
+        ),
+        Err(error) => tracing::warn!(
+            target: "mesh_openai_observability",
+            event = "backend_error",
+            request_id,
+            operation,
+            elapsed_us = context.elapsed().as_micros() as u64,
+            error = %error,
+            "OpenAI backend operation failed"
+        ),
+    }
     cancel_on_drop.disarm();
     result
+}
+
+fn log_request_started(request_id: &RequestId, operation: &'static str, model: &str, stream: bool) {
+    tracing::info!(
+        target: "mesh_openai_observability",
+        event = "request_started",
+        request_id = %request_id.0,
+        operation,
+        model,
+        stream,
+        "OpenAI request accepted"
+    );
+}
+
+fn request_error_outcome(error: &OpenAiError) -> &'static str {
+    if error.status() == StatusCode::GATEWAY_TIMEOUT {
+        "timeout"
+    } else {
+        "backend_error"
+    }
+}
+
+fn observe_backend_stream<S, T>(
+    stream: S,
+    operation: &'static str,
+    context: &OpenAiRequestContext,
+    stream_error: Arc<AtomicBool>,
+) -> impl Stream<Item = OpenAiResult<T>> + Send + 'static
+where
+    S: Stream<Item = OpenAiResult<T>> + Send + 'static,
+    T: Send + 'static,
+{
+    let context = context.clone();
+    let mut item_count = 0_u64;
+    let mut first_item = false;
+    stream.map(move |item| {
+        item_count = item_count.saturating_add(1);
+        if !first_item {
+            first_item = true;
+            tracing::info!(
+                target: "mesh_openai_observability",
+                event = "stream_first_item",
+                request_id = context.request_id().unwrap_or("unknown"),
+                operation,
+                item_count,
+                time_to_first_item_us = context.elapsed().as_micros() as u64,
+                "OpenAI stream emitted its first item"
+            );
+        }
+        if let Err(error) = &item {
+            stream_error.store(true, Ordering::Release);
+            tracing::warn!(
+                target: "mesh_openai_observability",
+                event = "stream_item_error",
+                request_id = context.request_id().unwrap_or("unknown"),
+                operation,
+                item_count,
+                elapsed_us = context.elapsed().as_micros() as u64,
+                error = %error,
+                "OpenAI stream emitted an error"
+            );
+        }
+        item
+    })
+}
+
+fn log_response_completed(context: &OpenAiRequestContext, operation: &'static str, usage: &Usage) {
+    tracing::info!(
+        target: "mesh_openai_observability",
+        event = "response_completed",
+        request_id = context.request_id().unwrap_or("unknown"),
+        operation,
+        elapsed_us = context.elapsed().as_micros() as u64,
+        prompt_tokens = usage.prompt_tokens,
+        completion_tokens = usage.completion_tokens,
+        total_tokens = usage.total_tokens,
+        "OpenAI response completed"
+    );
 }
 
 async fn backend_call<T, F>(
@@ -690,11 +909,78 @@ fn new_request_id() -> String {
     format!("req-{millis}-{counter}")
 }
 
-fn sse_response<S>(events: S, cancellation: CancellationToken) -> Response
+struct RequestObservation {
+    request_id: String,
+    operation: &'static str,
+    started_at: std::time::Instant,
+    terminal: bool,
+}
+
+impl RequestObservation {
+    fn new(request_id: String, operation: &'static str) -> Self {
+        Self {
+            request_id,
+            operation,
+            started_at: std::time::Instant::now(),
+            terminal: false,
+        }
+    }
+
+    fn finish(&mut self, outcome: &'static str) {
+        if self.terminal {
+            return;
+        }
+        self.terminal = true;
+        tracing::info!(
+            target: "mesh_openai_observability",
+            event = "request_finished",
+            request_id = %self.request_id,
+            operation = self.operation,
+            outcome,
+            elapsed_us = self.started_at.elapsed().as_micros() as u64,
+            "OpenAI request finished"
+        );
+    }
+}
+
+impl Drop for RequestObservation {
+    fn drop(&mut self) {
+        self.finish("cancelled");
+    }
+}
+
+struct StreamLifecycle {
+    observation: RequestObservation,
+    stream_error: Arc<AtomicBool>,
+}
+
+impl StreamLifecycle {
+    fn new(observation: RequestObservation, stream_error: Arc<AtomicBool>) -> Self {
+        Self {
+            observation,
+            stream_error,
+        }
+    }
+
+    fn finish_natural(&mut self) {
+        let outcome = if self.stream_error.load(Ordering::Acquire) {
+            "backend_error"
+        } else {
+            "success"
+        };
+        self.observation.finish(outcome);
+    }
+}
+
+fn sse_response<S>(
+    events: S,
+    cancellation: CancellationToken,
+    lifecycle: StreamLifecycle,
+) -> Response
 where
     S: Stream<Item = Result<Event, Infallible>> + Send + 'static,
 {
-    Sse::new(CancelOnDropSseStream::new(events, cancellation))
+    Sse::new(CancelOnDropSseStream::new(events, cancellation, lifecycle))
         .keep_alive(KeepAlive::default())
         .into_response()
 }
@@ -702,16 +988,18 @@ where
 struct CancelOnDropSseStream {
     inner: Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send + 'static>>,
     cancellation: CancellationToken,
+    lifecycle: StreamLifecycle,
 }
 
 impl CancelOnDropSseStream {
-    fn new<S>(inner: S, cancellation: CancellationToken) -> Self
+    fn new<S>(inner: S, cancellation: CancellationToken, lifecycle: StreamLifecycle) -> Self
     where
         S: Stream<Item = Result<Event, Infallible>> + Send + 'static,
     {
         Self {
             inner: Box::pin(inner),
             cancellation,
+            lifecycle,
         }
     }
 }
@@ -719,8 +1007,13 @@ impl CancelOnDropSseStream {
 impl Stream for CancelOnDropSseStream {
     type Item = Result<Event, Infallible>;
 
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        self.inner.as_mut().poll_next(cx)
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        let result = this.inner.as_mut().poll_next(cx);
+        if matches!(result, Poll::Ready(None)) {
+            this.lifecycle.finish_natural();
+        }
+        result
     }
 }
 
@@ -758,6 +1051,18 @@ mod tests {
     #[test]
     fn trusted_agent_session_header_parser_rejects_invalid_names() {
         assert!(parse_agent_session_header("not a header").is_none());
+    }
+
+    #[test]
+    fn request_error_outcome_distinguishes_timeouts() {
+        assert_eq!(
+            request_error_outcome(&OpenAiError::timeout("slow")),
+            "timeout"
+        );
+        assert_eq!(
+            request_error_outcome(&OpenAiError::backend("upstream failed")),
+            "backend_error"
+        );
     }
     use crate::{
         FinishReason,
