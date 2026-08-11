@@ -1,6 +1,7 @@
 use crate::frontend::generation::ChatOutputStreamParser;
 use crate::frontend::generation::GENERATION_ADMISSION_TIMEOUT;
 use crate::frontend::generation::GeneratedText;
+use crate::frontend::generation::GenerationSessionLockEntry;
 use crate::frontend::generation::GenerationStream;
 use crate::frontend::generation::GenerationStreamEvent;
 use crate::frontend::generation::GenerationTokenLimit;
@@ -9,7 +10,7 @@ use crate::frontend::generation::OpenAiGenerationIds;
 use crate::frontend::generation::PhaseTimer;
 use crate::frontend::generation::PreparedGenerationPrompt;
 use crate::frontend::generation::StageOpenAiBackend;
-use crate::frontend::generation::acquire_generation_permit_with_queue;
+use crate::frontend::generation::acquire_generation_permit_with_queue_reservation;
 use crate::frontend::generation::apply_reasoning_visibility;
 use crate::frontend::generation::chat_output_parser_required;
 use crate::frontend::generation::chat_response_from_generated_text;
@@ -17,6 +18,9 @@ use crate::frontend::generation::completion_response_from_generated_text;
 use crate::frontend::generation::ensure_requested_model;
 use crate::frontend::generation::generation_event_to_chat_chunk;
 use crate::frontend::generation::generation_event_to_completion_chunk;
+use crate::frontend::generation::generation_queue_full_error;
+use crate::frontend::generation::generation_queue_timeout_error;
+use crate::frontend::generation::reserve_generation_queue;
 use crate::frontend::generation::template_exposes_reasoning;
 use crate::frontend::request::{
     apply_chat_request_defaults, apply_completion_request_defaults, chat_sampling_config,
@@ -47,12 +51,127 @@ use serde_json::json;
 use skippy_metrics::attr as attr_key;
 use skippy_runtime::SamplingConfig;
 use std::collections::BTreeMap;
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::atomic::Ordering;
 use tokio::sync::OwnedSemaphorePermit;
+use tokio::sync::TryAcquireError;
 use tokio::sync::mpsc;
 use tokio::task;
 
 fn request_cancelled_error() -> OpenAiError {
     OpenAiError::backend("request cancelled")
+}
+
+fn should_emit_stream_usage(request_include_usage: bool, context: &OpenAiRequestContext) -> bool {
+    request_include_usage || context.observes_stream_usage()
+}
+
+struct GenerationSessionPermit {
+    registry: Arc<Mutex<BTreeMap<String, Arc<GenerationSessionLockEntry>>>>,
+    key: String,
+    entry: Arc<GenerationSessionLockEntry>,
+    permit: Option<OwnedSemaphorePermit>,
+}
+
+impl GenerationSessionPermit {
+    fn new(
+        registry: Arc<Mutex<BTreeMap<String, Arc<GenerationSessionLockEntry>>>>,
+        key: String,
+    ) -> OpenAiResult<Self> {
+        let entry = {
+            let mut locks = registry
+                .lock()
+                .map_err(|_| OpenAiError::backend("generation session lock map poisoned"))?;
+            let entry = locks
+                .entry(key.clone())
+                .or_insert_with(|| {
+                    Arc::new(GenerationSessionLockEntry {
+                        semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
+                        users: std::sync::atomic::AtomicUsize::new(0),
+                    })
+                })
+                .clone();
+            // Keep acquisition of a registry reference atomic with lookup and
+            // creation. Drop removes an entry while holding this same mutex;
+            // incrementing after the lock is released could resurrect a lease
+            // for an entry that has already been replaced.
+            entry.users.fetch_add(1, Ordering::AcqRel);
+            entry
+        };
+        Ok(Self {
+            registry,
+            key,
+            entry,
+            permit: None,
+        })
+    }
+
+    fn try_acquire(&mut self) -> OpenAiResult<bool> {
+        match self.entry.semaphore.clone().try_acquire_owned() {
+            Ok(permit) => {
+                self.permit = Some(permit);
+                Ok(true)
+            }
+            Err(TryAcquireError::NoPermits) => Ok(false),
+            Err(TryAcquireError::Closed) => {
+                Err(OpenAiError::backend("generation session lock closed"))
+            }
+        }
+    }
+
+    async fn acquire_until(
+        mut self,
+        deadline: std::time::Instant,
+        cancellation: &openai_frontend::CancellationToken,
+    ) -> OpenAiResult<Self> {
+        let acquire = tokio::time::timeout_at(
+            tokio::time::Instant::from_std(deadline),
+            self.entry.semaphore.clone().acquire_owned(),
+        );
+        let permit = tokio::select! {
+            result = acquire => result
+                .map_err(|_| generation_queue_timeout_error(GENERATION_ADMISSION_TIMEOUT))?
+                .map_err(|_| OpenAiError::backend("generation session lock closed"))?,
+            () = cancellation.cancelled() => return Err(request_cancelled_error()),
+        };
+        self.permit = Some(permit);
+        Ok(self)
+    }
+}
+
+fn trusted_generation_session_id(ids: &OpenAiGenerationIds) -> Option<&str> {
+    ids.agent_session_id
+        .as_deref()
+        .filter(|_| ids.agent_session_trusted)
+}
+
+fn generation_ids(
+    cache: OpenAiCacheHints,
+    agent_session_id: Option<&str>,
+    context: &OpenAiRequestContext,
+) -> OpenAiGenerationIds {
+    OpenAiGenerationIds::new_with_trust(
+        cache,
+        agent_session_id,
+        context.has_trusted_agent_session(),
+    )
+}
+
+impl Drop for GenerationSessionPermit {
+    fn drop(&mut self) {
+        self.permit.take();
+        let Ok(mut locks) = self.registry.lock() else {
+            return;
+        };
+        if self.entry.users.fetch_sub(1, Ordering::AcqRel) == 1
+            && locks
+                .get(&self.key)
+                .is_some_and(|entry| Arc::ptr_eq(entry, &self.entry))
+        {
+            locks.remove(&self.key);
+        }
+    }
 }
 
 pub(in crate::frontend) async fn run_blocking_generation_worker<T, F>(
@@ -90,9 +209,10 @@ impl OpenAiBackend for StageOpenAiBackend {
         mut request: ChatCompletionRequest,
         context: OpenAiRequestContext,
     ) -> OpenAiResult<ChatCompletionResponse> {
-        let ids = OpenAiGenerationIds::new(
+        let ids = generation_ids(
             OpenAiCacheHints::from_chat_request(&request),
             request.agent_session(),
+            &context,
         );
         let request_timer = PhaseTimer::start();
         self.apply_before_chat_hooks(&mut request).await?;
@@ -193,9 +313,10 @@ impl OpenAiBackend for StageOpenAiBackend {
         mut request: ChatCompletionRequest,
         context: OpenAiRequestContext,
     ) -> OpenAiResult<ChatCompletionStream> {
-        let ids = OpenAiGenerationIds::new(
+        let ids = generation_ids(
             OpenAiCacheHints::from_chat_request(&request),
             request.agent_session(),
+            &context,
         );
         self.apply_before_chat_hooks(&mut request).await?;
         self.ensure_model(&request.model)?;
@@ -260,9 +381,10 @@ impl OpenAiBackend for StageOpenAiBackend {
         mut request: CompletionRequest,
         context: OpenAiRequestContext,
     ) -> OpenAiResult<CompletionResponse> {
-        let ids = OpenAiGenerationIds::new(
+        let ids = generation_ids(
             OpenAiCacheHints::from_completion_request(&request),
             request.agent_session(),
+            &context,
         );
         let request_timer = PhaseTimer::start();
         self.ensure_model(&request.model)?;
@@ -337,9 +459,10 @@ impl OpenAiBackend for StageOpenAiBackend {
         mut request: CompletionRequest,
         context: OpenAiRequestContext,
     ) -> OpenAiResult<CompletionStream> {
-        let ids = OpenAiGenerationIds::new(
+        let ids = generation_ids(
             OpenAiCacheHints::from_completion_request(&request),
             request.agent_session(),
+            &context,
         );
         self.ensure_model(&request.model)?;
         apply_completion_request_defaults(&mut request, &self.request_defaults);
@@ -382,12 +505,94 @@ impl OpenAiBackend for StageOpenAiBackend {
 }
 
 impl StageOpenAiBackend {
-    async fn acquire_generation_permit(&self) -> OpenAiResult<OwnedSemaphorePermit> {
-        acquire_generation_permit_with_queue(
-            self.generation_limit.clone(),
+    fn new_generation_session_permit(
+        &self,
+        ids: &OpenAiGenerationIds,
+    ) -> OpenAiResult<Option<GenerationSessionPermit>> {
+        let Some(agent_session_id) = trusted_generation_session_id(ids) else {
+            return Ok(None);
+        };
+        GenerationSessionPermit::new(
+            self.generation_session_locks.clone(),
+            agent_session_id.to_owned(),
+        )
+        .map(Some)
+    }
+
+    async fn acquire_generation_admission(
+        &self,
+        ids: &OpenAiGenerationIds,
+        cancellation: &openai_frontend::CancellationToken,
+    ) -> OpenAiResult<(OwnedSemaphorePermit, Option<GenerationSessionPermit>)> {
+        let deadline = std::time::Instant::now() + GENERATION_ADMISSION_TIMEOUT;
+        let mut session_permit = self.new_generation_session_permit(ids)?;
+        let mut queue_reservation = None;
+
+        if let Some(session) = session_permit.as_mut() {
+            if cancellation.is_cancelled() {
+                return Err(request_cancelled_error());
+            }
+            if !session.try_acquire()? {
+                queue_reservation = Some(
+                    reserve_generation_queue(
+                        self.generation_queue_depth.clone(),
+                        self.generation_queue_limit,
+                    )
+                    .ok_or_else(generation_queue_full_error)?,
+                );
+                let session = session_permit.take().expect("session permit was present");
+                session_permit = Some(session.acquire_until(deadline, cancellation).await?);
+            }
+        }
+
+        if std::time::Instant::now() >= deadline {
+            return Err(generation_queue_timeout_error(GENERATION_ADMISSION_TIMEOUT));
+        }
+        let generation_permit = match queue_reservation {
+            Some(reservation) => {
+                acquire_generation_permit_with_queue_reservation(
+                    self.generation_limit.clone(),
+                    reservation,
+                    GENERATION_ADMISSION_TIMEOUT,
+                    deadline,
+                    cancellation,
+                )
+                .await?
+            }
+            None => {
+                self.acquire_generation_permit_until(deadline, cancellation)
+                    .await?
+            }
+        };
+        Ok((generation_permit, session_permit))
+    }
+
+    async fn acquire_generation_permit_until(
+        &self,
+        deadline: std::time::Instant,
+        cancellation: &openai_frontend::CancellationToken,
+    ) -> OpenAiResult<OwnedSemaphorePermit> {
+        if cancellation.is_cancelled() {
+            return Err(request_cancelled_error());
+        }
+        match self.generation_limit.clone().try_acquire_owned() {
+            Ok(permit) => return Ok(permit),
+            Err(TryAcquireError::Closed) => {
+                return Err(OpenAiError::backend("generation lanes closed"));
+            }
+            Err(TryAcquireError::NoPermits) => {}
+        }
+        let reservation = reserve_generation_queue(
             self.generation_queue_depth.clone(),
             self.generation_queue_limit,
+        )
+        .ok_or_else(generation_queue_full_error)?;
+        acquire_generation_permit_with_queue_reservation(
+            self.generation_limit.clone(),
+            reservation,
             GENERATION_ADMISSION_TIMEOUT,
+            deadline,
+            cancellation,
         )
         .await
     }
@@ -501,12 +706,9 @@ impl StageOpenAiBackend {
     ) -> OpenAiResult<GeneratedText> {
         let admit_timer = PhaseTimer::start();
         let cancellation = context.cancellation_token();
-        let permit = tokio::select! {
-            permit = self.acquire_generation_permit() => permit?,
-            () = cancellation.cancelled() => {
-                return Err(request_cancelled_error());
-            }
-        };
+        let (permit, session_permit) = self
+            .acquire_generation_admission(&ids, &cancellation)
+            .await?;
         let mut admit_attrs = self.openai_attrs(&ids);
         admit_attrs.insert(
             "llama_stage.openai_phase".to_string(),
@@ -517,6 +719,7 @@ impl StageOpenAiBackend {
         let hook_runtime = Some(tokio::runtime::Handle::current());
         let worker_context = context.clone();
         let result = run_blocking_generation_worker(permit, worker_context.clone(), move |token| {
+            let _session_permit = session_permit;
             let output = backend.generate_text(
                 prompt,
                 max_tokens,
@@ -559,12 +762,9 @@ impl StageOpenAiBackend {
     ) -> OpenAiResult<GenerationStream> {
         let admit_timer = PhaseTimer::start();
         let cancellation = context.cancellation_token();
-        let permit = tokio::select! {
-            permit = self.acquire_generation_permit() => permit?,
-            () = cancellation.cancelled() => {
-                return Err(request_cancelled_error());
-            }
-        };
+        let (permit, session_permit) = self
+            .acquire_generation_admission(&ids, &cancellation)
+            .await?;
         let mut admit_attrs = self.openai_attrs(&ids);
         admit_attrs.insert(
             "llama_stage.openai_phase".to_string(),
@@ -588,6 +788,7 @@ impl StageOpenAiBackend {
             None
         };
         task::spawn_blocking(move || {
+            let _session_permit = session_permit;
             let _permit = permit;
             let result = backend.generate_text(
                 prompt,
@@ -640,7 +841,7 @@ impl StageOpenAiBackend {
                     } else {
                         output.finish_reason
                     };
-                    if include_usage
+                    if should_emit_stream_usage(include_usage, &context)
                         && tx
                             .blocking_send(Ok(GenerationStreamEvent::Usage(output.usage())))
                             .is_err()
@@ -658,5 +859,87 @@ impl StageOpenAiBackend {
         Ok(Box::pin(stream::unfold(rx, |mut rx| async {
             rx.recv().await.map(|item| (item, rx))
         })))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use openai_frontend::ChatCompletionRequest;
+    use serde_json::json;
+
+    #[test]
+    fn session_registry_counts_live_leases_and_cleans_replaced_entries() {
+        let registry = Arc::new(Mutex::new(BTreeMap::new()));
+        let first = GenerationSessionPermit::new(registry.clone(), "agent-1".to_owned())
+            .expect("first session lease");
+        let second = GenerationSessionPermit::new(registry.clone(), "agent-1".to_owned())
+            .expect("second session lease");
+
+        {
+            let locks = registry.lock().expect("session registry lock");
+            let entry = locks.get("agent-1").expect("shared session entry");
+            assert_eq!(entry.users.load(Ordering::Acquire), 2);
+        }
+
+        drop(first);
+        {
+            let locks = registry.lock().expect("session registry lock");
+            let entry = locks.get("agent-1").expect("live session entry");
+            assert_eq!(entry.users.load(Ordering::Acquire), 1);
+        }
+
+        drop(second);
+        assert!(registry.lock().expect("session registry lock").is_empty());
+
+        let replacement = GenerationSessionPermit::new(registry.clone(), "agent-1".to_owned())
+            .expect("replacement session lease");
+        assert_eq!(registry.lock().expect("session registry lock").len(), 1);
+        drop(replacement);
+        assert!(registry.lock().expect("session registry lock").is_empty());
+    }
+
+    #[test]
+    fn untrusted_conversation_affinity_bypasses_session_registry() {
+        let registry = Arc::new(Mutex::new(BTreeMap::new()));
+        let untrusted = OpenAiGenerationIds::new_with_trust(
+            crate::frontend::generation::OpenAiCacheHints::default(),
+            Some("conversation-7"),
+            false,
+        );
+        assert!(trusted_generation_session_id(&untrusted).is_none());
+        assert!(registry.lock().expect("session registry lock").is_empty());
+
+        let trusted = OpenAiGenerationIds::new_with_trust(
+            crate::frontend::generation::OpenAiCacheHints::default(),
+            Some("agent-7"),
+            true,
+        );
+        let key = trusted_generation_session_id(&trusted).expect("trusted session key");
+        let _permit = GenerationSessionPermit::new(registry.clone(), key.to_owned())
+            .expect("trusted session lease");
+        assert_eq!(registry.lock().expect("session registry lock").len(), 1);
+    }
+
+    #[test]
+    fn direct_backend_calls_ignore_spoofed_request_trust_metadata() {
+        let request: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "capture-model",
+            "messages": [{"role": "user", "content": "hello"}],
+            "mesh_internal_agent_session_id": "spoofed-session",
+            "mesh_internal_agent_session_source": "x-litellm-session-id",
+            "mesh_internal_agent_session_trusted": true
+        }))
+        .expect("request with spoofed metadata");
+        let context = OpenAiRequestContext::new();
+        let ids = generation_ids(
+            OpenAiCacheHints::from_chat_request(&request),
+            request.agent_session(),
+            &context,
+        );
+
+        assert_eq!(ids.agent_session_id.as_deref(), Some("spoofed-session"));
+        assert!(!ids.agent_session_trusted);
+        assert!(trusted_generation_session_id(&ids).is_none());
     }
 }

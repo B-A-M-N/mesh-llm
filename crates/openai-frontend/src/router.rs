@@ -194,7 +194,9 @@ async fn chat_completions(
     payload: Result<Json<ChatCompletionRequest>, JsonRejection>,
 ) -> Result<Response, OpenAiError> {
     let Json(mut request) = json_payload(payload)?;
-    request.set_agent_session(agent_session_from_header(&state.config, &headers)?);
+    let header_session = agent_session_from_header(&state.config, &headers)?;
+    let trusted_agent_session = header_session.is_some();
+    request.set_agent_session(header_session);
     request.validate()?;
     log_request_started(
         &request_id,
@@ -206,10 +208,13 @@ async fn chat_completions(
     if request.stream {
         let include_usage = request.include_usage();
         let model = request.model.clone();
-        let context = OpenAiRequestContext::with_request_id(request_id.0.clone());
+        let context =
+            request_context(&request_id, trusted_agent_session).with_stream_usage_observation();
         let cancellation = context.cancellation_token();
         let stream_error = Arc::new(AtomicBool::new(false));
         let stream_completed = Arc::new(AtomicBool::new(false));
+        let response_completed_logged = Arc::new(AtomicBool::new(false));
+        let stream_usage = Arc::new(Mutex::new(None::<Usage>));
         let backend_stream = match backend_call_with_cancellation(
             &state,
             "chat_completion_stream",
@@ -233,26 +238,48 @@ async fn chat_completions(
             stream_error.clone(),
         );
         let prelude = stream::once(async move { json_event(&ChatCompletionChunk::role(model)) });
+        let captured_usage = stream_usage.clone();
         let done_completed = stream_completed.clone();
         let events = prelude
-            .chain(stream.filter_map(move |item| async move {
-                match item {
-                    Ok(chunk) if !include_usage && chunk.usage.is_some() => None,
-                    Ok(chunk) => Some(json_event(&chunk)),
-                    Err(error) => Some(json_event(&error.body())),
+            .chain(stream.filter_map(move |item| {
+                let captured_usage = captured_usage.clone();
+                async move {
+                    match item {
+                        Ok(chunk) => {
+                            if let Some(usage) = chunk.usage.as_ref() {
+                                *captured_usage
+                                    .lock()
+                                    .expect("chat stream usage lock poisoned") =
+                                    Some(usage.clone());
+                            }
+                            if !include_usage && chunk.usage.is_some() {
+                                None
+                            } else {
+                                Some(json_event(&chunk))
+                            }
+                        }
+                        Err(error) => Some(json_event(&error.body())),
+                    }
                 }
             }))
             .chain(stream::once(async move {
                 done_completed.store(true, Ordering::Release);
                 done_event()
             }));
+        let completion = StreamCompletion::new(
+            context.clone(),
+            "chat_completion",
+            stream_usage,
+            response_completed_logged,
+        );
         Ok(sse_response(
             events,
             cancellation,
-            StreamLifecycle::new(observation, stream_error, stream_completed),
+            StreamLifecycle::new(observation, stream_error, stream_completed)
+                .with_completion(completion),
         ))
     } else {
-        let context = OpenAiRequestContext::with_request_id(request_id.0.clone());
+        let context = request_context(&request_id, trusted_agent_session);
         let response = match backend_call_with_cancellation(
             &state,
             "chat_completion",
@@ -287,6 +314,7 @@ async fn responses(
         OpenAiError::invalid_request(format!("invalid Responses request: {error}"))
     })?;
     let header_session = agent_session_from_header(&state.config, &headers)?;
+    let trusted_agent_session = header_session.is_some();
     let responses_session = normalization
         .agent_session_id
         .map(|id| AgentSessionIdentity::new(id, AgentSessionSource::ResponsesConversation))
@@ -305,10 +333,14 @@ async fn responses(
     let mut observation = RequestObservation::new(request_id.0.clone(), "responses");
     match normalization.response_adapter {
         ResponseAdapterMode::OpenAiResponsesStream => {
-            let context = OpenAiRequestContext::with_request_id(request_id.0.clone());
+            let include_usage = request.include_usage();
+            let context =
+                request_context(&request_id, trusted_agent_session).with_stream_usage_observation();
             let cancellation = context.cancellation_token();
             let stream_error = Arc::new(AtomicBool::new(false));
             let stream_completed = Arc::new(AtomicBool::new(false));
+            let response_completed_logged = Arc::new(AtomicBool::new(false));
+            let stream_usage = Arc::new(Mutex::new(None::<Usage>));
             let state_machine = Arc::new(Mutex::new(ResponseSseState::new(request.model.clone())));
             let backend_stream = match backend_call_with_cancellation(
                 &state,
@@ -333,6 +365,7 @@ async fn responses(
                 stream_error.clone(),
             );
             let body_state = state_machine.clone();
+            let captured_usage = stream_usage.clone();
             let body_events = stream.flat_map(move |item| {
                 let mut out = Vec::new();
                 let mut state_machine = body_state
@@ -404,6 +437,10 @@ async fn responses(
                         }
                         if let Some(usage) = chunk.usage.as_ref() {
                             state_machine.usage = Some(usage_to_responses_usage(usage));
+                            *captured_usage
+                                .lock()
+                                .expect("responses stream usage lock poisoned") =
+                                Some(usage.clone());
                         }
                     }
                     Err(error) => {
@@ -506,7 +543,11 @@ async fn responses(
                             &state_machine.model,
                             &state_machine.item_id,
                             &state_machine.output_text,
-                            state_machine.usage.clone(),
+                            if include_usage {
+                                state_machine.usage.clone()
+                            } else {
+                                None
+                            },
                             sequence_number,
                         ))
                         .unwrap_or_else(|_| Event::default().data("{}")),
@@ -521,14 +562,21 @@ async fn responses(
                     done_completed.store(true, Ordering::Release);
                     done_event()
                 }));
+            let completion = StreamCompletion::new(
+                context.clone(),
+                "responses",
+                stream_usage,
+                response_completed_logged,
+            );
             Ok(sse_response(
                 events,
                 cancellation,
-                StreamLifecycle::new(observation, stream_error, stream_completed),
+                StreamLifecycle::new(observation, stream_error, stream_completed)
+                    .with_completion(completion),
             ))
         }
         _ => {
-            let context = OpenAiRequestContext::with_request_id(request_id.0.clone());
+            let context = request_context(&request_id, trusted_agent_session);
             let response = match backend_call_with_cancellation(
                 &state,
                 "responses",
@@ -566,16 +614,21 @@ async fn completions(
     payload: Result<Json<CompletionRequest>, JsonRejection>,
 ) -> Result<Response, OpenAiError> {
     let Json(mut request) = json_payload(payload)?;
-    request.set_agent_session(agent_session_from_header(&state.config, &headers)?);
+    let header_session = agent_session_from_header(&state.config, &headers)?;
+    let trusted_agent_session = header_session.is_some();
+    request.set_agent_session(header_session);
     request.validate()?;
     log_request_started(&request_id, "completion", &request.model, request.stream);
     let mut observation = RequestObservation::new(request_id.0.clone(), "completion");
     if request.stream {
         let include_usage = request.include_usage();
-        let context = OpenAiRequestContext::with_request_id(request_id.0.clone());
+        let context =
+            request_context(&request_id, trusted_agent_session).with_stream_usage_observation();
         let cancellation = context.cancellation_token();
         let stream_error = Arc::new(AtomicBool::new(false));
         let stream_completed = Arc::new(AtomicBool::new(false));
+        let response_completed_logged = Arc::new(AtomicBool::new(false));
+        let stream_usage = Arc::new(Mutex::new(None::<Usage>));
         let backend_stream = match backend_call_with_cancellation(
             &state,
             "completion_stream",
@@ -596,26 +649,48 @@ async fn completions(
             &context,
             stream_error.clone(),
         );
+        let captured_usage = stream_usage.clone();
         let done_completed = stream_completed.clone();
         let events = stream
-            .filter_map(move |item| async move {
-                match item {
-                    Ok(chunk) if !include_usage && chunk.usage.is_some() => None,
-                    Ok(chunk) => Some(json_event(&chunk)),
-                    Err(error) => Some(json_event(&error.body())),
+            .filter_map(move |item| {
+                let captured_usage = captured_usage.clone();
+                async move {
+                    match item {
+                        Ok(chunk) => {
+                            if let Some(usage) = chunk.usage.as_ref() {
+                                *captured_usage
+                                    .lock()
+                                    .expect("completion stream usage lock poisoned") =
+                                    Some(usage.clone());
+                            }
+                            if !include_usage && chunk.usage.is_some() {
+                                None
+                            } else {
+                                Some(json_event(&chunk))
+                            }
+                        }
+                        Err(error) => Some(json_event(&error.body())),
+                    }
                 }
             })
             .chain(stream::once(async move {
                 done_completed.store(true, Ordering::Release);
                 done_event()
             }));
+        let completion = StreamCompletion::new(
+            context.clone(),
+            "completion",
+            stream_usage,
+            response_completed_logged,
+        );
         Ok(sse_response(
             events,
             cancellation,
-            StreamLifecycle::new(observation, stream_error, stream_completed),
+            StreamLifecycle::new(observation, stream_error, stream_completed)
+                .with_completion(completion),
         ))
     } else {
-        let context = OpenAiRequestContext::with_request_id(request_id.0.clone());
+        let context = request_context(&request_id, trusted_agent_session);
         let response = match backend_call_with_cancellation(
             &state,
             "completion",
@@ -670,6 +745,15 @@ fn resolve_agent_session(
         }
         (Some(header), _) => Ok(Some(header)),
         (None, protocol) => Ok(protocol),
+    }
+}
+
+fn request_context(request_id: &RequestId, trusted_agent_session: bool) -> OpenAiRequestContext {
+    let context = OpenAiRequestContext::with_request_id(request_id.0.clone());
+    if trusted_agent_session {
+        context.with_trusted_agent_session()
+    } else {
+        context
     }
 }
 
@@ -847,6 +931,17 @@ fn log_response_completed(context: &OpenAiRequestContext, operation: &'static st
     );
 }
 
+fn log_stream_response_completed(
+    context: &OpenAiRequestContext,
+    operation: &'static str,
+    usage: &Usage,
+    response_completed_logged: &AtomicBool,
+) {
+    if !response_completed_logged.swap(true, Ordering::AcqRel) {
+        log_response_completed(context, operation, usage);
+    }
+}
+
 async fn backend_call<T, F>(
     state: &FrontendState,
     operation: &'static str,
@@ -972,10 +1067,46 @@ impl Drop for RequestObservation {
     }
 }
 
+struct StreamCompletion {
+    context: OpenAiRequestContext,
+    operation: &'static str,
+    usage: Arc<Mutex<Option<Usage>>>,
+    response_completed_logged: Arc<AtomicBool>,
+}
+
+impl StreamCompletion {
+    fn new(
+        context: OpenAiRequestContext,
+        operation: &'static str,
+        usage: Arc<Mutex<Option<Usage>>>,
+        response_completed_logged: Arc<AtomicBool>,
+    ) -> Self {
+        Self {
+            context,
+            operation,
+            usage,
+            response_completed_logged,
+        }
+    }
+
+    fn log_if_successful(&self) {
+        let usage = self.usage.lock().ok().and_then(|usage| usage.clone());
+        if let Some(usage) = usage {
+            log_stream_response_completed(
+                &self.context,
+                self.operation,
+                &usage,
+                &self.response_completed_logged,
+            );
+        }
+    }
+}
+
 struct StreamLifecycle {
     observation: RequestObservation,
     stream_error: Arc<AtomicBool>,
     stream_completed: Arc<AtomicBool>,
+    completion: Option<StreamCompletion>,
 }
 
 impl StreamLifecycle {
@@ -988,7 +1119,13 @@ impl StreamLifecycle {
             observation,
             stream_error,
             stream_completed,
+            completion: None,
         }
+    }
+
+    fn with_completion(mut self, completion: StreamCompletion) -> Self {
+        self.completion = Some(completion);
+        self
     }
 
     fn finish_natural(&mut self) {
@@ -997,6 +1134,11 @@ impl StreamLifecycle {
         } else {
             "success"
         };
+        if outcome == "success"
+            && let Some(completion) = self.completion.as_ref()
+        {
+            completion.log_if_successful();
+        }
         self.observation.finish(outcome);
     }
 
@@ -1014,6 +1156,11 @@ impl StreamLifecycle {
 
     fn finish_drop(&mut self, cancellation_already_requested: bool) {
         let outcome = self.drop_outcome(cancellation_already_requested);
+        if outcome == "success"
+            && let Some(completion) = self.completion.as_ref()
+        {
+            completion.log_if_successful();
+        }
         self.observation.finish(outcome);
     }
 }
@@ -1073,6 +1220,8 @@ impl Drop for CancelOnDropSseStream {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+    use std::fmt;
     use std::sync::{Arc, Mutex};
 
     use async_trait::async_trait;
@@ -1085,6 +1234,11 @@ mod tests {
     use http_body_util::BodyExt;
     use serde_json::{Value, json};
     use tower::ServiceExt;
+    use tracing::{
+        Event, Subscriber,
+        field::Visit,
+        span::{Attributes, Id, Record},
+    };
 
     use super::*;
 
@@ -1099,6 +1253,88 @@ mod tests {
     #[test]
     fn trusted_agent_session_header_parser_rejects_invalid_names() {
         assert!(parse_agent_session_header("not a header").is_none());
+    }
+
+    #[test]
+    fn stream_response_completion_log_includes_cached_tokens_once_for_all_routes() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = EventCapture {
+            events: events.clone(),
+        };
+        let context = OpenAiRequestContext::with_request_id("request-1".to_string());
+        let usage = Usage::new(12, 3).with_cached_tokens(9);
+
+        tracing::subscriber::with_default(subscriber, || {
+            for operation in ["chat_completion", "responses", "completion"] {
+                let logged = AtomicBool::new(false);
+                log_stream_response_completed(&context, operation, &usage, &logged);
+                log_stream_response_completed(
+                    &context,
+                    operation,
+                    &Usage::new(12, 3).with_cached_tokens(10),
+                    &logged,
+                );
+            }
+        });
+
+        let events = events.lock().expect("event capture lock poisoned");
+        assert_eq!(events.len(), 3);
+        for (event, operation) in events
+            .iter()
+            .zip(["chat_completion", "responses", "completion"])
+        {
+            assert_eq!(event["event"], "response_completed");
+            assert_eq!(event["operation"], operation);
+            assert_eq!(event["cached_tokens"], "9");
+        }
+    }
+
+    struct EventCapture {
+        events: Arc<Mutex<Vec<BTreeMap<String, String>>>>,
+    }
+
+    impl Subscriber for EventCapture {
+        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+            metadata.target() == "mesh_openai_observability"
+        }
+
+        fn new_span(&self, _span: &Attributes<'_>) -> Id {
+            Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &Id, _values: &Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &Id, _follows: &Id) {}
+
+        fn event(&self, event: &Event<'_>) {
+            let mut fields = FieldCapture::default();
+            event.record(&mut fields);
+            self.events
+                .lock()
+                .expect("event capture lock poisoned")
+                .push(fields.values);
+        }
+
+        fn enter(&self, _span: &Id) {}
+
+        fn exit(&self, _span: &Id) {}
+    }
+
+    #[derive(Default)]
+    struct FieldCapture {
+        values: BTreeMap<String, String>,
+    }
+
+    impl Visit for FieldCapture {
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            self.values
+                .insert(field.name().to_string(), value.to_string());
+        }
+
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn fmt::Debug) {
+            self.values
+                .insert(field.name().to_string(), format!("{value:?}"));
+        }
     }
 
     #[test]
@@ -1144,6 +1380,149 @@ mod tests {
         stream_error.store(true, Ordering::Release);
         assert_eq!(lifecycle.drop_outcome(false), "backend_error");
     }
+
+    #[test]
+    fn stream_completion_logging_requires_usage_and_clean_success() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = EventCapture {
+            events: events.clone(),
+        };
+        let context = OpenAiRequestContext::with_request_id("request-2".to_owned());
+
+        tracing::subscriber::with_default(subscriber, || {
+            let completion = StreamCompletion::new(
+                context.clone(),
+                "chat_completion",
+                Arc::new(Mutex::new(Some(Usage::new(1, 1)))),
+                Arc::new(AtomicBool::new(false)),
+            );
+            let mut lifecycle = StreamLifecycle::new(
+                RequestObservation::new("request-2".to_owned(), "chat_completion"),
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(false)),
+            )
+            .with_completion(completion);
+            lifecycle.finish_natural();
+
+            let completion = StreamCompletion::new(
+                context.clone(),
+                "responses",
+                Arc::new(Mutex::new(Some(Usage::new(4, 5).with_cached_tokens(2)))),
+                Arc::new(AtomicBool::new(false)),
+            );
+            let mut lifecycle = StreamLifecycle::new(
+                RequestObservation::new("request-2".to_owned(), "responses"),
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(false)),
+            )
+            .with_completion(completion);
+            lifecycle.finish_natural();
+
+            let stream_error = Arc::new(AtomicBool::new(true));
+            let completion = StreamCompletion::new(
+                context.clone(),
+                "completion",
+                Arc::new(Mutex::new(Some(Usage::new(1, 1)))),
+                Arc::new(AtomicBool::new(false)),
+            );
+            let mut lifecycle = StreamLifecycle::new(
+                RequestObservation::new("request-2".to_owned(), "completion"),
+                stream_error,
+                Arc::new(AtomicBool::new(false)),
+            )
+            .with_completion(completion);
+            lifecycle.finish_natural();
+
+            let completion = StreamCompletion::new(
+                context,
+                "completion",
+                Arc::new(Mutex::new(Some(Usage::new(2, 3)))),
+                Arc::new(AtomicBool::new(false)),
+            );
+            let mut lifecycle = StreamLifecycle::new(
+                RequestObservation::new("request-3".to_owned(), "completion"),
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(false)),
+            )
+            .with_completion(completion);
+            lifecycle.finish_drop(false);
+        });
+
+        let events = events.lock().expect("event capture lock poisoned");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event
+                    .get("event")
+                    .is_some_and(|value| value == "response_completed"))
+                .count(),
+            2
+        );
+
+        let completion = StreamCompletion::new(
+            OpenAiRequestContext::with_request_id("request-5".to_owned()),
+            "chat_completion",
+            Arc::new(Mutex::new(Some(Usage::new(4, 5)))),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let events = Arc::new(Mutex::new(Vec::new()));
+        tracing::subscriber::with_default(
+            EventCapture {
+                events: events.clone(),
+            },
+            || completion.log_if_successful(),
+        );
+        assert_eq!(
+            events
+                .lock()
+                .expect("event capture lock poisoned")
+                .iter()
+                .filter(|event| event
+                    .get("event")
+                    .is_some_and(|value| value == "response_completed"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn terminal_done_drop_logs_response_completed_once() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let completion = StreamCompletion::new(
+            OpenAiRequestContext::with_request_id("request-drop".to_owned()),
+            "chat_completion",
+            Arc::new(Mutex::new(Some(Usage::new(2, 3)))),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let mut lifecycle = StreamLifecycle::new(
+            RequestObservation::new("request-drop".to_owned(), "chat_completion"),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(true)),
+        )
+        .with_completion(completion);
+
+        tracing::subscriber::with_default(
+            EventCapture {
+                events: events.clone(),
+            },
+            || {
+                lifecycle.finish_drop(false);
+                lifecycle.finish_drop(false);
+            },
+        );
+
+        let events = events.lock().expect("event capture lock poisoned");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event
+                    .get("event")
+                    .is_some_and(|value| value == "response_completed"))
+                .count(),
+            1
+        );
+    }
+
     use crate::{
         FinishReason,
         backend::{
@@ -1266,7 +1645,10 @@ mod tests {
             Ok(Box::pin(stream::iter(vec![
                 Ok(ChatCompletionChunk::delta(model.clone(), "hel")),
                 Ok(ChatCompletionChunk::delta(model.clone(), "lo")),
-                Ok(ChatCompletionChunk::usage(model.clone(), Usage::new(3, 2))),
+                Ok(ChatCompletionChunk::usage(
+                    model.clone(),
+                    Usage::new(3, 2).with_cached_tokens(1),
+                )),
                 Ok(ChatCompletionChunk::done_with_reason(
                     model,
                     FinishReason::Length,
@@ -1292,7 +1674,7 @@ mod tests {
                 Ok(crate::CompletionChunk::delta(model.clone(), "a")),
                 Ok(crate::CompletionChunk::usage(
                     model.clone(),
-                    Usage::new(2, 1),
+                    Usage::new(2, 1).with_cached_tokens(1),
                 )),
                 Ok(crate::CompletionChunk::done_with_reason(
                     model,
@@ -1349,6 +1731,7 @@ mod tests {
     #[derive(Default)]
     struct SessionCaptureBackend {
         requests: Arc<Mutex<Vec<ChatCompletionRequest>>>,
+        contexts: Arc<Mutex<Vec<OpenAiRequestContext>>>,
     }
 
     #[async_trait]
@@ -1367,6 +1750,15 @@ mod tests {
                 "ok",
                 Usage::new(1, 1),
             ))
+        }
+
+        async fn chat_completion_with_context(
+            &self,
+            request: ChatCompletionRequest,
+            context: OpenAiRequestContext,
+        ) -> OpenAiResult<ChatCompletionResponse> {
+            self.contexts.lock().unwrap().push(context);
+            self.chat_completion(request).await
         }
 
         async fn chat_completion_stream(
@@ -1637,6 +2029,7 @@ mod tests {
             requests[0].agent_session_source(),
             Some("x-litellm-session-id")
         );
+        assert!(backend.contexts.lock().unwrap()[0].has_trusted_agent_session());
     }
 
     #[tokio::test]
@@ -1698,7 +2091,28 @@ mod tests {
             requests[0].agent_session_source(),
             Some("responses.conversation")
         );
+        assert!(!backend.contexts.lock().unwrap()[0].has_trusted_agent_session());
         assert!(!requests[0].extra.contains_key("conversation"));
+    }
+
+    #[tokio::test]
+    async fn direct_backend_context_rejects_spoofed_trust_metadata() {
+        let backend = SessionCaptureBackend::default();
+        let request: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "capture-model",
+            "messages": [{"role": "user", "content": "hello"}],
+            "mesh_internal_agent_session_id": "spoofed-session",
+            "mesh_internal_agent_session_source": "x-litellm-session-id",
+            "mesh_internal_agent_session_trusted": true
+        }))
+        .unwrap();
+
+        backend
+            .chat_completion_with_context(request, OpenAiRequestContext::new())
+            .await
+            .unwrap();
+
+        assert!(!backend.contexts.lock().unwrap()[0].has_trusted_agent_session());
     }
 
     #[tokio::test]
@@ -2193,6 +2607,24 @@ mod tests {
         assert!(body.contains("event: response.completed"));
         assert!(body.contains(r#""sequence_number":1"#));
         assert!(body.contains(r#""output_text":"hello""#));
+        assert!(body.contains("data: [DONE]"));
+    }
+
+    #[tokio::test]
+    async fn responses_stream_suppresses_usage_unless_requested() {
+        let response = post_json(
+            "/v1/responses",
+            json!({
+                "model": "test-model",
+                "input": "hi",
+                "stream": true
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_body_text(response).await;
+        assert!(body.contains("event: response.completed"));
+        assert!(!body.contains(r#""input_tokens""#));
         assert!(body.contains("data: [DONE]"));
     }
 
