@@ -67,6 +67,8 @@ pub struct OpenAiRequestContext {
     cancellation: CancellationToken,
     request_id: Option<String>,
     started_at: Instant,
+    stream_usage_observation: bool,
+    trusted_agent_session: bool,
 }
 
 impl OpenAiRequestContext {
@@ -79,6 +81,29 @@ impl OpenAiRequestContext {
             request_id: Some(request_id.into()),
             ..Self::default()
         }
+    }
+
+    /// Enables internal stream-usage observation for an HTTP adapter. This is
+    /// deliberately separate from the client's `include_usage` wire option so
+    /// direct backend consumers retain their existing stream semantics.
+    pub fn with_stream_usage_observation(mut self) -> Self {
+        self.stream_usage_observation = true;
+        self
+    }
+
+    pub fn observes_stream_usage(&self) -> bool {
+        self.stream_usage_observation
+    }
+
+    pub(crate) fn with_trusted_agent_session(mut self) -> Self {
+        self.trusted_agent_session = true;
+        self
+    }
+
+    /// Returns whether the request entered through the configured trusted
+    /// agent-session header. Direct backend calls cannot set this marker.
+    pub fn has_trusted_agent_session(&self) -> bool {
+        self.trusted_agent_session
     }
 
     pub fn request_id(&self) -> Option<&str> {
@@ -108,6 +133,8 @@ impl Default for OpenAiRequestContext {
             cancellation: CancellationToken::new(),
             request_id: None,
             started_at: Instant::now(),
+            stream_usage_observation: false,
+            trusted_agent_session: false,
         }
     }
 }

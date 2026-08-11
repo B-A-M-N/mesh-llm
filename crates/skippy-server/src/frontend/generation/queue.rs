@@ -11,6 +11,7 @@ use anyhow::Result;
 use anyhow::anyhow;
 use anyhow::bail;
 use axum::http::StatusCode;
+use openai_frontend::CancellationToken;
 use openai_frontend::OpenAiError;
 use openai_frontend::OpenAiErrorKind;
 use openai_frontend::OpenAiResult;
@@ -21,6 +22,7 @@ use std::sync::Mutex;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
+use std::time::Instant;
 use tokio::sync::OwnedSemaphorePermit;
 use tokio::sync::Semaphore;
 use tokio::sync::TryAcquireError;
@@ -35,12 +37,45 @@ impl Drop for GenerationQueueReservation {
     }
 }
 
+pub(in crate::frontend) async fn acquire_generation_permit_with_queue_reservation(
+    generation_limit: Arc<Semaphore>,
+    reservation: GenerationQueueReservation,
+    admission_timeout: Duration,
+    deadline: Instant,
+    cancellation: &CancellationToken,
+) -> OpenAiResult<OwnedSemaphorePermit> {
+    if cancellation.is_cancelled() {
+        return Err(OpenAiError::backend("request cancelled"));
+    }
+
+    let timeout = tokio::time::timeout_at(
+        tokio::time::Instant::from_std(deadline),
+        generation_limit.acquire_owned(),
+    );
+    tokio::select! {
+        result = timeout => {
+            drop(reservation);
+            match result {
+                Ok(Ok(permit)) => Ok(permit),
+                Ok(Err(_)) => Err(generation_lanes_busy_error()),
+                Err(_) => Err(generation_queue_timeout_error(admission_timeout)),
+            }
+        }
+        () = cancellation.cancelled() => {
+            drop(reservation);
+            Err(OpenAiError::backend("request cancelled"))
+        }
+    }
+}
+
+#[allow(dead_code)]
 pub(in crate::frontend) async fn acquire_generation_permit_with_queue(
     generation_limit: Arc<Semaphore>,
     generation_queue_depth: Arc<AtomicUsize>,
     generation_queue_limit: usize,
     admission_timeout: Duration,
 ) -> OpenAiResult<OwnedSemaphorePermit> {
+    let deadline = Instant::now() + admission_timeout;
     match generation_limit.clone().try_acquire_owned() {
         Ok(permit) => return Ok(permit),
         Err(TryAcquireError::Closed) => return Err(generation_lanes_busy_error()),
@@ -50,10 +85,15 @@ pub(in crate::frontend) async fn acquire_generation_permit_with_queue(
     let _queue_reservation =
         reserve_generation_queue(generation_queue_depth, generation_queue_limit)
             .ok_or_else(generation_queue_full_error)?;
-    tokio::time::timeout(admission_timeout, generation_limit.acquire_owned())
-        .await
-        .map_err(|_| generation_queue_timeout_error(admission_timeout))?
-        .map_err(|_| generation_lanes_busy_error())
+    let cancellation = CancellationToken::new();
+    acquire_generation_permit_with_queue_reservation(
+        generation_limit,
+        _queue_reservation,
+        admission_timeout,
+        deadline,
+        &cancellation,
+    )
+    .await
 }
 
 pub(in crate::frontend) fn reserve_generation_queue(

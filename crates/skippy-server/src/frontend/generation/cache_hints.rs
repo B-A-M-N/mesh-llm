@@ -44,13 +44,15 @@ pub(in crate::frontend) struct OpenAiGenerationIds {
     pub(in crate::frontend) request_id: u64,
     pub(in crate::frontend) request_started_at: Instant,
     pub(in crate::frontend) agent_session_id: Option<Box<str>>,
+    pub(in crate::frontend) agent_session_trusted: bool,
     pub(in crate::frontend) cache: OpenAiCacheHints,
 }
 
 impl OpenAiGenerationIds {
-    pub(in crate::frontend) fn new(
+    pub(in crate::frontend) fn new_with_trust(
         cache: OpenAiCacheHints,
         agent_session_id: Option<&str>,
+        agent_session_trusted: bool,
     ) -> Self {
         let request_started_at = Instant::now();
         let sequence = OPENAI_GENERATION_COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -59,6 +61,7 @@ impl OpenAiGenerationIds {
         // prefix KV cache can restore a prior prompt across turns. Requests
         // still need distinct wire IDs for tracing and in-flight ownership.
         let session_label = agent_session_id
+            .filter(|_| agent_session_trusted)
             .map(|id| format!("openai-agent-session-{id}"))
             .unwrap_or_else(|| format!("openai-session-{}-{sequence}", now_unix_millis()));
         let request_id = request_id(&session_label, sequence, process_nonce());
@@ -68,6 +71,7 @@ impl OpenAiGenerationIds {
             session_label,
             request_started_at,
             agent_session_id: agent_session_id.map(Into::into),
+            agent_session_trusted: agent_session_trusted && agent_session_id.is_some(),
             cache,
         }
     }
@@ -101,8 +105,16 @@ mod tests {
 
     #[test]
     fn agent_session_reuses_native_session_but_not_request_id() {
-        let first = OpenAiGenerationIds::new(OpenAiCacheHints::default(), Some("agent-42"));
-        let second = OpenAiGenerationIds::new(OpenAiCacheHints::default(), Some("agent-42"));
+        let first = OpenAiGenerationIds::new_with_trust(
+            OpenAiCacheHints::default(),
+            Some("agent-42"),
+            true,
+        );
+        let second = OpenAiGenerationIds::new_with_trust(
+            OpenAiCacheHints::default(),
+            Some("agent-42"),
+            true,
+        );
 
         assert_eq!(first.session_label, "openai-agent-session-agent-42");
         assert_eq!(first.session_label, second.session_label);
@@ -112,9 +124,31 @@ mod tests {
 
     #[test]
     fn requests_without_agent_session_get_fresh_native_sessions() {
-        let first = OpenAiGenerationIds::new(OpenAiCacheHints::default(), None);
-        let second = OpenAiGenerationIds::new(OpenAiCacheHints::default(), None);
+        let first = OpenAiGenerationIds::new_with_trust(OpenAiCacheHints::default(), None, false);
+        let second = OpenAiGenerationIds::new_with_trust(OpenAiCacheHints::default(), None, false);
 
+        assert_ne!(first.session_id, second.session_id);
+        assert_ne!(first.request_id, second.request_id);
+    }
+
+    #[test]
+    fn repeated_untrusted_agent_sessions_get_fresh_native_sessions() {
+        let first = OpenAiGenerationIds::new_with_trust(
+            OpenAiCacheHints::default(),
+            Some("conversation-7"),
+            false,
+        );
+        let second = OpenAiGenerationIds::new_with_trust(
+            OpenAiCacheHints::default(),
+            Some("conversation-7"),
+            false,
+        );
+
+        assert_eq!(first.agent_session_id.as_deref(), Some("conversation-7"));
+        assert_eq!(second.agent_session_id.as_deref(), Some("conversation-7"));
+        assert!(!first.agent_session_trusted);
+        assert!(!second.agent_session_trusted);
+        assert_ne!(first.session_label, second.session_label);
         assert_ne!(first.session_id, second.session_id);
         assert_ne!(first.request_id, second.request_id);
     }
