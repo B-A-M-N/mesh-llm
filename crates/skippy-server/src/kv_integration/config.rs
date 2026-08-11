@@ -123,10 +123,13 @@ fn open_disk_tier(config: &StageConfig) -> Option<PrefixDiskTier> {
 /// number is a node total rather than a per-stage allowance that silently
 /// multiplies by the number of loaded models. See `disk_budget`.
 fn stage_disk_budget_bytes(root: &Path, config: &StageConfig) -> Option<u64> {
-    // Free space is measured on the parent, because `root` itself may not
-    // exist yet -- it is created by `PrefixDiskTier::open`.
-    let probe = root.parent().unwrap_or(root);
-    let free_bytes = disk_budget::free_space_bytes(probe);
+    // Free space is measured on the nearest ancestor that exists. Neither
+    // `root` nor its parent is created until `PrefixDiskTier::open` runs, and
+    // `statvfs` on a missing path fails -- which the policy correctly reads
+    // as "do not enable". Probing only the parent therefore disabled the tier
+    // on every first run, before the cache directory had ever been created.
+    let probe = disk_budget::existing_ancestor(root);
+    let free_bytes = disk_budget::free_space_bytes(&probe);
     let budget = disk_budget::resolve_node_budget(
         explicit_disk_tier_bytes(),
         disk_tier_explicitly_enabled(),

@@ -411,11 +411,19 @@ impl StageOpenAiBackend {
         // this, stage 0 is the only stage in the pipeline with no persistent
         // tier, and the cross-stage agreement gate would veto every restore
         // attempt on its miss -- wasting every downstream disk hit.
+        //
+        // Offered independently of the resident cache's admission decision,
+        // for the same reason as the dense recorder path: the resident tier
+        // measures KV cells and declines anything over half the context
+        // window, while the disk tier measures bytes and a write. Sharing a
+        // veto meant nothing was archived for large agentic prefixes.
         let mut archive_candidate = crate::kv_integration::ArchiveCandidate::default();
-        for (identity, record) in identities.iter().zip(resident_records.iter()) {
-            if let Some(record) = record {
-                archive_candidate.offer(identity, record.token_count, token_ids.len());
-            }
+        for identity in &identities {
+            crate::kv_integration::offer_archive_candidate(
+                &mut archive_candidate,
+                identity,
+                token_ids.len(),
+            );
         }
         if let Some(identity) = archive_candidate.take() {
             let mut runtime = self

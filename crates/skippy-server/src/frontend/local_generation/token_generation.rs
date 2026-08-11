@@ -681,26 +681,30 @@ impl StageOpenAiBackend {
             // single large prompt.
             let mut archive_candidate = crate::kv_integration::ArchiveCandidate::default();
             for identity in kv.record_identities(&self.config, &base, 0, prefill_tokens) {
+                // Offer to the archive before the resident cache decides.
+                // The two tiers have different cost models -- KV cells versus
+                // bytes-and-a-write -- and must not share a veto. A large
+                // agentic prefix is exactly the case where they disagree:
+                // `max_resident_tokens` is half the context window, so on a
+                // 32k-context node every candidate for a 25k prompt is
+                // declined as uncacheable, and gating archival on that
+                // decision meant the node persisted nothing at precisely the
+                // prompt sizes the disk tier exists for.
+                //
+                // `ArchiveCandidate` still applies the selection policy and
+                // `archive_dense_prefix` still applies the size floor and
+                // dedupe check, so this remains at most one archive per
+                // request. See `ArchiveCandidate` for which candidate is
+                // chosen and why the obvious choices are both wrong.
+                crate::kv_integration::offer_archive_candidate(
+                    &mut archive_candidate,
+                    &identity,
+                    prefill_tokens.len(),
+                );
                 if let Ok(Some(record)) =
                     kv.record_resident_prefix(runtime, session_id, &identity, prefill_tokens)
                 {
                     resident_recorded_pages = resident_recorded_pages.saturating_add(1);
-                    // Archive dense prefixes so they outlive resident eviction
-                    // and process restart. Done here, at record time, rather
-                    // than on eviction: eviction runs on the decode hot path
-                    // and a multi-hundred-MB export there would spike TTFT.
-                    // Remember the *shortest* recorded candidate as the
-                    // archive target. Candidates arrive longest-first, so the
-                    // last one is the lowest — and the low candidate is the
-                    // See `ArchiveCandidate` for which candidate is chosen
-                    // and why the obvious choices are both wrong.
-                    if record.stored {
-                        archive_candidate.offer(
-                            &identity,
-                            record.token_count,
-                            prefill_tokens.len(),
-                        );
-                    }
                     let mut attrs = self.openai_attrs(ids);
                     attrs.insert(
                         "skippy.kv.recorded_page_id".to_string(),

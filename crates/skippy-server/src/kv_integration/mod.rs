@@ -20,7 +20,7 @@ mod activation;
 mod config;
 mod dense_disk;
 mod disk_budget;
-pub use dense_disk::ArchiveCandidate;
+pub use dense_disk::{ArchiveCandidate, offer_archive_candidate};
 mod exact_state;
 mod identity;
 mod records;

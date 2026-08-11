@@ -579,33 +579,6 @@ pub(in crate::binary_transport) fn maybe_lookup_binary_prefill(
     result
 }
 
-/// Offer a record candidate to the archive selector.
-///
-/// Deliberately independent of the resident cache's admission decision: the
-/// disk tier's cost model is bytes-and-a-write, the resident cache's is KV
-/// cells, and a candidate rejected by one is routinely worth accepting in the
-/// other. The only requirement here is that the runtime actually holds the
-/// tokens the archive would export, which for a `token_start == 0` prefill
-/// means the candidate cannot claim more tokens than this request carried.
-///
-/// `ArchiveCandidate` still applies the selection policy (prefer the longest
-/// prefix strictly shorter than the full prompt), and `archive_dense_prefix`
-/// still applies the size floor and dedupe check, so a wider offer does not
-/// mean more writes -- it is still at most one archive per request.
-fn offer_archive_candidate(
-    archive_candidate: &mut crate::kv_integration::ArchiveCandidate,
-    identity: &PrefillKvIdentity,
-    full_len: usize,
-) {
-    let Ok(token_count) = usize::try_from(identity.identity.token_count) else {
-        return;
-    };
-    if token_count == 0 || token_count > full_len {
-        return;
-    }
-    archive_candidate.offer(identity, token_count, full_len);
-}
-
 /// Whether a record candidate is already covered by this request's restore.
 ///
 /// `min_record_tokens` is the restored prefix length. Candidates at or below
@@ -678,7 +651,11 @@ pub(in crate::binary_transport) fn maybe_record_binary_prefill(
             // its tokens right now. Gating archival on resident success is
             // what pinned stage-0 of a split to a single 768-token page while
             // stage-1 archived the full ladder.
-            offer_archive_candidate(&mut archive_candidate, &identity, token_ids.len());
+            crate::kv_integration::offer_archive_candidate(
+                &mut archive_candidate,
+                &identity,
+                token_ids.len(),
+            );
             if candidate_already_resident(token_count, min_record_tokens) {
                 continue;
             }
@@ -886,7 +863,11 @@ pub(in crate::binary_transport) fn maybe_record_binary_full_prefill(
             .min(token_ids.len());
         // See the chunked recorder: archival admission is independent of
         // whether the resident cache accepts this candidate.
-        offer_archive_candidate(&mut archive_candidate, &identity, token_ids.len());
+        crate::kv_integration::offer_archive_candidate(
+            &mut archive_candidate,
+            &identity,
+            token_ids.len(),
+        );
         if token_count_usize == token_ids.len() {
             match kv.record_exact_state(runtime, session_id, &identity) {
                 Ok(Some(record)) => {
@@ -1133,7 +1114,7 @@ mod record_gate_tests {
         let mut pick = ArchiveCandidate::default();
         // Simulate a stage where the resident cache accepts nothing at all.
         for tokens in [8458u64, 8192, 4096, 768, 512] {
-            super::offer_archive_candidate(&mut pick, &identity(tokens), full);
+            crate::kv_integration::offer_archive_candidate(&mut pick, &identity(tokens), full);
         }
         assert_eq!(
             pick.take().expect("candidate").identity.token_count,
@@ -1147,8 +1128,8 @@ mod record_gate_tests {
     #[test]
     fn candidates_longer_than_the_request_are_not_offered() {
         let mut pick = ArchiveCandidate::default();
-        super::offer_archive_candidate(&mut pick, &identity(9000), 8458);
-        super::offer_archive_candidate(&mut pick, &identity(0), 8458);
+        crate::kv_integration::offer_archive_candidate(&mut pick, &identity(9000), 8458);
+        crate::kv_integration::offer_archive_candidate(&mut pick, &identity(0), 8458);
         assert!(pick.take().is_none());
     }
 

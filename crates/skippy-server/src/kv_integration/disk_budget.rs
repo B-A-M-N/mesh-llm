@@ -29,7 +29,7 @@
 //! here, so the policy is tuned for hit rate rather than frugality.
 
 use std::{
-    path::Path,
+    path::{Path, PathBuf},
     sync::{Mutex, OnceLock},
 };
 
@@ -139,6 +139,30 @@ pub(super) fn claim_stage_share(node_budget: u64) -> Option<u64> {
     Some(claimed)
 }
 
+/// The nearest ancestor of `path` that exists on disk.
+///
+/// The cache directory is created by the tier itself, so on a first run
+/// neither it nor its configured parent exists yet. `statvfs` fails on a
+/// missing path, and the budget policy treats an unreadable filesystem as
+/// "do not enable" -- correct in general, but it meant the tier could never
+/// open the very first time. Walking up to an existing ancestor measures the
+/// same filesystem the cache will live on, since the missing components will
+/// be created under it.
+pub(super) fn existing_ancestor(path: &Path) -> PathBuf {
+    let mut current = path;
+    loop {
+        if current.exists() {
+            return current.to_path_buf();
+        }
+        match current.parent() {
+            Some(parent) => current = parent,
+            // A path with no existing ancestor at all: fall back to the root,
+            // which lets `statvfs` decide rather than guessing here.
+            None => return PathBuf::from("/"),
+        }
+    }
+}
+
 /// Free bytes available on the filesystem holding `path`.
 ///
 /// Returns `None` when the platform query fails, which callers must treat as
@@ -208,6 +232,25 @@ mod tests {
             resolve_node_budget(None, true, Some(4 * GIB)),
             NodeBudget::InsufficientSpace { .. }
         ));
+    }
+
+    /// First run: the cache directory and its parent do not exist yet, so
+    /// free space must be measured on an ancestor that does. Probing a
+    /// missing path made `statvfs` fail and disabled the tier permanently on
+    /// any node that had never created the directory.
+    #[test]
+    fn free_space_is_measured_on_an_existing_ancestor() {
+        let temp = std::env::temp_dir();
+        let missing = temp
+            .join("skippy-kv-budget-probe-does-not-exist")
+            .join("nested")
+            .join("deeper");
+        assert!(!missing.exists());
+
+        let ancestor = existing_ancestor(&missing);
+
+        assert!(ancestor.exists());
+        assert!(free_space_bytes(&ancestor).is_some_and(|bytes| bytes > 0));
     }
 
     /// An unreadable filesystem must not be read as "plenty of room".

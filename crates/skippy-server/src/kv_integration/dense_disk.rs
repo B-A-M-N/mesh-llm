@@ -263,6 +263,33 @@ impl ArchiveCandidate {
     }
 }
 
+/// Offer a record candidate to the archive selector.
+///
+/// Deliberately independent of the resident cache's admission decision: the
+/// disk tier's cost model is bytes-and-a-write, the resident cache's is KV
+/// cells, and a candidate rejected by one is routinely worth accepting in the
+/// other. The only requirement here is that the runtime actually holds the
+/// tokens the archive would export, which for a `token_start == 0` prefill
+/// means the candidate cannot claim more tokens than this request carried.
+///
+/// `ArchiveCandidate` still applies the selection policy (prefer the longest
+/// prefix strictly shorter than the full prompt), and `archive_dense_prefix`
+/// still applies the size floor and dedupe check, so a wider offer does not
+/// mean more writes -- it is still at most one archive per request.
+pub fn offer_archive_candidate(
+    archive_candidate: &mut ArchiveCandidate,
+    identity: &PrefillKvIdentity,
+    full_len: usize,
+) {
+    let Ok(token_count) = usize::try_from(identity.identity.token_count) else {
+        return;
+    };
+    if token_count == 0 || token_count > full_len {
+        return;
+    }
+    archive_candidate.offer(identity, token_count, full_len);
+}
+
 #[cfg(test)]
 mod archive_candidate_tests {
     use super::*;
