@@ -837,6 +837,10 @@ fn log_response_completed(context: &OpenAiRequestContext, operation: &'static st
         operation,
         elapsed_us = context.elapsed().as_micros() as u64,
         prompt_tokens = usage.prompt_tokens,
+        cached_tokens = usage
+            .prompt_tokens_details
+            .as_ref()
+            .map_or(0, |details| details.cached_tokens),
         completion_tokens = usage.completion_tokens,
         total_tokens = usage.total_tokens,
         "OpenAI response completed"
