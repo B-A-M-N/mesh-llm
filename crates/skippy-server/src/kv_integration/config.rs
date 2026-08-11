@@ -16,7 +16,10 @@ use skippy_protocol::{
 };
 use skippy_runtime::ModelInfo;
 
-use super::{ExactStateExtra, KvStageIntegration, StageKvMode, StagePrefixCachePayload};
+use super::{
+    ExactStateExtra, KvStageIntegration, StageKvMode, StagePrefixCachePayload, disk_budget,
+    disk_budget::NodeBudget,
+};
 
 impl KvStageIntegration {
     pub fn from_config(config: &StageConfig) -> Result<Option<Self>> {
@@ -68,9 +71,6 @@ impl KvStageIntegration {
     }
 }
 
-/// Default disk-tier budget when enabled without an explicit size.
-const DEFAULT_DISK_TIER_BYTES: u64 = 8 * 1024 * 1024 * 1024;
-
 /// Open the KV disk tier for this stage, if configured.
 ///
 /// The tier is **opt-in**: it writes gigabytes to the user's disk, so it is
@@ -82,7 +82,7 @@ const DEFAULT_DISK_TIER_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 /// identity already covers configuration differences; this keeps the
 /// *directories* separable so operators can reason about and delete them.
 fn open_disk_tier(config: &StageConfig) -> Option<PrefixDiskTier> {
-    let max_bytes = disk_tier_budget_bytes()?;
+    let root = disk_tier_root(config);
     // Persisting pages requires the identity to be anchored to *content*, not
     // to a display name. `model_id` is a human-facing label -- two different
     // GGUFs can legitimately be served under one name, and across a restart
@@ -106,7 +106,7 @@ fn open_disk_tier(config: &StageConfig) -> Option<PrefixDiskTier> {
         );
         return None;
     }
-    let root = disk_tier_root(config);
+    let max_bytes = stage_disk_budget_bytes(&root, config)?;
     match PrefixDiskTier::open(&root, max_bytes) {
         Ok(tier) => Some(tier),
         Err(error) => {
@@ -117,13 +117,50 @@ fn open_disk_tier(config: &StageConfig) -> Option<PrefixDiskTier> {
     }
 }
 
-fn disk_tier_budget_bytes() -> Option<u64> {
-    if let Ok(value) = std::env::var("SKIPPY_KV_DISK_TIER_MIB")
-        && let Ok(mib) = value.trim().parse::<u64>()
-    {
-        return (mib > 0).then(|| mib.saturating_mul(1024 * 1024));
+/// This stage's share of the node-level disk budget.
+///
+/// The budget is resolved once per node and shared out, so the configured
+/// number is a node total rather than a per-stage allowance that silently
+/// multiplies by the number of loaded models. See `disk_budget`.
+fn stage_disk_budget_bytes(root: &Path, config: &StageConfig) -> Option<u64> {
+    // Free space is measured on the parent, because `root` itself may not
+    // exist yet -- it is created by `PrefixDiskTier::open`.
+    let probe = root.parent().unwrap_or(root);
+    let free_bytes = disk_budget::free_space_bytes(probe);
+    let budget = disk_budget::resolve_node_budget(
+        explicit_disk_tier_bytes(),
+        disk_tier_explicitly_enabled(),
+        free_bytes,
+    );
+    if let NodeBudget::InsufficientSpace { free_bytes } = budget {
+        eprintln!(
+            "skippy: KV disk tier disabled for stage {}: only {:.1} GiB free on {}",
+            config.stage_id,
+            free_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+            probe.display(),
+        );
+        return None;
     }
-    let enabled = std::env::var("SKIPPY_KV_DISK_TIER")
+    let node_bytes = budget.bytes()?;
+    let share = disk_budget::claim_stage_share(node_bytes);
+    if share.is_none() {
+        eprintln!(
+            "skippy: KV disk tier disabled for stage {}: node disk budget already fully claimed",
+            config.stage_id,
+        );
+    }
+    share
+}
+
+/// An explicitly configured node-level budget, if any.
+fn explicit_disk_tier_bytes() -> Option<u64> {
+    let value = std::env::var("SKIPPY_KV_DISK_TIER_MIB").ok()?;
+    let mib = value.trim().parse::<u64>().ok()?;
+    (mib > 0).then(|| mib.saturating_mul(1024 * 1024))
+}
+
+fn disk_tier_explicitly_enabled() -> bool {
+    std::env::var("SKIPPY_KV_DISK_TIER")
         .ok()
         .map(|value| {
             matches!(
@@ -131,8 +168,7 @@ fn disk_tier_budget_bytes() -> Option<u64> {
                 "1" | "on" | "true"
             )
         })
-        .unwrap_or(false);
-    enabled.then_some(DEFAULT_DISK_TIER_BYTES)
+        .unwrap_or(false)
 }
 
 fn disk_tier_root(config: &StageConfig) -> PathBuf {
