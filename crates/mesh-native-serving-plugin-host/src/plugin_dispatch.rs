@@ -108,11 +108,19 @@ impl PluginCommandQueue {
     /// A late candidate is withheld from decode, so its `discard` is the only
     /// remaining way the plugin can resolve that decision ID. It must not be
     /// dropped just because ordinary traffic filled the queue.
+    ///
+    /// One slot in the terminal reserve is held exclusively for `Fence`, so
+    /// finish can always be ordered after earlier dispositions.
     fn try_enqueue_terminal(
         &self,
         command: PluginCommand,
     ) -> std::result::Result<(), PluginCommandQueueError> {
-        self.enqueue_within(command, PLUGIN_COMMAND_CAPACITY + PLUGIN_TERMINAL_RESERVE)
+        let capacity = if matches!(command, PluginCommand::Fence(_)) {
+            PLUGIN_COMMAND_CAPACITY + PLUGIN_TERMINAL_RESERVE
+        } else {
+            PLUGIN_COMMAND_CAPACITY + PLUGIN_TERMINAL_RESERVE - 1
+        };
+        self.enqueue_within(command, capacity)
     }
 
     fn enqueue_within(
