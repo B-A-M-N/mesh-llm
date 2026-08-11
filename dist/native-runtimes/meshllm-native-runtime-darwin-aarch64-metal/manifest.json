@@ -1,0 +1,83 @@
+{
+  "build": {
+    "backend": "metal",
+    "library_sha256": "a5615e8ea4d39e44da8e781785742ac3b8898a4bf15bc38e088e602c4a617dab",
+    "llama_patch_digest": "85c6e471de2e4b60b7d59a649f3f69034d6d2bc761cfdc4abafc3101b43ad419",
+    "llama_patched_sha": "b4330b0890dad18bda1a6614c0648fbfad50aa2f",
+    "llama_upstream_sha": "8190848bb36c7df4251db4352bd81bc07d0a4385",
+    "platform": "darwin-aarch64",
+    "primary_library": "lib/libllama.dylib"
+  },
+  "runtime": {
+    "backend": {
+      "kind": "metal"
+    },
+    "files": {
+      "lib/libggml-base.0.17.0.dylib": "9f169ca97cb1cb81ebecf9272704254848e90f01e50dded8c5a73b117537557c",
+      "lib/libggml-base.0.dylib": "e42b1f370b3e4391c3b34c0ff971e38c500a88de542c90ca79d6e1f665f7e2a1",
+      "lib/libggml-base.dylib": "d65d56c4cbc8474106702f7fbe7e6d97919442ab87424ad861086d16259fd11c",
+      "lib/libggml-blas.0.17.0.dylib": "9e34b508a800d94b2c1c2a962cf4f11ef1c87783b694a51f3d32e4322c098258",
+      "lib/libggml-blas.0.dylib": "df5d79960d78edf5ce2f6109137d63b8a4286a0a978d195181c74f8a87d0f38f",
+      "lib/libggml-blas.dylib": "4e0485e97857bc2927e5f337f648b141d44a81b110aa7865caca2e6e32f36dd6",
+      "lib/libggml-cpu.0.17.0.dylib": "bb700dcc010786ca9e740e66155e9348070fed04400e964b7172a5397f79cc5a",
+      "lib/libggml-cpu.0.dylib": "18668c5bee7c501a8ba489a3d74822adac8822fe7430595c236aadfcc986072c",
+      "lib/libggml-cpu.dylib": "a2e78cc26fb259539bd4ae3ae8eb516f6fa5afad46f1a1bae6e66d9e65960f2d",
+      "lib/libggml-metal.0.17.0.dylib": "cf57f4125de442bd1f2453f3bd9a8d4b9c6c4b8254cc92333a9d61ed7e23111a",
+      "lib/libggml-metal.0.dylib": "89ecddf73c1d0a3044e8e2f0f635eb573156a515d9c880adcadd7e43e1b776e5",
+      "lib/libggml-metal.dylib": "a84bfd1e8545aadbc38f1e63122889a0016777692fdc01a996b19c0f331e95b3",
+      "lib/libggml.0.17.0.dylib": "8062690921d2f958af5caac3fcb5080454406644c4ce82f6ea78092073b56170",
+      "lib/libggml.0.dylib": "26f84ad00dff0d60c156b6fda500e8a0d15f717577b7a80e2ef69b25dd7c924c",
+      "lib/libggml.dylib": "f44febc8cf8a706af1174e3a6fa7a09fcffbc3b9121d312078144edb9a18d67e",
+      "lib/libllama-common.0.0.10240.dylib": "f111a5796e83c79ffce2e04827ffb319ef6d6cb612e3658ebeb61b911f6f9891",
+      "lib/libllama-common.0.dylib": "3765640fd7e3d10c2f8bb49a04a26cfc2a544efe7b4b69287c16602345a12161",
+      "lib/libllama-common.dylib": "c299aecc80f4220459701ac5f096dd67dc0218d03b350a32de1a0b635eed4b5e",
+      "lib/libllama.0.0.10240.dylib": "265671093b473520ddd3946b4c72b340823fc64e8f241bcff699452c6007717d",
+      "lib/libllama.0.dylib": "183283187a675adc5f784cf33195438c9c4af0a9900ee6032f8410f4bef21560",
+      "lib/libllama.dylib": "a5615e8ea4d39e44da8e781785742ac3b8898a4bf15bc38e088e602c4a617dab",
+      "lib/libmtmd.0.0.10240.dylib": "afad4c99d5ca54b253995a52b7d6dc4c87648fca62f964216cc1ac9ca4a96b95",
+      "lib/libmtmd.0.dylib": "a4c987e3fd78c2c7d16c1b24b89a9cda135ce2e239a20655bc152fe0dc05a979",
+      "lib/libmtmd.dylib": "9632f0faeaf0982e1475d485b4cf37ef331d6d4922adff8bf9cc2eee4a33d204"
+    },
+    "id": "meshllm-native-runtime-darwin-aarch64-metal",
+    "libraries": [
+      "lib/libggml-base.0.17.0.dylib",
+      "lib/libggml-base.0.dylib",
+      "lib/libggml-base.dylib",
+      "lib/libggml-blas.0.17.0.dylib",
+      "lib/libggml-blas.0.dylib",
+      "lib/libggml-blas.dylib",
+      "lib/libggml-cpu.0.17.0.dylib",
+      "lib/libggml-cpu.0.dylib",
+      "lib/libggml-cpu.dylib",
+      "lib/libggml-metal.0.17.0.dylib",
+      "lib/libggml-metal.0.dylib",
+      "lib/libggml-metal.dylib",
+      "lib/libggml.0.17.0.dylib",
+      "lib/libggml.0.dylib",
+      "lib/libggml.dylib",
+      "lib/libllama-common.0.0.10240.dylib",
+      "lib/libllama-common.0.dylib",
+      "lib/libllama-common.dylib",
+      "lib/libllama.0.0.10240.dylib",
+      "lib/libllama.0.dylib",
+      "lib/libmtmd.0.0.10240.dylib",
+      "lib/libmtmd.0.dylib",
+      "lib/libmtmd.dylib",
+      "lib/libllama.dylib"
+    ],
+    "mesh_version": "0.72.1",
+    "platform": {
+      "arch": "aarch64",
+      "os": "macos",
+      "target": "aarch64-apple-darwin"
+    },
+    "rank": 0,
+    "sha256": null,
+    "signature": null,
+    "skippy_abi": "0.1.35",
+    "tools": {
+      "tools/mesh-llm-gpu-benchmark": "70da414425177e8b9049125034937f50993e6c9d1ba7cd69d38256a7e11c7b8d"
+    },
+    "url": null
+  }
+}
