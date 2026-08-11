@@ -368,6 +368,7 @@ impl PluginDriver {
                 LinearProposalSourceOutcome::HostDeadlineExceeded,
             ));
         }
+
         let (reply, response) = sync_channel(1);
         match self
             .queue
@@ -499,6 +500,32 @@ fn run_proposal(
 ) {
     let deadline = query.deadline;
     let queue_wait_us = elapsed_us(enqueued_at);
+    if Instant::now() >= deadline {
+        let _ = reply.send(abstention(
+            queue_wait_us,
+            LinearProposalSourceOutcome::DeadlineExceededBeforeDispatch,
+        ));
+        return;
+    }
+
+    // Reports and discards run on the passive worker so they cannot consume
+    // proposal callback time. The primary worker owns this fence, which makes
+    // proposal ordering serial even when multiple callers enqueue proposals
+    // concurrently. Unlike the caller-side deadline wait, this completion
+    // wait is never abandoned: after it completes we recheck the original
+    // absolute deadline before invoking the plugin.
+    if let Err(error) = fence_passive(passive_queue) {
+        eprintln!("native serving plugin proposal fence failed: {error:#}");
+        let _ = reply.send(ProposalResponse {
+            proposal: Err(format!("{error:#}")),
+            telemetry: LinearProposalSourceTelemetry {
+                queue_wait_us,
+                callback_elapsed_us: 0,
+                outcome: LinearProposalSourceOutcome::SourceError,
+            },
+        });
+        return;
+    }
     if Instant::now() >= deadline {
         let _ = reply.send(abstention(
             queue_wait_us,

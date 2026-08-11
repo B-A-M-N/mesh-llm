@@ -5,7 +5,7 @@ use std::{
     ffi::{c_char, c_void},
     ptr::NonNull,
     sync::{
-        Arc, Mutex,
+        Arc, Condvar, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
     thread,
@@ -18,6 +18,71 @@ use skippy_server::frontend::LinearProposalQuery;
 use crate::{ActivePlugin, LoadedDefinition, MAX_NATIVE_PLUGIN_PROPOSAL_TOKENS};
 
 pub(crate) static FAKE_NAME: &[u8] = b"test-serving-plugin";
+
+/// Deterministic callback gate for ordering tests. The callback announces
+/// entry, then waits until the test explicitly releases it.
+pub(crate) struct CallbackGate {
+    state: Mutex<CallbackGateState>,
+    signal: Condvar,
+}
+
+#[derive(Default)]
+struct CallbackGateState {
+    entered: bool,
+    released: bool,
+}
+
+impl CallbackGate {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            state: Mutex::new(CallbackGateState::default()),
+            signal: Condvar::new(),
+        })
+    }
+
+    fn wait(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.entered = true;
+        self.signal.notify_all();
+        while !state.released {
+            state = self.signal.wait(state).unwrap();
+        }
+    }
+
+    pub(crate) fn wait_until_entered(&self) {
+        let mut state = self.state.lock().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !state.entered {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                panic!("timed out waiting for gated callback to enter");
+            }
+            let (next_state, timeout) = self.signal.wait_timeout(state, remaining).unwrap();
+            state = next_state;
+            if timeout.timed_out() && !state.entered {
+                panic!("timed out waiting for gated callback to enter");
+            }
+        }
+    }
+
+    pub(crate) fn release(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.released = true;
+        self.signal.notify_all();
+    }
+
+    pub(crate) fn release_on_drop(self: &Arc<Self>) -> CallbackGateRelease {
+        CallbackGateRelease(Arc::clone(self))
+    }
+}
+
+pub(crate) struct CallbackGateRelease(Arc<CallbackGate>);
+
+impl Drop for CallbackGateRelease {
+    fn drop(&mut self) {
+        self.0.release();
+    }
+}
 
 /// Per-instance observations, so tests running in parallel cannot see each
 /// other's callback counts.
@@ -34,6 +99,8 @@ pub(crate) struct FakeState {
     poll_fails: bool,
     commit_delay: Duration,
     report_delay: Duration,
+    report_gate: Option<Arc<CallbackGate>>,
+    proposal_gate: Option<Arc<CallbackGate>>,
     begin_fails: bool,
     events: Arc<Mutex<Vec<&'static str>>>,
     abort_count: Arc<AtomicUsize>,
@@ -104,6 +171,9 @@ unsafe extern "C" fn fake_start_proposal(
 ) -> abi::PluginStatus {
     let state = unsafe { &*instance.cast::<FakeState>() };
     state.events.lock().unwrap().push("proposal");
+    if let Some(gate) = &state.proposal_gate {
+        gate.wait();
+    }
     thread::sleep(state.start_delay);
     unsafe { *operation = 1 };
     abi::PluginStatus::OK
@@ -148,6 +218,10 @@ unsafe extern "C" fn fake_report_proposal(
 ) -> abi::PluginStatus {
     let state = unsafe { &*instance.cast::<FakeState>() };
     state.events.lock().unwrap().push("report");
+    if let Some(gate) = &state.report_gate {
+        gate.wait();
+        state.events.lock().unwrap().push("report_done");
+    }
     thread::sleep(state.report_delay);
     abi::PluginStatus::OK
 }
@@ -158,6 +232,10 @@ unsafe extern "C" fn fake_discard_proposal(
 ) -> abi::PluginStatus {
     let state = unsafe { &*instance.cast::<FakeState>() };
     state.events.lock().unwrap().push("discard");
+    if let Some(gate) = &state.report_gate {
+        gate.wait();
+        state.events.lock().unwrap().push("discard_done");
+    }
     thread::sleep(state.report_delay);
     abi::PluginStatus::OK
 }
@@ -232,6 +310,28 @@ pub(crate) fn fake_active_with_timing(
     Arc<Mutex<Vec<&'static str>>>,
     Arc<AtomicUsize>,
 ) {
+    fake_active_with_timing_and_gates(
+        start_delay,
+        commit_delay,
+        report_delay,
+        begin_fails,
+        None,
+        None,
+    )
+}
+
+pub(crate) fn fake_active_with_timing_and_gates(
+    start_delay: Duration,
+    commit_delay: Duration,
+    report_delay: Duration,
+    begin_fails: bool,
+    report_gate: Option<Arc<CallbackGate>>,
+    proposal_gate: Option<Arc<CallbackGate>>,
+) -> (
+    ActivePlugin,
+    Arc<Mutex<Vec<&'static str>>>,
+    Arc<AtomicUsize>,
+) {
     let table = Box::leak(Box::new(fake_table()));
     let definition = Arc::new(LoadedDefinition {
         _library: None,
@@ -249,6 +349,8 @@ pub(crate) fn fake_active_with_timing(
         poll_fails: false,
         commit_delay,
         report_delay,
+        report_gate,
+        proposal_gate,
         begin_fails,
         events: Arc::clone(&events),
         abort_count: Arc::clone(&abort_count),
@@ -268,14 +370,28 @@ pub(crate) fn fake_active_with_timing(
 }
 
 pub(crate) fn fake_active_with_late_candidate(poll_delay: Duration) -> ActivePlugin {
-    let (active, _, _) =
-        fake_active_with_timing(Duration::ZERO, Duration::ZERO, Duration::ZERO, false);
+    fake_active_with_late_candidate_and_gates_with_events(poll_delay, None, None).0
+}
+
+pub(crate) fn fake_active_with_late_candidate_and_gates_with_events(
+    poll_delay: Duration,
+    report_gate: Option<Arc<CallbackGate>>,
+    proposal_gate: Option<Arc<CallbackGate>>,
+) -> (ActivePlugin, Arc<Mutex<Vec<&'static str>>>) {
+    let (active, events, _) = fake_active_with_timing_and_gates(
+        Duration::ZERO,
+        Duration::ZERO,
+        Duration::ZERO,
+        false,
+        report_gate,
+        proposal_gate,
+    );
     let instance = active.instance.unwrap().as_ptr().cast::<FakeState>();
     unsafe {
         (*instance).poll_delay = poll_delay;
         (*instance).poll_returns_candidate = true;
     }
-    active
+    (active, events)
 }
 
 /// Clones the per-instance observation handles out of a fake plugin.

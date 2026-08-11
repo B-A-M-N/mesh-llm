@@ -2,12 +2,14 @@
 
 use std::{
     sync::{Arc, atomic::Ordering, mpsc::sync_channel},
+    thread,
     time::{Duration, Instant},
 };
 
 use skippy_server::frontend::{
     GenerationAbort, GenerationCommit, GenerationLifecycleIngress, GenerationLifecycleObservation,
-    GenerationStart, LinearProposalDiscardReason, LinearProposalQuery, LinearProposalSourceOutcome,
+    GenerationStart, LinearProposalDiscardReason, LinearProposalQuery, LinearProposalReceipt,
+    LinearProposalSourceOutcome, OpaqueProposalDecisionId,
 };
 
 use super::{
@@ -17,11 +19,34 @@ use super::{
 use crate::{
     NativeLifecycleIngress,
     test_support::{
-        fake_active, fake_active_with_events, fake_active_with_failing_proposal,
-        fake_active_with_late_candidate, fake_active_with_observations, fake_active_with_options,
-        fake_active_with_timing, fake_observations, proposal_query, wait_for_event,
+        CallbackGate, fake_active, fake_active_with_events, fake_active_with_failing_proposal,
+        fake_active_with_late_candidate, fake_active_with_late_candidate_and_gates_with_events,
+        fake_active_with_observations, fake_active_with_options, fake_active_with_timing,
+        fake_active_with_timing_and_gates, fake_observations, proposal_query, wait_for_event,
     },
 };
+
+fn queued_fence_count(queue: &PluginCommandQueue) -> usize {
+    queue
+        .state
+        .lock()
+        .unwrap()
+        .commands
+        .iter()
+        .filter(|queued| matches!(&queued.command, PluginCommand::Fence(_)))
+        .count()
+}
+
+fn wait_until(predicate: impl Fn() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while !predicate() {
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for test state"
+        );
+        thread::yield_now();
+    }
+}
 
 #[test]
 fn blocking_plugin_cannot_extend_the_decode_deadline() {
@@ -106,7 +131,7 @@ fn slow_commit_abstains_before_plugin_dispatch_and_later_positions_recover() {
 }
 
 #[test]
-fn running_passive_discard_cannot_delay_the_next_proposal() {
+fn slow_passive_discard_cannot_run_the_next_proposal_after_its_deadline() {
     let (active, events, _) = fake_active_with_timing(
         Duration::ZERO,
         Duration::ZERO,
@@ -129,10 +154,10 @@ fn running_passive_discard_cannot_delay_the_next_proposal() {
     assert!(response.proposal.unwrap().is_none());
     assert_eq!(
         response.telemetry.outcome,
-        LinearProposalSourceOutcome::Abstained
+        LinearProposalSourceOutcome::HostDeadlineExceeded
     );
     assert!(started.elapsed() < Duration::from_millis(60));
-    assert_eq!(*events.lock().unwrap(), ["discard", "proposal"]);
+    assert_eq!(*events.lock().unwrap(), ["discard"]);
 }
 
 #[test]
@@ -275,6 +300,238 @@ fn finish_waits_for_prior_passive_discard() {
     assert_eq!(*events.lock().unwrap(), ["discard"]);
     finish.join().unwrap().unwrap();
     assert_eq!(*events.lock().unwrap(), ["discard", "finish"]);
+}
+
+#[test]
+fn proposal_waits_for_prior_passive_discard_ack_before_dispatch() {
+    let discard_gate = CallbackGate::new();
+    let (active, events, _) = fake_active_with_timing_and_gates(
+        Duration::ZERO,
+        Duration::ZERO,
+        Duration::ZERO,
+        false,
+        Some(Arc::clone(&discard_gate)),
+        None,
+    );
+    let driver = PluginDriver::spawn(active).unwrap();
+    let _release_gate = discard_gate.release_on_drop();
+    driver
+        .enqueue_terminal(PluginCommand::Discard(
+            vec![1],
+            LinearProposalDiscardReason::PositionMismatch,
+        ))
+        .unwrap();
+    discard_gate.wait_until_entered();
+
+    let passive_queue = Arc::clone(&driver.passive_queue);
+    let driver_for_proposal = Arc::new(driver);
+    let proposal_driver = Arc::clone(&driver_for_proposal);
+    let proposal = thread::spawn(move || {
+        proposal_driver
+            .propose(proposal_query(Instant::now() + Duration::from_secs(1)))
+            .unwrap()
+    });
+    wait_until(|| queued_fence_count(&passive_queue) == 1);
+    assert_eq!(*events.lock().unwrap(), ["discard"]);
+
+    discard_gate.release();
+    let response = proposal.join().unwrap();
+
+    assert_eq!(
+        response.telemetry.outcome,
+        LinearProposalSourceOutcome::Abstained
+    );
+    assert_eq!(
+        *events.lock().unwrap(),
+        ["discard", "discard_done", "proposal"]
+    );
+}
+
+#[test]
+fn proposal_waits_for_prior_passive_report_ack_before_dispatch() {
+    let report_gate = CallbackGate::new();
+    let (active, events, _) = fake_active_with_timing_and_gates(
+        Duration::ZERO,
+        Duration::ZERO,
+        Duration::ZERO,
+        false,
+        Some(Arc::clone(&report_gate)),
+        None,
+    );
+    let driver = PluginDriver::spawn(active).unwrap();
+    let _release_gate = report_gate.release_on_drop();
+    driver
+        .enqueue_terminal(PluginCommand::Report(LinearProposalReceipt::test_fixture(
+            OpaqueProposalDecisionId::new(vec![1]).unwrap(),
+        )))
+        .unwrap();
+    report_gate.wait_until_entered();
+
+    let passive_queue = Arc::clone(&driver.passive_queue);
+    let driver_for_proposal = Arc::new(driver);
+    let proposal_driver = Arc::clone(&driver_for_proposal);
+    let proposal = thread::spawn(move || {
+        proposal_driver
+            .propose(proposal_query(Instant::now() + Duration::from_secs(1)))
+            .unwrap()
+    });
+    wait_until(|| queued_fence_count(&passive_queue) == 1);
+    assert_eq!(*events.lock().unwrap(), ["commit", "report"]);
+
+    report_gate.release();
+    let response = proposal.join().unwrap();
+    assert_eq!(
+        response.telemetry.outcome,
+        LinearProposalSourceOutcome::Abstained
+    );
+    assert_eq!(
+        *events.lock().unwrap(),
+        ["commit", "report", "report_done", "proposal"]
+    );
+}
+
+#[test]
+fn late_candidate_discard_is_fenced_before_the_following_proposal() {
+    let discard_gate = CallbackGate::new();
+    let (active, events) = fake_active_with_late_candidate_and_gates_with_events(
+        Duration::from_millis(20),
+        Some(Arc::clone(&discard_gate)),
+        None,
+    );
+    let driver = Arc::new(PluginDriver::spawn(active).unwrap());
+    let _release_gate = discard_gate.release_on_drop();
+
+    let (reply, response) = sync_channel(1);
+    driver
+        .queue
+        .try_enqueue(PluginCommand::Proposal(
+            proposal_query(Instant::now() + Duration::from_millis(5)),
+            reply,
+        ))
+        .unwrap();
+    let first = response.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert_eq!(
+        first.telemetry.outcome,
+        LinearProposalSourceOutcome::CandidateReturnedTooLate
+    );
+    discard_gate.wait_until_entered();
+    assert_eq!(*events.lock().unwrap(), ["proposal", "discard"]);
+
+    let next_driver = Arc::clone(&driver);
+    let next = thread::spawn(move || {
+        next_driver
+            .propose(proposal_query(Instant::now() + Duration::from_secs(1)))
+            .unwrap()
+    });
+    wait_until(|| queued_fence_count(&driver.passive_queue) == 1);
+    assert_eq!(*events.lock().unwrap(), ["proposal", "discard"]);
+
+    discard_gate.release();
+    let second = next.join().unwrap();
+    assert_eq!(second.telemetry.outcome, LinearProposalSourceOutcome::Ready);
+    assert_eq!(
+        *events.lock().unwrap(),
+        ["proposal", "discard", "discard_done", "proposal"]
+    );
+}
+
+#[test]
+fn concurrent_proposals_enqueue_only_one_inflight_passive_fence() {
+    let discard_gate = CallbackGate::new();
+    let (active, events, _) = fake_active_with_timing_and_gates(
+        Duration::ZERO,
+        Duration::ZERO,
+        Duration::ZERO,
+        false,
+        Some(Arc::clone(&discard_gate)),
+        None,
+    );
+    let driver = Arc::new(PluginDriver::spawn(active).unwrap());
+    let _release_gate = discard_gate.release_on_drop();
+    driver
+        .enqueue_terminal(PluginCommand::Discard(
+            vec![1],
+            LinearProposalDiscardReason::PositionMismatch,
+        ))
+        .unwrap();
+    discard_gate.wait_until_entered();
+
+    let callers = (0..8)
+        .map(|_| {
+            let driver = Arc::clone(&driver);
+            thread::spawn(move || {
+                driver
+                    .propose(proposal_query(Instant::now() + Duration::from_secs(1)))
+                    .unwrap()
+            })
+        })
+        .collect::<Vec<_>>();
+    wait_until(|| queued_fence_count(&driver.passive_queue) == 1);
+    assert_eq!(queued_fence_count(&driver.passive_queue), 1);
+
+    discard_gate.release();
+    for caller in callers {
+        assert_eq!(
+            caller.join().unwrap().telemetry.outcome,
+            LinearProposalSourceOutcome::Abstained
+        );
+    }
+    assert_eq!(
+        events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|&&event| event == "discard_done")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn blocked_passive_completion_never_dispatches_expired_proposal() {
+    let discard_gate = CallbackGate::new();
+    let (active, events, _) = fake_active_with_timing_and_gates(
+        Duration::ZERO,
+        Duration::ZERO,
+        Duration::ZERO,
+        false,
+        Some(Arc::clone(&discard_gate)),
+        None,
+    );
+    let driver = Arc::new(PluginDriver::spawn(active).unwrap());
+    let _release_gate = discard_gate.release_on_drop();
+    driver
+        .enqueue_terminal(PluginCommand::Discard(
+            vec![1],
+            LinearProposalDiscardReason::PositionMismatch,
+        ))
+        .unwrap();
+    discard_gate.wait_until_entered();
+
+    let expired_driver = Arc::clone(&driver);
+    let expired = thread::spawn(move || {
+        expired_driver
+            .propose(proposal_query(Instant::now() + Duration::from_millis(20)))
+            .unwrap()
+    });
+    let expired_result = expired.join().unwrap();
+    assert_eq!(
+        expired_result.telemetry.outcome,
+        LinearProposalSourceOutcome::HostDeadlineExceeded
+    );
+
+    discard_gate.release();
+    let follow_up = driver
+        .propose(proposal_query(Instant::now() + Duration::from_secs(1)))
+        .unwrap();
+    assert_eq!(
+        follow_up.telemetry.outcome,
+        LinearProposalSourceOutcome::Abstained
+    );
+    assert_eq!(
+        *events.lock().unwrap(),
+        ["discard", "discard_done", "proposal"]
+    );
 }
 
 #[test]

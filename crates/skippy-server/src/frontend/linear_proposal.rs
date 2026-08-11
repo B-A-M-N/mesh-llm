@@ -219,6 +219,35 @@ pub struct LinearProposalReceipt {
 }
 
 impl LinearProposalReceipt {
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn test_fixture(decision_id: OpaqueProposalDecisionId) -> Self {
+        Self {
+            request_id: 1,
+            session_id: 2,
+            decision_id,
+            disposition: LinearProposalDisposition::FullAccept,
+            proposal_token_count: 1,
+            verification_rows: 1,
+            accepted_proposal_tokens: 1,
+            committed_tokens: vec![1].into_boxed_slice(),
+            verification_row_predictions: vec![1].into_boxed_slice(),
+            canonical_prediction_count: 1,
+            correction_or_boundary_token: Some(1),
+            base_position: 0,
+            position_after_verification: 1,
+            canonical_position: 1,
+            trimmed_rows: 0,
+            proposal_elapsed_us: 0,
+            verification_elapsed_us: 0,
+            repair_elapsed_us: 0,
+            total_elapsed_us: 0,
+            runtime_lock_wait_us: 0,
+            runtime_lock_hold_us: 0,
+            runtime_lock_acquires: 0,
+        }
+    }
+
     pub(crate) fn insert_telemetry_attrs(&self, attrs: &mut BTreeMap<String, serde_json::Value>) {
         attrs.insert(
             "llama_stage.linear_proposal.disposition".to_string(),

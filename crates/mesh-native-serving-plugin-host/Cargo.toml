@@ -16,3 +16,6 @@ skippy-server = { path = "../skippy-server", version = "0.72.1" }
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+skippy-server = { path = "../skippy-server", version = "0.72.1", features = ["test-support"] }

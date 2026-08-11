@@ -14,6 +14,7 @@ path = "src/lib.rs"
 [features]
 default = []
 dynamic-native-runtime = ["skippy-runtime/dynamic-native-runtime"]
+test-support = []
 
 [dependencies]
 ahash.workspace = true
