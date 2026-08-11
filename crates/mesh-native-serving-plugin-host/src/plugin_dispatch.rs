@@ -3,7 +3,8 @@
 //! Lifecycle and proposal callbacks share one ordered queue so every proposal
 //! observes the committed state that preceded it. Passive terminal callbacks
 //! (`report` / `discard`) run on their own worker so they can never consume a
-//! proposal's deadline.
+//! proposal's deadline. Proposal dispatch fences that passive queue first, so
+//! commits -> report -> next proposal remains causal.
 
 use std::{
     collections::VecDeque,
@@ -39,8 +40,17 @@ pub(crate) enum PluginCommand {
     Abort(GenerationAbort),
     Finish(GenerationReceipt),
     Proposal(LinearProposalQuery, SyncSender<ProposalResponse>),
-    Report(LinearProposalReceipt),
+    /// Primary-queue handoff for a report. The primary worker enqueues the
+    /// actual passive report only after all earlier lifecycle commits, then
+    /// waits for the passive callback before it accepts later primary work.
+    ReportHandoff(LinearProposalReceipt),
+    Report(LinearProposalReceipt, SyncSender<Result<()>>),
     Discard(Vec<u8>, LinearProposalDiscardReason),
+    /// A passive-queue barrier. The primary worker waits for this barrier
+    /// before invoking a proposal or finalizing a generation, so all earlier
+    /// reports/discards have completed before the plugin sees the next
+    /// callback.
+    Fence(SyncSender<()>),
 }
 
 pub(crate) struct ProposalResponse {
@@ -108,7 +118,14 @@ impl PluginCommandQueue {
         &self,
         command: PluginCommand,
     ) -> std::result::Result<(), PluginCommandQueueError> {
-        self.enqueue_within(command, PLUGIN_COMMAND_CAPACITY + PLUGIN_TERMINAL_RESERVE)
+        let capacity = if matches!(command, PluginCommand::Fence(_)) {
+            PLUGIN_COMMAND_CAPACITY + PLUGIN_TERMINAL_RESERVE
+        } else {
+            // Keep one slot available for a fence after ordinary terminal
+            // callbacks fill the reserved headroom.
+            PLUGIN_COMMAND_CAPACITY + PLUGIN_TERMINAL_RESERVE - 1
+        };
+        self.enqueue_within(command, capacity)
     }
 
     fn enqueue_within(
@@ -311,10 +328,28 @@ impl PluginDriver {
         self.queue_for(&command).enqueue(command)
     }
 
+    /// Enqueues a terminal proposal disposition using reserved capacity.
+    pub(crate) fn enqueue_terminal(&self, command: PluginCommand) -> Result<()> {
+        self.ensure_healthy()?;
+        self.queue_for(&command)
+            .try_enqueue_terminal(command)
+            .map_err(|error| match error {
+                PluginCommandQueueError::Full => {
+                    anyhow!("native serving plugin terminal queue is full")
+                }
+                PluginCommandQueueError::Stopped => {
+                    anyhow!("native serving plugin passive worker stopped")
+                }
+                PluginCommandQueueError::Poisoned => {
+                    anyhow!("native serving plugin terminal queue lock poisoned")
+                }
+            })
+    }
+
     fn queue_for(&self, command: &PluginCommand) -> &Arc<PluginCommandQueue> {
         if matches!(
             command,
-            PluginCommand::Report(_) | PluginCommand::Discard(_, _)
+            PluginCommand::Report(_, _) | PluginCommand::Discard(_, _) | PluginCommand::Fence(_)
         ) {
             &self.passive_queue
         } else {
@@ -336,7 +371,11 @@ impl PluginDriver {
                 LinearProposalSourceOutcome::HostDeadlineExceeded,
             ));
         }
-        let (reply, response) = sync_channel(1);
+        // A proposal is accepted only when the caller receives it. A buffered
+        // reply could be written after recv_timeout returned, then orphaned
+        // when the receiver was dropped without giving the worker a chance to
+        // discard the candidate.
+        let (reply, response) = sync_channel(0);
         match self
             .queue
             .try_enqueue(PluginCommand::Proposal(query, reply))
@@ -436,22 +475,32 @@ fn plugin_worker(
         command,
     }) = queue.next()
     {
-        let result = match command {
-            PluginCommand::Begin(event) => active.begin(&event),
-            PluginCommand::Committed(event) => active.committed(&event),
-            PluginCommand::Abort(event) => active.abort(&event),
-            PluginCommand::Finish(event) => active.finish(&event),
+        let (result, lifecycle) = match command {
+            PluginCommand::Begin(event) => (active.begin(&event), true),
+            PluginCommand::Committed(event) => (active.committed(&event), true),
+            PluginCommand::Abort(event) => (active.abort(&event), true),
+            PluginCommand::Finish(event) => (
+                finish_after_passive_fence(&passive_queue, || active.finish(&event)),
+                true,
+            ),
+            PluginCommand::ReportHandoff(event) => {
+                let result = report_after_passive_handoff(&passive_queue, event);
+                (result, false)
+            }
             PluginCommand::Proposal(query, reply) => {
                 run_proposal(&active, &passive_queue, enqueued_at, query, &reply);
                 continue;
             }
-            PluginCommand::Report(_) | PluginCommand::Discard(_, _) => {
+            PluginCommand::Report(_, _)
+            | PluginCommand::Discard(_, _)
+            | PluginCommand::Fence(_) => {
                 unreachable!("passive plugin callbacks must use the passive worker queue")
             }
         };
-        if let Err(error) = &result {
-            eprintln!("native serving plugin lifecycle callback failed: {error:#}");
+        if lifecycle && result.is_err() {
             lifecycle_delivery_failures.fetch_add(1, Ordering::Relaxed);
+        } else if let Err(error) = result {
+            eprintln!("native serving plugin report handoff failed: {error:#}");
         }
     }
 }
@@ -466,10 +515,46 @@ fn run_proposal(
     let deadline = query.deadline;
     let queue_wait_us = elapsed_us(enqueued_at);
     if Instant::now() >= deadline {
-        let _ = reply.send(abstention(
-            queue_wait_us,
-            LinearProposalSourceOutcome::DeadlineExceededBeforeDispatch,
-        ));
+        send_proposal_response(
+            passive_queue,
+            reply,
+            abstention(
+                queue_wait_us,
+                LinearProposalSourceOutcome::DeadlineExceededBeforeDispatch,
+            ),
+        );
+        return;
+    }
+
+    // Reports and discards run on the passive worker so they cannot consume
+    // proposal callback time. This fence serializes the passive terminal
+    // callbacks with the primary proposal queue. The wait is not abandoned;
+    // after it completes, the original absolute deadline is checked again.
+    if let Err(error) = fence_passive(passive_queue) {
+        eprintln!("native serving plugin proposal fence failed: {error:#}");
+        send_proposal_response(
+            passive_queue,
+            reply,
+            ProposalResponse {
+                proposal: Err(format!("{error:#}")),
+                telemetry: LinearProposalSourceTelemetry {
+                    queue_wait_us,
+                    callback_elapsed_us: 0,
+                    outcome: LinearProposalSourceOutcome::SourceError,
+                },
+            },
+        );
+        return;
+    }
+    if Instant::now() >= deadline {
+        send_proposal_response(
+            passive_queue,
+            reply,
+            abstention(
+                queue_wait_us,
+                LinearProposalSourceOutcome::DeadlineExceededBeforeDispatch,
+            ),
+        );
         return;
     }
 
@@ -506,14 +591,49 @@ fn run_proposal(
         }
     };
 
-    let _ = reply.send(ProposalResponse {
-        proposal,
-        telemetry: LinearProposalSourceTelemetry {
-            queue_wait_us,
-            callback_elapsed_us,
-            outcome,
+    send_proposal_response(
+        passive_queue,
+        reply,
+        ProposalResponse {
+            proposal,
+            telemetry: LinearProposalSourceTelemetry {
+                queue_wait_us,
+                callback_elapsed_us,
+                outcome,
+            },
         },
-    });
+    );
+}
+
+/// Delivers a proposal response, resolving an on-time candidate if the
+/// bounded caller reply has already been dropped or timed out.
+fn send_proposal_response(
+    passive_queue: &PluginCommandQueue,
+    reply: &SyncSender<ProposalResponse>,
+    response: ProposalResponse,
+) {
+    let candidate_decision_id = response
+        .proposal
+        .as_ref()
+        .ok()
+        .and_then(|proposal| proposal.as_ref())
+        .map(|proposal| proposal.decision_id.as_bytes().to_vec());
+    if reply.send(response).is_ok() {
+        return;
+    }
+
+    if let Some(decision_id) = candidate_decision_id {
+        if let Err(error) = passive_queue.try_enqueue_terminal(PluginCommand::Discard(
+            decision_id,
+            LinearProposalDiscardReason::DeadlineExceeded,
+        )) {
+            eprintln!(
+                "native serving plugin could not deliver the terminal discard for a detached proposal reply: {error:?}"
+            );
+        }
+    } else {
+        eprintln!("native serving plugin proposal reply receiver was dropped");
+    }
 }
 
 /// Resolves a decision the host refuses to forward after its deadline.
@@ -529,6 +649,61 @@ fn discard_late_candidate(passive_queue: &PluginCommandQueue, proposal: &LinearP
     }
 }
 
+fn report_after_passive_handoff(
+    passive_queue: &PluginCommandQueue,
+    receipt: LinearProposalReceipt,
+) -> Result<()> {
+    let (ack, result) = sync_channel(0);
+    passive_queue
+        .try_enqueue_terminal(PluginCommand::Report(receipt, ack))
+        .map_err(|error| match error {
+            PluginCommandQueueError::Full => {
+                anyhow!("native serving plugin terminal queue is full")
+            }
+            PluginCommandQueueError::Stopped => {
+                anyhow!("native serving plugin passive worker stopped")
+            }
+            PluginCommandQueueError::Poisoned => {
+                anyhow!("native serving plugin terminal queue lock poisoned")
+            }
+        })?;
+    result
+        .recv()
+        .map_err(|_| anyhow!("native serving plugin passive worker stopped before report ack"))?
+}
+
+/// Waits until every passive terminal callback queued before this point has
+/// completed. This preserves report/discard causality without putting slow
+/// callbacks on the proposal-deadline queue.
+fn fence_passive(passive_queue: &PluginCommandQueue) -> Result<()> {
+    let (reply, response) = sync_channel(1);
+    passive_queue
+        .try_enqueue_terminal(PluginCommand::Fence(reply))
+        .map_err(|error| match error {
+            PluginCommandQueueError::Full => {
+                anyhow!("native serving plugin terminal queue is full")
+            }
+            PluginCommandQueueError::Stopped => {
+                anyhow!("native serving plugin passive worker stopped")
+            }
+            PluginCommandQueueError::Poisoned => {
+                anyhow!("native serving plugin terminal queue lock poisoned")
+            }
+        })?;
+    response
+        .recv()
+        .map_err(|_| anyhow!("native serving plugin passive worker stopped before fence"))?;
+    Ok(())
+}
+
+fn finish_after_passive_fence<T>(
+    passive_queue: &PluginCommandQueue,
+    finish: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    fence_passive(passive_queue)?;
+    finish()
+}
+
 fn plugin_passive_worker(
     active: Arc<ActivePlugin>,
     queue: Arc<PluginCommandQueue>,
@@ -540,16 +715,25 @@ fn plugin_passive_worker(
     };
     while let Some(queued) = queue.next() {
         match queued.command {
-            PluginCommand::Report(event) => {
-                let _ = active.report(&event);
+            PluginCommand::Report(event, ack) => {
+                let result = active.report(&event);
+                if ack.send(result).is_err() {
+                    eprintln!(
+                        "native serving plugin report callback acknowledgement receiver dropped"
+                    );
+                }
             }
             PluginCommand::Discard(decision_id, reason) => {
                 let _ = active.discard(&decision_id, reason);
+            }
+            PluginCommand::Fence(reply) => {
+                let _ = reply.send(());
             }
             PluginCommand::Begin(_)
             | PluginCommand::Committed(_)
             | PluginCommand::Abort(_)
             | PluginCommand::Finish(_)
+            | PluginCommand::ReportHandoff(_)
             | PluginCommand::Proposal(_, _) => {
                 unreachable!("lifecycle and proposal callbacks must use the primary worker queue")
             }

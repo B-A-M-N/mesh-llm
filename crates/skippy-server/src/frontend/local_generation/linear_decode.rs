@@ -63,56 +63,49 @@ impl StageOpenAiBackend {
                     .saturating_add(state.decoded_tokens),
                 remaining_new_tokens,
                 runtime_max_proposal_tokens: state.linear_proposal_max_tokens,
-                pending_token_ids: state
-                    .pending_linear_proposal_tokens
-                    .clone()
-                    .into_boxed_slice(),
             },
         ) {
             Ok(LinearProposalQueryOutcome::Skipped) => {
                 return Ok(LinearProposalProgress::NotUsed);
             }
-            Ok(outcome) => {
-                state.pending_linear_proposal_tokens.clear();
-                match outcome {
-                    LinearProposalQueryOutcome::Skipped => unreachable!("handled above"),
-                    LinearProposalQueryOutcome::NoProposal { source_telemetry } => {
-                        self.emit_linear_proposal_source_telemetry(
-                            source_telemetry,
-                            state.emit_token_debug,
-                        );
-                        None
-                    }
-                    LinearProposalQueryOutcome::DeadlineExceeded {
-                        proposal_elapsed_us,
+            Ok(outcome) => match outcome {
+                LinearProposalQueryOutcome::Skipped => unreachable!("handled above"),
+                LinearProposalQueryOutcome::NoProposal { source_telemetry } => {
+                    self.emit_linear_proposal_source_telemetry(
                         source_telemetry,
-                    } => {
-                        self.emit_linear_proposal_source_telemetry(
-                            source_telemetry,
-                            state.emit_token_debug,
-                        );
-                        let mut attrs = BTreeMap::new();
-                        attrs.insert(
-                            "llama_stage.linear_proposal.discard_reason".to_string(),
-                            json!("deadline_exceeded"),
-                        );
-                        attrs.insert(
-                            "llama_stage.linear_proposal.proposal_us".to_string(),
-                            json!(proposal_elapsed_us),
-                        );
-                        self.telemetry
-                            .emit("stage.openai_linear_proposal_late", attrs);
-                        None
-                    }
-                    LinearProposalQueryOutcome::Ready(queried) => {
-                        self.emit_linear_proposal_source_telemetry(
-                            queried.source_telemetry,
-                            state.emit_token_debug,
-                        );
-                        Some(queried)
-                    }
+                        state.emit_token_debug,
+                    );
+                    None
                 }
-            }
+                LinearProposalQueryOutcome::DeadlineExceeded {
+                    proposal_elapsed_us,
+                    source_telemetry,
+                } => {
+                    self.emit_linear_proposal_source_telemetry(
+                        source_telemetry,
+                        state.emit_token_debug,
+                    );
+                    let mut attrs = BTreeMap::new();
+                    attrs.insert(
+                        "llama_stage.linear_proposal.discard_reason".to_string(),
+                        json!("deadline_exceeded"),
+                    );
+                    attrs.insert(
+                        "llama_stage.linear_proposal.proposal_us".to_string(),
+                        json!(proposal_elapsed_us),
+                    );
+                    self.telemetry
+                        .emit("stage.openai_linear_proposal_late", attrs);
+                    None
+                }
+                LinearProposalQueryOutcome::Ready(queried) => {
+                    self.emit_linear_proposal_source_telemetry(
+                        queried.source_telemetry,
+                        state.emit_token_debug,
+                    );
+                    Some(queried)
+                }
+            },
             Err(error) => {
                 state.linear_context_tokens = None;
                 state.linear_proposal_max_tokens = 0;

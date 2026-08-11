@@ -70,9 +70,10 @@ impl LinearProposal {
 /// Bounded, target-authoritative state supplied to a proposal source.
 ///
 /// The proposal path deliberately does not pass a full context buffer. The
-/// bounded canonical token delta since the previous proposal boundary travels
-/// with this query, so a source can update its state synchronously without a
-/// separate lifecycle event or copying or hashing an arbitrarily large prompt.
+/// Ordered lifecycle commits establish the canonical generated-token deltas
+/// before this query is dispatched. The query carries only the resulting
+/// authoritative counts, so a source can update its state from ordered
+/// lifecycle events without copying or hashing an arbitrarily large prompt.
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub struct LinearProposalQuery {
@@ -94,12 +95,6 @@ pub struct LinearProposalQuery {
     pub decode_step: usize,
     /// Maximum proposal width Skippy will accept for this query.
     pub max_proposal_tokens: usize,
-    /// Canonical target tokens emitted since the previous proposal boundary.
-    ///
-    /// Proposal sources apply this delta before producing the proposal. Keeping
-    /// the delta on the synchronous query avoids a separate lifecycle event on
-    /// the local-generation hot path.
-    pub pending_token_ids: Box<[i32]>,
     /// Advisory deadline the synchronous source must honor.
     pub deadline: Instant,
 }
@@ -123,15 +118,8 @@ impl LinearProposalQuery {
             committed_token_count,
             decode_step,
             max_proposal_tokens,
-            pending_token_ids: Vec::new().into_boxed_slice(),
             deadline,
         }
-    }
-
-    #[must_use]
-    pub fn with_pending_token_ids(mut self, pending_token_ids: Box<[i32]>) -> Self {
-        self.pending_token_ids = pending_token_ids;
-        self
     }
 }
 
@@ -185,6 +173,14 @@ pub struct LinearProposalReceipt {
     pub verification_rows: usize,
     /// Number of source tokens accepted by target verification.
     pub accepted_proposal_tokens: usize,
+    /// Total target tokens generated after applying this proposal outcome.
+    ///
+    /// Serving integrations must use this target-authoritative position to
+    /// verify that ordered lifecycle commits reached the proposal boundary
+    /// before reporting the outcome. It is deliberately separate from the
+    /// committed token slice: the slice describes this outcome, while this
+    /// count describes the complete generation prefix at the boundary.
+    pub generated_token_count: usize,
     /// Target tokens committed to the response stream.
     pub committed_tokens: Box<[i32]>,
     /// Authoritative prediction prefix through the full-accept boundary or
@@ -219,6 +215,45 @@ pub struct LinearProposalReceipt {
 }
 
 impl LinearProposalReceipt {
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn test_fixture(decision_id: OpaqueProposalDecisionId) -> Self {
+        Self::test_fixture_with_generated_token_count(decision_id, 1)
+    }
+
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn test_fixture_with_generated_token_count(
+        decision_id: OpaqueProposalDecisionId,
+        generated_token_count: usize,
+    ) -> Self {
+        Self {
+            request_id: 1,
+            session_id: 2,
+            decision_id,
+            disposition: LinearProposalDisposition::FullAccept,
+            proposal_token_count: 1,
+            verification_rows: 1,
+            accepted_proposal_tokens: 1,
+            generated_token_count,
+            committed_tokens: vec![1].into_boxed_slice(),
+            verification_row_predictions: vec![1].into_boxed_slice(),
+            canonical_prediction_count: 1,
+            correction_or_boundary_token: Some(1),
+            base_position: 0,
+            position_after_verification: 1,
+            canonical_position: 1,
+            trimmed_rows: 0,
+            proposal_elapsed_us: 0,
+            verification_elapsed_us: 0,
+            repair_elapsed_us: 0,
+            total_elapsed_us: 0,
+            runtime_lock_wait_us: 0,
+            runtime_lock_hold_us: 0,
+            runtime_lock_acquires: 0,
+        }
+    }
+
     pub(crate) fn insert_telemetry_attrs(&self, attrs: &mut BTreeMap<String, serde_json::Value>) {
         attrs.insert(
             "llama_stage.linear_proposal.disposition".to_string(),
@@ -480,8 +515,8 @@ pub(crate) struct QueriedLinearProposal {
 }
 
 pub(crate) enum LinearProposalQueryOutcome {
-    /// No proposal command was submitted, so any pending token delta remains
-    /// owned by the caller.
+    /// No proposal command was submitted because the bounded query was not
+    /// admissible at this boundary.
     Skipped,
     NoProposal {
         source_telemetry: Option<LinearProposalSourceTelemetry>,
@@ -502,7 +537,6 @@ pub(crate) struct LinearProposalQueryParams {
     pub(crate) committed_token_count: usize,
     pub(crate) remaining_new_tokens: usize,
     pub(crate) runtime_max_proposal_tokens: usize,
-    pub(crate) pending_token_ids: Box<[i32]>,
 }
 
 pub(crate) fn query_linear_proposal(
@@ -532,18 +566,15 @@ pub(crate) fn query_linear_proposal(
     let proposal_started = Instant::now();
     let response = config
         .source()
-        .propose(
-            LinearProposalQuery::new(
-                params.request_id,
-                params.session_id,
-                params.prompt_token_count,
-                params.committed_token_count,
-                params.decode_step,
-                max_proposal_tokens,
-                deadline,
-            )
-            .with_pending_token_ids(params.pending_token_ids),
-        )
+        .propose(LinearProposalQuery::new(
+            params.request_id,
+            params.session_id,
+            params.prompt_token_count,
+            params.committed_token_count,
+            params.decode_step,
+            max_proposal_tokens,
+            deadline,
+        ))
         .map_err(openai_backend_error)?;
     let proposal_elapsed_us = elapsed_us(proposal_started);
     let (proposal, source_telemetry) = response.into_parts();
@@ -673,7 +704,6 @@ mod tests {
             committed_token_count,
             remaining_new_tokens,
             runtime_max_proposal_tokens,
-            pending_token_ids: Vec::new().into_boxed_slice(),
         }
     }
 
@@ -684,17 +714,12 @@ mod tests {
         discard_fails: Mutex<bool>,
         report_fails: Mutex<bool>,
         queries: Mutex<Vec<RecordedQuery>>,
-        pending_token_batches: Mutex<Vec<Box<[i32]>>>,
         receipts: Mutex<Vec<LinearProposalReceipt>>,
         discards: Mutex<Vec<(OpaqueProposalDecisionId, LinearProposalDiscardReason)>>,
     }
 
     impl LinearProposalIngress for FakeIngress {
         fn propose(&self, query: LinearProposalQuery) -> Result<LinearProposalSourceResponse> {
-            self.pending_token_batches
-                .lock()
-                .unwrap()
-                .push(query.pending_token_ids.clone());
             self.queries.lock().unwrap().push(RecordedQuery {
                 request_id: query.request_id,
                 session_id: query.session_id,
@@ -827,6 +852,7 @@ mod tests {
             proposal_token_count: 1,
             verification_rows: 2,
             accepted_proposal_tokens: 1,
+            generated_token_count: 2,
             committed_tokens: vec![11, 12].into_boxed_slice(),
             verification_row_predictions: vec![11, 12].into_boxed_slice(),
             canonical_prediction_count: 2,
@@ -925,39 +951,6 @@ mod tests {
     }
 
     #[test]
-    fn query_forwards_pending_tokens_to_the_proposal_source() {
-        let source = Arc::new(FakeIngress::default());
-        let config =
-            LinearProposalIngressConfig::new(source.clone(), Duration::from_secs(1), 4).unwrap();
-        let mut params = query_params(7, 8, 2, 1, 3, 5, 4);
-        params.pending_token_ids = vec![31, 32].into_boxed_slice();
-
-        assert!(matches!(
-            query_linear_proposal(&config, params).unwrap(),
-            LinearProposalQueryOutcome::NoProposal { .. }
-        ));
-        assert_eq!(
-            source.pending_token_batches.lock().unwrap().as_slice(),
-            &[vec![31, 32].into_boxed_slice()]
-        );
-    }
-
-    #[test]
-    fn query_does_not_accept_pending_tokens_without_proposal_capacity() {
-        let source = Arc::new(FakeIngress::default());
-        let config =
-            LinearProposalIngressConfig::new(source.clone(), Duration::from_secs(1), 4).unwrap();
-        let mut params = query_params(7, 8, 2, 1, 3, 1, 4);
-        params.pending_token_ids = vec![31].into_boxed_slice();
-
-        assert!(matches!(
-            query_linear_proposal(&config, params).unwrap(),
-            LinearProposalQueryOutcome::Skipped
-        ));
-        assert!(source.pending_token_batches.lock().unwrap().is_empty());
-    }
-
-    #[test]
     fn query_rejects_an_inconsistent_prompt_decode_boundary_before_ingress() {
         let source = Arc::new(FakeIngress::default());
         let config =
@@ -1050,6 +1043,7 @@ mod tests {
             proposal_token_count: 4,
             verification_rows: 5,
             accepted_proposal_tokens: 1,
+            generated_token_count: 2,
             committed_tokens: vec![11, 42].into_boxed_slice(),
             verification_row_predictions: vec![11, 42, 43, 44, 45].into_boxed_slice(),
             canonical_prediction_count: 2,
@@ -1102,6 +1096,7 @@ mod tests {
             proposal_token_count: 1,
             verification_rows: 2,
             accepted_proposal_tokens: 1,
+            generated_token_count: 2,
             committed_tokens: vec![12_345, 67_890].into_boxed_slice(),
             verification_row_predictions: vec![12_345, 67_890].into_boxed_slice(),
             canonical_prediction_count: 2,

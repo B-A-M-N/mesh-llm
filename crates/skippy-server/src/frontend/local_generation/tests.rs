@@ -192,7 +192,16 @@ fn local_generation_eventually_delivers_receipts_and_cleanup_survives_sink_error
 
     wait_for_receipts(&sink, 1);
     let commits = sink.commits.lock().unwrap();
-    assert!(commits.is_empty());
+    assert_eq!(commits.len(), emitted.len());
+    let mut committed_tokens = Vec::new();
+    for (index, commit) in commits.iter().enumerate() {
+        assert_eq!(commit.request_id, ids.request_id);
+        assert_eq!(commit.session_id, ids.session_id);
+        assert_eq!(commit.generated_token_count, index + 1);
+        assert_eq!(commit.token_ids.len(), 1);
+        committed_tokens.extend_from_slice(&commit.token_ids);
+    }
+    assert_eq!(committed_tokens, emitted);
     drop(commits);
     let receipts = sink.receipts.lock().unwrap();
     assert_eq!(receipts.len(), 1);
