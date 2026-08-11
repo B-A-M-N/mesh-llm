@@ -209,6 +209,7 @@ async fn chat_completions(
         let context = OpenAiRequestContext::with_request_id(request_id.0.clone());
         let cancellation = context.cancellation_token();
         let stream_error = Arc::new(AtomicBool::new(false));
+        let stream_completed = Arc::new(AtomicBool::new(false));
         let backend_stream = match backend_call_with_cancellation(
             &state,
             "chat_completion_stream",
@@ -232,6 +233,7 @@ async fn chat_completions(
             stream_error.clone(),
         );
         let prelude = stream::once(async move { json_event(&ChatCompletionChunk::role(model)) });
+        let done_completed = stream_completed.clone();
         let events = prelude
             .chain(stream.filter_map(move |item| async move {
                 match item {
@@ -240,11 +242,14 @@ async fn chat_completions(
                     Err(error) => Some(json_event(&error.body())),
                 }
             }))
-            .chain(stream::once(async { done_event() }));
+            .chain(stream::once(async move {
+                done_completed.store(true, Ordering::Release);
+                done_event()
+            }));
         Ok(sse_response(
             events,
             cancellation,
-            StreamLifecycle::new(observation, stream_error),
+            StreamLifecycle::new(observation, stream_error, stream_completed),
         ))
     } else {
         let context = OpenAiRequestContext::with_request_id(request_id.0.clone());
@@ -303,6 +308,7 @@ async fn responses(
             let context = OpenAiRequestContext::with_request_id(request_id.0.clone());
             let cancellation = context.cancellation_token();
             let stream_error = Arc::new(AtomicBool::new(false));
+            let stream_completed = Arc::new(AtomicBool::new(false));
             let state_machine = Arc::new(Mutex::new(ResponseSseState::new(request.model.clone())));
             let backend_stream = match backend_call_with_cancellation(
                 &state,
@@ -508,13 +514,17 @@ async fn responses(
                 out
             })
             .flat_map(|out| stream::iter(out.into_iter().map(Ok::<_, Infallible>)));
+            let done_completed = stream_completed.clone();
             let events = body_events
                 .chain(tail_events)
-                .chain(stream::once(async { done_event() }));
+                .chain(stream::once(async move {
+                    done_completed.store(true, Ordering::Release);
+                    done_event()
+                }));
             Ok(sse_response(
                 events,
                 cancellation,
-                StreamLifecycle::new(observation, stream_error),
+                StreamLifecycle::new(observation, stream_error, stream_completed),
             ))
         }
         _ => {
@@ -565,6 +575,7 @@ async fn completions(
         let context = OpenAiRequestContext::with_request_id(request_id.0.clone());
         let cancellation = context.cancellation_token();
         let stream_error = Arc::new(AtomicBool::new(false));
+        let stream_completed = Arc::new(AtomicBool::new(false));
         let backend_stream = match backend_call_with_cancellation(
             &state,
             "completion_stream",
@@ -585,6 +596,7 @@ async fn completions(
             &context,
             stream_error.clone(),
         );
+        let done_completed = stream_completed.clone();
         let events = stream
             .filter_map(move |item| async move {
                 match item {
@@ -593,11 +605,14 @@ async fn completions(
                     Err(error) => Some(json_event(&error.body())),
                 }
             })
-            .chain(stream::once(async { done_event() }));
+            .chain(stream::once(async move {
+                done_completed.store(true, Ordering::Release);
+                done_event()
+            }));
         Ok(sse_response(
             events,
             cancellation,
-            StreamLifecycle::new(observation, stream_error),
+            StreamLifecycle::new(observation, stream_error, stream_completed),
         ))
     } else {
         let context = OpenAiRequestContext::with_request_id(request_id.0.clone());
@@ -760,8 +775,11 @@ fn log_request_started(request_id: &RequestId, operation: &'static str, model: &
 }
 
 fn request_error_outcome(error: &OpenAiError) -> &'static str {
-    if error.status() == StatusCode::GATEWAY_TIMEOUT {
+    let status = error.status();
+    if status == StatusCode::GATEWAY_TIMEOUT {
         "timeout"
+    } else if status.is_client_error() {
+        "client_error"
     } else {
         "backend_error"
     }
@@ -926,9 +944,9 @@ impl RequestObservation {
         }
     }
 
-    fn finish(&mut self, outcome: &'static str) {
+    fn finish(&mut self, outcome: &'static str) -> bool {
         if self.terminal {
-            return;
+            return false;
         }
         self.terminal = true;
         tracing::info!(
@@ -940,6 +958,7 @@ impl RequestObservation {
             elapsed_us = self.started_at.elapsed().as_micros() as u64,
             "OpenAI request finished"
         );
+        true
     }
 }
 
@@ -952,13 +971,19 @@ impl Drop for RequestObservation {
 struct StreamLifecycle {
     observation: RequestObservation,
     stream_error: Arc<AtomicBool>,
+    stream_completed: Arc<AtomicBool>,
 }
 
 impl StreamLifecycle {
-    fn new(observation: RequestObservation, stream_error: Arc<AtomicBool>) -> Self {
+    fn new(
+        observation: RequestObservation,
+        stream_error: Arc<AtomicBool>,
+        stream_completed: Arc<AtomicBool>,
+    ) -> Self {
         Self {
             observation,
             stream_error,
+            stream_completed,
         }
     }
 
@@ -968,6 +993,23 @@ impl StreamLifecycle {
         } else {
             "success"
         };
+        self.observation.finish(outcome);
+    }
+
+    fn drop_outcome(&self, cancellation_already_requested: bool) -> &'static str {
+        if self.stream_error.load(Ordering::Acquire) {
+            "backend_error"
+        } else if self.stream_completed.load(Ordering::Acquire) {
+            "success"
+        } else if cancellation_already_requested {
+            "cancelled"
+        } else {
+            "client_disconnect"
+        }
+    }
+
+    fn finish_drop(&mut self, cancellation_already_requested: bool) {
+        let outcome = self.drop_outcome(cancellation_already_requested);
         self.observation.finish(outcome);
     }
 }
@@ -1019,6 +1061,8 @@ impl Stream for CancelOnDropSseStream {
 
 impl Drop for CancelOnDropSseStream {
     fn drop(&mut self) {
+        let cancellation_already_requested = self.cancellation.is_cancelled();
+        self.lifecycle.finish_drop(cancellation_already_requested);
         self.cancellation.cancel();
     }
 }
@@ -1063,6 +1107,38 @@ mod tests {
             request_error_outcome(&OpenAiError::backend("upstream failed")),
             "backend_error"
         );
+        assert_eq!(
+            request_error_outcome(&OpenAiError::model_not_found("missing")),
+            "client_error"
+        );
+    }
+
+    #[test]
+    fn request_observation_finishes_at_most_once() {
+        let mut observation = RequestObservation::new("req-1".to_owned(), "chat_completion");
+        assert!(observation.finish("success"));
+        assert!(!observation.finish("backend_error"));
+        assert!(observation.terminal);
+    }
+
+    #[test]
+    fn stream_drop_outcome_preserves_terminal_cause() {
+        let stream_error = Arc::new(AtomicBool::new(false));
+        let stream_completed = Arc::new(AtomicBool::new(false));
+        let lifecycle = StreamLifecycle::new(
+            RequestObservation::new("req-1".to_owned(), "chat_completion"),
+            stream_error.clone(),
+            stream_completed.clone(),
+        );
+
+        assert_eq!(lifecycle.drop_outcome(false), "client_disconnect");
+        assert_eq!(lifecycle.drop_outcome(true), "cancelled");
+
+        stream_completed.store(true, Ordering::Release);
+        assert_eq!(lifecycle.drop_outcome(false), "success");
+
+        stream_error.store(true, Ordering::Release);
+        assert_eq!(lifecycle.drop_outcome(false), "backend_error");
     }
     use crate::{
         FinishReason,
