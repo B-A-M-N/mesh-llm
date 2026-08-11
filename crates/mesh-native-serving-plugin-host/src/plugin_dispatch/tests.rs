@@ -10,7 +10,10 @@ use skippy_server::frontend::{
     GenerationStart, LinearProposalDiscardReason, LinearProposalQuery, LinearProposalSourceOutcome,
 };
 
-use super::{PluginCommand, PluginCommandQueue, PluginCommandQueueError, PluginDriver};
+use super::{
+    PluginCommand, PluginCommandQueue, PluginCommandQueueError, PluginDriver,
+    finish_after_passive_fence,
+};
 use crate::{
     NativeLifecycleIngress,
     test_support::{
@@ -241,6 +244,37 @@ fn lifecycle_ingress_shares_plugin_queue_order_with_proposals() {
         .unwrap();
 
     assert_eq!(*events.lock().unwrap(), ["begin", "commit", "proposal"]);
+}
+
+#[test]
+fn finish_waits_for_prior_passive_discard() {
+    let (active, events, _) = fake_active_with_timing(
+        Duration::ZERO,
+        Duration::ZERO,
+        Duration::from_millis(100),
+        false,
+    );
+    let driver = Arc::new(PluginDriver::spawn(active).unwrap());
+
+    driver
+        .enqueue_terminal(PluginCommand::Discard(
+            vec![1],
+            LinearProposalDiscardReason::PositionMismatch,
+        ))
+        .unwrap();
+    let passive_queue = Arc::clone(&driver.passive_queue);
+    let finish_events = Arc::clone(&events);
+    let finish = std::thread::spawn(move || {
+        finish_after_passive_fence(&passive_queue, || {
+            finish_events.lock().unwrap().push("finish");
+            Ok(())
+        })
+    });
+
+    wait_for_event(events.as_ref(), "discard");
+    assert_eq!(*events.lock().unwrap(), ["discard"]);
+    finish.join().unwrap().unwrap();
+    assert_eq!(*events.lock().unwrap(), ["discard", "finish"]);
 }
 
 #[test]

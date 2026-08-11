@@ -89,9 +89,11 @@ unsafe extern "C" fn fake_abort(
 }
 
 unsafe extern "C" fn fake_finish(
-    _instance: abi::PluginInstance,
+    instance: abi::PluginInstance,
     _event: *const abi::GenerationFinish,
 ) -> abi::PluginStatus {
+    let state = unsafe { &*instance.cast::<FakeState>() };
+    state.events.lock().unwrap().push("finish");
     abi::PluginStatus::OK
 }
 

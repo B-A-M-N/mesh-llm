@@ -41,6 +41,10 @@ pub(crate) enum PluginCommand {
     Proposal(LinearProposalQuery, SyncSender<ProposalResponse>),
     Report(LinearProposalReceipt),
     Discard(Vec<u8>, LinearProposalDiscardReason),
+    /// A passive-queue barrier. The primary worker waits for this barrier
+    /// before finalizing a generation, so all earlier reports/discards have
+    /// completed before the plugin sees its lifecycle finish callback.
+    Fence(SyncSender<()>),
 }
 
 pub(crate) struct ProposalResponse {
@@ -311,10 +315,30 @@ impl PluginDriver {
         self.queue_for(&command).enqueue(command)
     }
 
+    /// Enqueues a terminal proposal disposition using the reserved queue
+    /// capacity. Every report/discard must be deliverable before finalization
+    /// can be fenced behind it.
+    pub(crate) fn enqueue_terminal(&self, command: PluginCommand) -> Result<()> {
+        self.ensure_healthy()?;
+        self.queue_for(&command)
+            .try_enqueue_terminal(command)
+            .map_err(|error| match error {
+                PluginCommandQueueError::Full => {
+                    anyhow!("native serving plugin terminal queue is full")
+                }
+                PluginCommandQueueError::Stopped => {
+                    anyhow!("native serving plugin passive worker stopped")
+                }
+                PluginCommandQueueError::Poisoned => {
+                    anyhow!("native serving plugin terminal queue lock poisoned")
+                }
+            })
+    }
+
     fn queue_for(&self, command: &PluginCommand) -> &Arc<PluginCommandQueue> {
         if matches!(
             command,
-            PluginCommand::Report(_) | PluginCommand::Discard(_, _)
+            PluginCommand::Report(_) | PluginCommand::Discard(_, _) | PluginCommand::Fence(_)
         ) {
             &self.passive_queue
         } else {
@@ -440,12 +464,15 @@ fn plugin_worker(
             PluginCommand::Begin(event) => (active.begin(&event), true),
             PluginCommand::Committed(event) => (active.committed(&event), true),
             PluginCommand::Abort(event) => (active.abort(&event), true),
-            PluginCommand::Finish(event) => (active.finish(&event), true),
+            PluginCommand::Finish(event) => (
+                finish_after_passive_fence(&passive_queue, || active.finish(&event)),
+                true,
+            ),
             PluginCommand::Proposal(query, reply) => {
                 run_proposal(&active, &passive_queue, enqueued_at, query, &reply);
                 continue;
             }
-            PluginCommand::Report(_) | PluginCommand::Discard(_, _) => {
+            PluginCommand::Report(_) | PluginCommand::Discard(_, _) | PluginCommand::Fence(_) => {
                 unreachable!("passive plugin callbacks must use the passive worker queue")
             }
         };
@@ -528,6 +555,39 @@ fn discard_late_candidate(passive_queue: &PluginCommandQueue, proposal: &LinearP
     }
 }
 
+/// Waits until every passive terminal callback queued before this point has
+/// completed. This preserves the causal order between proposal outcomes and
+/// the lifecycle finish callback without putting slow passive callbacks on the
+/// proposal-deadline queue.
+fn fence_passive(passive_queue: &PluginCommandQueue) -> Result<()> {
+    let (reply, response) = sync_channel(1);
+    passive_queue
+        .try_enqueue_terminal(PluginCommand::Fence(reply))
+        .map_err(|error| match error {
+            PluginCommandQueueError::Full => {
+                anyhow!("native serving plugin terminal queue is full")
+            }
+            PluginCommandQueueError::Stopped => {
+                anyhow!("native serving plugin passive worker stopped")
+            }
+            PluginCommandQueueError::Poisoned => {
+                anyhow!("native serving plugin terminal queue lock poisoned")
+            }
+        })?;
+    response
+        .recv()
+        .map_err(|_| anyhow!("native serving plugin passive worker stopped before fence"))?;
+    Ok(())
+}
+
+fn finish_after_passive_fence<T>(
+    passive_queue: &PluginCommandQueue,
+    finish: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    fence_passive(passive_queue)?;
+    finish()
+}
+
 fn plugin_passive_worker(
     active: Arc<ActivePlugin>,
     queue: Arc<PluginCommandQueue>,
@@ -544,6 +604,9 @@ fn plugin_passive_worker(
             }
             PluginCommand::Discard(decision_id, reason) => {
                 let _ = active.discard(&decision_id, reason);
+            }
+            PluginCommand::Fence(reply) => {
+                let _ = reply.send(());
             }
             PluginCommand::Begin(_)
             | PluginCommand::Committed(_)

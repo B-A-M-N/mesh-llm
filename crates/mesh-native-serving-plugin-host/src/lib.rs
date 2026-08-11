@@ -428,10 +428,12 @@ impl ActivePlugin {
         };
         let status = unsafe { (self.definition.api().finish_generation)(self.instance()?, &event) };
         let result = self.call_status("finish generation", status);
-        self.committed_generated_tokens
-            .lock()
-            .map_err(|_| anyhow!("native serving plugin commit state lock poisoned"))?
-            .remove(&key);
+        if result.is_ok() {
+            self.committed_generated_tokens
+                .lock()
+                .map_err(|_| anyhow!("native serving plugin commit state lock poisoned"))?
+                .remove(&key);
+        }
         result
     }
 
@@ -713,7 +715,8 @@ impl LinearProposalIngress for NativeProposalIngress {
     }
 
     fn report(&self, receipt: &LinearProposalReceipt) -> Result<()> {
-        self.driver.enqueue(PluginCommand::Report(receipt.clone()))
+        self.driver
+            .enqueue_terminal(PluginCommand::Report(receipt.clone()))
     }
 
     fn discard(
@@ -721,7 +724,7 @@ impl LinearProposalIngress for NativeProposalIngress {
         decision_id: &OpaqueProposalDecisionId,
         reason: LinearProposalDiscardReason,
     ) -> Result<()> {
-        self.driver.enqueue(PluginCommand::Discard(
+        self.driver.enqueue_terminal(PluginCommand::Discard(
             decision_id.as_bytes().to_vec(),
             reason,
         ))
