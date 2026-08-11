@@ -7,11 +7,13 @@ use std::{
 
 use skippy_server::frontend::{
     GenerationAbort, GenerationCommit, GenerationLifecycleIngress, GenerationLifecycleObservation,
-    GenerationReceipt, GenerationStart, GenerationTermination, LinearProposalDiscardReason,
-    LinearProposalQuery, LinearProposalSourceOutcome, generation_token_id_digest,
+    GenerationStart, LinearProposalDiscardReason, LinearProposalQuery, LinearProposalSourceOutcome,
 };
 
-use super::{PluginCommand, PluginCommandQueue, PluginCommandQueueError, PluginDriver};
+use super::{
+    PluginCommand, PluginCommandQueue, PluginCommandQueueError, PluginDriver,
+    finish_after_passive_fence,
+};
 use crate::{
     NativeLifecycleIngress,
     test_support::{
@@ -260,29 +262,18 @@ fn finish_waits_for_prior_passive_discard() {
             LinearProposalDiscardReason::PositionMismatch,
         ))
         .unwrap();
-    let driver_clone = Arc::clone(&driver);
+    let passive_queue = Arc::clone(&driver.passive_queue);
+    let finish_events = Arc::clone(&events);
     let finish = std::thread::spawn(move || {
-        let receipt = GenerationReceipt {
-            request_id: 1,
-            session_id: 2,
-            agent_session_id: None,
-            prompt_token_count: 0,
-            prompt_token_digest: generation_token_id_digest(&[]),
-            prompt_token_ids: Arc::from([]),
-            generated_token_ids: vec![].into_boxed_slice(),
-            final_session_position: 0,
-            termination: GenerationTermination::MaxTokens,
-            model_generation_elapsed_us: 0,
-            request_to_first_token_us: None,
-            request_to_token_emission_us: vec![].into_boxed_slice(),
-            full_state: None,
-        };
-        driver_clone.enqueue(PluginCommand::Finish(receipt)).unwrap();
+        finish_after_passive_fence(&passive_queue, || {
+            finish_events.lock().unwrap().push("finish");
+            Ok(())
+        })
     });
 
     wait_for_event(events.as_ref(), "discard");
     assert_eq!(*events.lock().unwrap(), ["discard"]);
-    finish.join().unwrap();
+    finish.join().unwrap().unwrap();
     assert_eq!(*events.lock().unwrap(), ["discard", "finish"]);
 }
 
