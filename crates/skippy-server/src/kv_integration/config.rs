@@ -94,14 +94,11 @@ fn open_disk_tier(config: &StageConfig) -> Option<PrefixDiskTier> {
     // So require at least one content digest before enabling the tier, and
     // say why when declining. Refusing to cache is always recoverable; a
     // wrong hit is not.
-    if config.manifest_sha256.is_none()
-        && config.source_model_sha256.is_none()
-        && config.package_ref.is_none()
-    {
+    if !has_valid_content_digest(config) {
         eprintln!(
-            "skippy: KV disk tier disabled for stage {}: no content digest \
-             (manifest_sha256/source_model_sha256/package_ref) to anchor cache \
-             identity across restarts",
+            "skippy: KV disk tier disabled for stage {}: no valid content digest \
+             (manifest_sha256/source_model_sha256) to anchor cache identity across \
+             restarts",
             config.stage_id
         );
         return None;
@@ -115,6 +112,20 @@ fn open_disk_tier(config: &StageConfig) -> Option<PrefixDiskTier> {
             None
         }
     }
+}
+
+fn has_valid_content_digest(config: &StageConfig) -> bool {
+    [
+        config.manifest_sha256.as_deref(),
+        config.source_model_sha256.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .any(is_sha256_digest)
+}
+
+fn is_sha256_digest(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 /// This stage's share of the node-level disk budget.
@@ -540,6 +551,19 @@ mod tests {
             Some(StageKvCachePayload::ResidentKv)
         );
         assert_eq!(parse_cache_payload("nope"), None);
+    }
+
+    #[test]
+    fn disk_tier_requires_a_valid_content_digest() {
+        let mut config = test_config("example/model");
+        config.package_ref = Some("/tmp/mutable-package".to_string());
+        assert!(!has_valid_content_digest(&config));
+
+        config.manifest_sha256 = Some("not-a-digest".to_string());
+        assert!(!has_valid_content_digest(&config));
+
+        config.source_model_sha256 = Some("a".repeat(64));
+        assert!(has_valid_content_digest(&config));
     }
 
     fn test_config(model_id: &str) -> StageConfig {

@@ -83,7 +83,7 @@ Consequences specific to split topologies:
   disk tier cheaper per node than the solo numbers suggest.
 - Package-backed stages already cache only their own layer range, so W4 composes
   with materialized stage caches without loading a monolithic GGUF.
-- Because `topology_id` and the layer range are in the hash, **re-splitting
+- Because the layer range is in the hash, **re-splitting
   invalidates every page.** A mesh that replans topology loses its entire
   retention benefit. Worth measuring how often replanning happens before
   investing in W4/W5.
@@ -340,7 +340,7 @@ problems:
 1. **Identity is not peer-portable as written** — omits KV dtype and backend
    (W0). Two peers with different `kv_cache_policy` or different GPU vendors
    produce identical `page_id`s for incompatible bytes.
-2. **`topology_id`/`stage_id`/`layer_start`/`layer_end` are in the hash**, so a
+2. **`stage_id`/`layer_start`/`layer_end` are in the hash**, so a
    hit requires the same split. In a heterogeneous mesh that is exactly what
    does not hold. Unsplit peers serving the whole model would match; split
    meshes mostly would not.
@@ -465,10 +465,12 @@ identity now hashes `manifest_sha256`, `source_model_sha256`, `package_ref` and
 never-collides namespace into one keyed on a user-facing string, with silent
 numerical corruption as the failure mode.
 
-**2. Archiving the longest candidate is useless.** Capping to one archive per
+**2. Archiving the request's own tail is useless.** Capping to one archive per
 request initially picked the *longest* recorded candidate — the request's own
-tail, which nothing else ever asks for. Cross-restart hits disappeared until
-the archive target was changed to the *lowest* (most shareable) candidate.
+tail, which nothing else ever asks for. Switching to the *lowest* candidate
+restored cross-restart hits but archived too little to matter (see the split
+section below). `ArchiveCandidate` now selects the longest prefix that still
+excludes the request tail.
 
 ### Measured
 
@@ -589,7 +591,7 @@ five real issues, all now fixed:
 | Finding | Fix |
 |---|---|
 | Metadata (`extra`, the KV page descriptor) was not checksummed, only the payload. A corrupted-but-valid-JSON index could apply correct bytes under a wrong layout. | `extra_checksum` on every entry, verified before the payload; format version bumped to 3. Test: `tampered_metadata_is_rejected_even_though_the_payload_is_intact`. |
-| Weights with no content digest could alias: two different GGUFs served under one `model_id` collide on disk. | The tier now refuses to open unless at least one of `manifest_sha256` / `source_model_sha256` / `package_ref` is present, and says why. |
+| Weights with no content digest could alias: two different GGUFs served under one `model_id` collide on disk. | The tier now refuses to open unless at least one of `manifest_sha256` / `source_model_sha256` is a valid 64-hex SHA-256 digest. A `package_ref` alone is not sufficient, so mutable local paths fail closed. |
 | No directory locking on non-Unix; the tier silently ran unprotected. | Non-Unix now fails closed with an explicit error rather than running without a lock. |
 | Crash-left `.tmp` files were never reclaimed, leaking a page's bytes per crash. | Reclaimed at open, which is safe because open holds the exclusive lock. Test: `crash_left_temp_files_are_reclaimed_on_open`. |
 | Debug `eprintln!` instrumentation left in committed code. | Removed. |
@@ -693,7 +695,7 @@ correct here --- a seed prompt's full length is exactly the shared prefix.
 Same experiment across a 2-node split: seeded first-request 1.27s against
 ~1.30s cold, i.e. no gain. The per-stage archives show why:
 
-```
+```text
 stage 0 : [2048, 1920, 1792, ... 512]   <- full ladder
 stage 1 : [512]                          <- floor only
 ```

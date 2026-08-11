@@ -112,6 +112,16 @@ impl<E: Clone> ExactStateCache<E> {
     }
 
     pub fn lookup(&mut self, page_id: &str) -> Option<ExactStateLookup<E>> {
+        let hit = self.lookup_ram(page_id);
+        if hit.is_some() {
+            self.misses.note_hit(page_id);
+        } else {
+            self.misses.note_miss(page_id, now_secs());
+        }
+        hit
+    }
+
+    fn lookup_ram(&mut self, page_id: &str) -> Option<ExactStateLookup<E>> {
         self.clock = self.clock.saturating_add(1);
         let entries = self.entries.len();
         if let Some(entry) = self.entries.get_mut(page_id) {
@@ -125,10 +135,8 @@ impl<E: Clone> ExactStateCache<E> {
                 extra: entry.extra.clone(),
                 from_disk: false,
             };
-            self.misses.note_hit(page_id);
             return Some(hit);
         }
-        self.misses.note_miss(page_id, now_secs());
         None
     }
 
@@ -147,13 +155,16 @@ impl<E: Clone> ExactStateCache<E> {
         payload_kind: crate::ExactStatePayloadKind,
         extra: impl FnOnce() -> E,
     ) -> Result<Option<ExactStateLookup<E>>> {
-        if let Some(hit) = self.lookup(page_id) {
+        if let Some(hit) = self.lookup_ram(page_id) {
+            self.misses.note_hit(page_id);
             return Ok(Some(hit));
         }
         let Some(disk) = self.disk.as_mut() else {
+            self.misses.note_miss(page_id, now_secs());
             return Ok(None);
         };
         let Some(load) = disk.load(page_id, payload_kind.as_str())? else {
+            self.misses.note_miss(page_id, now_secs());
             return Ok(None);
         };
 
@@ -796,6 +807,65 @@ mod disk_tier_integration_tests {
             restored.payload.recurrent_state_bytes().unwrap().as_ref(),
             &recurrent[..]
         );
+    }
+
+    #[test]
+    fn resident_kv_archives_round_trip_without_a_recurrent_component() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cache = cache_with_disk(&dir, 1);
+        let kv = vec![3u8; 2048];
+
+        cache.store_on_disk(
+            "page-a",
+            256,
+            ExactStatePayloadKind::ResidentKvArchive,
+            &[&kv],
+            (),
+        );
+
+        let restored = cache
+            .lookup_disk_only("page-a", ExactStatePayloadKind::ResidentKvArchive)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            restored.payload.kind(),
+            ExactStatePayloadKind::ResidentKvArchive
+        );
+        assert!(restored.payload.is_mapped());
+        assert_eq!(
+            restored.payload.kv_bytes().unwrap().unwrap().as_ref(),
+            &kv[..]
+        );
+        assert!(restored.payload.recurrent_state_bytes().is_err());
+    }
+
+    #[test]
+    fn disk_hit_is_not_counted_as_a_ram_miss() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cache = cache_with_disk(&dir, 1);
+        cache.record(
+            "page-a".to_string(),
+            256,
+            ExactStatePayload::full_state(vec![1u8; 2048]),
+            (),
+        );
+        cache.record(
+            "page-b".to_string(),
+            256,
+            ExactStatePayload::full_state(vec![2u8; 2048]),
+            (),
+        );
+
+        let restored = cache
+            .lookup_with_disk("page-a", ExactStatePayloadKind::FullState, || ())
+            .unwrap()
+            .unwrap();
+
+        assert!(restored.from_disk);
+        let stats = cache.miss_stats();
+        assert_eq!(stats.total_misses(), 0);
+        assert_eq!(stats.hits, 1);
     }
 
     /// Asking for the wrong payload kind must fail loudly rather than

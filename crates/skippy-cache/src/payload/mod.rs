@@ -36,6 +36,9 @@ pub enum ExactStatePayload {
         kv: CacheBytes,
         recurrent: CacheBytes,
     },
+    ResidentKvArchive {
+        kv: CacheBytes,
+    },
 }
 
 impl ExactStatePayload {
@@ -58,14 +61,21 @@ impl ExactStatePayload {
         }
     }
 
+    pub fn resident_kv_archive(kv: Vec<u8>) -> Self {
+        Self::ResidentKvArchive {
+            kv: CacheBytes::inline(kv),
+        }
+    }
+
     /// Components in the order they are written to the disk tier.
     ///
-    /// Returns `None` when any component cannot be borrowed contiguously.
+    /// Returns an error when any component cannot be borrowed contiguously.
     pub fn disk_components(&self) -> Result<Vec<Cow<'_, [u8]>>> {
         Ok(match self {
             Self::FullState { bytes } => vec![bytes.as_cow()?],
             Self::RecurrentOnly { recurrent } => vec![recurrent.as_cow()?],
             Self::KvRecurrent { kv, recurrent } => vec![kv.as_cow()?, recurrent.as_cow()?],
+            Self::ResidentKvArchive { kv } => vec![kv.as_cow()?],
         })
     }
 
@@ -89,11 +99,8 @@ impl ExactStatePayload {
             ExactStatePayloadKind::FullState => Self::FullState {
                 bytes: components.remove(0),
             },
-            // A dense archive carries attention KV only; there is no
-            // recurrent component to reconstruct.
-            ExactStatePayloadKind::ResidentKvArchive => Self::KvRecurrent {
+            ExactStatePayloadKind::ResidentKvArchive => Self::ResidentKvArchive {
                 kv: components.remove(0),
-                recurrent: CacheBytes::inline(Vec::new()),
             },
             ExactStatePayloadKind::RecurrentOnly => Self::RecurrentOnly {
                 recurrent: components.remove(0),
@@ -112,6 +119,7 @@ impl ExactStatePayload {
             Self::FullState { bytes } => bytes.is_mapped(),
             Self::RecurrentOnly { recurrent } => recurrent.is_mapped(),
             Self::KvRecurrent { kv, recurrent } => kv.is_mapped() && recurrent.is_mapped(),
+            Self::ResidentKvArchive { kv } => kv.is_mapped(),
         }
     }
 
@@ -120,6 +128,7 @@ impl ExactStatePayload {
             Self::FullState { .. } => ExactStatePayloadKind::FullState,
             Self::RecurrentOnly { .. } => ExactStatePayloadKind::RecurrentOnly,
             Self::KvRecurrent { .. } => ExactStatePayloadKind::KvRecurrent,
+            Self::ResidentKvArchive { .. } => ExactStatePayloadKind::ResidentKvArchive,
         }
     }
 
@@ -128,6 +137,7 @@ impl ExactStatePayload {
             Self::FullState { bytes } => bytes.len(),
             Self::RecurrentOnly { recurrent } => recurrent.len(),
             Self::KvRecurrent { kv, recurrent } => kv.len().saturating_add(recurrent.len()),
+            Self::ResidentKvArchive { kv } => kv.len(),
         }
     }
 
@@ -160,14 +170,16 @@ impl ExactStatePayload {
 
     pub fn kv_bytes(&self) -> Result<Option<Cow<'_, [u8]>>> {
         match self {
-            Self::KvRecurrent { kv, .. } => Ok(Some(kv.as_cow()?)),
+            Self::KvRecurrent { kv, .. } | Self::ResidentKvArchive { kv } => Ok(Some(kv.as_cow()?)),
             _ => Ok(None),
         }
     }
 
     pub fn kv_bytes_timed(&self) -> Result<Option<(Cow<'_, [u8]>, CacheBytesReconstructStats)>> {
         match self {
-            Self::KvRecurrent { kv, .. } => Ok(Some(kv.as_cow_timed()?)),
+            Self::KvRecurrent { kv, .. } | Self::ResidentKvArchive { kv } => {
+                Ok(Some(kv.as_cow_timed()?))
+            }
             _ => Ok(None),
         }
     }
@@ -190,6 +202,10 @@ impl ExactStatePayload {
                     kv_stats.saturating_add(recurrent_stats),
                 )
             }
+            Self::ResidentKvArchive { kv } => {
+                let (kv, stats) = blobs.store_bytes(kv);
+                (Self::ResidentKvArchive { kv }, stats)
+            }
         }
     }
 
@@ -201,6 +217,7 @@ impl ExactStatePayload {
                 blobs.release_bytes(kv);
                 blobs.release_bytes(recurrent);
             }
+            Self::ResidentKvArchive { kv } => blobs.release_bytes(kv),
         }
     }
 }

@@ -149,7 +149,6 @@ pub struct DiskTierStats {
     pub verifications_skipped: u64,
 }
 
-/// A size-bounded, mmap-backed store of evicted prefixes.
 /// An exclusive advisory lock over a cache directory, held for the lifetime of
 /// the tier and released when the file descriptor closes (including on crash).
 #[derive(Debug)]
@@ -195,6 +194,7 @@ impl DirectoryLock {
     }
 }
 
+/// A size-bounded, mmap-backed store of evicted prefixes.
 #[derive(Debug)]
 pub struct PrefixDiskTier {
     _lock: DirectoryLock,

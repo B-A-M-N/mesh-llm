@@ -383,14 +383,15 @@ mod tests {
         config.stage_index = 0;
         config.layer_start = 0;
         let mut incoming = incoming_message();
-        incoming.token_count = 1;
-        let output = f32_frame(0, 1, &[1.0, 2.0, 3.0, 4.0]);
+        incoming.token_count = 4;
 
+        // Keep the encoded payload valid for the four-token wire header while
+        // the frame descriptor exercises the first-stage short-frame branch.
         assert!(
             forwarded_stage_message_timed(
                 &config,
                 &incoming,
-                &output,
+                &f32_frame(0, 1, &[1.0; 16]),
                 WireActivationDType::F32,
                 4,
             )

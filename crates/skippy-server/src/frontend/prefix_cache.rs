@@ -545,13 +545,25 @@ impl StageOpenAiBackend {
                 })
                 .collect::<OpenAiResult<Vec<_>>>()?
         };
-        // See the chunked recorder above: archive the lowest candidate.
-        if let Some(identity) = identities.last() {
+        // Archive the longest successfully resident candidate that excludes
+        // the request tail. A candidate that was not admitted to the resident
+        // cache is not safe to export: the runtime may not hold its sequence.
+        let mut archive_candidate = crate::kv_integration::ArchiveCandidate::default();
+        for (identity, record) in identities.iter().zip(records.iter()) {
+            if record.is_some() {
+                crate::kv_integration::offer_archive_candidate(
+                    &mut archive_candidate,
+                    identity,
+                    token_ids.len(),
+                );
+            }
+        }
+        if let Some(identity) = archive_candidate.take() {
             let mut runtime = self
                 .runtime
                 .lock()
                 .map_err(|_| OpenAiError::backend("runtime lock poisoned"))?;
-            let _ = kv.archive_dense_prefix(&mut runtime, session_id, identity);
+            let _ = kv.archive_dense_prefix(&mut runtime, session_id, &identity);
         }
         let mut recorded_any = false;
         for record in records.into_iter().flatten() {
