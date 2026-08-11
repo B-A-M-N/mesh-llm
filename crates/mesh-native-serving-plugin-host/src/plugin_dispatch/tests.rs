@@ -483,6 +483,30 @@ fn a_full_passive_queue_still_accepts_the_terminal_discard() {
 }
 
 #[test]
+fn a_full_terminal_queue_still_accepts_the_passive_fence() {
+    let queue = PluginCommandQueue::new();
+    while queue
+        .try_enqueue(PluginCommand::Discard(
+            vec![1],
+            LinearProposalDiscardReason::PositionMismatch,
+        ))
+        .is_ok()
+    {}
+    while queue
+        .try_enqueue_terminal(PluginCommand::Discard(
+            vec![2],
+            LinearProposalDiscardReason::DeadlineExceeded,
+        ))
+        .is_ok()
+    {}
+
+    let (ack, _reply) = sync_channel(1);
+    queue
+        .try_enqueue_terminal(PluginCommand::Fence(ack))
+        .expect("the fence must retain one exclusive terminal slot");
+}
+
+#[test]
 fn a_late_candidate_delivers_its_discard_to_the_plugin() {
     // The host withholds a late candidate, so `discard` is the only way the
     // plugin can learn that decision's fate.
