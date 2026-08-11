@@ -35,7 +35,7 @@
 //! errors that quarantine the entry.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs::{self, File},
     io::Write,
     path::{Path, PathBuf},
@@ -143,6 +143,10 @@ pub struct DiskTierStats {
     pub evictions: u64,
     /// Entries rejected because their bytes failed verification.
     pub corrupt_entries: u64,
+    /// Loads that hashed the payload against its stored checksums.
+    pub verifications: u64,
+    /// Loads served from an already-verified live mapping.
+    pub verifications_skipped: u64,
 }
 
 /// A size-bounded, mmap-backed store of evicted prefixes.
@@ -200,6 +204,16 @@ pub struct PrefixDiskTier {
     entries: HashMap<String, DiskEntry>,
     /// Live mappings, kept so repeated restores of a hot page reuse one map.
     mappings: HashMap<String, Arc<Mmap>>,
+    /// Pages whose bytes this process has already hashed against their stored
+    /// checksums, and whose mapping has been live continuously since.
+    ///
+    /// Verification dominates restore cost -- a 2 GB page is ~0.9s of blake3
+    /// against ~40ms of native import -- and re-hashing bytes this process
+    /// already verified, while holding an exclusive lock on the directory and
+    /// a live mapping of the file, adds no protection. Membership is dropped
+    /// wherever the mapping is (quarantine, budget eviction, reset), so an
+    /// entry can never be trusted across a remap.
+    verified: HashSet<String>,
     use_clock: u64,
     temp_counter: u64,
     stats: DiskTierStats,
@@ -233,6 +247,7 @@ impl PrefixDiskTier {
             bytes: 0,
             entries: HashMap::new(),
             mappings: HashMap::new(),
+            verified: HashSet::new(),
             use_clock: 0,
             temp_counter: 0,
             stats: DiskTierStats {
@@ -308,6 +323,7 @@ impl PrefixDiskTier {
         fs::create_dir_all(&pages).with_context(|| format!("reset {}", pages.display()))?;
         self.entries.clear();
         self.mappings.clear();
+        self.verified.clear();
         self.bytes = 0;
         self.stats.entries = 0;
         self.stats.bytes = 0;
@@ -446,9 +462,11 @@ impl PrefixDiskTier {
             ));
         }
 
+        let mut freshly_mapped = false;
         let mmap = match self.mappings.get(page_id) {
             Some(mmap) => mmap.clone(),
             None => {
+                freshly_mapped = true;
                 let path = self.entry_path(&entry.file_name);
                 let file = File::open(&path)
                     .with_context(|| format!("open KV page file {}", path.display()))?;
@@ -490,20 +508,37 @@ impl PrefixDiskTier {
             ));
         }
 
+        // Hash the payload on the first load of a mapping, and not again
+        // while that mapping stays live. The bytes cannot change underneath a
+        // held mapping: entries are published by atomic rename and never
+        // modified in place, and this process holds an exclusive lock on the
+        // directory. Re-hashing them on every restore would be ~95% of the
+        // cost of a restore and would detect nothing a first verification did
+        // not already rule out. A remap re-verifies, because that is where a
+        // different file could appear.
+        let must_verify = freshly_mapped || !self.verified.contains(page_id);
         let mut parts = Vec::with_capacity(entry.components.len());
         for component in &entry.components {
             let bytes = CacheBytes::mapped(mmap.clone(), component.offset, component.len)?;
-            // Verify before handing bytes to the runtime. This faults the
-            // pages in, which a restore is about to do anyway.
-            let actual = blake3::hash(bytes.as_cow()?.as_ref()).to_hex().to_string();
-            if actual != component.checksum {
-                self.quarantine(page_id);
-                self.stats.corrupt_entries = self.stats.corrupt_entries.saturating_add(1);
-                return Err(anyhow!(
-                    "KV disk entry failed checksum verification for page {page_id}"
-                ));
+            if must_verify {
+                // Verify before handing bytes to the runtime. This faults the
+                // pages in, which a restore is about to do anyway.
+                let actual = blake3::hash(bytes.as_cow()?.as_ref()).to_hex().to_string();
+                if actual != component.checksum {
+                    self.quarantine(page_id);
+                    self.stats.corrupt_entries = self.stats.corrupt_entries.saturating_add(1);
+                    return Err(anyhow!(
+                        "KV disk entry failed checksum verification for page {page_id}"
+                    ));
+                }
             }
             parts.push(bytes);
+        }
+        if must_verify {
+            self.verified.insert(page_id.to_string());
+            self.stats.verifications = self.stats.verifications.saturating_add(1);
+        } else {
+            self.stats.verifications_skipped = self.stats.verifications_skipped.saturating_add(1);
         }
 
         self.use_clock = self.use_clock.saturating_add(1);
@@ -541,6 +576,7 @@ impl PrefixDiskTier {
     /// Drop an entry that cannot be trusted.
     fn quarantine(&mut self, page_id: &str) {
         self.mappings.remove(page_id);
+        self.verified.remove(page_id);
         if let Some(entry) = self.entries.remove(page_id) {
             self.bytes = self.bytes.saturating_sub(entry.total_bytes);
             let _ = fs::remove_file(self.entry_path(&entry.file_name));
@@ -562,6 +598,7 @@ impl PrefixDiskTier {
                 break;
             };
             self.mappings.remove(&victim);
+            self.verified.remove(&victim);
             if let Some(entry) = self.entries.remove(&victim) {
                 self.bytes = self.bytes.saturating_sub(entry.total_bytes);
                 let _ = fs::remove_file(self.entry_path(&entry.file_name));
@@ -706,6 +743,81 @@ mod tests {
             &payload[..]
         );
         assert_eq!(reopened.stats().entries, 1);
+    }
+
+    /// Verification is ~95% of restore cost on a multi-gigabyte page, so a
+    /// repeat load of a live mapping must not pay it again.
+    #[test]
+    fn a_repeat_load_of_a_live_mapping_skips_re_verification() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut tier = tier(&dir, 1 << 20);
+        tier.store("page-a", 512, "full-state", &[&[7u8; 4096]], None)
+            .unwrap();
+
+        tier.load("page-a", "full-state").unwrap().unwrap();
+        tier.load("page-a", "full-state").unwrap().unwrap();
+        tier.load("page-a", "full-state").unwrap().unwrap();
+
+        let stats = tier.stats();
+        assert_eq!(stats.verifications, 1, "first load must verify");
+        assert_eq!(
+            stats.verifications_skipped, 2,
+            "later loads of the same mapping must not re-hash"
+        );
+    }
+
+    /// The safety condition on skipping: trust is tied to a live mapping, so
+    /// a fresh process -- which could be looking at a different file -- must
+    /// verify again.
+    #[test]
+    fn reopening_the_tier_verifies_again() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut tier = tier(&dir, 1 << 20);
+            tier.store("page-a", 512, "full-state", &[&[7u8; 4096]], None)
+                .unwrap();
+            tier.load("page-a", "full-state").unwrap().unwrap();
+            tier.load("page-a", "full-state").unwrap().unwrap();
+            assert_eq!(tier.stats().verifications_skipped, 1);
+        }
+
+        let mut reopened = tier(&dir, 1 << 20);
+        reopened.load("page-a", "full-state").unwrap().unwrap();
+        assert_eq!(
+            reopened.stats().verifications,
+            1,
+            "a new process must not inherit trust from the previous one"
+        );
+    }
+
+    /// Skipping must never let corruption through on a page this process has
+    /// not actually verified.
+    #[test]
+    fn corruption_is_still_caught_on_the_first_load_after_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_name = {
+            let mut tier = tier(&dir, 1 << 20);
+            tier.store("page-a", 64, "full-state", &[&[3u8; 4096]], None)
+                .unwrap();
+            // Verify once, then drop the tier so the mapping and its trust go
+            // with it.
+            tier.load("page-a", "full-state").unwrap().unwrap();
+            tier.entries["page-a"].file_name.clone()
+        };
+
+        let path = dir.path().join(ENTRY_DIR_NAME).join(&file_name);
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[0] ^= 0xff;
+        std::fs::write(&path, &bytes).unwrap();
+
+        let mut reopened = tier(&dir, 1 << 20);
+        let error = reopened
+            .load("page-a", "full-state")
+            .expect_err("corruption must be caught after a reopen");
+        assert!(
+            error.to_string().contains("checksum"),
+            "expected a checksum failure, got: {error}"
+        );
     }
 
     /// Corrupt bytes must never reach the runtime: that is silent numerical
