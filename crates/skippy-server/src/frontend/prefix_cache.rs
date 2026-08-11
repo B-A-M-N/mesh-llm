@@ -545,18 +545,29 @@ impl StageOpenAiBackend {
                 })
                 .collect::<OpenAiResult<Vec<_>>>()?
         };
-        // Archive the longest successfully resident candidate that excludes
-        // the request tail. A candidate that was not admitted to the resident
-        // cache is not safe to export: the runtime may not hold its sequence.
+        // Archive the longest candidate that excludes the request tail,
+        // independently of resident-cache admission -- the same rule as the
+        // chunked recorder above.
+        //
+        // Admission is not the safety condition. `archive_dense_prefix`
+        // exports from the *live session* via `export_kv_page(session_id, 0,
+        // token_count)`, which `validate_export_range` checks against the
+        // session's known token count -- not against any resident-prefix
+        // sequence. `offer_archive_candidate` already refuses a candidate
+        // claiming more tokens than this request carried, which is exactly
+        // that condition.
+        //
+        // Gating on admission is also the measured failure: the resident tier
+        // declines anything over `max_resident_tokens` (half the context
+        // window), so on a 32k-context node every rung of a 25k agentic prompt
+        // is declined and nothing reaches disk at all.
         let mut archive_candidate = crate::kv_integration::ArchiveCandidate::default();
-        for (identity, record) in identities.iter().zip(records.iter()) {
-            if record.is_some() {
-                crate::kv_integration::offer_archive_candidate(
-                    &mut archive_candidate,
-                    identity,
-                    token_ids.len(),
-                );
-            }
+        for identity in &identities {
+            crate::kv_integration::offer_archive_candidate(
+                &mut archive_candidate,
+                identity,
+                token_ids.len(),
+            );
         }
         if let Some(identity) = archive_candidate.take() {
             let mut runtime = self

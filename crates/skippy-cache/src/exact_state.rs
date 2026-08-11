@@ -70,7 +70,7 @@ pub struct ExactStateCacheStats {
     pub max_bytes: u64,
 }
 
-impl<E: Clone> ExactStateCache<E> {
+impl<E: Clone + serde::Serialize> ExactStateCache<E> {
     pub fn new(max_entries: usize, max_bytes: u64) -> Self {
         Self {
             max_entries: max_entries.max(1),
@@ -154,11 +154,15 @@ impl<E: Clone> ExactStateCache<E> {
         page_id: &str,
         payload_kind: crate::ExactStatePayloadKind,
         extra: impl FnOnce() -> E,
-    ) -> Result<Option<ExactStateLookup<E>>> {
+    ) -> Result<Option<ExactStateLookup<E>>>
+    where
+        E: serde::de::DeserializeOwned,
+    {
         if let Some(hit) = self.lookup_ram(page_id) {
             self.misses.note_hit(page_id);
             return Ok(Some(hit));
         }
+        let cached_extra = self.disk_extras.get(page_id).cloned();
         let Some(disk) = self.disk.as_mut() else {
             self.misses.note_miss(page_id, now_secs());
             return Ok(None);
@@ -168,6 +172,17 @@ impl<E: Clone> ExactStateCache<E> {
             return Ok(None);
         };
 
+        // Prefer this process's copy, then the persisted one, and only then
+        // the caller's fallback. For a payload that is not self-describing the
+        // persisted descriptor is what makes the bytes importable at all, so
+        // ignoring it turned a restorable page into a silent miss.
+        let extra = cached_extra
+            .or_else(|| {
+                load.extra
+                    .clone()
+                    .and_then(|value| serde_json::from_value::<E>(value).ok())
+            })
+            .unwrap_or_else(extra);
         let payload = ExactStatePayload::from_disk_components(payload_kind, load.components)?;
         self.misses.note_hit(page_id);
         Ok(Some(ExactStateLookup {
@@ -176,7 +191,7 @@ impl<E: Clone> ExactStateCache<E> {
             logical_bytes: payload.byte_len(),
             entries: self.entries.len(),
             payload,
-            extra: extra(),
+            extra,
             from_disk: true,
         }))
     }
@@ -209,10 +224,7 @@ impl<E: Clone> ExactStateCache<E> {
         kind: crate::ExactStatePayloadKind,
         components: &[&[u8]],
         extra: E,
-    ) -> bool
-    where
-        E: serde::Serialize,
-    {
+    ) -> bool {
         let Some(disk) = self.disk.as_mut() else {
             return false;
         };
@@ -404,15 +416,32 @@ impl<E: Clone> ExactStateCache<E> {
             return;
         };
         let borrowed: Vec<&[u8]> = components.iter().map(|bytes| bytes.as_ref()).collect();
-        // Demoted RAM entries carry no persisted metadata: their payloads are
-        // self-describing (full-state / recurrent), unlike archived KV pages.
-        let _ = disk.store(
-            page_id,
-            entry.token_count,
-            entry.payload.kind().as_str(),
-            &borrowed,
-            None,
-        );
+        // Persist the metadata with the bytes, exactly as `store_on_disk`
+        // does. A recurrent KV payload is not self-describing: without its
+        // page descriptor the bytes cannot be imported, so an entry demoted
+        // with no metadata comes back after a restart as a permanent silent
+        // miss -- disk consumed, nothing restorable.
+        //
+        // A unit metadata type encodes as JSON null, which round-trips as an
+        // absent field; normalise it so absent and null mean the same thing
+        // and the metadata checksum still matches.
+        let encoded = serde_json::to_value(&entry.extra)
+            .ok()
+            .filter(|value| !value.is_null());
+        let stored = disk
+            .store(
+                page_id,
+                entry.token_count,
+                entry.payload.kind().as_str(),
+                &borrowed,
+                encoded,
+            )
+            .is_ok()
+            && disk.contains(page_id);
+        if stored {
+            self.disk_extras
+                .insert(page_id.to_string(), entry.extra.clone());
+        }
     }
 
     fn add_token_count(&mut self, token_count: u64) {
@@ -536,6 +565,58 @@ mod disk_tier_integration_tests {
     fn cache_with_disk(dir: &tempfile::TempDir, max_entries: usize) -> ExactStateCache<()> {
         let disk = PrefixDiskTier::open(dir.path(), 64 << 20).expect("open disk tier");
         ExactStateCache::new(max_entries, 0).with_disk_tier(disk)
+    }
+
+    /// A recurrent KV payload is not self-describing: without its page
+    /// descriptor the bytes cannot be imported. A demoted entry that dropped
+    /// its metadata came back after a restart as a permanent silent miss --
+    /// disk consumed, nothing restorable.
+    #[test]
+    fn a_demoted_entry_keeps_the_metadata_needed_to_import_it() {
+        #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+        struct Desc {
+            layer_start: u32,
+            layer_end: u32,
+        }
+        fn typed_cache(dir: &tempfile::TempDir) -> ExactStateCache<Desc> {
+            let disk = PrefixDiskTier::open(dir.path(), 64 << 20).expect("open disk tier");
+            // Capacity of one, so a second record demotes the first.
+            ExactStateCache::new(1, 0).with_disk_tier(disk)
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let desc = Desc {
+            layer_start: 0,
+            layer_end: 35,
+        };
+        {
+            let mut cache = typed_cache(&dir);
+            cache.record(
+                "page-a".to_string(),
+                4096,
+                ExactStatePayload::full_state(vec![7u8; 4096]),
+                desc.clone(),
+            );
+            cache.record(
+                "page-b".to_string(),
+                64,
+                ExactStatePayload::full_state(vec![0u8; 64]),
+                desc.clone(),
+            );
+        }
+
+        let mut restarted = typed_cache(&dir);
+        let restored = restarted
+            .lookup_with_disk("page-a", ExactStatePayloadKind::FullState, || Desc {
+                layer_start: 999,
+                layer_end: 999,
+            })
+            .unwrap()
+            .expect("a demoted entry must survive a restart");
+        assert_eq!(
+            restored.extra, desc,
+            "the descriptor must come back from disk, not from the caller fallback"
+        );
     }
 
     /// The motivating scenario: a prefix is evicted from RAM under pressure
