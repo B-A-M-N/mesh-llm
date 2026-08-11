@@ -651,6 +651,10 @@ impl LinearProposalIngress for NativeProposalIngress {
             .enqueue_terminal(PluginCommand::ReportHandoff(receipt.clone()))
     }
 
+    fn report_delivery_failures(&self) -> u64 {
+        self.driver.report_delivery_failures()
+    }
+
     fn discard(
         &self,
         decision_id: &OpaqueProposalDecisionId,

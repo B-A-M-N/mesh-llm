@@ -236,6 +236,7 @@ pub(crate) struct PluginDriver {
     active: Arc<ActivePlugin>,
     pub(crate) fatal_error: Arc<Mutex<Option<String>>>,
     lifecycle_delivery_failures: Arc<AtomicU64>,
+    report_delivery_failures: Arc<AtomicU64>,
     worker: WorkerHandle,
     passive_worker: WorkerHandle,
 }
@@ -252,6 +253,7 @@ impl PluginDriver {
         let active = Arc::new(active);
         let fatal_error = Arc::new(Mutex::new(None));
         let lifecycle_delivery_failures = Arc::new(AtomicU64::new(0));
+        let report_delivery_failures = Arc::new(AtomicU64::new(0));
         let exit = Arc::new(WorkerExit::new());
         let passive_exit = Arc::new(WorkerExit::new());
 
@@ -259,6 +261,7 @@ impl PluginDriver {
         let worker_passive_queue = Arc::clone(&passive_queue);
         let worker_active = Arc::clone(&active);
         let worker_failures = Arc::clone(&lifecycle_delivery_failures);
+        let worker_report_failures = Arc::clone(&report_delivery_failures);
         let worker_exit = Arc::clone(&exit);
         let handle = thread::Builder::new()
             .name("mesh-native-serving-plugin".to_string())
@@ -268,6 +271,7 @@ impl PluginDriver {
                     worker_queue,
                     worker_passive_queue,
                     worker_failures,
+                    worker_report_failures,
                     worker_exit,
                 );
             })
@@ -293,6 +297,7 @@ impl PluginDriver {
             active,
             fatal_error,
             lifecycle_delivery_failures,
+            report_delivery_failures,
             worker: WorkerHandle {
                 exit,
                 handle: Mutex::new(Some(handle)),
@@ -359,6 +364,10 @@ impl PluginDriver {
 
     pub(crate) fn lifecycle_delivery_failures(&self) -> u64 {
         self.lifecycle_delivery_failures.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn report_delivery_failures(&self) -> u64 {
+        self.report_delivery_failures.load(Ordering::Relaxed)
     }
 
     pub(crate) fn propose(&self, query: LinearProposalQuery) -> Result<ProposalResponse> {
@@ -464,6 +473,7 @@ fn plugin_worker(
     queue: Arc<PluginCommandQueue>,
     passive_queue: Arc<PluginCommandQueue>,
     lifecycle_delivery_failures: Arc<AtomicU64>,
+    report_delivery_failures: Arc<AtomicU64>,
     exit: Arc<WorkerExit>,
 ) {
     let _stop_guard = WorkerStopGuard {
@@ -497,10 +507,13 @@ fn plugin_worker(
                 unreachable!("passive plugin callbacks must use the passive worker queue")
             }
         };
-        if lifecycle && result.is_err() {
-            lifecycle_delivery_failures.fetch_add(1, Ordering::Relaxed);
-        } else if let Err(error) = result {
-            eprintln!("native serving plugin report handoff failed: {error:#}");
+        if let Err(error) = result {
+            if lifecycle {
+                lifecycle_delivery_failures.fetch_add(1, Ordering::Relaxed);
+            } else {
+                report_delivery_failures.fetch_add(1, Ordering::Relaxed);
+                eprintln!("native serving plugin report handoff failed: {error:#}");
+            }
         }
     }
 }
@@ -530,7 +543,10 @@ fn run_proposal(
     // proposal callback time. This fence serializes the passive terminal
     // callbacks with the primary proposal queue. The wait is not abandoned;
     // after it completes, the original absolute deadline is checked again.
-    if let Err(error) = fence_passive(passive_queue) {
+    let passive_wait_timeout = deadline
+        .saturating_duration_since(Instant::now())
+        .min(CLEAN_SHUTDOWN_TIMEOUT);
+    if let Err(error) = fence_passive(passive_queue, passive_wait_timeout) {
         eprintln!("native serving plugin proposal fence failed: {error:#}");
         send_proposal_response(
             passive_queue,
@@ -622,17 +638,15 @@ fn send_proposal_response(
         return;
     }
 
-    if let Some(decision_id) = candidate_decision_id {
-        if let Err(error) = passive_queue.try_enqueue_terminal(PluginCommand::Discard(
+    if let Some(decision_id) = candidate_decision_id
+        && let Err(error) = passive_queue.try_enqueue_terminal(PluginCommand::Discard(
             decision_id,
             LinearProposalDiscardReason::DeadlineExceeded,
-        )) {
-            eprintln!(
-                "native serving plugin could not deliver the terminal discard for a detached proposal reply: {error:?}"
-            );
-        }
-    } else {
-        eprintln!("native serving plugin proposal reply receiver was dropped");
+        ))
+    {
+        eprintln!(
+            "native serving plugin could not deliver the terminal discard for a detached proposal reply: {error:?}"
+        );
     }
 }
 
@@ -667,15 +681,21 @@ fn report_after_passive_handoff(
                 anyhow!("native serving plugin terminal queue lock poisoned")
             }
         })?;
-    result
-        .recv()
-        .map_err(|_| anyhow!("native serving plugin passive worker stopped before report ack"))?
+    match result.recv_timeout(CLEAN_SHUTDOWN_TIMEOUT) {
+        Ok(result) => result,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => bail!(
+            "native serving plugin report callback did not complete within {CLEAN_SHUTDOWN_TIMEOUT:?}"
+        ),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            bail!("native serving plugin passive worker stopped before report ack")
+        }
+    }
 }
 
 /// Waits until every passive terminal callback queued before this point has
 /// completed. This preserves report/discard causality without putting slow
 /// callbacks on the proposal-deadline queue.
-fn fence_passive(passive_queue: &PluginCommandQueue) -> Result<()> {
+fn fence_passive(passive_queue: &PluginCommandQueue, timeout: Duration) -> Result<()> {
     let (reply, response) = sync_channel(1);
     passive_queue
         .try_enqueue_terminal(PluginCommand::Fence(reply))
@@ -690,17 +710,22 @@ fn fence_passive(passive_queue: &PluginCommandQueue) -> Result<()> {
                 anyhow!("native serving plugin terminal queue lock poisoned")
             }
         })?;
-    response
-        .recv()
-        .map_err(|_| anyhow!("native serving plugin passive worker stopped before fence"))?;
-    Ok(())
+    match response.recv_timeout(timeout) {
+        Ok(()) => Ok(()),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            bail!("native serving plugin passive callbacks did not complete within {timeout:?}")
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            bail!("native serving plugin passive worker stopped before fence")
+        }
+    }
 }
 
 fn finish_after_passive_fence<T>(
     passive_queue: &PluginCommandQueue,
     finish: impl FnOnce() -> Result<T>,
 ) -> Result<T> {
-    fence_passive(passive_queue)?;
+    fence_passive(passive_queue, CLEAN_SHUTDOWN_TIMEOUT)?;
     finish()
 }
 

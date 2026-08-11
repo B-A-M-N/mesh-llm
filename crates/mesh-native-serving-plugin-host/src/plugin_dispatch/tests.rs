@@ -433,6 +433,7 @@ fn accepted_proposal_commits_report_and_later_lifecycle_commands_are_ordered_by_
     );
     let driver = Arc::new(PluginDriver::spawn(active).unwrap());
     let _release_gate = report_gate.release_on_drop();
+    let _release_commit_gate = commit_gate.release_on_drop();
     let lifecycle = NativeLifecycleIngress {
         driver: Arc::clone(&driver),
     };

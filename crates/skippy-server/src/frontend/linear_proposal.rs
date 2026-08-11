@@ -384,6 +384,11 @@ pub trait LinearProposalIngress: Send + Sync {
     /// Receives the target-authoritative outcome for a verified proposal.
     fn report(&self, receipt: &LinearProposalReceipt) -> Result<()>;
 
+    /// Returns asynchronous failures observed after a report was accepted.
+    fn report_delivery_failures(&self) -> u64 {
+        0
+    }
+
     /// Resolves a source decision that Skippy could not verify.
     fn discard(
         &self,
@@ -504,6 +509,11 @@ impl LinearProposalIngressConfig {
     /// Returns the configured proposal source.
     pub fn source(&self) -> &Arc<dyn LinearProposalIngress> {
         &self.source
+    }
+
+    /// Returns report callback failures observed after enqueue-time success.
+    pub fn report_delivery_failures(&self) -> u64 {
+        self.source.report_delivery_failures()
     }
 }
 

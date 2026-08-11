@@ -44,8 +44,16 @@ impl CallbackGate {
         let mut state = self.state.lock().unwrap();
         state.entered = true;
         self.signal.notify_all();
+        let deadline = Instant::now() + Duration::from_secs(2);
         while !state.released {
-            state = self.signal.wait(state).unwrap();
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(!remaining.is_zero(), "timed out waiting for gated callback");
+            let (next_state, timeout) = self.signal.wait_timeout(state, remaining).unwrap();
+            state = next_state;
+            assert!(
+                !timeout.timed_out() || state.released,
+                "timed out waiting for gated callback"
+            );
         }
     }
 
