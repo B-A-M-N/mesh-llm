@@ -124,6 +124,7 @@ impl KvStageIntegration {
             return Ok(None);
         }
         for identity in identities {
+            let verify_timer = std::time::Instant::now();
             let restored = {
                 let mut cache = self
                     .exact_states
@@ -177,11 +178,16 @@ impl KvStageIntegration {
                 continue;
             }
 
+            let verify_ms = verify_timer.elapsed().as_secs_f64() * 1000.0;
+            let payload_bytes = kv.as_ref().len() as u64;
+
             // Import borrows the mapped bytes directly; no copy is made.
-            if runtime
+            let import_timer = std::time::Instant::now();
+            let import_failed = runtime
                 .import_kv_page(session_id, &desc, kv.as_ref())
-                .is_err()
-            {
+                .is_err();
+            let import_ms = import_timer.elapsed().as_secs_f64() * 1000.0;
+            if import_failed {
                 // A failed import can leave partially written KV cells behind
                 // while the host still believes the session holds none.
                 // Importing a different-length page on top of that would
@@ -192,6 +198,9 @@ impl KvStageIntegration {
             return Ok(Some(DenseDiskRestore {
                 page_id: identity.page_id.clone(),
                 token_count: restored.token_count,
+                verify_ms,
+                import_ms,
+                payload_bytes,
             }));
         }
         Ok(None)
@@ -199,10 +208,22 @@ impl KvStageIntegration {
 }
 
 /// A dense prefix served back from the disk tier.
+///
+/// The two phase timings are carried out to telemetry because the first
+/// measurement of a 25k-token restore spent ~18s inside this function, and
+/// wall clock alone could not say whether that was checksum verification
+/// (which faults every page in and hashes it) or the native import. Those
+/// have completely different fixes, so the split is reported rather than
+/// inferred.
 #[derive(Debug, Clone)]
 pub struct DenseDiskRestore {
     pub page_id: String,
     pub token_count: u64,
+    /// Lookup, checksum verification, and page faulting.
+    pub verify_ms: f64,
+    /// `skippy_import_kv_page` alone.
+    pub import_ms: f64,
+    pub payload_bytes: u64,
 }
 
 /// Picks which recorded candidate to archive, at most one per request.

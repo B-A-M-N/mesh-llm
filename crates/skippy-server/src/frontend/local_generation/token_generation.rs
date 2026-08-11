@@ -542,6 +542,21 @@ impl StageOpenAiBackend {
                                     "skippy.kv.suffix_prefill_tokens".to_string(),
                                     json!(prefill_tokens.len().saturating_sub(restored_tokens)),
                                 );
+                                // Split the restore cost so a slow restore can
+                                // be attributed to verification or to the
+                                // native import without guessing.
+                                attrs.insert(
+                                    "skippy.kv.disk_verify_ms".to_string(),
+                                    json!(restored.verify_ms),
+                                );
+                                attrs.insert(
+                                    "skippy.kv.disk_import_ms".to_string(),
+                                    json!(restored.import_ms),
+                                );
+                                attrs.insert(
+                                    "skippy.kv.disk_payload_bytes".to_string(),
+                                    json!(restored.payload_bytes),
+                                );
                                 self.telemetry
                                     .emit("stage.openai_kv_lookup_decision", attrs);
                             }

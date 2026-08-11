@@ -94,6 +94,13 @@ too_many_lines = "warn"
 # Do not remove this section: direct GGUF debug startup spends most of its time
 # hashing the source model via sha2/sha2-asm before native skippy model open,
 # so keep those crates near release speed in dev builds.
+# blake3 verifies every KV page read back from the disk tier, so an
+# unoptimized build hashes multi-gigabyte pages at a few hundred MB/s and
+# makes a cache restore look far more expensive than it is. Same reasoning
+# as sha2 below: cryptographic primitives are hot even in dev builds.
+[profile.dev.package.blake3]
+opt-level = 3
+
 [profile.dev.package.sha2]
 opt-level = 3
 
