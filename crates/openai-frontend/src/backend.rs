@@ -4,6 +4,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
+    time::Instant,
 };
 
 use async_trait::async_trait;
@@ -61,14 +62,31 @@ impl CancellationToken {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct OpenAiRequestContext {
     cancellation: CancellationToken,
+    request_id: Option<String>,
+    started_at: Instant,
 }
 
 impl OpenAiRequestContext {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn with_request_id(request_id: impl Into<String>) -> Self {
+        Self {
+            request_id: Some(request_id.into()),
+            ..Self::default()
+        }
+    }
+
+    pub fn request_id(&self) -> Option<&str> {
+        self.request_id.as_deref()
+    }
+
+    pub fn elapsed(&self) -> std::time::Duration {
+        self.started_at.elapsed()
     }
 
     pub fn cancellation_token(&self) -> CancellationToken {
@@ -81,6 +99,16 @@ impl OpenAiRequestContext {
 
     pub fn is_cancelled(&self) -> bool {
         self.cancellation.is_cancelled()
+    }
+}
+
+impl Default for OpenAiRequestContext {
+    fn default() -> Self {
+        Self {
+            cancellation: CancellationToken::new(),
+            request_id: None,
+            started_at: Instant::now(),
+        }
     }
 }
 
