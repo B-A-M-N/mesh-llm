@@ -543,16 +543,27 @@ fn run_proposal(
     // proposal callback time. This fence serializes the passive terminal
     // callbacks with the primary proposal queue. The wait is not abandoned;
     // after it completes, the original absolute deadline is checked again.
-    let passive_wait_timeout = deadline
-        .saturating_duration_since(Instant::now())
-        .min(CLEAN_SHUTDOWN_TIMEOUT);
-    if let Err(error) = fence_passive(passive_queue, passive_wait_timeout) {
-        eprintln!("native serving plugin proposal fence failed: {error:#}");
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    let fence_timeout = remaining.min(CLEAN_SHUTDOWN_TIMEOUT);
+    let fence_consumes_query_deadline = remaining <= CLEAN_SHUTDOWN_TIMEOUT;
+    if let Err(error) = fence_passive(passive_queue, fence_timeout) {
+        if fence_consumes_query_deadline && matches!(&error, PassiveFenceError::Timeout(_)) {
+            send_proposal_response(
+                passive_queue,
+                reply,
+                abstention(
+                    queue_wait_us,
+                    LinearProposalSourceOutcome::HostDeadlineExceeded,
+                ),
+            );
+            return;
+        }
+        eprintln!("native serving plugin proposal fence failed: {error}");
         send_proposal_response(
             passive_queue,
             reply,
             ProposalResponse {
-                proposal: Err(format!("{error:#}")),
+                proposal: Err(error.to_string()),
                 telemetry: LinearProposalSourceTelemetry {
                     queue_wait_us,
                     callback_elapsed_us: 0,
@@ -695,29 +706,50 @@ fn report_after_passive_handoff(
 /// Waits until every passive terminal callback queued before this point has
 /// completed. This preserves report/discard causality without putting slow
 /// callbacks on the proposal-deadline queue.
-fn fence_passive(passive_queue: &PluginCommandQueue, timeout: Duration) -> Result<()> {
+#[derive(Debug)]
+enum PassiveFenceError {
+    Timeout(Duration),
+    Failure(anyhow::Error),
+}
+
+impl std::fmt::Display for PassiveFenceError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Timeout(timeout) => write!(
+                formatter,
+                "native serving plugin passive callbacks did not complete within {timeout:?}"
+            ),
+            Self::Failure(error) => write!(formatter, "{error:#}"),
+        }
+    }
+}
+
+fn fence_passive(
+    passive_queue: &PluginCommandQueue,
+    timeout: Duration,
+) -> std::result::Result<(), PassiveFenceError> {
     let (reply, response) = sync_channel(1);
     passive_queue
         .try_enqueue_terminal(PluginCommand::Fence(reply))
-        .map_err(|error| match error {
-            PluginCommandQueueError::Full => {
-                anyhow!("native serving plugin terminal queue is full")
-            }
-            PluginCommandQueueError::Stopped => {
-                anyhow!("native serving plugin passive worker stopped")
-            }
-            PluginCommandQueueError::Poisoned => {
-                anyhow!("native serving plugin terminal queue lock poisoned")
-            }
+        .map_err(|error| {
+            PassiveFenceError::Failure(match error {
+                PluginCommandQueueError::Full => {
+                    anyhow!("native serving plugin terminal queue is full")
+                }
+                PluginCommandQueueError::Stopped => {
+                    anyhow!("native serving plugin passive worker stopped")
+                }
+                PluginCommandQueueError::Poisoned => {
+                    anyhow!("native serving plugin terminal queue lock poisoned")
+                }
+            })
         })?;
     match response.recv_timeout(timeout) {
         Ok(()) => Ok(()),
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-            bail!("native serving plugin passive callbacks did not complete within {timeout:?}")
-        }
-        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-            bail!("native serving plugin passive worker stopped before fence")
-        }
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(PassiveFenceError::Timeout(timeout)),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(PassiveFenceError::Failure(
+            anyhow!("native serving plugin passive worker stopped before fence"),
+        )),
     }
 }
 
@@ -725,7 +757,7 @@ fn finish_after_passive_fence<T>(
     passive_queue: &PluginCommandQueue,
     finish: impl FnOnce() -> Result<T>,
 ) -> Result<T> {
-    fence_passive(passive_queue, CLEAN_SHUTDOWN_TIMEOUT)?;
+    fence_passive(passive_queue, CLEAN_SHUTDOWN_TIMEOUT).map_err(|error| anyhow!("{error}"))?;
     finish()
 }
 

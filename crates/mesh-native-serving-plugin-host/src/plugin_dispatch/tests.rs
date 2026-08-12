@@ -408,14 +408,18 @@ fn blocking_commit_cannot_extend_the_proposal_deadline() {
             1,
             2,
             1,
+            2,
             1,
-            0,
             8,
             started + Duration::from_millis(5),
         ))
         .unwrap();
 
     assert!(result.proposal.unwrap().is_none());
+    assert_eq!(
+        result.telemetry.outcome,
+        LinearProposalSourceOutcome::HostDeadlineExceeded
+    );
     assert!(
         started.elapsed() < Duration::from_millis(150),
         "proposal waited {:?} for a blocking commit",
