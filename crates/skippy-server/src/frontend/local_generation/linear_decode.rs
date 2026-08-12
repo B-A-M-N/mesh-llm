@@ -416,6 +416,7 @@ mod tests {
             generation_limit: Arc::new(Semaphore::new(1)),
             generation_queue_depth: Arc::new(AtomicUsize::new(0)),
             generation_queue_limit: 1,
+            generation_session_locks: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
             generation_token_budget: Arc::new(GenerationTokenBudget::new(128)),
             hook_policy: None,
             generation_receipt: None,
@@ -425,10 +426,11 @@ mod tests {
             decode_frame_batcher: DecodeFrameBatcher::new(runtime, 1),
         };
         let sampling = SamplingConfig::default();
-        let ids = OpenAiGenerationIds::new(OpenAiCacheHints::default(), None);
+        let ids = OpenAiGenerationIds::new_with_trust(OpenAiCacheHints::default(), None, false);
         let prompt_token_ids = [1, 2];
         let request = LocalGeneration {
             prompt_token_ids: &prompt_token_ids,
+            recurrent_cache_prefix_token_ids: None,
             max_tokens: 5,
             sampling: &sampling,
             chat_sampling_metadata: None,
@@ -442,6 +444,7 @@ mod tests {
         let mut state = DecodeState {
             decoded_tokens: 0,
             current: 2,
+            generated_token_ids: Vec::new(),
             stopped: false,
             runtime_lock_wait_ms: 0.0,
             runtime_lock_wait_max_ms: 0.0,

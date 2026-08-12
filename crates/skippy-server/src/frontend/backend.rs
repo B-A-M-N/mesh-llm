@@ -533,6 +533,8 @@ impl StageOpenAiBackend {
                 return Err(request_cancelled_error());
             }
             if !session.try_acquire()? {
+                let session = session_permit.take().expect("session permit was present");
+                session_permit = Some(session.acquire_until(deadline, cancellation).await?);
                 queue_reservation = Some(
                     reserve_generation_queue(
                         self.generation_queue_depth.clone(),
@@ -540,8 +542,6 @@ impl StageOpenAiBackend {
                     )
                     .ok_or_else(generation_queue_full_error)?,
                 );
-                let session = session_permit.take().expect("session permit was present");
-                session_permit = Some(session.acquire_until(deadline, cancellation).await?);
             }
         }
 

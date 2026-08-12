@@ -210,33 +210,21 @@ async fn chat_completions(
         let model = request.model.clone();
         let context =
             request_context(&request_id, trusted_agent_session).with_stream_usage_observation();
-        let cancellation = context.cancellation_token();
-        let stream_error = Arc::new(AtomicBool::new(false));
-        let stream_completed = Arc::new(AtomicBool::new(false));
-        let response_completed_logged = Arc::new(AtomicBool::new(false));
-        let stream_usage = Arc::new(Mutex::new(None::<Usage>));
-        let backend_stream = match backend_call_with_cancellation(
+        let telemetry = prepare_observed_stream(
             &state,
             "chat_completion_stream",
             &context,
+            &mut observation,
             state
                 .backend
                 .chat_completion_stream(request, context.clone()),
         )
-        .await
-        {
-            Ok(stream) => stream,
-            Err(error) => {
-                observation.finish(request_error_outcome(&error));
-                return Err(error);
-            }
-        };
-        let stream = observe_backend_stream(
-            backend_stream,
-            "chat_completion_stream",
-            &context,
-            stream_error.clone(),
-        );
+        .await?;
+        let stream_usage = telemetry.stream_usage.clone();
+        let lifecycle = telemetry.lifecycle(observation, context.clone(), "chat_completion");
+        let stream = telemetry.stream;
+        let cancellation = telemetry.cancellation;
+        let stream_completed = telemetry.stream_completed;
         let prelude = stream::once(async move { json_event(&ChatCompletionChunk::role(model)) });
         let captured_usage = stream_usage.clone();
         let done_completed = stream_completed.clone();
@@ -266,18 +254,7 @@ async fn chat_completions(
                 done_completed.store(true, Ordering::Release);
                 done_event()
             }));
-        let completion = StreamCompletion::new(
-            context.clone(),
-            "chat_completion",
-            stream_usage,
-            response_completed_logged,
-        );
-        Ok(sse_response(
-            events,
-            cancellation,
-            StreamLifecycle::new(observation, stream_error, stream_completed)
-                .with_completion(completion),
-        ))
+        Ok(sse_response(events, cancellation, lifecycle))
     } else {
         let context = request_context(&request_id, trusted_agent_session);
         let response = match backend_call_with_cancellation(
@@ -336,34 +313,22 @@ async fn responses(
             let include_usage = request.include_usage();
             let context =
                 request_context(&request_id, trusted_agent_session).with_stream_usage_observation();
-            let cancellation = context.cancellation_token();
-            let stream_error = Arc::new(AtomicBool::new(false));
-            let stream_completed = Arc::new(AtomicBool::new(false));
-            let response_completed_logged = Arc::new(AtomicBool::new(false));
-            let stream_usage = Arc::new(Mutex::new(None::<Usage>));
             let state_machine = Arc::new(Mutex::new(ResponseSseState::new(request.model.clone())));
-            let backend_stream = match backend_call_with_cancellation(
+            let telemetry = prepare_observed_stream(
                 &state,
                 "responses_stream",
                 &context,
+                &mut observation,
                 state
                     .backend
                     .chat_completion_stream(request, context.clone()),
             )
-            .await
-            {
-                Ok(stream) => stream,
-                Err(error) => {
-                    observation.finish(request_error_outcome(&error));
-                    return Err(error);
-                }
-            };
-            let stream = observe_backend_stream(
-                backend_stream,
-                "responses_stream",
-                &context,
-                stream_error.clone(),
-            );
+            .await?;
+            let stream_usage = telemetry.stream_usage.clone();
+            let lifecycle = telemetry.lifecycle(observation, context.clone(), "responses");
+            let stream = telemetry.stream;
+            let cancellation = telemetry.cancellation;
+            let stream_completed = telemetry.stream_completed;
             let body_state = state_machine.clone();
             let captured_usage = stream_usage.clone();
             let body_events = stream.flat_map(move |item| {
@@ -562,18 +527,7 @@ async fn responses(
                     done_completed.store(true, Ordering::Release);
                     done_event()
                 }));
-            let completion = StreamCompletion::new(
-                context.clone(),
-                "responses",
-                stream_usage,
-                response_completed_logged,
-            );
-            Ok(sse_response(
-                events,
-                cancellation,
-                StreamLifecycle::new(observation, stream_error, stream_completed)
-                    .with_completion(completion),
-            ))
+            Ok(sse_response(events, cancellation, lifecycle))
         }
         _ => {
             let context = request_context(&request_id, trusted_agent_session);
@@ -624,31 +578,19 @@ async fn completions(
         let include_usage = request.include_usage();
         let context =
             request_context(&request_id, trusted_agent_session).with_stream_usage_observation();
-        let cancellation = context.cancellation_token();
-        let stream_error = Arc::new(AtomicBool::new(false));
-        let stream_completed = Arc::new(AtomicBool::new(false));
-        let response_completed_logged = Arc::new(AtomicBool::new(false));
-        let stream_usage = Arc::new(Mutex::new(None::<Usage>));
-        let backend_stream = match backend_call_with_cancellation(
+        let telemetry = prepare_observed_stream(
             &state,
             "completion_stream",
             &context,
+            &mut observation,
             state.backend.completion_stream(request, context.clone()),
         )
-        .await
-        {
-            Ok(stream) => stream,
-            Err(error) => {
-                observation.finish(request_error_outcome(&error));
-                return Err(error);
-            }
-        };
-        let stream = observe_backend_stream(
-            backend_stream,
-            "completion_stream",
-            &context,
-            stream_error.clone(),
-        );
+        .await?;
+        let stream_usage = telemetry.stream_usage.clone();
+        let lifecycle = telemetry.lifecycle(observation, context.clone(), "completion");
+        let stream = telemetry.stream;
+        let cancellation = telemetry.cancellation;
+        let stream_completed = telemetry.stream_completed;
         let captured_usage = stream_usage.clone();
         let done_completed = stream_completed.clone();
         let events = stream
@@ -677,18 +619,7 @@ async fn completions(
                 done_completed.store(true, Ordering::Release);
                 done_event()
             }));
-        let completion = StreamCompletion::new(
-            context.clone(),
-            "completion",
-            stream_usage,
-            response_completed_logged,
-        );
-        Ok(sse_response(
-            events,
-            cancellation,
-            StreamLifecycle::new(observation, stream_error, stream_completed)
-                .with_completion(completion),
-        ))
+        Ok(sse_response(events, cancellation, lifecycle))
     } else {
         let context = request_context(&request_id, trusted_agent_session);
         let response = match backend_call_with_cancellation(
@@ -869,6 +800,69 @@ fn request_error_outcome(error: &OpenAiError) -> &'static str {
     }
 }
 
+struct StreamTelemetry<T> {
+    stream: Pin<Box<dyn Stream<Item = OpenAiResult<T>> + Send + 'static>>,
+    cancellation: CancellationToken,
+    stream_error: Arc<AtomicBool>,
+    stream_completed: Arc<AtomicBool>,
+    stream_usage: Arc<Mutex<Option<Usage>>>,
+    response_completed_logged: Arc<AtomicBool>,
+}
+
+impl<T> StreamTelemetry<T> {
+    fn lifecycle(
+        &self,
+        observation: RequestObservation,
+        context: OpenAiRequestContext,
+        operation: &'static str,
+    ) -> StreamLifecycle {
+        let completion = StreamCompletion::new(
+            context,
+            operation,
+            self.stream_usage.clone(),
+            self.response_completed_logged.clone(),
+        );
+        StreamLifecycle::new(
+            observation,
+            self.stream_error.clone(),
+            self.stream_completed.clone(),
+        )
+        .with_completion(completion)
+    }
+}
+
+async fn prepare_observed_stream<T, S, F>(
+    state: &FrontendState,
+    operation: &'static str,
+    context: &OpenAiRequestContext,
+    observation: &mut RequestObservation,
+    future: F,
+) -> OpenAiResult<StreamTelemetry<T>>
+where
+    F: Future<Output = OpenAiResult<S>>,
+    S: Stream<Item = OpenAiResult<T>> + Send + 'static,
+    T: Send + 'static,
+{
+    let backend_stream =
+        match backend_call_with_cancellation(state, operation, context, future).await {
+            Ok(stream) => stream,
+            Err(error) => {
+                observation.finish(request_error_outcome(&error));
+                return Err(error);
+            }
+        };
+    let stream_error = Arc::new(AtomicBool::new(false));
+    let stream = observe_backend_stream(backend_stream, operation, context, stream_error.clone());
+    Ok(StreamTelemetry {
+        stream: Box::pin(stream),
+        cancellation: context.cancellation_token(),
+        stream_error,
+        stream_completed: Arc::new(AtomicBool::new(false)),
+        stream_usage: Arc::new(Mutex::new(None)),
+        response_completed_logged: Arc::new(AtomicBool::new(false)),
+    })
+}
+
 fn observe_backend_stream<S, T>(
     stream: S,
     operation: &'static str,
@@ -1026,6 +1020,25 @@ fn new_request_id() -> String {
     format!("req-{millis}-{counter}")
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamFinishOutcome {
+    Success,
+    BackendError,
+    Cancelled,
+    ClientDisconnect,
+}
+
+impl StreamFinishOutcome {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::BackendError => "backend_error",
+            Self::Cancelled => "cancelled",
+            Self::ClientDisconnect => "client_disconnect",
+        }
+    }
+}
+
 struct RequestObservation {
     request_id: String,
     operation: &'static str,
@@ -1130,38 +1143,38 @@ impl StreamLifecycle {
 
     fn finish_natural(&mut self) {
         let outcome = if self.stream_error.load(Ordering::Acquire) {
-            "backend_error"
+            StreamFinishOutcome::BackendError
         } else {
-            "success"
+            StreamFinishOutcome::Success
         };
-        if outcome == "success"
+        if outcome == StreamFinishOutcome::Success
             && let Some(completion) = self.completion.as_ref()
         {
             completion.log_if_successful();
         }
-        self.observation.finish(outcome);
+        self.observation.finish(outcome.as_str());
     }
 
-    fn drop_outcome(&self, cancellation_already_requested: bool) -> &'static str {
+    fn drop_outcome(&self, cancellation_already_requested: bool) -> StreamFinishOutcome {
         if self.stream_error.load(Ordering::Acquire) {
-            "backend_error"
+            StreamFinishOutcome::BackendError
         } else if self.stream_completed.load(Ordering::Acquire) {
-            "success"
+            StreamFinishOutcome::Success
         } else if cancellation_already_requested {
-            "cancelled"
+            StreamFinishOutcome::Cancelled
         } else {
-            "client_disconnect"
+            StreamFinishOutcome::ClientDisconnect
         }
     }
 
     fn finish_drop(&mut self, cancellation_already_requested: bool) {
         let outcome = self.drop_outcome(cancellation_already_requested);
-        if outcome == "success"
+        if outcome == StreamFinishOutcome::Success
             && let Some(completion) = self.completion.as_ref()
         {
             completion.log_if_successful();
         }
-        self.observation.finish(outcome);
+        self.observation.finish(outcome.as_str());
     }
 }
 
@@ -1371,14 +1384,20 @@ mod tests {
             stream_completed.clone(),
         );
 
-        assert_eq!(lifecycle.drop_outcome(false), "client_disconnect");
-        assert_eq!(lifecycle.drop_outcome(true), "cancelled");
+        assert_eq!(
+            lifecycle.drop_outcome(false),
+            StreamFinishOutcome::ClientDisconnect
+        );
+        assert_eq!(lifecycle.drop_outcome(true), StreamFinishOutcome::Cancelled);
 
         stream_completed.store(true, Ordering::Release);
-        assert_eq!(lifecycle.drop_outcome(false), "success");
+        assert_eq!(lifecycle.drop_outcome(false), StreamFinishOutcome::Success);
 
         stream_error.store(true, Ordering::Release);
-        assert_eq!(lifecycle.drop_outcome(false), "backend_error");
+        assert_eq!(
+            lifecycle.drop_outcome(false),
+            StreamFinishOutcome::BackendError
+        );
     }
 
     #[test]
