@@ -725,6 +725,41 @@ stage 1 : [16768, 16640, 16512, ... ] (88 entries)  <- full ladder
 Both stages archive the 16768-token shared bulk, so the all-or-nothing veto is
 satisfied and the chain restores. Seeding is therefore **not** solo-only.
 
+### Confirmed on two physical machines
+
+The measurement above is a loopback split -- two processes on one host, sharing
+a disk and a GPU. That validates the agreement protocol but not the things only
+a real network can break: page identity agreeing across two independently
+configured hosts, restore negotiation over real QUIC latency, and each node
+owning a separate cache directory on separate storage.
+
+Repeated across an M4 Pro and a Mac mini on a LAN (13-14ms direct QUIC),
+Qwen3-8B Q4_K_M layer package, `--max-vram 4 --ctx-size 16384` per node, 8 GiB
+tier per node. Stage 0 held layers 0-22 on one machine, stage 1 layers 22-36 on
+the other:
+
+| Scenario | Time | cached_tokens |
+|---|---|---|
+| Cold, both caches empty | 12.45s | 0 |
+| Cross-session, same prefix, new tail | **1.49s** / 1.53s | 4096 |
+| First request after restarting **both** machines' nodes | **1.72s** | 4096 |
+
+Both nodes independently persisted `format_version: 1` indexes of
+`resident-kv-archive` entries and reloaded them into a freshly negotiated
+topology, so the restored page ids agreed across hosts. Stage 1 also exercised
+budget eviction (`disk_evictions` 0 -> 3 -> 5 against a 2 GiB stage share) while
+still serving hits, which the loopback run never reached.
+
+Two notes for anyone reproducing this. The split only plans when *both* nodes
+are genuinely too small: with 36 layers at ~0.2GB each, `--max-vram 5` let one
+node take all 36 and serve solo, while `--max-vram 4` at the model's native
+40960 context failed to plan at all (`split_capacity_shortfall`, 30/36 layers
+placeable). `--max-vram 4 --ctx-size 16384` is the window where a real split
+forms. Separately, the join has to be directed at the node whose advertised
+addresses are reachable -- joining toward a node advertising an unreachable
+address times out at 30s and falls back to standalone, which looks like a
+discovery failure but is not one.
+
 ### Not done
 
 - **W1** KV quantization, **W3** page-granular export, **W5** export-on-eviction,
