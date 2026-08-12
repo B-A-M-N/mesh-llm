@@ -750,15 +750,66 @@ topology, so the restored page ids agreed across hosts. Stage 1 also exercised
 budget eviction (`disk_evictions` 0 -> 3 -> 5 against a 2 GiB stage share) while
 still serving hits, which the loopback run never reached.
 
-Two notes for anyone reproducing this. The split only plans when *both* nodes
-are genuinely too small: with 36 layers at ~0.2GB each, `--max-vram 5` let one
-node take all 36 and serve solo, while `--max-vram 4` at the model's native
-40960 context failed to plan at all (`split_capacity_shortfall`, 30/36 layers
-placeable). `--max-vram 4 --ctx-size 16384` is the window where a real split
-forms. Separately, the join has to be directed at the node whose advertised
-addresses are reachable -- joining toward a node advertising an unreachable
-address times out at 30s and falls back to standalone, which looks like a
-discovery failure but is not one.
+#### Forcing the split deterministically
+
+Do **not** reproduce this by tuning `--max-vram` until a split happens. That is
+what the first attempt did, and it is both unreliable and actively misleading:
+at `--max-vram 5` one node quietly took all 36 layers and served solo while
+still showing a healthy two-node mesh, and equal artificial caps on both nodes
+can also flip coordinator election, since the coordinator is the participant
+with the greatest advertised VRAM.
+
+Use the documented mechanism instead (`docs/SKIPPY_SPLITS.md`): `--split` to
+force staged serving even when the model would fit locally, plus
+`--split-topology-lock` to pin the exact nodes and layer ranges. The lock is
+fail-closed -- if the pinned ranges do not fit, startup fails rather than
+silently falling back.
+
+```json
+{
+  "version": 1,
+  "model": "meshllm/Qwen3-8B-Q4_K_M-layers",
+  "manifest_sha256": "<sha256 of the raw model-package.json bytes>",
+  "stages": [
+    { "node": "<stage-0 endpoint id>", "layer_start": 0,  "layer_end": 32 },
+    { "node": "<stage-1 endpoint id>", "layer_start": 32, "layer_end": 36 }
+  ]
+}
+```
+
+Points worth knowing, each of which cost time to rediscover:
+
+- Stage 0 must be the node that would be elected coordinator: highest advertised
+  VRAM, endpoint id as tie-break.
+- Use **full endpoint ids**, not hostnames. Both lab machines advertise
+  `mac.lan`, and a hostname selector must resolve uniquely among participants.
+- `manifest_sha256` is the SHA-256 of the `model-package.json` file's bytes, not
+  a digest recorded inside it.
+- Place the identical lock on every serving node and pass both flags on each.
+- The join must be directed at the node whose advertised addresses are
+  reachable; joining toward an unreachable address times out at 30s and falls
+  back to standalone, which presents as a discovery failure but is not one.
+
+Verify with `GET /api/runtime/stages` on the coordinator, not `/v1/models`.
+`/v1/models` proves the model is routable; only the stages endpoint proves two
+distinct endpoint ids own disjoint layer ranges. That distinction is exactly
+what the accidental solo-serving run above would have hidden.
+
+#### Re-measured under a locked topology
+
+Same two machines, `--split --split-topology-lock`, `--ctx-size 8192`, stage 0
+layers 0-32 on the M4 Pro and stage 1 layers 32-36 on the mini, confirmed
+through `/api/runtime/stages`:
+
+| Scenario | Time | cached_tokens |
+|---|---|---|
+| Cold, both caches empty | 5.48s | 0 |
+| Cross-session, same prefix, new tail | **1.39s** / 1.29s | 4096 |
+| First request after restarting **both** nodes | **1.48s** | 4096 |
+
+Both nodes again persisted `format_version: 1` indexes independently (stage 0
+one entry, stage 1 a 34-entry ladder) and restored into a freshly negotiated
+topology.
 
 ### Not done
 
