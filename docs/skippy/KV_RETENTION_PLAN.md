@@ -553,11 +553,15 @@ check in the encoder. It is now an explicit named assertion in
 | Cross-session, same prefix, new tail | 1.34s | **0.57s** |
 | First request after restarting both nodes | 1.33s | 1.32s |
 
-Cross-session split reuse works. **Restart reuse does not yet pay off**, and
-the reason is visible in the archive index: stage 0 archives its full ladder
-including the 2048-token shared bulk, but the downstream stage archives only a
-512-token page. Because of the veto, one stage's shallow archive negates the
-other's good one.
+Cross-session split reuse works. Restart reuse did **not** pay off at this
+point in the branch, and the reason was visible in the archive index: stage 0
+archived its full ladder including the 2048-token shared bulk, but the
+downstream stage archived only a 512-token page. Because of the veto, one
+stage's shallow archive negated the other's good one.
+
+> **Superseded.** This was fixed by `e1c4af42` and `b32dec97`. See
+> "It works on splits too (re-measured)" below for the current numbers:
+> 31.02s cold -> 1.54s after restarting both nodes on an 8B split.
 
 This also exposed a real bug in the first implementation: archiving the
 *lowest* ladder candidate. For a 2129-token prompt that is a 256-token page —
@@ -690,34 +694,36 @@ session or process with the same weights, layer range, KV dtype and backend.
 `ArchiveCandidate` also prefers the longest *partial* candidate, which is
 correct here --- a seed prompt's full length is exactly the shared prefix.
 
-### It does not yet work on splits
+### It works on splits too (re-measured)
 
-Same experiment across a 2-node split: seeded first-request 1.27s against
-~1.30s cold, i.e. no gain. The per-stage archives show why:
+The earlier ratchet is fixed. `e1c4af42` stopped `min_record_tokens` from
+starving the archive selector on a warm restore (candidates below the restore
+point are still offered to the archive; only resident re-recording is skipped)
+and moved archival out of the `config.downstream.is_some()` branch, so the last
+stage of a chain archives at all. `b32dec97` then removed the resident-admission
+gate on stage-0 full prefill, which had been declining every rung of a prompt
+larger than `max_resident_tokens`.
+
+Re-measured on a 2-node loopback split, Qwen3-8B Q4_K_M layer package,
+~16.9k-token agent prompt, `--max-vram 10` per stage, disk tier at 8 GiB per
+stage:
+
+| Scenario | Time |
+|---|---|
+| Cold, empty disk cache both stages | 31.02s |
+| Cross-session, same prefix, new tail | **1.29s** / 0.91s |
+| First request after restarting **both** nodes | **1.54s** |
+
+That is a **20x** restart win where the previous measurement showed none
+(1.33s vs 1.32s on 0.5B). The per-stage archive ladders now look like:
 
 ```text
-stage 0 : [2048, 1920, 1792, ... 512]   <- full ladder
-stage 1 : [512]                          <- floor only
+stage 0 : [16768]                                   <- one page, the shared bulk
+stage 1 : [16768, 16640, 16512, ... ] (88 entries)  <- full ladder
 ```
 
-512 is exactly `MIN_ARCHIVE_TOKENS`, so the downstream stage is archiving the
-smallest page it is allowed to and nothing else. With the all-or-nothing veto,
-stage 1's shallow archive cancels stage 0's good one.
-
-Root cause: `record_completed_prefill` passes `min_record_tokens =
-restored_tokens` (`binary_messaging/prefill_recording.rs:67-81`) and the
-recorder skips every candidate `<= min_record_tokens`
-(`binary_kv.rs:632`). On a warm chain restore the downstream stage therefore
-declines to record precisely the shared-bulk candidates it just served. The
-ladder can only get shallower with each warm request --- a ratchet in the
-wrong direction.
-
-That gate is right for its original purpose (do not re-record what was just
-restored *into the resident cache*) and wrong for the archive, which needs the
-shared bulk specifically. Fixing it is a behaviour change on the record path
-and should land separately, with per-stage archive depth as the evidence.
-
-Until then, seeding is a **solo-only** capability.
+Both stages archive the 16768-token shared bulk, so the all-or-nothing veto is
+satisfied and the chain restores. Seeding is therefore **not** solo-only.
 
 ### Not done
 
