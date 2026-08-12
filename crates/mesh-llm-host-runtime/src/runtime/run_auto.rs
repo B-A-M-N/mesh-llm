@@ -1184,19 +1184,34 @@ async fn start_provider_for_openai_surface(
     is_client: bool,
     context: ProviderSupervisorContext,
     discovery: Option<&ProviderRuntimeDiscoveryOptions>,
+    requested_model_id: Option<&str>,
     tunnel_mgr: &tunnel::Manager,
     api_port: u16,
 ) -> Option<ProviderSupervisorHandle> {
     if is_client {
         return None;
     }
-    let supervisor = start_apple_provider_supervisor(context, discovery).await;
+    let supervisor = start_apple_provider_supervisor(context, discovery, requested_model_id).await;
     if supervisor.is_some() {
         // Provider-only hosts have no GGUF startup loop to register the API
         // port. Provider gossip begins only after the sidecar is healthy.
         tunnel_mgr.set_http_port(api_port);
     }
     supervisor
+}
+
+fn startup_specs_for_provider(
+    startup_specs: &[StartupModelSpec],
+    provider_supervisor: Option<&ProviderSupervisorHandle>,
+) -> Vec<StartupModelSpec> {
+    let Some(provider) = provider_supervisor else {
+        return startup_specs.to_vec();
+    };
+    startup_specs
+        .iter()
+        .filter(|spec| spec.model_ref.to_string_lossy() != provider.model_id)
+        .cloned()
+        .collect()
 }
 
 #[expect(
@@ -1360,6 +1375,7 @@ pub(super) async fn run_auto(ctx: RunAutoContext) -> Result<()> {
             node: node.clone(),
         },
         provider_runtime_discovery.as_ref(),
+        requested_model_names.first().map(String::as_str),
         &tunnel_mgr,
         api_port,
     )
@@ -1394,6 +1410,7 @@ pub(super) async fn run_auto(ctx: RunAutoContext) -> Result<()> {
         spawn_run_auto_discovery_publisher(&options, &node, console_state.as_ref()).await;
 
     let runtime_data_producer = runtime_data_producer_for_console(console_state.as_ref()).await;
+
     run_auto_runtime_loop_and_shutdown(RunAutoRuntimeLifecycleContext {
         options: &options,
         config: &config,
@@ -1414,7 +1431,7 @@ pub(super) async fn run_auto(ctx: RunAutoContext) -> Result<()> {
         api_proxy_handle,
         console_server_handle,
         discovery_publisher,
-        startup_specs: &startup_specs,
+        startup_specs: &startup_specs_for_provider(&startup_specs, provider_supervisor.as_ref()),
         tunnel_mgr: &tunnel_mgr,
         skippy_telemetry: &skippy_telemetry,
         api_port,
