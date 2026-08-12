@@ -284,8 +284,13 @@ prefills report `skipped_tier_disabled` and cost nothing. Resident, in-process
 reuse is unaffected, because a sequence copy duplicates both caches.
 
 Supporting these models on disk needs a composite page -- a full-prefix base
-page plus an SWA suffix page -- which is a separate piece of work. Adding the
+page plus an SWA suffix page -- which is tracked in issue #1264. Adding the
 ISWA types to the export path without that would be actively unsafe.
+
+Inkling is the hardest case and has its own issue, #1265: it is both
+hybrid-recurrent and sliding-window, so its recurrent state round-trips while
+its attention KV half is declined. It needs the composite page *and* the
+recurrent component restored together.
 
 ## Retention policy
 
