@@ -47,6 +47,9 @@ pub(in crate::network::openai) fn virtual_mesh_context_length(
         if model == mesh_mixture_of_agents::VIRTUAL_MODEL_NAME {
             continue;
         }
+        if crate::network::openai::provider_policy::is_explicit_only_model(model) {
+            continue;
+        }
         let context = runtimes
             .iter()
             .filter(|runtime| runtime.model_name == *model)
@@ -63,7 +66,10 @@ pub(in crate::network::openai) fn virtual_mesh_context_length(
 pub(in crate::network::openai) fn should_advertise_virtual_mesh(models: &[String]) -> bool {
     models
         .iter()
-        .filter(|model| model.as_str() != mesh_mixture_of_agents::VIRTUAL_MODEL_NAME)
+        .filter(|model| {
+            model.as_str() != mesh_mixture_of_agents::VIRTUAL_MODEL_NAME
+                && !crate::network::openai::provider_policy::is_explicit_only_model(model)
+        })
         .take(2)
         .count()
         >= 2
@@ -79,6 +85,7 @@ mod tests {
             identity_hash: None,
             context_length,
             ready: true,
+            ..Default::default()
         }
     }
 
