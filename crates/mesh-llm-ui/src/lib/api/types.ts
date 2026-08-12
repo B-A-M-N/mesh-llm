@@ -115,6 +115,7 @@ export interface PeerInfo {
   release_attestation?: ReleaseAttestationSummary
   gpus?: GpuInfo[]
   first_joined_mesh_ts?: number
+  provider_runtimes?: ProviderRuntimeInfo[]
 }
 
 export type MeshPublicationState = 'private' | 'public' | 'publish_failed'
@@ -130,8 +131,28 @@ export interface RuntimeStageInfo {
 
 export interface RuntimeInfo {
   backend?: string
-  models?: { name: string; status: string; port?: number }[]
+  models?: RuntimeModelInfo[]
   stages?: RuntimeStageInfo[]
+}
+
+export interface ProviderRuntimeInfo {
+  model_name: string
+  provider_kind?: string
+  model_version?: string
+  max_concurrent_requests?: number
+  active_requests?: number
+  queued_requests?: number
+}
+
+export interface RuntimeModelInfo {
+  name: string
+  status: string
+  port?: number
+  provider_kind?: string
+  model_version?: string
+  max_concurrent_requests?: number
+  active_requests?: number
+  queued_requests?: number
 }
 
 export interface StatusPayload {

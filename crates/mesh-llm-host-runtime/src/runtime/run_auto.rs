@@ -5,9 +5,9 @@ use super::{
     AutoRuntimeNodeSetup, BootstrapProxyStopTx, DashboardContextUsage, ManagedModelController,
     ModelTargetReconciliationPolicy, ModelTargetReconciliationState, OpenAiGuardrailPolicyHandle,
     PreparedRuntimeStartup, ProviderRuntimeDiscoveryOptions, ProviderSupervisorContext,
-    RunAutoAdditionalModelsContext, RunAutoConsoleStateContext, RunAutoRuntimeLifecycleContext,
-    RunAutoServingSurface, RunAutoServingSurfaceContext, RuntimeCapacityLedger,
-    RuntimeDashboardSnapshotProvider, RuntimeEvent, RuntimeInstanceRegistry,
+    ProviderSupervisorHandle, RunAutoAdditionalModelsContext, RunAutoConsoleStateContext,
+    RunAutoRuntimeLifecycleContext, RunAutoServingSurface, RunAutoServingSurfaceContext,
+    RuntimeCapacityLedger, RuntimeDashboardSnapshotProvider, RuntimeEvent, RuntimeInstanceRegistry,
     RuntimeModelHandleEntry, RuntimeOptions, RuntimeResourcePlanningProfile, RuntimeSurface,
     SkippyNativeLogForwardingGuard, StartupLocalModelTask, StartupMeshCreationState,
     StartupModelPlan, StartupModelSpec, StartupReadyReporter, bridge_skippy_native_logs,
@@ -1180,6 +1180,25 @@ pub(super) struct RunAutoContext {
     pub(super) provider_runtime_discovery: Option<ProviderRuntimeDiscoveryOptions>,
 }
 
+async fn start_provider_for_openai_surface(
+    is_client: bool,
+    context: ProviderSupervisorContext,
+    discovery: Option<&ProviderRuntimeDiscoveryOptions>,
+    tunnel_mgr: &tunnel::Manager,
+    api_port: u16,
+) -> Option<ProviderSupervisorHandle> {
+    if is_client {
+        return None;
+    }
+    let supervisor = start_apple_provider_supervisor(context, discovery).await;
+    if supervisor.is_some() {
+        // Provider-only hosts have no GGUF startup loop to register the API
+        // port. Provider gossip begins only after the sidecar is healthy.
+        tunnel_mgr.set_http_port(api_port);
+    }
+    supervisor
+}
+
 #[expect(
     clippy::cognitive_complexity,
     reason = "run_auto is the top-level runtime orchestration path and preserves startup/shutdown ordering"
@@ -1332,19 +1351,19 @@ pub(super) async fn run_auto(ctx: RunAutoContext) -> Result<()> {
     })
     .await?;
 
-    let provider_supervisor = if is_client {
-        None
-    } else {
-        start_apple_provider_supervisor(
-            ProviderSupervisorContext {
-                target_tx: target_tx.clone(),
-                dashboard_processes: runtime_state.dashboard_processes.clone(),
-                console_state: console_state.clone(),
-            },
-            provider_runtime_discovery.as_ref(),
-        )
-        .await
-    };
+    let provider_supervisor = start_provider_for_openai_surface(
+        is_client,
+        ProviderSupervisorContext {
+            target_tx: target_tx.clone(),
+            dashboard_processes: runtime_state.dashboard_processes.clone(),
+            console_state: console_state.clone(),
+            node: node.clone(),
+        },
+        provider_runtime_discovery.as_ref(),
+        &tunnel_mgr,
+        api_port,
+    )
+    .await;
 
     let primary_model_name = requested_model_names.first().cloned().unwrap_or_default();
     let startup_ready_reporter = StartupReadyReporter::new_with_failure_policy(

@@ -37,7 +37,7 @@ use super::response::{
 };
 use super::routing_rank::{
     cached_auto_model_satisfies_media_requirements, move_target_first,
-    order_remote_hosts_by_context, order_targets_by_context,
+    order_remote_hosts_by_context, order_targets_by_context, preferred_provider_target,
 };
 
 const REMOTE_UNCOMMITTED_RETRIES: usize = 1;
@@ -714,6 +714,7 @@ async fn resolve_auto_model_request(args: AutoModelRequestArgs<'_>) -> AutoModel
     let routing_metrics = node.routing_metrics();
     let with_caps: Vec<router::RoutingCandidate<'_>> = served
         .iter()
+        .filter(|name| !super::provider_policy::is_explicit_only_model(name))
         .map(|name| {
             let caps = capabilities_for_model(name, descriptors);
             let (tps_hint, throughput_samples) = routing_metrics
@@ -998,13 +999,18 @@ async fn route_model_request_inner(args: RouteModelRequestArgs<'_>) -> bool {
         return true;
     }
 
-    let selection = crate::network::affinity::select_model_target_from_candidates(
+    let mut selection = crate::network::affinity::select_model_target_from_candidates(
         targets,
         &ordered_candidates,
         model,
         request.body_json.as_ref(),
         affinity,
     );
+    if !selection.affinity_selected
+        && let Some(preferred) = preferred_provider_target(&node, model, &ordered_candidates).await
+    {
+        selection.target = preferred;
+    }
     if matches!(selection.target, election::InferenceTarget::None) {
         return send_route_model_none_target(&node, tcp_stream, model).await;
     }
@@ -1618,6 +1624,7 @@ mod tests {
             identity_hash: None,
             context_length: Some(32_768),
             ready: true,
+            ..Default::default()
         }];
         node.insert_test_peer(peer).await;
         let affinity = AffinityRouter::new();

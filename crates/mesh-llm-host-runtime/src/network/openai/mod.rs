@@ -2,6 +2,7 @@ pub(crate) mod auto_route;
 mod forwarded_request;
 pub(crate) mod ingress;
 pub(crate) mod moa_gateway;
+mod provider_policy;
 mod request_normalize;
 mod request_parse;
 mod response;
