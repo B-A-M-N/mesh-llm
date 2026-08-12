@@ -55,10 +55,12 @@ pub(in crate::binary_transport) struct BinaryRestoredPrefix {
     resident_seq_id: Option<i32>,
     resident_borrowed: Option<bool>,
     exact: bool,
+    /// Which tier served the payload, for hit attribution.
+    source: &'static str,
 }
 
 impl BinaryRestoredPrefix {
-    fn exact(page_id: String, token_count: usize, entries: usize) -> Self {
+    fn exact(page_id: String, token_count: usize, entries: usize, source: &'static str) -> Self {
         Self {
             page_id,
             token_count,
@@ -66,6 +68,7 @@ impl BinaryRestoredPrefix {
             resident_seq_id: None,
             resident_borrowed: None,
             exact: true,
+            source,
         }
     }
 
@@ -83,6 +86,7 @@ impl BinaryRestoredPrefix {
             resident_seq_id: None,
             resident_borrowed: None,
             exact: false,
+            source: "disk",
         }
     }
 
@@ -100,10 +104,15 @@ impl BinaryRestoredPrefix {
             resident_seq_id: Some(seq_id),
             resident_borrowed: Some(borrowed),
             exact: false,
+            source: "ram",
         }
     }
 
     fn insert_hit_attrs(&self, attrs: &mut BTreeMap<String, Value>) {
+        attrs.insert(
+            "skippy.exact_cache.hit_source".to_string(),
+            json!(self.source),
+        );
         if self.exact {
             attrs.insert(
                 "skippy.exact_cache.hit_page_id".to_string(),
@@ -322,6 +331,7 @@ fn restore_binary_prefix(
             restored.page_id,
             restored.token_count,
             restored.entries,
+            restored.source.as_str(),
         ))),
         None => {
             if let Some(restored) =

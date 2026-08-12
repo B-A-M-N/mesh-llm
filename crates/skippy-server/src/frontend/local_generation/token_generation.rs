@@ -565,6 +565,15 @@ impl StageOpenAiBackend {
                                     "skippy.kv.disk_payload_bytes".to_string(),
                                     json!(restored.payload_bytes),
                                 );
+                                // A dense disk hit is by definition served
+                                // from disk; state it explicitly so the hit
+                                // stream is attributable without knowing
+                                // which decision label implies which tier.
+                                attrs.insert(
+                                    "skippy.exact_cache.hit_source".to_string(),
+                                    json!("disk"),
+                                );
+                                kv.insert_disk_tier_attrs(&mut attrs);
                                 self.telemetry
                                     .emit("stage.openai_kv_lookup_decision", attrs);
                             }
@@ -760,6 +769,7 @@ impl StageOpenAiBackend {
             if let Some(identity) = archive_candidate.take() {
                 let mut attrs = self.openai_attrs(ids);
                 attrs.insert("skippy.kv.decision".to_string(), json!("disk_archive"));
+                kv.insert_disk_tier_attrs(&mut attrs);
                 match kv.archive_dense_prefix(runtime, session_id, &identity) {
                     Ok(outcome) => outcome.insert_attrs(&identity, &mut attrs),
                     Err(error) => {

@@ -305,7 +305,7 @@ impl KvStageIntegration {
     /// process. Without these a disk tier that has quietly stopped storing
     /// (full budget, every write failing, every entry quarantined) is
     /// indistinguishable from one that is simply never probed.
-    fn disk_tier_attrs(&self) -> Vec<(&'static str, Value)> {
+    pub fn disk_tier_attrs(&self) -> Vec<(&'static str, Value)> {
         let Some(stats) = self
             .exact_states
             .lock()
@@ -332,6 +332,18 @@ impl KvStageIntegration {
                 json!(stats.verifications_skipped),
             ),
         ]
+    }
+
+    /// Attach the disk-tier counters to a decision event.
+    ///
+    /// The OpenAI/embedded path builds its attribute maps per decision rather
+    /// than starting from `attrs()`, so without this the counters were only
+    /// ever visible on the binary transport -- i.e. never on the single-node
+    /// dense path that most users actually run.
+    pub fn insert_disk_tier_attrs(&self, attrs: &mut BTreeMap<String, Value>) {
+        for (key, value) in self.disk_tier_attrs() {
+            attrs.insert(key.to_string(), value);
+        }
     }
 
     fn exact_state_stats(&self) -> skippy_cache::ExactStateCacheStats {

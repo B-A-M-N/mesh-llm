@@ -435,6 +435,7 @@ impl StageOpenAiBackend {
             };
             let mut attrs = self.openai_attrs(ids);
             attrs.insert("skippy.kv.decision".to_string(), json!("disk_archive"));
+            kv.insert_disk_tier_attrs(&mut attrs);
             match outcome {
                 Ok(outcome) => outcome.insert_attrs(&identity, &mut attrs),
                 Err(error) => {
@@ -598,6 +599,7 @@ impl StageOpenAiBackend {
             };
             let mut attrs = self.openai_attrs(ids);
             attrs.insert("skippy.kv.decision".to_string(), json!("disk_archive"));
+            kv.insert_disk_tier_attrs(&mut attrs);
             match outcome {
                 Ok(outcome) => outcome.insert_attrs(&identity, &mut attrs),
                 Err(error) => {
