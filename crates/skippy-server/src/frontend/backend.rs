@@ -900,6 +900,28 @@ mod tests {
     }
 
     #[test]
+    fn same_agent_session_requests_are_serialized() {
+        let registry = Arc::new(Mutex::new(BTreeMap::new()));
+        let mut first = GenerationSessionPermit::new(registry.clone(), "agent-1".to_owned())
+            .expect("first session lease");
+        let mut second = GenerationSessionPermit::new(registry.clone(), "agent-1".to_owned())
+            .expect("second session lease");
+        let mut other = GenerationSessionPermit::new(registry.clone(), "agent-2".to_owned())
+            .expect("other session lease");
+
+        assert!(first.try_acquire().expect("first session permit"));
+        assert!(!second.try_acquire().expect("second session must wait"));
+        assert!(other.try_acquire().expect("independent session permit"));
+
+        drop(first);
+        assert!(
+            second
+                .try_acquire()
+                .expect("second session permit after release")
+        );
+    }
+
+    #[test]
     fn untrusted_conversation_affinity_bypasses_session_registry() {
         let registry = Arc::new(Mutex::new(BTreeMap::new()));
         let untrusted = OpenAiGenerationIds::new_with_trust(

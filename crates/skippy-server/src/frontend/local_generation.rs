@@ -5,7 +5,9 @@ mod tests;
 mod token_generation;
 
 #[cfg(test)]
-pub(super) use token_generation::native_mtp_dispatch_counts_for_test;
+pub(super) use token_generation::{
+    linear_proposal_allowed, native_mtp_dispatch_counts_for_test, post_decode_checkpoint_tokens,
+};
 
 use crate::frontend::generation::PhaseTimer;
 use crate::frontend::generation::StageOpenAiBackend;
