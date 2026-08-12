@@ -63,6 +63,9 @@ impl StageOpenAiBackend {
                     .saturating_add(state.decoded_tokens),
                 remaining_new_tokens,
                 runtime_max_proposal_tokens: state.linear_proposal_max_tokens,
+                // The lifecycle-serialized path supplies this delta through
+                // ordered generation events.
+                pending_token_ids: Vec::new().into_boxed_slice(),
             },
         ) {
             Ok(LinearProposalQueryOutcome::Skipped) => {

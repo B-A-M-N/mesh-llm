@@ -70,10 +70,9 @@ impl LinearProposal {
 /// Bounded, target-authoritative state supplied to a proposal source.
 ///
 /// The proposal path deliberately does not pass a full context buffer. The
-/// Ordered lifecycle commits establish the canonical generated-token deltas
-/// before this query is dispatched. The query carries only the resulting
-/// authoritative counts, so a source can update its state from ordered
-/// lifecycle events without copying or hashing an arbitrarily large prompt.
+/// bounded canonical token delta since the previous proposal boundary travels
+/// with this query, so a source can update its state synchronously without a
+/// separate lifecycle event or copying or hashing an arbitrarily large prompt.
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub struct LinearProposalQuery {
@@ -95,6 +94,12 @@ pub struct LinearProposalQuery {
     pub decode_step: usize,
     /// Maximum proposal width Skippy will accept for this query.
     pub max_proposal_tokens: usize,
+    /// Canonical target tokens emitted since the previous proposal boundary.
+    ///
+    /// Proposal sources apply this delta before producing the proposal. Keeping
+    /// the delta on the synchronous query avoids a separate lifecycle event on
+    /// the local-generation hot path.
+    pub pending_token_ids: Box<[i32]>,
     /// Advisory deadline the synchronous source must honor.
     pub deadline: Instant,
 }
@@ -118,8 +123,15 @@ impl LinearProposalQuery {
             committed_token_count,
             decode_step,
             max_proposal_tokens,
+            pending_token_ids: Vec::new().into_boxed_slice(),
             deadline,
         }
+    }
+
+    #[must_use]
+    pub fn with_pending_token_ids(mut self, pending_token_ids: Box<[i32]>) -> Self {
+        self.pending_token_ids = pending_token_ids;
+        self
     }
 }
 
@@ -547,6 +559,7 @@ pub(crate) struct LinearProposalQueryParams {
     pub(crate) committed_token_count: usize,
     pub(crate) remaining_new_tokens: usize,
     pub(crate) runtime_max_proposal_tokens: usize,
+    pub(crate) pending_token_ids: Box<[i32]>,
 }
 
 pub(crate) fn query_linear_proposal(
@@ -576,15 +589,18 @@ pub(crate) fn query_linear_proposal(
     let proposal_started = Instant::now();
     let response = config
         .source()
-        .propose(LinearProposalQuery::new(
-            params.request_id,
-            params.session_id,
-            params.prompt_token_count,
-            params.committed_token_count,
-            params.decode_step,
-            max_proposal_tokens,
-            deadline,
-        ))
+        .propose(
+            LinearProposalQuery::new(
+                params.request_id,
+                params.session_id,
+                params.prompt_token_count,
+                params.committed_token_count,
+                params.decode_step,
+                max_proposal_tokens,
+                deadline,
+            )
+            .with_pending_token_ids(params.pending_token_ids),
+        )
         .map_err(openai_backend_error)?;
     let proposal_elapsed_us = elapsed_us(proposal_started);
     let (proposal, source_telemetry) = response.into_parts();
@@ -714,6 +730,7 @@ mod tests {
             committed_token_count,
             remaining_new_tokens,
             runtime_max_proposal_tokens,
+            pending_token_ids: Vec::new().into_boxed_slice(),
         }
     }
 
