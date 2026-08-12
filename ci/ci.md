@@ -306,6 +306,9 @@ flowchart TD
 - Pull requests test affected crates plus their reverse dependents. Main pushes
   and manual dispatches assign every Cargo workspace member to the matrix, so a
   targeted-routing mistake cannot permanently hide a crate suite.
+- The executable-provider artifact contract in `mesh-llm-provider-runtime` is
+  an SDK-smoke input. It remains separate from the Skippy-native runtime crate,
+  but changes to either contract exercise SDK consumers.
 - `rust_changed` is not an artifact-build signal. Rust tooling changes such as
   `tools/xtask/**` still run PR Quality formatting/clippy, but PR Builds only
   builds `mesh-llm` artifacts when `inference_artifact_required` is true: a

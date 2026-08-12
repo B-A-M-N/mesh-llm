@@ -207,6 +207,8 @@ Local actions:
 Routing and test-planning scripts:
 
 - `scripts/affected-crates.sh` computes affected crates and reverse dependents.
+- `mesh-llm-provider-runtime` is a runtime-facing SDK input: changes to its
+  executable-provider artifact contract route the SDK smoke graph.
 - `scripts/plan-pr-build-jobs.py` maps PR change signals to the single ordered
   top-level job plan consumed by both conditional PR Builds jobs and its stable
   summary gate.

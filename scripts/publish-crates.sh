@@ -392,6 +392,7 @@ publish_crates=(
     mesh-llm-node
     mesh-llm-api-server
     mesh-llm-native-runtime
+    mesh-llm-provider-runtime
     mesh-llm-hardware-profile
     skippy-runtime
     openai-frontend
