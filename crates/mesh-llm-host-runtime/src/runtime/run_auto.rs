@@ -4,18 +4,18 @@ use super::status::mesh_guardrail_mode_to_openai;
 use super::{
     AutoRuntimeNodeSetup, BootstrapProxyStopTx, DashboardContextUsage, ManagedModelController,
     ModelTargetReconciliationPolicy, ModelTargetReconciliationState, OpenAiGuardrailPolicyHandle,
-    PreparedRuntimeStartup, ProviderSupervisorContext, RunAutoAdditionalModelsContext,
-    RunAutoConsoleStateContext, RunAutoRuntimeLifecycleContext, RunAutoServingSurface,
-    RunAutoServingSurfaceContext, RuntimeCapacityLedger, RuntimeDashboardSnapshotProvider,
-    RuntimeEvent, RuntimeInstanceRegistry, RuntimeModelHandleEntry, RuntimeOptions,
-    RuntimeResourcePlanningProfile, RuntimeSurface, SkippyNativeLogForwardingGuard,
-    StartupLocalModelTask, StartupMeshCreationState, StartupModelPlan, StartupModelSpec,
-    StartupReadyReporter, bridge_skippy_native_logs, build_serving_list, cli_has_explicit_models,
-    configure_skippy_native_logging, emit_configuration_ui_read_only_hint,
-    initialize_embedded_runtime_entrypoint, initialize_runtime_entrypoint,
-    maybe_discover_join_candidates, next_runtime_instance_id, nostr_rediscovery, nostr_relays,
-    openai_guardrail_policy_handle, owner_runtime_config, prepare_runtime_startup,
-    publish_initial_openai_guardrails_status, record_first_joined_mesh_ts,
+    PreparedRuntimeStartup, ProviderRuntimeDiscoveryOptions, ProviderSupervisorContext,
+    RunAutoAdditionalModelsContext, RunAutoConsoleStateContext, RunAutoRuntimeLifecycleContext,
+    RunAutoServingSurface, RunAutoServingSurfaceContext, RuntimeCapacityLedger,
+    RuntimeDashboardSnapshotProvider, RuntimeEvent, RuntimeInstanceRegistry,
+    RuntimeModelHandleEntry, RuntimeOptions, RuntimeResourcePlanningProfile, RuntimeSurface,
+    SkippyNativeLogForwardingGuard, StartupLocalModelTask, StartupMeshCreationState,
+    StartupModelPlan, StartupModelSpec, StartupReadyReporter, bridge_skippy_native_logs,
+    build_serving_list, cli_has_explicit_models, configure_skippy_native_logging,
+    emit_configuration_ui_read_only_hint, initialize_embedded_runtime_entrypoint,
+    initialize_runtime_entrypoint, maybe_discover_join_candidates, next_runtime_instance_id,
+    nostr_rediscovery, nostr_relays, openai_guardrail_policy_handle, owner_runtime_config,
+    prepare_runtime_startup, publish_initial_openai_guardrails_status, record_first_joined_mesh_ts,
     resolve_runtime_owner_key_path, resolve_startup_mesh_creation_state, run_auto_join_mesh_phase,
     run_auto_model_identity, run_auto_model_path_or_shutdown, run_auto_runtime_loop_and_shutdown,
     run_local_model_only, runtime_data_producer_for_console, runtime_startup_requirements,
@@ -114,6 +114,7 @@ pub(crate) struct EmbeddedRuntimeOptions {
     pub(crate) config_path: Option<PathBuf>,
     pub(crate) log_format: LogFormat,
     pub(crate) headless: bool,
+    pub(crate) provider_runtimes: ProviderRuntimeDiscoveryOptions,
     pub(crate) control_rx: Option<tokio::sync::mpsc::UnboundedReceiver<api::RuntimeControlRequest>>,
 }
 
@@ -169,7 +170,7 @@ pub(super) fn write_runtime_owner_metadata(
 
 pub(crate) async fn run() -> Result<()> {
     initialize_runtime_entrypoint()?;
-    run_runtime_cli(RuntimeOptions::default(), None, None, None).await
+    run_runtime_cli(RuntimeOptions::default(), None, None, None, None).await
 }
 
 pub(crate) async fn run_cli(
@@ -178,7 +179,7 @@ pub(crate) async fn run_cli(
     legacy_warning: Option<String>,
 ) -> Result<()> {
     initialize_runtime_entrypoint()?;
-    run_runtime_cli(options, explicit_surface, legacy_warning, None).await
+    run_runtime_cli(options, explicit_surface, legacy_warning, None, None).await
 }
 
 pub(crate) async fn run_embedded_runtime(mut options: EmbeddedRuntimeOptions) -> Result<()> {
@@ -186,8 +187,16 @@ pub(crate) async fn run_embedded_runtime(mut options: EmbeddedRuntimeOptions) ->
 
     let surface = options.runtime_surface();
     let control_rx = options.control_rx.take();
+    let provider_runtimes = options.provider_runtimes.clone();
     let options = options_from_embedded_options(options);
-    run_runtime_cli(options, Some(surface), None, control_rx).await
+    run_runtime_cli(
+        options,
+        Some(surface),
+        None,
+        control_rx,
+        Some(provider_runtimes),
+    )
+    .await
 }
 
 pub(super) fn options_from_embedded_options(embedded: EmbeddedRuntimeOptions) -> RuntimeOptions {
@@ -238,6 +247,7 @@ pub(super) async fn run_runtime_cli(
     explicit_surface: Option<RuntimeSurface>,
     legacy_warning: Option<String>,
     embedded_control_rx: Option<tokio::sync::mpsc::UnboundedReceiver<api::RuntimeControlRequest>>,
+    provider_runtime_discovery: Option<ProviderRuntimeDiscoveryOptions>,
 ) -> Result<()> {
     options.validate_discovery_mode_args()?;
 
@@ -331,6 +341,7 @@ pub(super) async fn run_runtime_cli(
         runtime,
         auto_join_candidates,
         embedded_control_rx,
+        provider_runtime_discovery,
     })
     .await
 }
@@ -1166,6 +1177,7 @@ pub(super) struct RunAutoContext {
     pub(super) auto_join_candidates: Vec<(String, Option<String>)>,
     pub(super) embedded_control_rx:
         Option<tokio::sync::mpsc::UnboundedReceiver<api::RuntimeControlRequest>>,
+    pub(super) provider_runtime_discovery: Option<ProviderRuntimeDiscoveryOptions>,
 }
 
 #[expect(
@@ -1183,6 +1195,7 @@ pub(super) async fn run_auto(ctx: RunAutoContext) -> Result<()> {
         runtime,
         auto_join_candidates,
         mut embedded_control_rx,
+        provider_runtime_discovery,
     } = ctx;
     let resolved_plugins = resolve_plugins_from_config(&config, &options)?;
     let swarm_capture = configure_swarm_capture(&options)?;
@@ -1322,11 +1335,14 @@ pub(super) async fn run_auto(ctx: RunAutoContext) -> Result<()> {
     let provider_supervisor = if is_client {
         None
     } else {
-        start_apple_provider_supervisor(ProviderSupervisorContext {
-            target_tx: target_tx.clone(),
-            dashboard_processes: runtime_state.dashboard_processes.clone(),
-            console_state: console_state.clone(),
-        })
+        start_apple_provider_supervisor(
+            ProviderSupervisorContext {
+                target_tx: target_tx.clone(),
+                dashboard_processes: runtime_state.dashboard_processes.clone(),
+                console_state: console_state.clone(),
+            },
+            provider_runtime_discovery.as_ref(),
+        )
         .await
     };
 

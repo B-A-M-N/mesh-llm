@@ -82,7 +82,10 @@ use self::control_loop::*;
 use self::dashboard::*;
 pub use self::discovery::nostr_relays;
 use self::model_lifecycle::*;
-use self::provider_supervisor::*;
+pub(crate) use self::provider_supervisor::ProviderRuntimeDiscoveryOptions;
+use self::provider_supervisor::{
+    ProviderSupervisorContext, ProviderSupervisorHandle, start_apple_provider_supervisor,
+};
 use self::publication::*;
 pub use self::run_auto::load_resolved_plugins;
 use self::run_auto::*;
