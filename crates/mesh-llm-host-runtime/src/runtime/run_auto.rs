@@ -4,24 +4,25 @@ use super::status::mesh_guardrail_mode_to_openai;
 use super::{
     AutoRuntimeNodeSetup, BootstrapProxyStopTx, DashboardContextUsage, ManagedModelController,
     ModelTargetReconciliationPolicy, ModelTargetReconciliationState, OpenAiGuardrailPolicyHandle,
-    PreparedRuntimeStartup, RunAutoAdditionalModelsContext, RunAutoConsoleStateContext,
-    RunAutoRuntimeLifecycleContext, RunAutoServingSurface, RunAutoServingSurfaceContext,
-    RuntimeCapacityLedger, RuntimeDashboardSnapshotProvider, RuntimeEvent, RuntimeInstanceRegistry,
-    RuntimeModelHandleEntry, RuntimeOptions, RuntimeResourcePlanningProfile, RuntimeSurface,
-    SkippyNativeLogForwardingGuard, StartupLocalModelTask, StartupMeshCreationState,
-    StartupModelPlan, StartupModelSpec, StartupReadyReporter, bridge_skippy_native_logs,
-    build_serving_list, cli_has_explicit_models, configure_skippy_native_logging,
-    emit_configuration_ui_read_only_hint, initialize_embedded_runtime_entrypoint,
-    initialize_runtime_entrypoint, maybe_discover_join_candidates, next_runtime_instance_id,
-    nostr_rediscovery, nostr_relays, openai_guardrail_policy_handle, owner_runtime_config,
-    prepare_runtime_startup, publish_initial_openai_guardrails_status, record_first_joined_mesh_ts,
+    PreparedRuntimeStartup, ProviderSupervisorContext, RunAutoAdditionalModelsContext,
+    RunAutoConsoleStateContext, RunAutoRuntimeLifecycleContext, RunAutoServingSurface,
+    RunAutoServingSurfaceContext, RuntimeCapacityLedger, RuntimeDashboardSnapshotProvider,
+    RuntimeEvent, RuntimeInstanceRegistry, RuntimeModelHandleEntry, RuntimeOptions,
+    RuntimeResourcePlanningProfile, RuntimeSurface, SkippyNativeLogForwardingGuard,
+    StartupLocalModelTask, StartupMeshCreationState, StartupModelPlan, StartupModelSpec,
+    StartupReadyReporter, bridge_skippy_native_logs, build_serving_list, cli_has_explicit_models,
+    configure_skippy_native_logging, emit_configuration_ui_read_only_hint,
+    initialize_embedded_runtime_entrypoint, initialize_runtime_entrypoint,
+    maybe_discover_join_candidates, next_runtime_instance_id, nostr_rediscovery, nostr_relays,
+    openai_guardrail_policy_handle, owner_runtime_config, prepare_runtime_startup,
+    publish_initial_openai_guardrails_status, record_first_joined_mesh_ts,
     resolve_runtime_owner_key_path, resolve_startup_mesh_creation_state, run_auto_join_mesh_phase,
     run_auto_model_identity, run_auto_model_path_or_shutdown, run_auto_runtime_loop_and_shutdown,
     run_local_model_only, runtime_data_producer_for_console, runtime_startup_requirements,
     setup_run_auto_console_state, setup_run_auto_serving_surface,
     spawn_embedded_runtime_control_forwarder, spawn_run_auto_additional_model_tasks,
-    spawn_run_auto_discovery_publisher, start_run_auto_bootstrap_proxy, startup_local_model_loop,
-    swarm_capture_observer_requested,
+    spawn_run_auto_discovery_publisher, start_apple_provider_supervisor,
+    start_run_auto_bootstrap_proxy, startup_local_model_loop, swarm_capture_observer_requested,
 };
 use crate::api;
 use crate::inference::{election, skippy};
@@ -1318,6 +1319,17 @@ pub(super) async fn run_auto(ctx: RunAutoContext) -> Result<()> {
     })
     .await?;
 
+    let provider_supervisor = if is_client {
+        None
+    } else {
+        start_apple_provider_supervisor(ProviderSupervisorContext {
+            target_tx: target_tx.clone(),
+            dashboard_processes: runtime_state.dashboard_processes.clone(),
+            console_state: console_state.clone(),
+        })
+        .await
+    };
+
     let primary_model_name = requested_model_names.first().cloned().unwrap_or_default();
     let startup_ready_reporter = StartupReadyReporter::new_with_failure_policy(
         &requested_model_names,
@@ -1375,6 +1387,7 @@ pub(super) async fn run_auto(ctx: RunAutoContext) -> Result<()> {
         interactive_started,
         lan_bootstrap_tasks,
         runtime,
+        provider_supervisor,
     })
     .await;
     if let Some(summary) = startup_ready_reporter.fail_fast_summary() {
