@@ -85,6 +85,7 @@ mod connections;
 mod direct_path;
 mod gossip;
 mod heartbeat;
+mod host_role_claims;
 mod identity_persistence;
 mod lan_bootstrap;
 mod model_identity;
@@ -108,6 +109,7 @@ mod stun;
 
 use connection_reservation::*;
 use connections::*;
+pub(crate) use host_role_claims::{HostRoleClaim, HostRoleClaims};
 use model_identity::*;
 use node_identity::*;
 use operational_logging::{MeshOperationalEvent, record_mesh_operational_event};

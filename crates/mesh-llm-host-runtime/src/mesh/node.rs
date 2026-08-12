@@ -40,6 +40,7 @@ pub struct Node {
     pub(crate) local_mesh_requirements: crate::MeshRequirements,
     pub(crate) state: Arc<Mutex<MeshState>>,
     pub(crate) role: Arc<Mutex<NodeRole>>,
+    pub(crate) host_role_claims: Arc<Mutex<HostRoleClaims>>,
     pub(crate) models: Arc<Mutex<Vec<String>>>,
     pub(crate) model_source: Arc<Mutex<Option<String>>>,
     pub(crate) serving_models: Arc<Mutex<Vec<String>>>,
@@ -775,6 +776,7 @@ impl Node {
                 recent_mesh_rejections: VecDeque::new(),
             })),
             role: Arc::new(Mutex::new(role)),
+            host_role_claims: Arc::new(Mutex::new(HostRoleClaims::default())),
             models: Arc::new(Mutex::new(Vec::new())),
             model_source: Arc::new(Mutex::new(None)),
             serving_models: Arc::new(Mutex::new(Vec::new())),
@@ -950,6 +952,7 @@ impl Node {
                 recent_mesh_rejections: VecDeque::new(),
             })),
             role: Arc::new(Mutex::new(role)),
+            host_role_claims: Arc::new(Mutex::new(HostRoleClaims::default())),
             models: Arc::new(Mutex::new(Vec::new())),
             model_source: Arc::new(Mutex::new(None)),
             serving_models: Arc::new(Mutex::new(Vec::new())),
@@ -1154,6 +1157,7 @@ impl Node {
         self.role.lock().await.clone()
     }
 
+    #[cfg(test)]
     pub async fn set_role(&self, role: NodeRole) {
         *self.role.lock().await = role;
     }

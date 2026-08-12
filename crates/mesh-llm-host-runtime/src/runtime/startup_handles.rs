@@ -19,7 +19,7 @@ use super::{
 };
 use crate::api;
 use crate::inference::{election, skippy};
-use crate::mesh::{self, NodeRole};
+use crate::mesh;
 use crate::network::tunnel;
 use crate::plugin;
 use crate::runtime::interactive;
@@ -665,6 +665,11 @@ pub(super) async fn startup_handle_fallback_failure(
             event.reason, event.generation, unavailable_stage_nodes
         )),
     });
+    // The failed fallback exits without the shared shutdown path, so release
+    // the local-model host claim explicitly before returning to the runtime.
+    ctx.node
+        .release_host_role(mesh::HostRoleClaim::LocalModel)
+        .await;
     startup_remove_runtime_instance_artifacts(ctx, model_name).await;
     StartupLoopControl::Return
 }
@@ -952,6 +957,9 @@ pub(super) async fn startup_shutdown_local_model_loop(
         task.abort();
         let _ = task.await;
     }
+    ctx.node
+        .release_host_role(mesh::HostRoleClaim::LocalModel)
+        .await;
     if !state.survey_exited_unexpectedly {
         ctx.survey_telemetry
             .record_unload(&state.survey_loaded_model);
@@ -1527,9 +1535,7 @@ pub(super) async fn startup_publish_loaded_runtime(
 ) {
     let payload = startup_register_loaded_runtime(ctx, loaded_name, handle).await;
     ctx.node
-        .set_role(NodeRole::Host {
-            http_port: ctx.api_port,
-        })
+        .claim_host_role(mesh::HostRoleClaim::LocalModel, ctx.api_port)
         .await;
     refresh_dashboard_context_usage(ctx.dashboard_context_usage, loaded_name, handle).await;
     publish_runtime_llama_slots(
