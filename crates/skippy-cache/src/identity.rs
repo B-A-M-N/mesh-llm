@@ -55,6 +55,35 @@ pub fn prefix_hash(config: &StageConfig, token_start: u64, token_ids: &[i32]) ->
 ///
 /// `NATIVE_KV_DTYPE` is a fixed layout tag and does **not** vary with the
 /// configured cache types, so it cannot stand in for them.
+/// Hash the identity of the *machine* the page bytes were produced on.
+///
+/// Page files are raw runtime memory. Their interpretation depends on the CPU
+/// architecture, the native byte order, and the pointer width of the process
+/// that exported them, and none of those appear anywhere else in the identity.
+/// In the default machine-local cache directory that is harmless. It stops
+/// being harmless the moment a directory is shared or copied:
+/// `SKIPPY_KV_DISK_TIER_DIR` accepts any path, the stage directory key holds
+/// only model and stage shape, and `backend_device` does not separate an
+/// x86_64 CUDA host from an aarch64 CUDA host, nor two CPU-only hosts that
+/// both record `<no-selected-device>`. The checksums would confirm the copied
+/// bytes arrived intact and the runtime would then import them as native — a
+/// silent misread, not a detected error.
+///
+/// Note that the identity hash deliberately encodes its own integers as
+/// little-endian, so two hosts of *different* native endianness otherwise
+/// compute the *same* page id. That is correct for a portable identifier and
+/// exactly why the byte order has to be named explicitly here.
+fn update_platform_identity(hasher: &mut blake3::Hasher) {
+    hasher.update(b"kv-platform-identity-v1");
+    hasher.update(std::env::consts::ARCH.as_bytes());
+    hasher.update(if cfg!(target_endian = "little") {
+        b"endian:le"
+    } else {
+        b"endian:be"
+    });
+    hasher.update(&(usize::BITS).to_le_bytes());
+}
+
 fn update_layout_identity(hasher: &mut blake3::Hasher, config: &StageConfig) {
     hasher.update(b"kv-layout-identity-v1");
     hasher.update(config.cache_type_k.as_bytes());
@@ -155,6 +184,7 @@ pub fn prefix_hash_with_namespace(
     hasher.update(&NATIVE_KV_LAYER_CONTIGUOUS_LAYOUT.to_le_bytes());
     hasher.update(NATIVE_KV_DTYPE.as_bytes());
     update_layout_identity(&mut hasher, config);
+    update_platform_identity(&mut hasher);
     hasher.update(format!("ctx:{}", config.ctx_size).as_bytes());
     if let Some(cache_namespace) = cache_namespace {
         hasher.update(b"openai-cache-namespace-v1");
@@ -289,6 +319,48 @@ mod identity_completeness_tests {
         };
 
         assert_ne!(hash_of(&test_config()), hash_of(&offloaded));
+    }
+
+    /// The platform tag is part of the hash, so a page written on one
+    /// architecture cannot be read back on another through a shared or copied
+    /// cache directory. Asserted against the real values rather than a
+    /// hand-built string so that dropping the call from `prefix_hash` fails
+    /// here.
+    #[test]
+    fn platform_identity_is_bound_into_the_page_hash() {
+        let mut with_platform = blake3::Hasher::new();
+        update_platform_identity(&mut with_platform);
+        let mut other_arch = blake3::Hasher::new();
+        other_arch.update(b"kv-platform-identity-v1");
+        other_arch.update(b"some-other-arch");
+        other_arch.update(b"endian:le");
+        other_arch.update(&(usize::BITS).to_le_bytes());
+
+        assert_ne!(with_platform.finalize(), other_arch.finalize());
+
+        let mut other_endian = blake3::Hasher::new();
+        other_endian.update(b"kv-platform-identity-v1");
+        other_endian.update(std::env::consts::ARCH.as_bytes());
+        other_endian.update(if cfg!(target_endian = "little") {
+            b"endian:be"
+        } else {
+            b"endian:le"
+        });
+        other_endian.update(&(usize::BITS).to_le_bytes());
+
+        assert_ne!(with_platform.finalize(), other_endian.finalize());
+
+        let mut other_width = blake3::Hasher::new();
+        other_width.update(b"kv-platform-identity-v1");
+        other_width.update(std::env::consts::ARCH.as_bytes());
+        other_width.update(if cfg!(target_endian = "little") {
+            b"endian:le"
+        } else {
+            b"endian:be"
+        });
+        other_width.update(&(usize::BITS / 2).to_le_bytes());
+
+        assert_ne!(with_platform.finalize(), other_width.finalize());
     }
 
     /// Pages are not portable across backends. A CUDA page must never be

@@ -237,6 +237,47 @@ mismatch discards it. Bump it whenever any of the following changes:
 There is no migration path and none should be added. The contents are
 regenerable, and the cost of being wrong is numerical corruption.
 
+The bump rule applies from the first **released** version onward. Identity
+changes made before version 1 ships do not need a bump, because no on-disk
+directory claiming version 1 exists yet in any build a user could have run.
+
+## Platform binding
+
+Page files are raw runtime memory, so their interpretation depends on the CPU
+architecture, native byte order, and pointer width of the process that wrote
+them. `update_platform_identity` hashes all three into the page id.
+
+This matters because the identity hash deliberately encodes its own integers
+as little-endian, so two hosts of different native endianness would otherwise
+compute the *same* page id for the same tokens. In the default machine-local
+cache directory that is harmless, but `SKIPPY_KV_DISK_TIER_DIR` accepts any
+path, including shared or copied storage; the stage directory key holds only
+model and stage shape; and `backend_device` does not distinguish an x86_64
+CUDA host from an aarch64 CUDA host, nor two CPU-only hosts that both record
+`<no-selected-device>`. Without the platform tag, a copied directory could
+produce a hit whose checksums pass -- the bytes did arrive intact -- and whose
+import is a silent misread.
+
+With it, a page from a different platform is a miss, never a wrong hit, and
+several platforms can share one directory without quarantining each other.
+
+## Retention policy
+
+Retention is LRU under a hard byte budget, with no TTL, and that is deliberate.
+
+The workload this tier exists for is an agent prefix that is returned to after
+a long gap; age alone does not make a content-bound page wrong. Entries become
+*unreachable* rather than incorrect when the model or configuration changes,
+because identity binds both. If no new writes arrive, retained entries consume
+no more than the budget already allotted them, and deleting them only forfeits
+future hits.
+
+A TTL would therefore be a privacy or disk-hygiene control, not a correctness
+one. The genuine gap is different: stage directories abandoned when `model_id`
+or stage shape changes are outside any tier subsequently opened, so nothing
+reclaims them. That wants a base-directory quota or GC, not expiry inside
+active caches.
+
 ## Observability
 
 Disk-tier counters are exported as telemetry attributes on every KV decision
