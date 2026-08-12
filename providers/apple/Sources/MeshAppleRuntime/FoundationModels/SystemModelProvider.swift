@@ -78,7 +78,7 @@ public actor SystemModelProvider {
       supportedLanguages: model.supportedLanguages
         .map(languageIdentifier)
         .sorted(),
-      variant: "system-default-\(modelVersion)",
+      variant: model.variant.displayName,
       modelVersion: modelVersion,
       versionSource: AppleRuntimeIdentifiers.systemModelVersionSource,
       versionedModelID: versionedModelID,
