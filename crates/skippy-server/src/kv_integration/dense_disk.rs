@@ -50,6 +50,9 @@ impl KvStageIntegration {
     /// Whether dense prefixes should be archived to the disk tier.
     fn dense_archive_enabled(&self) -> bool {
         self.payload == StagePrefixCachePayload::ResidentKv
+            && !self
+                .dense_archive_unsupported
+                .load(std::sync::atomic::Ordering::Relaxed)
             && self
                 .exact_states
                 .lock()
@@ -99,7 +102,27 @@ impl KvStageIntegration {
             // failure of the archive, not a policy decision, and collapsing
             // the two is exactly why a tier that never stores anything can
             // look healthy.
-            Err(_) => return Ok(DenseArchiveOutcome::Failed(DenseArchiveFailure::Export)),
+            Err(error) => {
+                let reason = error.to_string();
+                // An unsupported memory layout is a permanent property of this
+                // stage, not a transient failure of this request. Latch it off
+                // so we stop paying for an export attempt on every prefill,
+                // and report it as a skip: nothing is broken, this model's
+                // attention state simply cannot be described by one page.
+                if is_unsupported_memory_layout(&reason) {
+                    self.dense_archive_unsupported
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                    return Ok(DenseArchiveOutcome::Skipped(
+                        DenseArchiveSkip::UnsupportedMemoryLayout,
+                    ));
+                }
+                // Carry the native reason. "The export failed" without a cause
+                // is only marginally better than the silent bool this replaced:
+                // it says something is wrong and nothing about what.
+                return Ok(DenseArchiveOutcome::Failed(DenseArchiveFailure::Export {
+                    reason,
+                }));
+            }
         };
         let export_ms = export_timer.elapsed().as_secs_f64() * 1000.0;
         let payload_bytes = page.payload.len() as u64;
@@ -257,13 +280,19 @@ pub enum DenseArchiveSkip {
     TooShort,
     /// The tier already holds this page.
     AlreadyArchived,
+    /// The runtime's attention memory cannot be exported as one native KV
+    /// page. Sliding-window models split attention across a full-context base
+    /// cache and a window-bounded SWA cache; a single page with a single token
+    /// range cannot represent both, so the native side declines. Resident
+    /// reuse is unaffected.
+    UnsupportedMemoryLayout,
 }
 
 /// An archive that was wanted but did not happen.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DenseArchiveFailure {
     /// The runtime declined to export the KV page.
-    Export,
+    Export { reason: String },
     /// The tier refused or failed the write (budget, oversize, or IO).
     Write,
 }
@@ -314,6 +343,12 @@ impl DenseArchiveOutcome {
                 serde_json::json!(write_ms),
             );
         }
+        if let Self::Failed(DenseArchiveFailure::Export { reason }) = self {
+            attrs.insert(
+                "skippy.kv.archive_error".to_string(),
+                serde_json::json!(reason),
+            );
+        }
     }
 
     /// Stable label for telemetry.
@@ -323,7 +358,10 @@ impl DenseArchiveOutcome {
             Self::Skipped(DenseArchiveSkip::TierDisabled) => "skipped_tier_disabled",
             Self::Skipped(DenseArchiveSkip::TooShort) => "skipped_too_short",
             Self::Skipped(DenseArchiveSkip::AlreadyArchived) => "skipped_already_archived",
-            Self::Failed(DenseArchiveFailure::Export) => "failed_export",
+            Self::Skipped(DenseArchiveSkip::UnsupportedMemoryLayout) => {
+                "skipped_unsupported_memory"
+            }
+            Self::Failed(DenseArchiveFailure::Export { .. }) => "failed_export",
             Self::Failed(DenseArchiveFailure::Write) => "failed_write",
         }
     }
@@ -476,5 +514,58 @@ mod archive_candidate_tests {
     #[test]
     fn offering_nothing_selects_nothing() {
         assert!(ArchiveCandidate::default().take().is_none());
+    }
+}
+
+/// Whether a native export error means "this stage can never export a page",
+/// as opposed to a failure specific to one request.
+fn is_unsupported_memory_layout(reason: &str) -> bool {
+    reason.contains("runtime memory type is not supported for native KV pages")
+        || reason.contains("runtime has no attention KV cache")
+        || reason.contains("runtime has no GLM-DSA MLA KV cache")
+}
+
+#[cfg(test)]
+mod unsupported_memory_tests {
+    use super::*;
+
+    /// The exact strings the patched runtime emits when attention state cannot
+    /// be expressed as one page. Asserted literally: these are a cross-language
+    /// contract with `skippy_get_kv_cache`, and a silent drift here turns a
+    /// permanent, expected limitation back into a per-prefill failure.
+    #[test]
+    fn native_unsupported_memory_errors_are_recognised() {
+        for reason in [
+            "Unsupported: runtime memory type is not supported for native KV pages",
+            "Unsupported: runtime has no attention KV cache",
+            "Unsupported: runtime has no GLM-DSA MLA KV cache",
+        ] {
+            assert!(
+                is_unsupported_memory_layout(reason),
+                "should latch archiving off for: {reason}"
+            );
+        }
+    }
+
+    /// A real, transient failure must stay a failure. Latching on one of these
+    /// would silently disable the disk tier for the life of the process.
+    #[test]
+    fn ordinary_export_errors_do_not_latch() {
+        for reason in [
+            "RuntimeError: output buffer too small",
+            "InvalidArgument: session is required",
+            "runtime memory is unavailable",
+        ] {
+            assert!(
+                !is_unsupported_memory_layout(reason),
+                "should stay a retryable failure: {reason}"
+            );
+        }
+    }
+
+    #[test]
+    fn unsupported_memory_reports_a_distinct_status() {
+        let outcome = DenseArchiveOutcome::Skipped(DenseArchiveSkip::UnsupportedMemoryLayout);
+        assert_eq!(outcome.status(), "skipped_unsupported_memory");
     }
 }

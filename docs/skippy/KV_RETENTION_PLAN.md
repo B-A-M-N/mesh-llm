@@ -831,3 +831,45 @@ Cache directories are per stage-shape and hold an exclusive lock; a second
 instance on the same directory declines the tier rather than sharing it, because
 the index is last-writer-wins and orphan reclaim would delete the other
 instance's live files.
+
+## Model coverage
+
+Validated by live measurement, single node, ~6.3k-token agent prompt:
+
+| Model | Attention memory | Disk reuse |
+|---|---|---|
+| Qwen3-8B Q4_K_M (dense) | plain KV cache | yes -- 5.16s -> 0.47s, 6272 cached |
+| gemma-4-26B-A4B (MoE) | hybrid ISWA | declined, by design |
+
+**MoE is not the axis.** Experts live in the feed-forward layers and carry no
+state between tokens, so a mixture-of-experts model with an ordinary KV cache
+behaves exactly like a dense one here. The axis is whether attention KV is the
+complete continuation state.
+
+Gemma fails that test, and this is worth being precise about because the
+symptom is easy to misread as an MoE limitation. `llama_kv_cache_iswa` holds
+two caches: a base cache covering the full context for the non-SWA layers, and
+a window-bounded cache for the SWA layers. For an N-token prefix the correct
+state is `0..N` on the base layers but only the visible suffix on the SWA
+layers. One page with one token range cannot express that, so the native side
+declines the export -- correctly. Exporting the base cache alone would yield a
+page that silently omits every SWA layer, and importing it would advance
+`n_past` over state that was never restored.
+
+Two things follow, and both are now implemented:
+
+- The unsupported memory layout is latched per stage, so the cost is one
+  declined export rather than one per prefill, and it reports
+  `skipped_unsupported_memory` instead of `failed_export`. Nothing is broken;
+  this model simply cannot use the tier.
+- Gemma keeps `ResidentKv`, because a sequence copy duplicates both caches, so
+  in-process reuse is unaffected. Only the disk tier is out of reach.
+
+Note that Gemma shows no prefix reuse at all on `origin/main` either, disk tier
+or not -- verified by building `ff5e79f8` and running the same probe, which
+also returns `cached_tokens=0`. That is a pre-existing gap, not a regression
+from this branch, and out of scope here.
+
+Supporting SWA on disk needs a composite page: a full-prefix base page plus an
+SWA suffix page. That is separate work, and adding the ISWA types to the export
+path without it would be unsafe rather than merely incomplete.

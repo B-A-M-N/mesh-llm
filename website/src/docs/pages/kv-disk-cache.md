@@ -27,12 +27,24 @@ The disk cache is **off by default**. It uses real disk space and writes model
 state to it, so it is opt-in.
 
 ```sh
-# Enable with the default budget
-SKIPPY_KV_DISK_TIER=1 mesh-llm serve --model <model-ref>
+# Give the cache 8 GB
+mesh-llm serve --model <model-ref> --kv-cache-disk 8
 
-# Or set an explicit budget, in MiB
-SKIPPY_KV_DISK_TIER_MIB=8192 mesh-llm serve --model <model-ref>
+# Or let Mesh size it from free space
+mesh-llm serve --model <model-ref> --kv-cache-disk auto
+
+# Store it somewhere other than ~/.mesh-llm/kv-cache
+mesh-llm serve --model <model-ref> --kv-cache-disk 8 --kv-cache-disk-dir /data/kv
 ```
+
+| Flag | Effect |
+|---|---|
+| `--kv-cache-disk <GB>` | Enable with an explicit node-wide budget |
+| `--kv-cache-disk auto` | Enable and size from free space |
+| `--kv-cache-disk-dir <path>` | Store the cache somewhere other than the default |
+
+The equivalent environment variables still work and take precedence, which is
+useful for systemd units and containers:
 
 | Variable | Effect |
 |---|---|
@@ -92,3 +104,22 @@ nothing else.
 
 For the on-disk format, integrity guarantees, and versioning rules, see
 [KV disk tier on-disk format](https://github.com/Mesh-LLM/mesh-llm/blob/main/docs/skippy/KV_DISK_TIER_FORMAT.md).
+
+## Which models it works for
+
+Most dense and mixture-of-experts models are supported. Whether the cache
+applies depends on the shape of the model's attention state, not on whether it
+is MoE: experts sit in the feed-forward layers and carry no state between
+tokens.
+
+**Sliding-window attention models are the exception.** Gemma 3 and 4, and other
+models llama.cpp backs with interleaved sliding-window attention, split
+attention state across a full-context cache and a window-bounded one. A saved
+page cannot describe both, and saving only part of it would restore a prompt
+that looks complete but is not. Mesh detects this on the first attempt,
+disables the disk cache for that model, and carries on serving normally.
+In-memory prefix reuse is unaffected.
+
+To check what a running node decided, look for `skippy.kv.archive_status` in
+the logs: `skipped_unsupported_memory` means the model's attention state cannot
+be saved to disk.

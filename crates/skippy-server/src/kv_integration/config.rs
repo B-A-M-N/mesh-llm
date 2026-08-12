@@ -3,7 +3,7 @@ use std::{
     fs,
     path::Path,
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, atomic::AtomicBool},
 };
 
 use anyhow::Result;
@@ -67,6 +67,7 @@ impl KvStageIntegration {
             exact_states: Arc::new(Mutex::new(exact_states)),
             first_tokens: Arc::new(Mutex::new(BTreeMap::new())),
             replay_tokens: Arc::new(Mutex::new(BTreeMap::new())),
+            dense_archive_unsupported: Arc::new(AtomicBool::new(false)),
         }))
     }
 }

@@ -261,6 +261,32 @@ import is a silent misread.
 With it, a page from a different platform is a miss, never a wrong hit, and
 several platforms can share one directory without quarantining each other.
 
+## Models the disk tier declines
+
+Sliding-window attention models -- Gemma 3/4, and anything else llama.cpp backs
+with `llama_memory_hybrid_iswa` -- keep attention state in **two** caches: a
+full-context base cache for the non-SWA layers and a window-bounded cache for
+the SWA layers. For a prefix of N tokens the correct continuation state is
+`0..N` for the base layers but only the still-visible suffix for the SWA
+layers.
+
+A native KV page carries one token range over one cache, so it cannot describe
+that shape. The runtime declines the export with `runtime memory type is not
+supported for native KV pages`, and it is right to: exporting the base cache
+alone would produce a page that silently omits every SWA layer, and importing
+it would advance `n_past` over state that was never restored. That is numerical
+corruption, not a missing optimisation.
+
+So the tier treats it as a permanent, expected property of the stage rather
+than a per-request failure. The first attempt latches archiving off for that
+stage and reports `archive_status=skipped_unsupported_memory`; subsequent
+prefills report `skipped_tier_disabled` and cost nothing. Resident, in-process
+reuse is unaffected, because a sequence copy duplicates both caches.
+
+Supporting these models on disk needs a composite page -- a full-prefix base
+page plus an SWA suffix page -- which is a separate piece of work. Adding the
+ISWA types to the export path without that would be actively unsafe.
+
 ## Retention policy
 
 Retention is LRU under a hard byte budget, with no TTL, and that is deliberate.

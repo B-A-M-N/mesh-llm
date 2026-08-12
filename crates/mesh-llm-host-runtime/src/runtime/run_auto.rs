@@ -604,7 +604,81 @@ pub(super) fn configure_run_auto_process_state(
     skippy_runtime::set_filtered_native_logs_enabled(true);
     bridge_skippy_native_logs(native_log_rx);
     skippy::configure_materialized_stage_cache();
+    configure_kv_disk_cache(options);
     configure_skippy_native_logging(runtime.as_ref().map(|runtime| runtime.dir()));
+}
+
+/// Translate `--kv-cache-disk` into the environment the stage runtime reads.
+///
+/// The disk tier is resolved deep inside `skippy-server`, per stage, from
+/// `SKIPPY_KV_DISK_TIER*`. Those stay the underlying mechanism -- this only
+/// gives the feature a supported front door, because a capability that can
+/// only be reached by exporting an undocumented variable is not one users can
+/// be expected to find.
+///
+/// An explicit environment variable always wins, so existing setups and tests
+/// keep working unchanged.
+fn configure_kv_disk_cache(options: &RuntimeOptions) {
+    if let Some(dir) = options.kv_cache_disk_dir.as_ref()
+        && std::env::var_os("SKIPPY_KV_DISK_TIER_DIR").is_none()
+    {
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("SKIPPY_KV_DISK_TIER_DIR", dir) };
+    }
+
+    let Some(raw) = options.kv_cache_disk.as_ref() else {
+        return;
+    };
+    if std::env::var_os("SKIPPY_KV_DISK_TIER_MIB").is_some()
+        || std::env::var_os("SKIPPY_KV_DISK_TIER").is_some()
+    {
+        return;
+    }
+
+    match parse_kv_cache_disk(raw) {
+        Some(KvDiskBudget::Auto) => {
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            unsafe { std::env::set_var("SKIPPY_KV_DISK_TIER", "1") };
+        }
+        Some(KvDiskBudget::Mib(mib)) => {
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            unsafe { std::env::set_var("SKIPPY_KV_DISK_TIER_MIB", mib.to_string()) };
+        }
+        None => {
+            eprintln!(
+                "mesh-llm: ignoring --kv-cache-disk {raw:?}: expected a positive size in GB, or \"auto\""
+            );
+        }
+    }
+}
+
+/// What the user asked for with `--kv-cache-disk`.
+#[derive(Debug, PartialEq, Eq)]
+enum KvDiskBudget {
+    /// Let the existing free-space policy pick the size.
+    Auto,
+    /// An explicit node-wide budget.
+    Mib(u64),
+}
+
+/// Parse `--kv-cache-disk` without touching the environment, so the policy is
+/// testable on its own.
+fn parse_kv_cache_disk(raw: &str) -> Option<KvDiskBudget> {
+    let value = raw.trim();
+    // `auto` hands sizing to the existing free-space policy rather than
+    // inventing a second one here.
+    if value.eq_ignore_ascii_case("auto") {
+        return Some(KvDiskBudget::Auto);
+    }
+    match value.parse::<f64>() {
+        // A budget that rounds to zero MiB would disable the tier while
+        // looking like it had been asked for, so refuse it rather than
+        // silently doing nothing.
+        Ok(gb) if gb.is_finite() && gb > 0.0 && (gb * 1024.0) >= 1.0 => {
+            Some(KvDiskBudget::Mib((gb * 1024.0).round() as u64))
+        }
+        _ => None,
+    }
 }
 
 pub(super) fn spawn_node_benchmark_task(node: &mesh::Node, bin_dir: &Path) {
@@ -1520,4 +1594,30 @@ pub(super) async fn run_auto(ctx: RunAutoContext) -> Result<()> {
         anyhow::bail!("{summary}");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod kv_cache_disk_tests {
+    use super::{KvDiskBudget, parse_kv_cache_disk};
+
+    #[test]
+    fn sizes_are_read_as_gigabytes() {
+        assert_eq!(parse_kv_cache_disk("8"), Some(KvDiskBudget::Mib(8192)));
+        assert_eq!(parse_kv_cache_disk(" 0.5 "), Some(KvDiskBudget::Mib(512)));
+    }
+
+    #[test]
+    fn auto_defers_to_the_free_space_policy() {
+        assert_eq!(parse_kv_cache_disk("auto"), Some(KvDiskBudget::Auto));
+        assert_eq!(parse_kv_cache_disk("AUTO"), Some(KvDiskBudget::Auto));
+    }
+
+    /// Each of these would otherwise disable the tier while looking like the
+    /// user had enabled it, which is the one outcome worth being loud about.
+    #[test]
+    fn unusable_budgets_are_rejected_rather_than_silently_ignored() {
+        for raw in ["0", "-4", "", "lots", "0.0001", "nan", "inf"] {
+            assert_eq!(parse_kv_cache_disk(raw), None, "should reject {raw:?}");
+        }
+    }
 }

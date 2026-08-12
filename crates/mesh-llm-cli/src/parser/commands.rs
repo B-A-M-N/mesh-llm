@@ -671,6 +671,17 @@ pub struct Cli {
     #[arg(long)]
     pub max_vram: Option<f64>,
 
+    /// Keep agent prompt prefixes on disk so they survive a restart, capped at
+    /// this many GB for the whole node. Off by default. Use `auto` to size it
+    /// from free space.
+    #[arg(long, value_name = "GB|auto")]
+    pub kv_cache_disk: Option<String>,
+
+    /// Directory for the on-disk KV prefix cache. Defaults to
+    /// `~/.mesh-llm/kv-cache`.
+    #[arg(long, value_name = "PATH")]
+    pub kv_cache_disk_dir: Option<PathBuf>,
+
     /// Disable broadcasting GPU name, hostname, VRAM, and reserved bytes to peers. By default all nodes announce this hardware info.
     #[arg(long = "no-enumerate-host", hide = true)]
     pub no_enumerate_host: bool,
