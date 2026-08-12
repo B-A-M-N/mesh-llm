@@ -63,52 +63,58 @@ impl StageOpenAiBackend {
                     .saturating_add(state.decoded_tokens),
                 remaining_new_tokens,
                 runtime_max_proposal_tokens: state.linear_proposal_max_tokens,
-                // The lifecycle-serialized path supplies this delta through
-                // ordered generation events.
-                pending_token_ids: Vec::new().into_boxed_slice(),
+                pending_token_ids: state
+                    .pending_linear_proposal_tokens
+                    .clone()
+                    .into_boxed_slice(),
             },
         ) {
             Ok(LinearProposalQueryOutcome::Skipped) => {
                 return Ok(LinearProposalProgress::NotUsed);
             }
-            Ok(outcome) => match outcome {
-                LinearProposalQueryOutcome::Skipped => unreachable!("handled above"),
-                LinearProposalQueryOutcome::NoProposal { source_telemetry } => {
-                    self.emit_linear_proposal_source_telemetry(
+            Ok(outcome) => {
+                // The source has synchronously received this delta; do not
+                // resend it on the next proposal boundary.
+                state.pending_linear_proposal_tokens.clear();
+                match outcome {
+                    LinearProposalQueryOutcome::Skipped => unreachable!("handled above"),
+                    LinearProposalQueryOutcome::NoProposal { source_telemetry } => {
+                        self.emit_linear_proposal_source_telemetry(
+                            source_telemetry,
+                            state.emit_token_debug,
+                        );
+                        None
+                    }
+                    LinearProposalQueryOutcome::DeadlineExceeded {
+                        proposal_elapsed_us,
                         source_telemetry,
-                        state.emit_token_debug,
-                    );
-                    None
+                    } => {
+                        self.emit_linear_proposal_source_telemetry(
+                            source_telemetry,
+                            state.emit_token_debug,
+                        );
+                        let mut attrs = BTreeMap::new();
+                        attrs.insert(
+                            "llama_stage.linear_proposal.discard_reason".to_string(),
+                            json!("deadline_exceeded"),
+                        );
+                        attrs.insert(
+                            "llama_stage.linear_proposal.proposal_us".to_string(),
+                            json!(proposal_elapsed_us),
+                        );
+                        self.telemetry
+                            .emit("stage.openai_linear_proposal_late", attrs);
+                        None
+                    }
+                    LinearProposalQueryOutcome::Ready(queried) => {
+                        self.emit_linear_proposal_source_telemetry(
+                            queried.source_telemetry,
+                            state.emit_token_debug,
+                        );
+                        Some(queried)
+                    }
                 }
-                LinearProposalQueryOutcome::DeadlineExceeded {
-                    proposal_elapsed_us,
-                    source_telemetry,
-                } => {
-                    self.emit_linear_proposal_source_telemetry(
-                        source_telemetry,
-                        state.emit_token_debug,
-                    );
-                    let mut attrs = BTreeMap::new();
-                    attrs.insert(
-                        "llama_stage.linear_proposal.discard_reason".to_string(),
-                        json!("deadline_exceeded"),
-                    );
-                    attrs.insert(
-                        "llama_stage.linear_proposal.proposal_us".to_string(),
-                        json!(proposal_elapsed_us),
-                    );
-                    self.telemetry
-                        .emit("stage.openai_linear_proposal_late", attrs);
-                    None
-                }
-                LinearProposalQueryOutcome::Ready(queried) => {
-                    self.emit_linear_proposal_source_telemetry(
-                        queried.source_telemetry,
-                        state.emit_token_debug,
-                    );
-                    Some(queried)
-                }
-            },
+            }
             Err(error) => {
                 state.linear_context_tokens = None;
                 state.linear_proposal_max_tokens = 0;
@@ -203,6 +209,9 @@ impl StageOpenAiBackend {
             .last()
             .ok_or_else(|| OpenAiError::backend("linear proposal receipt committed no tokens"))?;
         committed_token_ids.extend_from_slice(&receipt.committed_tokens);
+        state
+            .pending_linear_proposal_tokens
+            .extend_from_slice(&receipt.committed_tokens);
         let stopped_by_proposal = receipt.disposition == LinearProposalDisposition::Stopped;
         if state.emit_token_debug {
             let mut proposal_attrs = BTreeMap::new();

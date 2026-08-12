@@ -711,6 +711,7 @@ mod tests {
         committed_token_count: usize,
         decode_step: usize,
         max_proposal_tokens: usize,
+        pending_token_ids: Box<[i32]>,
     }
 
     fn query_params(
@@ -754,6 +755,7 @@ mod tests {
                 committed_token_count: query.committed_token_count,
                 decode_step: query.decode_step,
                 max_proposal_tokens: query.max_proposal_tokens,
+                pending_token_ids: query.pending_token_ids,
             });
             thread::sleep(*self.delay.lock().unwrap());
             Ok(LinearProposalSourceResponse::new(
@@ -972,9 +974,36 @@ mod tests {
                 decode_step: 1,
                 committed_token_count: 3,
                 max_proposal_tokens: 4,
+                pending_token_ids: Vec::new().into_boxed_slice(),
             }]
         );
         assert!(source.discards.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn query_forwards_pending_tokens_to_the_proposal_source() {
+        let source = Arc::new(FakeIngress::default());
+        let id = OpaqueProposalDecisionId::new(vec![7]).unwrap();
+        *source.proposal.lock().unwrap() = Some(LinearProposal::new(id, vec![41]));
+        let config =
+            LinearProposalIngressConfig::new(source.clone(), Duration::from_secs(1), 4).unwrap();
+        let mut params = query_params(7, 8, 2, 1, 3, 5, 4);
+        params.pending_token_ids = vec![31, 32].into_boxed_slice();
+
+        query_linear_proposal(&config, params).expect("proposal query should succeed");
+
+        assert_eq!(
+            source.queries.lock().unwrap().as_slice(),
+            &[RecordedQuery {
+                request_id: 7,
+                session_id: 8,
+                prompt_token_count: 2,
+                committed_token_count: 3,
+                decode_step: 1,
+                max_proposal_tokens: 4,
+                pending_token_ids: vec![31, 32].into_boxed_slice(),
+            }]
+        );
     }
 
     #[test]
