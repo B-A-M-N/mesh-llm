@@ -364,9 +364,34 @@ impl StageOpenAiBackend {
         let mut decoded_prefill_suffix = false;
         if restored_prefill_tokens < prefill_tokens.len() {
             decoded_prefill_suffix = true;
-            runtime
-                .prefill(session_id, &prefill_tokens[restored_prefill_tokens..])
-                .map_err(openai_backend_error)?;
+            if let Some(checkpoint_tokens) =
+                request
+                    .recurrent_cache_prefix_token_ids
+                    .filter(|checkpoint_tokens| {
+                        !checkpoint_tokens.is_empty()
+                            && checkpoint_tokens.len() <= prefill_tokens.len()
+                            && prefill_tokens.starts_with(checkpoint_tokens)
+                            && restored_prefill_tokens < checkpoint_tokens.len()
+                    })
+            {
+                runtime
+                    .prefill(session_id, &checkpoint_tokens[restored_prefill_tokens..])
+                    .map_err(openai_backend_error)?;
+                let _ = self.record_exact_state_at_tokens(
+                    &mut runtime,
+                    session_id,
+                    request.ids,
+                    checkpoint_tokens,
+                    "chat_prefix_checkpoint",
+                );
+                runtime
+                    .prefill(session_id, &prefill_tokens[checkpoint_tokens.len()..])
+                    .map_err(openai_backend_error)?;
+            } else {
+                runtime
+                    .prefill(session_id, &prefill_tokens[restored_prefill_tokens..])
+                    .map_err(openai_backend_error)?;
+            }
         }
         cache_stats.matched_prefix_tokens = saturating_u32(restored_prefill_tokens);
         cache_stats.suffix_prefill_tokens =
@@ -748,21 +773,64 @@ impl StageOpenAiBackend {
         else {
             return false;
         };
-        let Ok(checkpoint_token_count) = u64::try_from(checkpoint_tokens.len()) else {
-            return false;
-        };
         let lock_timer = PhaseTimer::start();
         let Ok(mut runtime) = self.runtime.lock() else {
             return false;
         };
         let runtime_lock_wait_ms = lock_timer.elapsed_ms();
+        let recorded = self.record_exact_state_at_tokens(
+            &mut runtime,
+            session_id,
+            request.ids,
+            &checkpoint_tokens,
+            "post_decode_checkpoint",
+        );
+        if recorded {
+            let mut attrs = self.openai_attrs(request.ids);
+            attrs.insert(
+                "skippy.kv.decision".to_string(),
+                json!("post_decode_checkpoint_recorded"),
+            );
+            attrs.insert(
+                "llama_stage.runtime_lock_wait_ms".to_string(),
+                json!(runtime_lock_wait_ms),
+            );
+            self.telemetry
+                .emit("stage.openai_kv_record_decision", attrs);
+        }
+        recorded
+    }
+
+    /// Record a recurrent state only when the native session is at the exact
+    /// token boundary named by `checkpoint_tokens`.
+    ///
+    /// The caller must hold the runtime lock. This check is intentionally
+    /// canonical-position based: token text or a caller-supplied count cannot
+    /// authorize exporting a state at a different native position.
+    fn record_exact_state_at_tokens(
+        &self,
+        runtime: &mut RuntimeState,
+        session_id: &str,
+        ids: &OpenAiGenerationIds,
+        checkpoint_tokens: &[i32],
+        decision_prefix: &str,
+    ) -> bool {
+        let Some(kv) = self.kv.as_ref() else {
+            return false;
+        };
+        if kv.payload != StagePrefixCachePayload::KvRecurrent {
+            return false;
+        }
+        let Ok(checkpoint_token_count) = u64::try_from(checkpoint_tokens.len()) else {
+            return false;
+        };
         let runtime_token_count = match runtime.canonical_session_position(session_id) {
             Ok(position) => position,
             Err(error) => {
-                let mut attrs = self.openai_attrs(request.ids);
+                let mut attrs = self.openai_attrs(ids);
                 attrs.insert(
                     "skippy.kv.decision".to_string(),
-                    json!("post_decode_checkpoint_skipped"),
+                    json!(format!("{decision_prefix}_skipped")),
                 );
                 attrs.insert("skippy.kv.error".to_string(), json!(error.to_string()));
                 self.telemetry
@@ -770,16 +838,11 @@ impl StageOpenAiBackend {
                 return false;
             }
         };
-
-        // Never associate a recurrent payload with inferred token content. A
-        // hook or a future decode path may advance native state without
-        // emitting the same number of canonical response tokens; that state is
-        // safe to skip but unsafe to publish under the request transcript hash.
         if runtime_token_count != checkpoint_token_count {
-            let mut attrs = self.openai_attrs(request.ids);
+            let mut attrs = self.openai_attrs(ids);
             attrs.insert(
                 "skippy.kv.decision".to_string(),
-                json!("post_decode_checkpoint_skipped"),
+                json!(format!("{decision_prefix}_skipped")),
             );
             attrs.insert(
                 "skippy.kv.checkpoint_token_count".to_string(),
@@ -794,14 +857,14 @@ impl StageOpenAiBackend {
             return false;
         }
 
-        let base = self.local_kv_message_base(session_id, request.ids);
-        let identity = kv.prefill_identity(&self.config, &base, 0, &checkpoint_tokens);
-        match kv.record_exact_state(&mut runtime, session_id, &identity) {
+        let base = self.local_kv_message_base(session_id, ids);
+        let identity = kv.prefill_identity(&self.config, &base, 0, checkpoint_tokens);
+        match kv.record_exact_state(runtime, session_id, &identity) {
             Ok(Some(record)) => {
-                let mut attrs = self.openai_attrs(request.ids);
+                let mut attrs = self.openai_attrs(ids);
                 attrs.insert(
                     "skippy.kv.decision".to_string(),
-                    json!("post_decode_checkpoint_recorded"),
+                    json!(format!("{decision_prefix}_recorded")),
                 );
                 attrs.insert(
                     "skippy.exact_cache.recorded_page_id".to_string(),
@@ -819,56 +882,16 @@ impl StageOpenAiBackend {
                     "skippy.exact_cache.stored".to_string(),
                     json!(record.stored),
                 );
-                attrs.insert(
-                    "skippy.exact_cache.logical_bytes".to_string(),
-                    json!(record.logical_bytes),
-                );
-                attrs.insert(
-                    "skippy.exact_cache.physical_bytes".to_string(),
-                    json!(record.physical_bytes),
-                );
-                attrs.insert(
-                    "skippy.exact_cache.entries".to_string(),
-                    json!(record.entries),
-                );
-                attrs.insert(
-                    "skippy.exact_cache.evicted_entries".to_string(),
-                    json!(record.evicted_entries),
-                );
-                attrs.insert(
-                    "skippy.exact_cache.evicted_logical_bytes".to_string(),
-                    json!(record.evicted_logical_bytes),
-                );
-                attrs.insert(
-                    "skippy.exact_cache.dedupe_hash_ms".to_string(),
-                    json!(record.dedupe.hash_ms),
-                );
-                attrs.insert(
-                    "skippy.exact_cache.dedupe_block_count".to_string(),
-                    json!(record.dedupe.block_count),
-                );
-                attrs.insert(
-                    "skippy.exact_cache.dedupe_new_block_count".to_string(),
-                    json!(record.dedupe.new_block_count),
-                );
-                attrs.insert(
-                    "skippy.exact_cache.dedupe_reused_block_count".to_string(),
-                    json!(record.dedupe.reused_block_count),
-                );
-                attrs.insert(
-                    "llama_stage.runtime_lock_wait_ms".to_string(),
-                    json!(runtime_lock_wait_ms),
-                );
                 self.telemetry
                     .emit("stage.openai_kv_record_decision", attrs);
                 record.stored
             }
             Ok(None) => false,
             Err(error) => {
-                let mut attrs = self.openai_attrs(request.ids);
+                let mut attrs = self.openai_attrs(ids);
                 attrs.insert(
                     "skippy.kv.decision".to_string(),
-                    json!("post_decode_checkpoint_error"),
+                    json!(format!("{decision_prefix}_error")),
                 );
                 attrs.insert("skippy.kv.error".to_string(), json!(error.to_string()));
                 self.telemetry

@@ -129,6 +129,12 @@ pub(in crate::frontend) struct PreparedGenerationPrompt {
     pub(in crate::frontend) text: String,
     pub(in crate::frontend) media: Vec<MediaInput>,
     pub(in crate::frontend) chat_parse_metadata: Option<String>,
+    /// Rendered message-history text before an assistant-generation suffix.
+    ///
+    /// This is only a candidate. The generation path retokenizes it with the
+    /// loaded model and requires the resulting IDs to be an exact prefix of
+    /// `text` before it can be used for recurrent-state caching.
+    pub(in crate::frontend) recurrent_cache_prefix_text: Option<String>,
 }
 
 impl PreparedGenerationPrompt {
@@ -137,6 +143,7 @@ impl PreparedGenerationPrompt {
             text,
             media: Vec::new(),
             chat_parse_metadata: None,
+            recurrent_cache_prefix_text: None,
         }
     }
 

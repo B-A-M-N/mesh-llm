@@ -62,17 +62,46 @@ impl StageOpenAiBackend {
                 tool_emulation::rewrite_history_for_emulation(&request.messages, &instruction);
             let emulated =
                 self.render_chat_prompt(request, &options, &marker, Some(&rewritten), false)?;
+            let recurrent_cache_prefix_text = if emulated.media.is_empty() && options.add_assistant
+            {
+                let mut prefix_options = options.clone();
+                prefix_options.add_assistant = false;
+                Some(
+                    self.render_chat_prompt(
+                        request,
+                        &prefix_options,
+                        &marker,
+                        Some(&rewritten),
+                        false,
+                    )?
+                    .prompt,
+                )
+            } else {
+                None
+            };
             return Ok(PreparedGenerationPrompt {
                 text: emulated.prompt,
                 media: emulated.media,
                 chat_parse_metadata: Some(emulated.metadata_json),
+                recurrent_cache_prefix_text,
             });
         }
 
+        let recurrent_cache_prefix_text = if native.media.is_empty() && options.add_assistant {
+            let mut prefix_options = options.clone();
+            prefix_options.add_assistant = false;
+            Some(
+                self.render_chat_prompt(request, &prefix_options, &marker, None, true)?
+                    .prompt,
+            )
+        } else {
+            None
+        };
         Ok(PreparedGenerationPrompt {
             text: native.prompt,
             media: native.media,
             chat_parse_metadata: Some(native.metadata_json),
+            recurrent_cache_prefix_text,
         })
     }
 

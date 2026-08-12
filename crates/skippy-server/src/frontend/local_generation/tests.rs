@@ -232,6 +232,7 @@ fn recurrent_post_decode_checkpoint_reuses_a_growing_prompt() -> Result<()> {
     let first_stats = backend.generate_local_tokens(
         LocalGeneration {
             prompt_token_ids: &first_prompt,
+            recurrent_cache_prefix_token_ids: None,
             max_tokens: 2,
             sampling: &sampling,
             chat_sampling_metadata: None,
@@ -268,6 +269,7 @@ fn recurrent_post_decode_checkpoint_reuses_a_growing_prompt() -> Result<()> {
     let second_stats = backend.generate_local_tokens(
         LocalGeneration {
             prompt_token_ids: &second_prompt,
+            recurrent_cache_prefix_token_ids: None,
             max_tokens: 1,
             sampling: &sampling,
             chat_sampling_metadata: None,
@@ -397,6 +399,28 @@ fn recurrent_chat_checkpoint_preserves_cached_output_parity() -> Result<()> {
             "reasoning_effort": "none",
             "prompt_cache_key": "recurrent-chat-cache"
         }))?;
+        let first_prompt = backend.prepare_chat_prompt(
+            &first_request,
+            crate::frontend::request::chat_template_options(
+                &first_request,
+                &backend.request_defaults,
+            )?,
+        )?;
+        let first_prompt_tokens = backend.tokenize(&first_prompt.text)?;
+        let first_boundary_tokens = backend.tokenize(
+            first_prompt
+                .recurrent_cache_prefix_text
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("first chat prompt had no cache boundary"))?,
+        )?;
+        assert!(!first_boundary_tokens.is_empty());
+        assert!(first_boundary_tokens.len() < first_prompt_tokens.len());
+        assert_eq!(
+            &first_prompt_tokens[..first_boundary_tokens.len()],
+            first_boundary_tokens.as_slice(),
+            "first rendered prompt boundary was not an exact token prefix"
+        );
+
         let first_response = backend.chat_completion(first_request).await?;
         let first_content = first_response
             .choices
@@ -423,6 +447,20 @@ fn recurrent_chat_checkpoint_preserves_cached_output_parity() -> Result<()> {
             "reasoning_effort": "none",
             "prompt_cache_key": "recurrent-chat-cache"
         }))?;
+        let second_prompt = backend.prepare_chat_prompt(
+            &cached_request,
+            crate::frontend::request::chat_template_options(
+                &cached_request,
+                &backend.request_defaults,
+            )?,
+        )?;
+        let second_prompt_tokens = backend.tokenize(&second_prompt.text)?;
+        assert!(second_prompt_tokens.len() > first_boundary_tokens.len());
+        assert_eq!(
+            &second_prompt_tokens[..first_boundary_tokens.len()],
+            first_boundary_tokens.as_slice(),
+            "first message-history boundary was not a prefix of growing chat prompt"
+        );
         let cached_response = backend.chat_completion(cached_request).await?;
         let cached_content = cached_response
             .choices
@@ -562,6 +600,7 @@ fn local_generation_eventually_delivers_receipts_and_cleanup_survives_sink_error
     backend.generate_local_tokens(
         LocalGeneration {
             prompt_token_ids: &prompt_token_ids,
+            recurrent_cache_prefix_token_ids: None,
             max_tokens: 1,
             sampling: &sampling,
             chat_sampling_metadata: None,
@@ -606,6 +645,7 @@ fn local_generation_eventually_delivers_receipts_and_cleanup_survives_sink_error
     backend.generate_local_tokens(
         LocalGeneration {
             prompt_token_ids: &prompt_token_ids,
+            recurrent_cache_prefix_token_ids: None,
             max_tokens: 1,
             sampling: &sampling,
             chat_sampling_metadata: None,

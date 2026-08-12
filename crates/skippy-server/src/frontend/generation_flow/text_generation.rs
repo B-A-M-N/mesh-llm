@@ -69,6 +69,16 @@ impl StageOpenAiBackend {
         if prompt_token_ids.is_empty() {
             return Err(OpenAiError::invalid_request("prompt produced no tokens"));
         }
+        let recurrent_cache_prefix_token_ids = prompt
+            .recurrent_cache_prefix_text
+            .as_deref()
+            .map(|prefix| self.tokenize(prefix))
+            .transpose()?
+            .filter(|prefix| {
+                !prefix.is_empty()
+                    && prefix.len() < prompt_token_ids.len()
+                    && prompt_token_ids.starts_with(prefix)
+            });
         let max_tokens = max_tokens.resolve(prompt_token_ids.len(), self.ctx_size)?;
         let token_admit_timer = PhaseTimer::start();
         let token_budget_reservation = self.generation_token_budget.reserve_cancellable(
@@ -112,6 +122,7 @@ impl StageOpenAiBackend {
             OpenAiBackendMode::LocalRuntime => self.generate_local_tokens(
                 LocalGeneration {
                     prompt_token_ids: &prompt_token_ids,
+                    recurrent_cache_prefix_token_ids: recurrent_cache_prefix_token_ids.as_deref(),
                     max_tokens,
                     sampling: &sampling,
                     chat_sampling_metadata,
