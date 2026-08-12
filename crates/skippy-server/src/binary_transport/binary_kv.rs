@@ -763,11 +763,18 @@ pub(in crate::binary_transport) fn maybe_record_binary_prefill(
     // gating archival on one meant the tail of every chain never persisted.
     if let Some(identity) = archive_candidate.take() {
         let mut runtime = runtime.lock().expect("runtime lock poisoned");
-        if let Ok(true) = kv.archive_dense_prefix(&mut runtime, session_id, &identity) {
-            attrs.insert(
-                "skippy.kv.archived_tokens".to_string(),
-                json!(identity.identity.token_count),
-            );
+        match kv.archive_dense_prefix(&mut runtime, session_id, &identity) {
+            Ok(outcome) => outcome.insert_attrs(&identity, &mut attrs),
+            Err(error) => {
+                attrs.insert(
+                    "skippy.kv.archive_status".to_string(),
+                    json!("failed_error"),
+                );
+                attrs.insert(
+                    "skippy.kv.archive_error".to_string(),
+                    json!(error.to_string()),
+                );
+            }
         }
     }
     attrs.insert(
@@ -948,13 +955,20 @@ pub(in crate::binary_transport) fn maybe_record_binary_full_prefill(
     }
     // One archive per request; see the chunked recorder. The caller already
     // holds the runtime lock on this path.
-    if let Some(identity) = archive_candidate.take()
-        && let Ok(true) = kv.archive_dense_prefix(runtime, session_id, &identity)
-    {
-        attrs.insert(
-            "skippy.kv.archived_tokens".to_string(),
-            json!(identity.identity.token_count),
-        );
+    if let Some(identity) = archive_candidate.take() {
+        match kv.archive_dense_prefix(runtime, session_id, &identity) {
+            Ok(outcome) => outcome.insert_attrs(&identity, &mut attrs),
+            Err(error) => {
+                attrs.insert(
+                    "skippy.kv.archive_status".to_string(),
+                    json!("failed_error"),
+                );
+                attrs.insert(
+                    "skippy.kv.archive_error".to_string(),
+                    json!(error.to_string()),
+                );
+            }
+        }
     }
     attrs.insert(
         "skippy.kv.record_ms".to_string(),

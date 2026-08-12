@@ -439,6 +439,14 @@ impl StageOpenAiBackend {
                     "skippy.exact_cache.payload_kind".to_string(),
                     json!(restored.payload_kind.to_string()),
                 );
+                // Which tier served it. A RAM hit and a disk hit cost
+                // different amounts and fail for different reasons; without
+                // this the disk tier's effect is unmeasurable from the hit
+                // stream alone.
+                attrs.insert(
+                    "skippy.exact_cache.hit_source".to_string(),
+                    json!(restored.source.as_str()),
+                );
                 attrs.insert(
                     "skippy.exact_cache.restored_tokens".to_string(),
                     json!(restored.token_count),
@@ -749,15 +757,22 @@ impl StageOpenAiBackend {
             // process restart. Done here, after recording, rather than on
             // eviction: eviction runs on the decode hot path and a
             // multi-hundred-MB export there would spike TTFT.
-            if let Some(identity) = archive_candidate.take()
-                && let Ok(true) = kv.archive_dense_prefix(runtime, session_id, &identity)
-            {
+            if let Some(identity) = archive_candidate.take() {
                 let mut attrs = self.openai_attrs(ids);
                 attrs.insert("skippy.kv.decision".to_string(), json!("disk_archive"));
-                attrs.insert(
-                    "skippy.kv.archived_tokens".to_string(),
-                    json!(identity.identity.token_count),
-                );
+                match kv.archive_dense_prefix(runtime, session_id, &identity) {
+                    Ok(outcome) => outcome.insert_attrs(&identity, &mut attrs),
+                    Err(error) => {
+                        attrs.insert(
+                            "skippy.kv.archive_status".to_string(),
+                            json!("failed_error"),
+                        );
+                        attrs.insert(
+                            "skippy.kv.archive_error".to_string(),
+                            json!(error.to_string()),
+                        );
+                    }
+                }
                 self.telemetry
                     .emit("stage.openai_kv_record_decision", attrs);
             }

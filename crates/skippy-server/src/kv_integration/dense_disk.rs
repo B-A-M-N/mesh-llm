@@ -70,13 +70,13 @@ impl KvStageIntegration {
         runtime: &mut RuntimeState,
         session_id: &str,
         identity: &PrefillKvIdentity,
-    ) -> Result<bool> {
+    ) -> Result<DenseArchiveOutcome> {
         if !self.dense_archive_enabled() {
-            return Ok(false);
+            return Ok(DenseArchiveOutcome::Skipped(DenseArchiveSkip::TierDisabled));
         }
         let token_count = identity.identity.token_count;
         if token_count < MIN_ARCHIVE_TOKENS.max(self.candidate_policy.min_tokens) {
-            return Ok(false);
+            return Ok(DenseArchiveOutcome::Skipped(DenseArchiveSkip::TooShort));
         }
         {
             let cache = self
@@ -84,29 +84,50 @@ impl KvStageIntegration {
                 .lock()
                 .expect("exact state cache lock poisoned");
             if cache.disk_contains(&identity.page_id) {
-                return Ok(false);
+                return Ok(DenseArchiveOutcome::Skipped(
+                    DenseArchiveSkip::AlreadyArchived,
+                ));
             }
         }
 
         // Export the exact token range this page id was computed over, so the
         // archived bytes and the identity always agree.
+        let export_timer = std::time::Instant::now();
         let page = match runtime.export_kv_page(session_id, 0, token_count) {
             Ok(page) => page,
-            Err(_) => return Ok(false),
+            // Distinguished from a skip: the runtime declining to export is a
+            // failure of the archive, not a policy decision, and collapsing
+            // the two is exactly why a tier that never stores anything can
+            // look healthy.
+            Err(_) => return Ok(DenseArchiveOutcome::Failed(DenseArchiveFailure::Export)),
         };
-        let mut cache = self
-            .exact_states
-            .lock()
-            .expect("exact state cache lock poisoned");
-        Ok(cache.store_on_disk(
-            &identity.page_id,
-            token_count,
-            ExactStatePayloadKind::ResidentKvArchive,
-            &[&page.payload],
-            ExactStateExtra {
-                kv_desc: Some(page.desc),
-            },
-        ))
+        let export_ms = export_timer.elapsed().as_secs_f64() * 1000.0;
+        let payload_bytes = page.payload.len() as u64;
+        let write_timer = std::time::Instant::now();
+        let stored = {
+            let mut cache = self
+                .exact_states
+                .lock()
+                .expect("exact state cache lock poisoned");
+            cache.store_on_disk(
+                &identity.page_id,
+                token_count,
+                ExactStatePayloadKind::ResidentKvArchive,
+                &[&page.payload],
+                ExactStateExtra {
+                    kv_desc: Some(page.desc),
+                },
+            )
+        };
+        let write_ms = write_timer.elapsed().as_secs_f64() * 1000.0;
+        if !stored {
+            return Ok(DenseArchiveOutcome::Failed(DenseArchiveFailure::Write));
+        }
+        Ok(DenseArchiveOutcome::Archived {
+            payload_bytes,
+            export_ms,
+            write_ms,
+        })
     }
 
     /// Restore a dense prefix from the disk tier after a resident-cache miss.
@@ -204,6 +225,107 @@ impl KvStageIntegration {
             }));
         }
         Ok(None)
+    }
+}
+
+/// What happened to an attempted dense archive.
+///
+/// Previously this path returned `Result<bool>` and every caller matched
+/// `Ok(true)`, so "policy declined to archive" and "the archive failed"
+/// collapsed into the same silent `false`. Those need different responses --
+/// one is normal, the other means the disk tier is not doing its job -- so
+/// they are separate variants and both are reported.
+#[derive(Debug, Clone, PartialEq)]
+pub enum DenseArchiveOutcome {
+    Archived {
+        payload_bytes: u64,
+        /// Exporting the KV page out of the live session.
+        export_ms: f64,
+        /// Serializing and writing the entry to the tier.
+        write_ms: f64,
+    },
+    Skipped(DenseArchiveSkip),
+    Failed(DenseArchiveFailure),
+}
+
+/// A deliberate decision not to archive. Normal, and not an error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DenseArchiveSkip {
+    /// No disk tier configured, or this payload family does not archive.
+    TierDisabled,
+    /// Below the size floor where a restore beats recomputing.
+    TooShort,
+    /// The tier already holds this page.
+    AlreadyArchived,
+}
+
+/// An archive that was wanted but did not happen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DenseArchiveFailure {
+    /// The runtime declined to export the KV page.
+    Export,
+    /// The tier refused or failed the write (budget, oversize, or IO).
+    Write,
+}
+
+impl DenseArchiveOutcome {
+    pub fn archived(&self) -> bool {
+        matches!(self, Self::Archived { .. })
+    }
+
+    /// Write this outcome into a telemetry attribute map.
+    ///
+    /// Centralised because there are four archive call sites and they
+    /// previously reported the same thing four slightly different ways -- or,
+    /// on two of them, not at all.
+    pub fn insert_attrs(
+        &self,
+        identity: &PrefillKvIdentity,
+        attrs: &mut std::collections::BTreeMap<String, serde_json::Value>,
+    ) {
+        attrs.insert(
+            "skippy.kv.archive_status".to_string(),
+            serde_json::json!(self.status()),
+        );
+        attrs.insert(
+            "skippy.kv.archive_candidate_tokens".to_string(),
+            serde_json::json!(identity.identity.token_count),
+        );
+        if let Self::Archived {
+            payload_bytes,
+            export_ms,
+            write_ms,
+        } = self
+        {
+            attrs.insert(
+                "skippy.kv.archived_tokens".to_string(),
+                serde_json::json!(identity.identity.token_count),
+            );
+            attrs.insert(
+                "skippy.kv.archive_bytes".to_string(),
+                serde_json::json!(payload_bytes),
+            );
+            attrs.insert(
+                "skippy.kv.archive_export_ms".to_string(),
+                serde_json::json!(export_ms),
+            );
+            attrs.insert(
+                "skippy.kv.archive_write_ms".to_string(),
+                serde_json::json!(write_ms),
+            );
+        }
+    }
+
+    /// Stable label for telemetry.
+    pub fn status(&self) -> &'static str {
+        match self {
+            Self::Archived { .. } => "archived",
+            Self::Skipped(DenseArchiveSkip::TierDisabled) => "skipped_tier_disabled",
+            Self::Skipped(DenseArchiveSkip::TooShort) => "skipped_too_short",
+            Self::Skipped(DenseArchiveSkip::AlreadyArchived) => "skipped_already_archived",
+            Self::Failed(DenseArchiveFailure::Export) => "failed_export",
+            Self::Failed(DenseArchiveFailure::Write) => "failed_write",
+        }
     }
 }
 

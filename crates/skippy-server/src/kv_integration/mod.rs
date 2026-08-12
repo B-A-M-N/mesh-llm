@@ -20,16 +20,19 @@ mod activation;
 mod config;
 mod dense_disk;
 mod disk_budget;
-pub use dense_disk::{ArchiveCandidate, offer_archive_candidate};
+pub use dense_disk::{
+    ArchiveCandidate, DenseArchiveFailure, DenseArchiveOutcome, DenseArchiveSkip,
+    offer_archive_candidate,
+};
 mod exact_state;
 mod identity;
 mod records;
 mod resident_prefix;
 
 pub use records::{
-    AttachedPage, ExactStateRecord, ExactStateRestore, LookupBatchOutcome, PrefillKvIdentity,
-    RecordPageOutcome, ResidentActivationRecord, ResidentActivationRestore, ResidentPrefixRecord,
-    ResidentPrefixRestore,
+    AttachedPage, ExactStateRecord, ExactStateRestore, ExactStateSource, LookupBatchOutcome,
+    PrefillKvIdentity, RecordPageOutcome, ResidentActivationRecord, ResidentActivationRestore,
+    ResidentPrefixRecord, ResidentPrefixRestore,
 };
 
 pub(crate) fn proactive_eviction_error_kind(error: &anyhow::Error) -> &'static str {
@@ -288,6 +291,45 @@ impl KvStageIntegration {
             (
                 "skippy.kv.shared_prefix_record_limit",
                 json!(self.candidate_policy.record_limit),
+            ),
+        ]
+        .into_iter()
+        .chain(self.disk_tier_attrs())
+        .collect()
+    }
+
+    /// Disk-tier counters, flattened into telemetry attributes.
+    ///
+    /// The tier already counts demotions, promotions, budget evictions,
+    /// corruption and checksum work, but until now none of it left the
+    /// process. Without these a disk tier that has quietly stopped storing
+    /// (full budget, every write failing, every entry quarantined) is
+    /// indistinguishable from one that is simply never probed.
+    fn disk_tier_attrs(&self) -> Vec<(&'static str, Value)> {
+        let Some(stats) = self
+            .exact_states
+            .lock()
+            .expect("exact state cache lock poisoned")
+            .disk_stats()
+        else {
+            return vec![("skippy.kv.disk_tier_enabled", json!(false))];
+        };
+        vec![
+            ("skippy.kv.disk_tier_enabled", json!(true)),
+            ("skippy.kv.disk_entries", json!(stats.entries)),
+            ("skippy.kv.disk_bytes", json!(stats.bytes)),
+            ("skippy.kv.disk_max_bytes", json!(stats.max_bytes)),
+            ("skippy.kv.disk_demotions", json!(stats.demotions)),
+            ("skippy.kv.disk_promotions", json!(stats.promotions)),
+            ("skippy.kv.disk_evictions", json!(stats.evictions)),
+            (
+                "skippy.kv.disk_corrupt_entries",
+                json!(stats.corrupt_entries),
+            ),
+            ("skippy.kv.disk_verifications", json!(stats.verifications)),
+            (
+                "skippy.kv.disk_verifications_skipped",
+                json!(stats.verifications_skipped),
             ),
         ]
     }

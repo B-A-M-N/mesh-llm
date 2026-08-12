@@ -51,7 +51,7 @@ use crate::CacheBytes;
 
 /// Bumped whenever the on-disk layout or the identity contract changes, so a
 /// stale directory from an older build is discarded rather than misread.
-const DISK_TIER_FORMAT_VERSION: u32 = 3;
+const DISK_TIER_FORMAT_VERSION: u32 = 1;
 
 /// Checksum the caller metadata that describes how to interpret a page.
 ///

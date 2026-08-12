@@ -426,11 +426,30 @@ impl StageOpenAiBackend {
             );
         }
         if let Some(identity) = archive_candidate.take() {
-            let mut runtime = self
-                .runtime
-                .lock()
-                .map_err(|_| OpenAiError::backend("runtime lock poisoned"))?;
-            let _ = kv.archive_dense_prefix(&mut runtime, session_id, &identity);
+            let outcome = {
+                let mut runtime = self
+                    .runtime
+                    .lock()
+                    .map_err(|_| OpenAiError::backend("runtime lock poisoned"))?;
+                kv.archive_dense_prefix(&mut runtime, session_id, &identity)
+            };
+            let mut attrs = self.openai_attrs(ids);
+            attrs.insert("skippy.kv.decision".to_string(), json!("disk_archive"));
+            match outcome {
+                Ok(outcome) => outcome.insert_attrs(&identity, &mut attrs),
+                Err(error) => {
+                    attrs.insert(
+                        "skippy.kv.archive_status".to_string(),
+                        json!("failed_error"),
+                    );
+                    attrs.insert(
+                        "skippy.kv.archive_error".to_string(),
+                        json!(error.to_string()),
+                    );
+                }
+            }
+            self.telemetry
+                .emit("stage.openai_kv_record_decision", attrs);
         }
         let activation_records = kv.record_resident_activation(
             &self.config,
@@ -570,11 +589,30 @@ impl StageOpenAiBackend {
             );
         }
         if let Some(identity) = archive_candidate.take() {
-            let mut runtime = self
-                .runtime
-                .lock()
-                .map_err(|_| OpenAiError::backend("runtime lock poisoned"))?;
-            let _ = kv.archive_dense_prefix(&mut runtime, session_id, &identity);
+            let outcome = {
+                let mut runtime = self
+                    .runtime
+                    .lock()
+                    .map_err(|_| OpenAiError::backend("runtime lock poisoned"))?;
+                kv.archive_dense_prefix(&mut runtime, session_id, &identity)
+            };
+            let mut attrs = self.openai_attrs(ids);
+            attrs.insert("skippy.kv.decision".to_string(), json!("disk_archive"));
+            match outcome {
+                Ok(outcome) => outcome.insert_attrs(&identity, &mut attrs),
+                Err(error) => {
+                    attrs.insert(
+                        "skippy.kv.archive_status".to_string(),
+                        json!("failed_error"),
+                    );
+                    attrs.insert(
+                        "skippy.kv.archive_error".to_string(),
+                        json!(error.to_string()),
+                    );
+                }
+            }
+            self.telemetry
+                .emit("stage.openai_kv_record_decision", attrs);
         }
         let mut recorded_any = false;
         for record in records.into_iter().flatten() {

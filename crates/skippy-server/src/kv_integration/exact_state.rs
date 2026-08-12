@@ -4,8 +4,8 @@ use skippy_cache::ExactStatePayload;
 use crate::runtime_state::RuntimeState;
 
 use super::{
-    ExactStateExtra, ExactStateRecord, ExactStateRestore, KvStageIntegration, PrefillKvIdentity,
-    StagePrefixCachePayload, records::add_reconstruct_stats,
+    ExactStateExtra, ExactStateRecord, ExactStateRestore, ExactStateSource, KvStageIntegration,
+    PrefillKvIdentity, StagePrefixCachePayload, records::add_reconstruct_stats,
 };
 
 impl KvStageIntegration {
@@ -44,6 +44,7 @@ impl KvStageIntegration {
             let Some(lookup) = lookup else {
                 continue;
             };
+            let from_disk = lookup.from_disk;
             let mut reconstruct_ms = 0.0;
             let mut reconstruct_bytes = 0u64;
             let mut reconstruct_blocks = 0usize;
@@ -105,6 +106,11 @@ impl KvStageIntegration {
                 page_id: lookup.page_id,
                 token_count: lookup.token_count as usize,
                 payload_kind: lookup.payload.kind(),
+                source: if from_disk {
+                    ExactStateSource::Disk
+                } else {
+                    ExactStateSource::Ram
+                },
                 logical_bytes: lookup.logical_bytes,
                 entries: lookup.entries,
                 reconstruct_ms,

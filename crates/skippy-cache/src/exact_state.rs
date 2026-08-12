@@ -949,6 +949,113 @@ mod disk_tier_integration_tests {
         assert_eq!(stats.hits, 1);
     }
 
+    /// `RecurrentOnly` had no disk coverage at all: every payload-kind test
+    /// exercised `FullState`, `KvRecurrent` or `ResidentKvArchive`, so a
+    /// single-component recurrent payload could have been broken on the disk
+    /// path without any test noticing.
+    #[test]
+    fn recurrent_only_payloads_round_trip_through_the_disk_tier() {
+        let dir = tempfile::tempdir().unwrap();
+        let recurrent = vec![5u8; 3072];
+        {
+            let mut cache = cache_with_disk(&dir, 1);
+            cache.record(
+                "page-a".to_string(),
+                1024,
+                ExactStatePayload::recurrent_only(recurrent.clone()),
+                (),
+            );
+            // Force the demotion of page-a.
+            cache.record(
+                "page-b".to_string(),
+                64,
+                ExactStatePayload::recurrent_only(vec![0u8; 64]),
+                (),
+            );
+        }
+
+        // Reopened process: the entry must still be there and still readable.
+        let mut restarted = cache_with_disk(&dir, 1);
+        let restored = restarted
+            .lookup_with_disk("page-a", ExactStatePayloadKind::RecurrentOnly, || ())
+            .unwrap()
+            .expect("recurrent-only prefix should survive demotion and restart");
+
+        assert!(restored.from_disk);
+        assert_eq!(restored.token_count, 1024);
+        assert_eq!(
+            restored.payload.kind(),
+            ExactStatePayloadKind::RecurrentOnly
+        );
+        assert!(restored.payload.is_mapped());
+        assert_eq!(
+            restored.payload.recurrent_state_bytes().unwrap().as_ref(),
+            &recurrent[..]
+        );
+    }
+
+    /// Every stored kind must reject every other kind. The single-direction
+    /// test that existed left five of the six cross-kind pairs unchecked, and
+    /// a mismatch that is *not* caught is a payload reinterpreted under the
+    /// wrong layout -- silent numerical corruption, not a miss.
+    #[test]
+    fn every_payload_kind_rejects_a_lookup_for_a_different_kind() {
+        use ExactStatePayloadKind::{FullState, KvRecurrent, RecurrentOnly, ResidentKvArchive};
+
+        let all = [FullState, RecurrentOnly, KvRecurrent, ResidentKvArchive];
+        for stored in all {
+            for requested in all {
+                if stored == requested {
+                    continue;
+                }
+                let dir = tempfile::tempdir().unwrap();
+                let mut cache = cache_with_disk(&dir, 1);
+                let components: Vec<Vec<u8>> = (0..stored.disk_component_count())
+                    .map(|index| vec![index as u8 + 1; 256])
+                    .collect();
+                let borrowed: Vec<&[u8]> =
+                    components.iter().map(|bytes| bytes.as_slice()).collect();
+                assert!(
+                    cache.store_on_disk("page-a", 256, stored, &borrowed, ()),
+                    "storing {stored:?} should succeed"
+                );
+
+                assert!(
+                    cache.lookup_disk_only("page-a", requested).is_err(),
+                    "stored {stored:?} must not be served as {requested:?}"
+                );
+            }
+        }
+    }
+
+    /// A quarantined entry must stay rejected, not become a silent hit on the
+    /// next probe once the mapping is cached.
+    #[test]
+    fn a_kind_mismatch_quarantines_the_entry_for_later_correct_lookups_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cache = cache_with_disk(&dir, 1);
+        assert!(cache.store_on_disk(
+            "page-a",
+            256,
+            ExactStatePayloadKind::ResidentKvArchive,
+            &[&[7u8; 256][..]],
+            (),
+        ));
+
+        assert!(
+            cache
+                .lookup_disk_only("page-a", ExactStatePayloadKind::FullState)
+                .is_err()
+        );
+        assert!(
+            cache
+                .lookup_disk_only("page-a", ExactStatePayloadKind::ResidentKvArchive)
+                .unwrap()
+                .is_none(),
+            "a quarantined entry must not come back"
+        );
+    }
+
     /// Asking for the wrong payload kind must fail loudly rather than
     /// reinterpret the bytes.
     #[test]
