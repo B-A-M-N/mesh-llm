@@ -222,7 +222,13 @@ async function* runConnect(
 
       const errorBody = await parseApiErrorBody(response)
       const shouldRetry = attempt === 0 && isModelRouteNotFound(response.status, errorBody)
-      if (!shouldRetry || !(await waitForModelRouteRetry(abortSignal))) {
+      if (!shouldRetry) {
+        throw new ApiError(response.status, errorBody, `Chat request failed: ${response.status}`)
+      }
+
+      const retryAllowed = await waitForModelRouteRetry(abortSignal)
+      if (abortSignal?.aborted) return
+      if (!retryAllowed) {
         throw new ApiError(response.status, errorBody, `Chat request failed: ${response.status}`)
       }
     }
