@@ -1209,7 +1209,12 @@ fn startup_specs_for_provider(
     };
     startup_specs
         .iter()
-        .filter(|spec| spec.model_ref.to_string_lossy() != provider.model_id)
+        .filter(|spec| {
+            !provider
+                .model_ids
+                .iter()
+                .any(|model_id| spec.model_ref.to_string_lossy() == *model_id)
+        })
         .cloned()
         .collect()
 }
