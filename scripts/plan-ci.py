@@ -352,10 +352,18 @@ def _affected_crates(
     raw: object,
 ) -> list[str]:
     workspace_names = [package["name"] for package in packages]
-    if raw is not None and raw != []:
-        affected = _string_list(raw, "affected_crates")
-    elif profile in {"main", "manual-full"}:
+    if profile in {"main", "manual-full"}:
+        # Main and manual-full always validate the whole workspace; a narrower
+        # caller-supplied list would violate the full-coverage invariant that
+        # _validate_plan asserts for these profiles.
+        if raw is not None and raw != []:
+            supplied = _string_list(raw, "affected_crates")
+            unknown = sorted(set(supplied) - set(workspace_names))
+            if unknown:
+                raise PlanError(f"affected_crates contains non-workspace crates: {unknown}")
         affected = workspace_names
+    elif raw is not None and raw != []:
+        affected = _string_list(raw, "affected_crates")
     else:
         script = root / "scripts" / "affected-crates.sh"
         result = subprocess.run(

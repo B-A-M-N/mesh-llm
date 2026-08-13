@@ -339,6 +339,41 @@ class PlanCiTests(unittest.TestCase):
         ):
             PLANNER._validate_manifests(ownership, slices)
 
+    def test_main_ignores_narrow_caller_supplied_affected_crates(self) -> None:
+        payload = fixture("main.json")
+        payload["affected_crates"] = ["mesh-llm-config"]
+
+        plan = PLANNER.build_plan(payload, root=ROOT)
+
+        workspace = {"mesh-llm", "mesh-llm-host-runtime", "mesh-llm-config"}
+        tested = {
+            crate
+            for batch in plan["matrices"]["rust_tests"]
+            for crate in batch["crates"]
+        }
+        self.assertEqual(tested, workspace)
+        self.assertEqual(set(plan["affected_crates"]), workspace)
+
+    def test_manual_full_ignores_narrow_caller_supplied_affected_crates(self) -> None:
+        payload = fixture("main.json")
+        payload["profile"] = "manual-full"
+        payload["event_name"] = "workflow_dispatch"
+        payload["affected_crates"] = ["mesh-llm-config"]
+
+        plan = PLANNER.build_plan(payload, root=ROOT)
+
+        self.assertEqual(
+            set(plan["affected_crates"]),
+            {"mesh-llm", "mesh-llm-host-runtime", "mesh-llm-config"},
+        )
+
+    def test_main_still_rejects_non_workspace_affected_crates(self) -> None:
+        payload = fixture("main.json")
+        payload["affected_crates"] = ["not-a-crate"]
+
+        with self.assertRaises(PLANNER.PlanError):
+            PLANNER.build_plan(payload, root=ROOT)
+
     def test_manifest_domain_row_mapping_rejects_unknown_ids(self) -> None:
         ownership = json.loads((ROOT / "ci" / "ownership.yml").read_text())
         slices = json.loads((ROOT / "ci" / "slices.yml").read_text())
