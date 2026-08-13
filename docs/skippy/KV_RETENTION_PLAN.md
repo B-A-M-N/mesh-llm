@@ -598,7 +598,7 @@ five real issues, all now fixed:
 
 | Finding | Fix |
 |---|---|
-| Metadata (`extra`, the KV page descriptor) was not checksummed, only the payload. A corrupted-but-valid-JSON index could apply correct bytes under a wrong layout. | `extra_checksum` on every entry, verified before the payload; format version bumped to 3. Test: `tampered_metadata_is_rejected_even_though_the_payload_is_intact`. |
+| Metadata (`extra`, the KV page descriptor) was not checksummed, only the payload. A corrupted-but-valid-JSON index could apply correct bytes under a wrong layout. | `extra_checksum` on every entry, verified before the payload. This was added before the format shipped, so the final on-disk contract remains `format_version: 1`; intermediate development builds are not compatible. Test: `tampered_metadata_is_rejected_even_though_the_payload_is_intact`. |
 | Weights with no content digest could alias: two different GGUFs served under one `model_id` collide on disk. | The tier now refuses to open unless at least one of `manifest_sha256` / `source_model_sha256` is a valid 64-hex SHA-256 digest. A `package_ref` alone is not sufficient, so mutable local paths fail closed. |
 | No directory locking on non-Unix; the tier silently ran unprotected. | Non-Unix now fails closed with an explicit error rather than running without a lock. |
 | Crash-left `.tmp` files were never reclaimed, leaking a page's bytes per crash. | Reclaimed at open, which is safe because open holds the exclusive lock. Test: `crash_left_temp_files_are_reclaimed_on_open`. |
