@@ -105,20 +105,8 @@ pub struct KvStageIntegration {
     pub(crate) exact_states: Arc<Mutex<ExactStateCache<ExactStateExtra>>>,
     pub(crate) first_tokens: Arc<Mutex<BTreeMap<String, i32>>>,
     pub(crate) replay_tokens: Arc<Mutex<BTreeMap<String, Vec<i32>>>>,
-    /// Set once the runtime tells us this stage's attention memory cannot be
-    /// exported as a single native KV page.
-    ///
-    /// Sliding-window models (Gemma 3/4 and anything else llama.cpp backs with
-    /// `llama_memory_hybrid_iswa`) keep attention state in two caches: a
-    /// full-context base for the non-SWA layers and a window-bounded cache for
-    /// the SWA layers. One page with one token range cannot describe that, so
-    /// the native side declines the export -- correctly. Resident, in-process
-    /// reuse still works for these models, because a sequence copy duplicates
-    /// both caches; only the *disk* tier is out of reach.
-    ///
-    /// It is a property of the stage, not of the request, so retrying it per
-    /// archive burns an export attempt on every single prefill and reports a
-    /// failure that is really a permanent, expected limitation. Latch it.
+    /// Latches native layouts that cannot produce a disk-safe page. Composite ISWA
+    /// layouts are supported by ABI 0.1.39; unknown layouts still decline once.
     pub(crate) dense_archive_unsupported: Arc<AtomicBool>,
 }
 
