@@ -156,7 +156,7 @@ impl KvStageIntegration {
                             recurrent,
                         ),
                         ExactStateExtra {
-                            kv_desc: kv.as_ref().map(|kv| kv.desc),
+                            kv_desc: kv.as_ref().map(|kv| kv.desc.clone()),
                         },
                     )
                 }

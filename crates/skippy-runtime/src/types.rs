@@ -164,7 +164,7 @@ impl From<RawKvPageComponentDesc> for RuntimeKvPageComponentDesc {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RuntimeKvPageDesc {
     pub version: u32,
     pub layer_start: i32,
@@ -184,7 +184,7 @@ pub struct RuntimeKvPageDesc {
     #[serde(default)]
     pub component_count: u32,
     #[serde(default)]
-    pub components: [RuntimeKvPageComponentDesc; 2],
+    pub components: Box<[RuntimeKvPageComponentDesc; 2]>,
 }
 
 impl RuntimeKvPageDesc {
@@ -198,7 +198,7 @@ impl RuntimeKvPageDesc {
             skippy_ffi::KV_PAGE_CODEC_ISWA_COMPOSITE_V1
                 if self.version == 2 && self.component_count == 2 =>
             {
-                let [base, swa] = self.components;
+                let [base, swa] = *self.components;
                 if base.version != 1
                     || base.role != 1
                     || base.payload_offset != 0
@@ -237,7 +237,10 @@ impl RuntimeKvPageDesc {
             flags: self.flags,
             codec: self.codec,
             component_count: self.component_count,
-            components: self.components.map(RuntimeKvPageComponentDesc::as_raw),
+            components: self
+                .components
+                .as_ref()
+                .map(RuntimeKvPageComponentDesc::as_raw),
         }
     }
 }
@@ -260,7 +263,7 @@ impl From<RawKvPageDesc> for RuntimeKvPageDesc {
             flags: raw.flags,
             codec: raw.codec,
             component_count: raw.component_count,
-            components: raw.components.map(Into::into),
+            components: Box::new(raw.components.map(Into::into)),
         }
     }
 }
@@ -529,7 +532,7 @@ mod kv_page_descriptor_tests {
             payload_bytes: 12,
             codec: skippy_ffi::KV_PAGE_CODEC_ISWA_COMPOSITE_V1,
             component_count: 2,
-            components: [
+            components: Box::new([
                 RuntimeKvPageComponentDesc {
                     version: 1,
                     role: 1,
@@ -547,7 +550,7 @@ mod kv_page_descriptor_tests {
                     payload_bytes: 7,
                     ..Default::default()
                 },
-            ],
+            ]),
             layer_start: 0,
             layer_end: 2,
             token_start: 0,
@@ -581,7 +584,7 @@ mod kv_page_descriptor_tests {
                 v_row_bytes: 0,
                 v_element_bytes: 0,
                 flags: 0,
-                components: Default::default(),
+                components: Box::default(),
             };
             assert!(desc.validate_payload(3).is_ok());
         }
