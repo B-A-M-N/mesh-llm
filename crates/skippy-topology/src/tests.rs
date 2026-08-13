@@ -1673,6 +1673,26 @@ fn qwen35_series_inference_covers_qwen36_release_names() {
 }
 
 #[test]
+fn unknown_qwen3_point_releases_resolve_to_no_family() {
+    // A Qwen3 point release we have no evidence for must not be guessed into
+    // the non-recurrent `qwen3moe`/`qwen3_dense` families. Qwen3.5, 3.6 and
+    // 3.8 are all hybrid, so a wrong guess advertises a non-recurrent policy
+    // for a probably-recurrent model. No capability is the safe answer: it
+    // surfaces the gap at onboarding instead of at runtime.
+    for identity in [
+        "Qwen/Qwen3.9-40B-A3B-GGUF:Q4_K_M",
+        "unsloth/Qwen3.7-27B-GGUF:Q4_K_M",
+        "qwen39",
+        "qwen3.7",
+    ] {
+        assert!(
+            infer_family_capability(identity, 40, 2048).is_none(),
+            "{identity} must not resolve to a guessed family"
+        );
+    }
+}
+
+#[test]
 fn qwen3_parameter_sizes_are_not_mistaken_for_qwen35_series() {
     // `Qwen3-5B` compacts to `qwen35b`: the digit is a parameter count, not a
     // series number, so these must stay on the non-recurrent Qwen3 families.
@@ -1680,6 +1700,11 @@ fn qwen3_parameter_sizes_are_not_mistaken_for_qwen35_series() {
         ("Qwen/Qwen3-5B-GGUF:Q4_K_M", "qwen3_dense"),
         ("Qwen/Qwen3-6B-GGUF:Q4_K_M", "qwen3_dense"),
         ("Qwen/Qwen3-8B-GGUF:Q4_K_M", "qwen3_dense"),
+        // Fractional sizes compact to `qwen30.6b`: the digit after the dot is
+        // a size, not a point release.
+        ("Qwen/Qwen3-0.6B-GGUF:Q8_0", "qwen3_dense"),
+        // Multi-digit runs are parameter counts, not point releases.
+        ("Qwen/Qwen3-235B-A22B-GGUF:Q4_K_M", "qwen3moe"),
         ("Qwen/Qwen3-0.6B:Q8_0", "qwen3_dense"),
         ("Qwen/Qwen3-35B-A3B-GGUF:Q4_K_M", "qwen3moe"),
         ("Qwen/Qwen3-30B-A3B-GGUF:Q4_K_M", "qwen3moe"),

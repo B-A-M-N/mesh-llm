@@ -948,6 +948,14 @@ pub fn infer_family_capability(
     let normalized = model_identity.to_ascii_lowercase();
     let compact = normalized.replace(['_', '-', '/', ' '], "");
 
+    // A Qwen3 point release we have no evidence for must not be guessed into a
+    // neighbouring Qwen family. Every known point release (3.5, 3.6, 3.8) is
+    // hybrid, so the closest lexical match would advertise a non-recurrent
+    // policy for a probably-recurrent model. Stop before the fallback chain.
+    if unknown_qwen3_point_release(&compact) {
+        return None;
+    }
+
     infer_granite_gemma_capability(&compact, layer_count, activation_width)
         .or_else(|| {
             infer_falcon_minimax_glm_deepseek_capability(&compact, layer_count, activation_width)
@@ -1546,25 +1554,66 @@ fn qwen35_series_family_id(compact_identity: &str) -> Option<&'static str> {
     Some("qwen35")
 }
 
+/// Point releases of Qwen3 that are known to load as the `qwen35` /
+/// `qwen35moe` hybrid pair.
+///
+/// This list is deliberately explicit. Whether a new point release reuses an
+/// existing llama.cpp architecture is a fact about that release, not something
+/// derivable from its name, so a new entry must be justified by a real
+/// artifact. `unknown_qwen3_point_release` keeps the failure mode safe for
+/// releases that are not listed here yet.
+const QWEN35_SERIES_POINT_RELEASES: &[char] = &['5', '6', '8'];
+
 fn is_qwen35_series(compact_identity: &str) -> bool {
-    if compact_identity.contains("qwen3.5")
-        || compact_identity.contains("qwen3.6")
-        || compact_identity.contains("qwen3.8")
-    {
-        return true;
-    }
-    ["qwen35", "qwen36", "qwen38"].into_iter().any(|marker| {
-        compact_identity
-            .match_indices(marker)
-            .any(|(index, _)| !is_parameter_size_suffix(compact_identity, index + marker.len()))
-    })
+    qwen3_point_release(compact_identity)
+        .is_some_and(|release| QWEN35_SERIES_POINT_RELEASES.contains(&release))
+}
+
+/// Reports a Qwen3 point release digit, if the identity names one.
+///
+/// Both the dotted release spelling (`Qwen3.6-35B-A3B` -> `qwen3.6`) and the
+/// dotless architecture spelling (`qwen36`) are recognized. Parameter counts
+/// are not point releases: `Qwen3-8B` compacts to `qwen38b` and
+/// `Qwen3-235B-A22B` to `qwen3235ba22b`, so a digit run followed by `b`
+/// belongs to the model size.
+fn qwen3_point_release(compact_identity: &str) -> Option<char> {
+    compact_identity
+        .match_indices("qwen3")
+        .find_map(|(index, marker)| {
+            let rest = &compact_identity[index + marker.len()..];
+            if let Some(dotted) = rest.strip_prefix('.') {
+                // `qwen3.6-35b` keeps the size right after the release digit,
+                // so a dotted spelling is exactly one digit.
+                return dotted.chars().next().filter(char::is_ascii_digit);
+            }
+            let digits = rest.chars().take_while(char::is_ascii_digit).count();
+            // A multi-digit run is a parameter count (`qwen3235ba22b`), a
+            // single digit followed by `b` is too (`qwen38b`), and one
+            // followed by `.` is a fractional size (`Qwen3-0.6B` ->
+            // `qwen30.6b`).
+            if digits != 1 || rest[digits..].starts_with(['b', '.']) {
+                return None;
+            }
+            rest.chars().next()
+        })
+}
+
+/// Reports a Qwen3 point release that no family policy covers yet.
+///
+/// A release such as `Qwen3.9` almost certainly does not load as plain
+/// `qwen3moe`, so guessing that family would advertise a non-recurrent policy
+/// for a model that may well be hybrid. Returning no capability instead makes
+/// the gap explicit at onboarding time rather than silently wrong at runtime.
+fn unknown_qwen3_point_release(compact_identity: &str) -> bool {
+    qwen3_point_release(compact_identity)
+        .is_some_and(|release| !QWEN35_SERIES_POINT_RELEASES.contains(&release))
 }
 
 /// Distinguishes `Qwen3-5B` (compacts to `qwen35b`) and `Qwen3-8B`
 /// (`qwen38b`) from the Qwen3.5 series.
 ///
-/// A `b` directly after the marker is a parameter-count suffix, so the digit
-/// belongs to the model size rather than to a series number.
+/// A `b` directly after the digits is a parameter-count suffix, so they belong
+/// to the model size rather than to a series number.
 fn is_parameter_size_suffix(compact_identity: &str, index: usize) -> bool {
     compact_identity.as_bytes().get(index) == Some(&b'b')
 }
