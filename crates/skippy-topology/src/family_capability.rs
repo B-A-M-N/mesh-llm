@@ -747,8 +747,8 @@ pub fn falcon_h1_capability(layer_count: u32, activation_width: u32) -> FamilyCa
 
 /// Capability for the Qwen3.5 series (llama.cpp `qwen35` / `qwen35moe`).
 ///
-/// Qwen3.6 releases share this architecture pair; there is no separate `qwen36`
-/// architecture in llama.cpp. Certified evidence for both
+/// Qwen3.6 and Qwen3.8 releases share this architecture pair; there is no
+/// separate `qwen36` or `qwen38` architecture in llama.cpp. Certified evidence for both
 /// `mradermacher/UnifiedReward-Edit-qwen35-4b-i1-GGUF` (`qwen35`) and
 /// `unsloth/Qwen3.6-35B-A3B-GGUF` (`qwen35moe`) records state mobility as
 /// rejected-too-large, so exact full-state handoff must not be advertised.
@@ -1531,11 +1531,11 @@ fn infer_stage_runtime_fallback_capability(
 
 /// Resolves the Qwen3.5-series family id (`qwen35moe` or `qwen35`), if any.
 ///
-/// Qwen3.5 and Qwen3.6 releases both load as llama.cpp `qwen35` / `qwen35moe`;
-/// there is no separate `qwen36` architecture. Release names spell the series
-/// with a dot (`Qwen3.6-35B-A3B`), and the compacted identity keeps that dot,
-/// so both the dotted release spelling and the dotless architecture string have
-/// to be recognized here.
+/// Qwen3.5, Qwen3.6, and Qwen3.8 releases all load as llama.cpp `qwen35` /
+/// `qwen35moe`; there is no separate `qwen36` or `qwen38` architecture.
+/// Release names spell the series with a dot (`Qwen3.6-35B-A3B`), and the
+/// compacted identity keeps that dot, so both the dotted release spelling and
+/// the dotless architecture string have to be recognized here.
 fn qwen35_series_family_id(compact_identity: &str) -> Option<&'static str> {
     if !is_qwen35_series(compact_identity) {
         return None;
@@ -1547,17 +1547,21 @@ fn qwen35_series_family_id(compact_identity: &str) -> Option<&'static str> {
 }
 
 fn is_qwen35_series(compact_identity: &str) -> bool {
-    if compact_identity.contains("qwen3.5") || compact_identity.contains("qwen3.6") {
+    if compact_identity.contains("qwen3.5")
+        || compact_identity.contains("qwen3.6")
+        || compact_identity.contains("qwen3.8")
+    {
         return true;
     }
-    ["qwen35", "qwen36"].into_iter().any(|marker| {
+    ["qwen35", "qwen36", "qwen38"].into_iter().any(|marker| {
         compact_identity
             .match_indices(marker)
             .any(|(index, _)| !is_parameter_size_suffix(compact_identity, index + marker.len()))
     })
 }
 
-/// Distinguishes `Qwen3-5B` (compacts to `qwen35b`) from the Qwen3.5 series.
+/// Distinguishes `Qwen3-5B` (compacts to `qwen35b`) and `Qwen3-8B`
+/// (`qwen38b`) from the Qwen3.5 series.
 ///
 /// A `b` directly after the marker is a parameter-count suffix, so the digit
 /// belongs to the model size rather than to a series number.

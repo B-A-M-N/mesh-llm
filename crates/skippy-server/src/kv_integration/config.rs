@@ -162,6 +162,8 @@ fn infer_cache_payload(config: &StageConfig) -> StagePrefixCachePayload {
         || identity.contains("qwen3-next")
         || identity.contains("qwen3.6")
         || identity.contains("qwen3_6")
+        || identity.contains("qwen3.8")
+        || identity.contains("qwen3_8")
         || identity.contains("kimi-linear")
         || identity.contains("kimi_linear")
     {

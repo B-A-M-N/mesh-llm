@@ -1622,7 +1622,8 @@ fn reviewed_supported_families_smoke_plan_with_expected_policy_signals() {
 
 #[test]
 fn qwen35_series_inference_covers_qwen36_release_names() {
-    // Qwen3.6 loads as llama.cpp `qwen35`/`qwen35moe`; there is no `qwen36` arch.
+    // Qwen3.6 and Qwen3.8 load as llama.cpp `qwen35`/`qwen35moe`; there is no
+    // `qwen36` or `qwen38` arch.
     // Every quant and uploader must resolve to the recurrent series, not qwen3moe.
     for identity in [
         "unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q4_K_XL",
@@ -1630,8 +1631,12 @@ fn qwen35_series_inference_covers_qwen36_release_names() {
         "bartowski/Qwen3.6-35B-A3B-GGUF:Q4_K_M",
         "Qwen/Qwen3.6-35B-A3B-Instruct-GGUF:Q5_K_M",
         "unsloth/Qwen3.5-35B-A3B-GGUF:Q4_K_M",
+        "unsloth/Qwen3.8-2.4T-A95B-GGUF:UD-Q1_0",
+        "unsloth/Qwen3.8-2.4T-A95B-GGUF:UD-IQ2_XXS",
+        "meshllm/Qwen3.8-2.4T-A95B-UD-Q1_0-layers",
         "qwen35moe",
         "qwen36moe",
+        "qwen38moe",
     ] {
         let family = infer_family_capability(identity, 40, 2048)
             .unwrap_or_else(|| panic!("expected qwen35moe capability for {identity}"));
@@ -1651,8 +1656,10 @@ fn qwen35_series_inference_covers_qwen36_release_names() {
     for identity in [
         "unsloth/Qwen3.6-27B-GGUF:UD-Q4_K_XL",
         "unsloth/Qwen3.5-4B-GGUF:Q4_K_M",
+        "unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_XL",
         "qwen35",
         "qwen36",
+        "qwen38",
     ] {
         let family = infer_family_capability(identity, 32, 2560)
             .unwrap_or_else(|| panic!("expected qwen35 capability for {identity}"));
@@ -1672,6 +1679,7 @@ fn qwen3_parameter_sizes_are_not_mistaken_for_qwen35_series() {
     for (identity, expected) in [
         ("Qwen/Qwen3-5B-GGUF:Q4_K_M", "qwen3_dense"),
         ("Qwen/Qwen3-6B-GGUF:Q4_K_M", "qwen3_dense"),
+        ("Qwen/Qwen3-8B-GGUF:Q4_K_M", "qwen3_dense"),
         ("Qwen/Qwen3-0.6B:Q8_0", "qwen3_dense"),
         ("Qwen/Qwen3-35B-A3B-GGUF:Q4_K_M", "qwen3moe"),
         ("Qwen/Qwen3-30B-A3B-GGUF:Q4_K_M", "qwen3moe"),
