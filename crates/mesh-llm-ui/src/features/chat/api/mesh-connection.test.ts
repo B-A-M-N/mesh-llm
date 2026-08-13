@@ -447,6 +447,36 @@ describe('createMeshConnectionAdapter', () => {
     })
   })
 
+  it('retries a transient model-not-found response while public routing converges', async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ error: { message: "model 'apple/system' not found" } }), {
+          status: 404,
+          headers: { 'Content-Type': 'application/json' }
+        })
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          createSSEStream([
+            'data: {"type":"response.output_text.delta","delta":"Recovered"}\n',
+            'data: [DONE]\n'
+          ]),
+          { status: 200 }
+        )
+      )
+    vi.stubGlobal('fetch', fetchMock)
+
+    const adapter = createMeshConnectionAdapter('apple/system')
+    const chunks: StreamChunk[] = []
+    for await (const chunk of adapter.connect(createMessages(), undefined, undefined)) {
+      chunks.push(chunk)
+    }
+
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    expect(chunks.map((chunk) => chunk.type)).toContain(EventType.TEXT_MESSAGE_CONTENT)
+  })
+
   it('stops before /api/responses when attachment upload fails', async () => {
     const fetchMock = vi.fn().mockResolvedValue(
       new Response(JSON.stringify({ error: { message: 'Upload failed: 503' } }), {
