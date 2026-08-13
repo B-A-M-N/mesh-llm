@@ -109,7 +109,9 @@ async function compactResponsesInput(
   const firstMessage = Math.max(1, messages.length - 8)
   for (let start = firstMessage; start < messages.length; start += 1) {
     const candidate = await buildResponsesInput(messages.slice(start), model, clientId, requestId, systemPrompt)
-    if (JSON.stringify(candidate).length <= CONTEXT_COMPACTION_RETRY_BODY_BYTES) return candidate
+    const serialized = JSON.stringify(candidate)
+    const byteLength = new TextEncoder().encode(serialized).length
+    if (byteLength <= CONTEXT_COMPACTION_RETRY_BODY_BYTES) return candidate
   }
 
   return undefined

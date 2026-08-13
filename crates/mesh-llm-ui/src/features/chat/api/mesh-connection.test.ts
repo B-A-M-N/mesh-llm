@@ -543,6 +543,65 @@ describe('createMeshConnectionAdapter', () => {
     ).toContain('Compacted')
   })
 
+  it('measures UTF-8 byte length correctly when compacting multibyte text', async () => {
+    // Construct messages with multibyte characters (emoji + CJK) where UTF-16 .length
+    // would undercount the actual UTF-8 byte size, potentially allowing an oversized body.
+    // Each emoji is ~4 UTF-8 bytes but 2 UTF-16 code units (.length counts UTF-16).
+    // Each CJK character is ~3 UTF-8 bytes but 1 UTF-16 code unit.
+    const multibyteContent = '🌟🚀💡'.repeat(1000) + '你好世界'.repeat(500)
+    const longMessages = Array.from({ length: 8 }, (_, index) => ({
+      id: `message-${index}`,
+      role: index % 2 === 0 ? ('user' as const) : ('assistant' as const),
+      parts: [{ type: 'text' as const, content: `turn-${index} ${multibyteContent}` }],
+      createdAt: new Date(`2026-05-06T00:0${index}:00.000Z`)
+    }))
+
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ error: { message: "no context-compatible target for model 'apple/system'" } }), {
+          status: 503,
+          headers: { 'Content-Type': 'application/json' }
+        })
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          createSSEStream(['data: {"type":"response.output_text.delta","delta":"OK"}\n', 'data: [DONE]\n']),
+          { status: 200 }
+        )
+      )
+    vi.stubGlobal('fetch', fetchMock)
+
+    const adapter = createMeshConnectionAdapter('apple/system')
+    const chunks: StreamChunk[] = []
+    for await (const chunk of adapter.connect(longMessages, undefined, undefined)) {
+      chunks.push(chunk)
+    }
+
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    const compactedBodyString = String(fetchMock.mock.calls[1]?.[1]?.body)
+    const compactedBody = JSON.parse(compactedBodyString) as { input: unknown[] }
+
+    // Verify the compacted body is smaller than the original
+    const firstBody = JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body)) as { input: unknown[] }
+    expect(compactedBody.input.length).toBeLessThan(firstBody.input.length)
+
+    // Critical assertion: the serialized body must be at most CONTEXT_COMPACTION_RETRY_BODY_BYTES
+    // when measured in UTF-8 bytes (not UTF-16 code units).
+    const utf8ByteLength = new TextEncoder().encode(compactedBodyString).length
+    expect(utf8ByteLength).toBeLessThanOrEqual(14_000)
+
+    // Verify string .length would have undercounted (demonstrating the bug would have occurred)
+    expect(compactedBodyString.length).toBeLessThan(utf8ByteLength)
+
+    expect(
+      chunks
+        .filter((chunk) => chunk.type === EventType.TEXT_MESSAGE_CONTENT)
+        .map((chunk) => (chunk.type === EventType.TEXT_MESSAGE_CONTENT ? chunk.delta : ''))
+        .join('')
+    ).toContain('OK')
+  })
+
   it('stops before /api/responses when attachment upload fails', async () => {
     const fetchMock = vi.fn().mockResolvedValue(
       new Response(JSON.stringify({ error: { message: 'Upload failed: 503' } }), {
