@@ -500,6 +500,49 @@ describe('createMeshConnectionAdapter', () => {
     ).toContain('Recovered')
   })
 
+  it('compacts an oversized conversation after a context-route rejection', async () => {
+    const longMessages = Array.from({ length: 8 }, (_, index) => ({
+      id: `message-${index}`,
+      role: index % 2 === 0 ? ('user' as const) : ('assistant' as const),
+      parts: [{ type: 'text' as const, content: `turn-${index} ${'x'.repeat(3_000)}` }],
+      createdAt: new Date(`2026-05-06T00:0${index}:00.000Z`)
+    }))
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ error: { message: "no context-compatible target for model 'apple/system'" } }), {
+          status: 503,
+          headers: { 'Content-Type': 'application/json' }
+        })
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          createSSEStream(['data: {"type":"response.output_text.delta","delta":"Compacted"}\n', 'data: [DONE]\n']),
+          { status: 200 }
+        )
+      )
+    vi.stubGlobal('fetch', fetchMock)
+
+    const adapter = createMeshConnectionAdapter('apple/system')
+    const chunks: StreamChunk[] = []
+    for await (const chunk of adapter.connect(longMessages, undefined, undefined)) {
+      chunks.push(chunk)
+    }
+
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    const firstBody = JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body)) as { input: unknown[] }
+    const compactedBody = JSON.parse(String(fetchMock.mock.calls[1]?.[1]?.body)) as { input: unknown[] }
+    expect(compactedBody.input.length).toBeLessThan(firstBody.input.length)
+    expect(JSON.stringify(compactedBody)).toContain('turn-7')
+    expect(JSON.stringify(compactedBody)).not.toContain('turn-0')
+    expect(
+      chunks
+        .filter((chunk) => chunk.type === EventType.TEXT_MESSAGE_CONTENT)
+        .map((chunk) => (chunk.type === EventType.TEXT_MESSAGE_CONTENT ? chunk.delta : ''))
+        .join('')
+    ).toContain('Compacted')
+  })
+
   it('stops before /api/responses when attachment upload fails', async () => {
     const fetchMock = vi.fn().mockResolvedValue(
       new Response(JSON.stringify({ error: { message: 'Upload failed: 503' } }), {
