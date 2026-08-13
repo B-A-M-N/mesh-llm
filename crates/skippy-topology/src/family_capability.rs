@@ -947,12 +947,15 @@ pub fn infer_family_capability(
 
     let normalized = model_identity.to_ascii_lowercase();
     let compact = normalized.replace(['_', '-', '/', ' '], "");
+    // Release parsing needs the boundary after a dotted version, so it reads a
+    // form that keeps `-` while still joining `qwen3_8` into `qwen38`.
+    let release_form = normalized.replace(['_', '/', ' '], "");
 
     // A Qwen3 point release we have no evidence for must not be guessed into a
     // neighbouring Qwen family. Every known point release (3.5, 3.6, 3.8) is
     // hybrid, so the closest lexical match would advertise a non-recurrent
     // policy for a probably-recurrent model. Stop before the fallback chain.
-    if unknown_qwen3_point_release(&compact) {
+    if unknown_qwen3_point_release(&release_form) {
         return None;
     }
 
@@ -963,7 +966,7 @@ pub fn infer_family_capability(
         .or_else(|| infer_mistral_olmo_llama_capability(&compact, layer_count, activation_width))
         .or_else(|| infer_qwen_next_capability(&compact, layer_count, activation_width))
         .or_else(|| infer_recurrent_capability(&compact, layer_count, activation_width))
-        .or_else(|| infer_qwen_capability(&compact, layer_count, activation_width))
+        .or_else(|| infer_qwen_capability(&release_form, &compact, layer_count, activation_width))
         .or_else(|| infer_remaining_family_capability(&compact, layer_count, activation_width))
         .or_else(|| {
             infer_stage_runtime_fallback_capability(&compact, layer_count, activation_width)
@@ -1219,6 +1222,7 @@ fn infer_recurrent_capability(
 }
 
 fn infer_qwen_capability(
+    release_form: &str,
     compact: &str,
     layer_count: u32,
     activation_width: u32,
@@ -1226,7 +1230,7 @@ fn infer_qwen_capability(
     if compact.contains("qwen2moe") {
         return Some(qwen2moe_capability(layer_count, activation_width));
     }
-    if let Some(family_id) = qwen35_series_family_id(compact) {
+    if let Some(family_id) = qwen35_series_family_id(release_form, compact) {
         return Some(qwen35_series_capability(
             family_id,
             layer_count,
@@ -1544,8 +1548,8 @@ fn infer_stage_runtime_fallback_capability(
 /// Release names spell the series with a dot (`Qwen3.6-35B-A3B`), and the
 /// compacted identity keeps that dot, so both the dotted release spelling and
 /// the dotless architecture string have to be recognized here.
-fn qwen35_series_family_id(compact_identity: &str) -> Option<&'static str> {
-    if !is_qwen35_series(compact_identity) {
+fn qwen35_series_family_id(release_form: &str, compact_identity: &str) -> Option<&'static str> {
+    if !is_qwen35_series(release_form) {
         return None;
     }
     if compact_identity.contains("moe") || is_qwen3_active_parameter_moe(compact_identity) {
@@ -1564,27 +1568,48 @@ fn qwen35_series_family_id(compact_identity: &str) -> Option<&'static str> {
 /// releases that are not listed here yet.
 const QWEN35_SERIES_POINT_RELEASES: &[char] = &['5', '6', '8'];
 
-fn is_qwen35_series(compact_identity: &str) -> bool {
-    qwen3_point_release(compact_identity)
-        .is_some_and(|release| QWEN35_SERIES_POINT_RELEASES.contains(&release))
+fn is_qwen35_series(release_form: &str) -> bool {
+    matches!(
+        qwen3_release(release_form),
+        Some(Qwen3Release::PointRelease(release))
+            if QWEN35_SERIES_POINT_RELEASES.contains(&release)
+    )
 }
 
-/// Reports a Qwen3 point release digit, if the identity names one.
+/// What the `qwen3` marker in a compacted identity says about the release.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Qwen3Release {
+    /// A single-digit point release such as `Qwen3.6` or `qwen36`.
+    PointRelease(char),
+    /// A dotted release whose version is not a single digit, such as
+    /// `Qwen3.50`. It names *some* release, but not one this code has ever
+    /// reviewed, so it must never be narrowed to a reviewed neighbour.
+    UnreviewedDotted,
+}
+
+/// Reports what the identity says about its Qwen3 release, if anything.
 ///
 /// Both the dotted release spelling (`Qwen3.6-35B-A3B` -> `qwen3.6`) and the
 /// dotless architecture spelling (`qwen36`) are recognized. Parameter counts
 /// are not point releases: `Qwen3-8B` compacts to `qwen38b` and
 /// `Qwen3-235B-A22B` to `qwen3235ba22b`, so a digit run followed by `b`
 /// belongs to the model size.
-fn qwen3_point_release(compact_identity: &str) -> Option<char> {
-    compact_identity
+fn qwen3_release(release_form: &str) -> Option<Qwen3Release> {
+    release_form
         .match_indices("qwen3")
         .find_map(|(index, marker)| {
-            let rest = &compact_identity[index + marker.len()..];
+            let rest = &release_form[index + marker.len()..];
             if let Some(dotted) = rest.strip_prefix('.') {
                 // `qwen3.6-35b` keeps the size right after the release digit,
-                // so a dotted spelling is exactly one digit.
-                return dotted.chars().next().filter(char::is_ascii_digit);
+                // so a reviewed dotted spelling is exactly one digit. Anything
+                // else (`Qwen3.50`) is a release we know nothing about, and
+                // truncating it to its first digit would silently claim the
+                // reviewed `Qwen3.5` policy for an unreviewed architecture.
+                let digits = dotted.chars().take_while(char::is_ascii_digit).count();
+                if digits != 1 {
+                    return Some(Qwen3Release::UnreviewedDotted);
+                }
+                return dotted.chars().next().map(Qwen3Release::PointRelease);
             }
             let digits = rest.chars().take_while(char::is_ascii_digit).count();
             // A multi-digit run is a parameter count (`qwen3235ba22b`), a
@@ -1594,7 +1619,7 @@ fn qwen3_point_release(compact_identity: &str) -> Option<char> {
             if digits != 1 || rest[digits..].starts_with(['b', '.']) {
                 return None;
             }
-            rest.chars().next()
+            rest.chars().next().map(Qwen3Release::PointRelease)
         })
 }
 
@@ -1604,9 +1629,14 @@ fn qwen3_point_release(compact_identity: &str) -> Option<char> {
 /// `qwen3moe`, so guessing that family would advertise a non-recurrent policy
 /// for a model that may well be hybrid. Returning no capability instead makes
 /// the gap explicit at onboarding time rather than silently wrong at runtime.
-fn unknown_qwen3_point_release(compact_identity: &str) -> bool {
-    qwen3_point_release(compact_identity)
-        .is_some_and(|release| !QWEN35_SERIES_POINT_RELEASES.contains(&release))
+fn unknown_qwen3_point_release(release_form: &str) -> bool {
+    match qwen3_release(release_form) {
+        Some(Qwen3Release::PointRelease(release)) => {
+            !QWEN35_SERIES_POINT_RELEASES.contains(&release)
+        }
+        Some(Qwen3Release::UnreviewedDotted) => true,
+        None => false,
+    }
 }
 
 fn is_qwen3_active_parameter_moe(compact_identity: &str) -> bool {

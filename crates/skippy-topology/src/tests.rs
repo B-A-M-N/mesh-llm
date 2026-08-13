@@ -1684,6 +1684,11 @@ fn unknown_qwen3_point_releases_resolve_to_no_family() {
         "unsloth/Qwen3.7-27B-GGUF:Q4_K_M",
         "qwen39",
         "qwen3.7",
+        // A dotted release whose version is not a single digit must not be
+        // narrowed to its first digit: `Qwen3.50` is not `Qwen3.5`.
+        "Qwen/Qwen3.50-40B-A3B-GGUF:Q4_K_M",
+        "Qwen/Qwen3.58-40B-GGUF:Q4_K_M",
+        "qwen3.50",
     ] {
         assert!(
             infer_family_capability(identity, 40, 2048).is_none(),
