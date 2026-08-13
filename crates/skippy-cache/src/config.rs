@@ -233,15 +233,23 @@ impl PrefixCandidatePolicy {
             selected.push(near_tail);
         }
 
-        // Cap the ladder by *pinned tokens*, not slot count. Each recorded
-        // candidate pins its full length in KV cells, and the two slots above
-        // are the longest ones — for an 8k prompt they alone pin ~16k cells.
-        // Recording further candidates beyond the resident token budget just
-        // evicts what this same request recorded a moment earlier, which is
-        // the thrash the deeper ladder was meant to remove. `max_resident`
-        // of 0 means "unknown", and leaves the ladder unconstrained.
+        // Cap the ladder by *pinned tokens*, not slot count: recording more
+        // than the resident cache can hold just evicts what this same request
+        // recorded a moment earlier, which is the thrash the deeper ladder was
+        // meant to remove. `max_resident` of 0 means "unknown", and leaves the
+        // ladder unconstrained.
+        //
+        // The budget is charged against the *shared* rungs only. The exact and
+        // near-tail slots above are recorded unconditionally and are by far the
+        // longest — for a 12k prompt they alone pin ~24k cells, more than the
+        // whole budget on any context below 48k. Counting them here made the
+        // very first shared rung unaffordable and silently reduced every
+        // shipped default back to `[exact, near-tail]`, i.e. the pre-ladder
+        // behaviour this policy exists to replace. Their cost is already spent
+        // by the time we get here, so gating the cheap rungs on it protects
+        // nothing and forfeits every cross-session hit.
         let pinned_budget = self.max_resident_tokens_hint;
-        let mut pinned: u64 = selected.iter().sum();
+        let mut pinned: u64 = 0;
 
         for target in self.shared_slot_targets(token_count, limit) {
             if selected.len() >= limit {
@@ -522,12 +530,17 @@ mod record_ladder_tests {
         }
     }
 
-    /// The ladder must respect the resident token budget. The first two
-    /// slots are the longest candidates, so on a small pool they can consume
-    /// the entire budget on their own; recording more after that only evicts
-    /// what this same request just recorded.
+    /// The resident token budget bounds the *shared* rungs, not the two
+    /// mandatory slots.
+    ///
+    /// The exact and near-tail slots are recorded unconditionally and are the
+    /// longest candidates, so charging them against the budget consumed it
+    /// outright on any realistic context and left no shared rung affordable —
+    /// which is precisely the `[exact, near-tail]` behaviour the ladder
+    /// replaces. Their cost is already committed, so the budget governs only
+    /// what is still optional.
     #[test]
-    fn ladder_is_bounded_by_the_resident_token_budget() {
+    fn ladder_budget_bounds_the_shared_rungs_not_the_mandatory_slots() {
         let policy = PrefixCandidatePolicy {
             min_tokens: 256,
             stride_tokens: 128,
@@ -538,12 +551,23 @@ mod record_ladder_tests {
         };
 
         let recorded = policy.record_candidate_token_counts(8000);
-        let pinned: u64 = recorded.iter().sum();
 
-        // The exact length alone exceeds the budget, so nothing beyond the
-        // two mandatory slots may be recorded.
-        assert_eq!(recorded, vec![8000, 7936]);
-        assert!(pinned > 0);
+        assert_eq!(recorded[0], 8000, "exact length is always recorded");
+        assert_eq!(
+            recorded[1], 7936,
+            "near-tail continuation is always recorded"
+        );
+
+        let shared: Vec<u64> = recorded[2..].to_vec();
+        assert!(
+            !shared.is_empty(),
+            "a 4k budget must still afford shared rungs; got {recorded:?}"
+        );
+        let shared_pinned: u64 = shared.iter().sum();
+        assert!(
+            shared_pinned <= 4096,
+            "shared rungs {shared:?} pin {shared_pinned} tokens, over the 4096 budget"
+        );
     }
 
     /// With a generous budget the deeper ladder is admitted in full.
@@ -569,6 +593,68 @@ mod record_ladder_tests {
         assert_eq!(
             agentic_policy(6).record_candidate_token_counts(200),
             vec![200]
+        );
+    }
+}
+
+#[cfg(test)]
+mod shipped_default_ladder_tests {
+    use super::*;
+
+    /// The ladder must produce shareable rungs under the *shipped* config,
+    /// not just under hand-picked test values.
+    ///
+    /// `family_policy` derives `record_limit` from the entry cap, which is
+    /// itself derived from `n_ctx`, and `max_resident_tokens_hint` is a half
+    /// of `n_ctx`. Those three interact: charging the unconditional exact and
+    /// near-tail slots against the token budget consumed it entirely on every
+    /// context below ~48k, so the shared rungs were never affordable and the
+    /// deeper ladder silently did nothing on real deployments. This test pins
+    /// the composed behaviour so that regression cannot return unnoticed.
+    #[test]
+    fn shipped_defaults_record_shareable_rungs() {
+        for ctx in [8192u64, 16384, 32768, 131072] {
+            let max_entries = ((ctx / 2 / 256) as usize).clamp(1, 16);
+            let record_limit = ((max_entries as u64) / 4).clamp(2, 6);
+            let policy = PrefixCandidatePolicy {
+                min_tokens: 256,
+                stride_tokens: 128,
+                record_limit,
+                page_size_tokens: 256,
+                max_resident_tokens_hint: derive_max_resident_tokens(ctx),
+            };
+
+            let recorded = policy.record_candidate_token_counts(12288);
+            let shareable: Vec<u64> = recorded
+                .iter()
+                .copied()
+                .filter(|length| *length * 2 < 12288)
+                .collect();
+
+            assert!(
+                !shareable.is_empty(),
+                "ctx={ctx} recorded {recorded:?} with no rung below the request tail, \
+                 so a second session with the same system prompt cannot hit anything"
+            );
+        }
+    }
+
+    /// Contexts small enough to derive `record_limit = 2` keep the historical
+    /// `[exact, near-tail]` behaviour. Documented rather than asserted-away:
+    /// raising the floor changes default behaviour and is a separate decision.
+    #[test]
+    fn small_contexts_still_record_only_the_tail() {
+        let policy = PrefixCandidatePolicy {
+            min_tokens: 256,
+            stride_tokens: 128,
+            record_limit: 2,
+            page_size_tokens: 256,
+            max_resident_tokens_hint: derive_max_resident_tokens(4096),
+        };
+
+        assert_eq!(
+            policy.record_candidate_token_counts(12288),
+            vec![12288, 12160]
         );
     }
 }
