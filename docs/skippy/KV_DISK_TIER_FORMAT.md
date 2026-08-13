@@ -31,7 +31,7 @@ as a hit.
 
 ## Directory layout
 
-```
+```text
 <base>/<stage-key>/
   owner.lock            # advisory exclusive lock, held for the tier's lifetime
   index.json            # entry metadata for the whole directory

@@ -23,7 +23,6 @@ use skippy_runtime::ActivationFrame;
 use skippy_runtime::NativeMtpDraft as RuntimeNativeMtpDraft;
 use skippy_runtime::SamplingConfig;
 use std::cell::RefCell;
-use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -578,16 +577,17 @@ impl StageOpenAiBackend {
                                     .emit("stage.openai_kv_lookup_decision", attrs);
                             }
                             Ok(None) => {
-                                self.telemetry.emit(
-                                    "stage.openai_kv_lookup_decision",
-                                    BTreeMap::from([
-                                        ("skippy.kv.decision".to_string(), json!("miss")),
-                                        (
-                                            "llama_stage.request_id".to_string(),
-                                            json!(ids.request_id_string()),
-                                        ),
-                                    ]),
-                                );
+                                // Use the same attribute base as every other
+                                // branch. A bare map here produced a `miss`
+                                // event that could not be joined with the hit
+                                // and error events on session or model, which
+                                // is exactly the attribution the disk tier
+                                // needs to show a hit rate.
+                                let mut attrs = self.openai_attrs(ids);
+                                attrs.insert("skippy.kv.decision".to_string(), json!("miss"));
+                                kv.insert_disk_tier_attrs(&mut attrs);
+                                self.telemetry
+                                    .emit("stage.openai_kv_lookup_decision", attrs);
                             }
                             Err(error) => {
                                 let mut attrs = self.openai_attrs(ids);

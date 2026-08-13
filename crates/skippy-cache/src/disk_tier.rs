@@ -559,6 +559,11 @@ impl PrefixDiskTier {
         self.entries.contains_key(page_id)
     }
 
+    /// How many pages the tier currently holds.
+    pub fn entry_count(&self) -> usize {
+        self.entries.len()
+    }
+
     /// Longest stored prefix lengths, for extending lookup probing to lengths
     /// that only exist on disk.
     pub fn token_counts_at_most(&self, max_token_count: u64) -> Vec<u64> {

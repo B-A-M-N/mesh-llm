@@ -155,10 +155,21 @@ pub(super) fn existing_ancestor(path: &Path) -> PathBuf {
             return current.to_path_buf();
         }
         match current.parent() {
+            // A relative path bottoms out at `""`, whose parent is `None`.
+            // Falling through to `/` there would measure the root filesystem
+            // while the cache actually lands under the working directory, so
+            // a relative `SKIPPY_KV_DISK_TIER_DIR` on a separate volume would
+            // size its budget against the wrong disk. Resolve to `.` instead,
+            // which is the filesystem the relative path is actually rooted in.
+            Some(parent) if parent.as_os_str().is_empty() => {
+                return PathBuf::from(if path.is_absolute() { "/" } else { "." });
+            }
             Some(parent) => current = parent,
-            // A path with no existing ancestor at all: fall back to the root,
-            // which lets `statvfs` decide rather than guessing here.
-            None => return PathBuf::from("/"),
+            // An absolute path always reaches `/`; anything else is relative
+            // and resolves against the working directory.
+            None => {
+                return PathBuf::from(if path.is_absolute() { "/" } else { "." });
+            }
         }
     }
 }
@@ -251,6 +262,34 @@ mod tests {
 
         assert!(ancestor.exists());
         assert!(free_space_bytes(&ancestor).is_some_and(|bytes| bytes > 0));
+    }
+
+    /// A relative cache directory must be measured against the working
+    /// directory's filesystem, not the root filesystem.
+    ///
+    /// `SKIPPY_KV_DISK_TIER_DIR` accepts any string, so a relative value is
+    /// reachable. Walking a relative path's ancestors bottoms out at `""`,
+    /// and returning `/` from there sized the budget against whatever volume
+    /// holds the root — a different disk from the cache on any machine where
+    /// the working directory is a separate mount.
+    #[test]
+    fn a_relative_cache_path_resolves_to_the_working_directory() {
+        let relative = Path::new("skippy-kv-relative-probe-does-not-exist").join("stage-0");
+        assert!(relative.is_relative());
+
+        let ancestor = existing_ancestor(&relative);
+
+        assert_eq!(ancestor, Path::new("."));
+        assert!(ancestor.exists());
+        assert!(free_space_bytes(&ancestor).is_some_and(|bytes| bytes > 0));
+    }
+
+    /// An absolute path still resolves to the root when nothing else exists.
+    #[test]
+    fn an_absolute_cache_path_still_falls_back_to_the_root() {
+        let absolute = Path::new("/skippy-kv-absolute-probe-does-not-exist").join("stage-0");
+
+        assert_eq!(existing_ancestor(&absolute), Path::new("/"));
     }
 
     /// An unreadable filesystem must not be read as "plenty of room".

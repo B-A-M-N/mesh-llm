@@ -17,7 +17,8 @@ built. Both are in scope below.
 
 | Family | Payload | On eviction |
 |---|---|---|
-| Dense attention (llama, qwen3, deepseek2/3, glm4, gemma, minimax) | `ResidentKv` | native seq drop; **state is lost**, next request recomputes |
+| Dense attention (llama, qwen3, deepseek2/3, glm4, minimax) | `ResidentKv` | native seq drop; **state is lost**, next request recomputes |
+| Sliding-window / hybrid ISWA (Gemma 3/4, gpt-oss, cohere2, llama4) | `ResidentKv` | same, and disk retention is **declined** — see "Sliding-window models" below |
 | Hybrid/recurrent (Qwen3Next, Falcon-H1, RWKV/Mamba) | `KvRecurrent` | `export_kv_page` + `export_recurrent_state` into an in-RAM BLAKE3 block store |
 
 `ResidentKv` is a *performance* default, not a capability boundary: borrowing
@@ -502,9 +503,12 @@ of the reusable bulk, because restore cost is bounded by bytes while prefill
 cost is superlinear in tokens. The 0.5B number is small because there was
 almost nothing to save, not because the mechanism is weak.
 
-Still unmeasured: multi-node split topologies (where per-stage pages are
-smaller and *every* stage must hit), and how often topology replanning
-invalidates pages in a live mesh.
+Historical note (superseded): at the time this section was written, multi-node
+split topologies were unmeasured. They have since been measured on loopback and
+on a physical LAN — see "Split serving" and the two-machine results below.
+
+Still unmeasured: how often topology replanning invalidates pages in a live
+mesh, WAN-latency splits, and very large MoE models.
 
 
 ## Split serving

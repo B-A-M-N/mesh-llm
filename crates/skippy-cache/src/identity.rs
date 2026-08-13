@@ -41,20 +41,6 @@ pub fn prefix_hash(config: &StageConfig, token_start: u64, token_ids: &[i32]) ->
     prefix_hash_with_namespace(config, token_start, token_ids, None)
 }
 
-/// Hash the parts of a stage configuration that change the *bytes* of an
-/// exported KV page without changing the token sequence.
-///
-/// Identity must cover every input that alters the serialized layout or the
-/// numerical content of a page. In-process this is nearly free to get wrong —
-/// a single running stage has one configuration, so a collision cannot occur.
-/// It becomes **silent numerical corruption** the moment a page outlives the
-/// process that wrote it (the mmap tier) or crosses a node boundary: flipping
-/// `kv_cache_policy` from `quality` to `saver` rewrites `cache_type_k`/`_v`
-/// from `f16` to `q8_0`, and without these fields in the hash the stale q8_0
-/// bytes collide with an f16 `page_id` and get imported as f16.
-///
-/// `NATIVE_KV_DTYPE` is a fixed layout tag and does **not** vary with the
-/// configured cache types, so it cannot stand in for them.
 /// Hash the identity of the *machine* the page bytes were produced on.
 ///
 /// Page files are raw runtime memory. Their interpretation depends on the CPU
@@ -84,6 +70,20 @@ fn update_platform_identity(hasher: &mut blake3::Hasher) {
     hasher.update(&(usize::BITS).to_le_bytes());
 }
 
+/// Hash the parts of a stage configuration that change the *bytes* of an
+/// exported KV page without changing the token sequence.
+///
+/// Identity must cover every input that alters the serialized layout or the
+/// numerical content of a page. In-process this is nearly free to get wrong —
+/// a single running stage has one configuration, so a collision cannot occur.
+/// It becomes **silent numerical corruption** the moment a page outlives the
+/// process that wrote it (the mmap tier) or crosses a node boundary: flipping
+/// `kv_cache_policy` from `quality` to `saver` rewrites `cache_type_k`/`_v`
+/// from `f16` to `q8_0`, and without these fields in the hash the stale q8_0
+/// bytes collide with an f16 `page_id` and get imported as f16.
+///
+/// `NATIVE_KV_DTYPE` is a fixed layout tag and does **not** vary with the
+/// configured cache types, so it cannot stand in for them.
 fn update_layout_identity(hasher: &mut blake3::Hasher, config: &StageConfig) {
     hasher.update(b"kv-layout-identity-v1");
     hasher.update(config.cache_type_k.as_bytes());

@@ -6,7 +6,7 @@ This artifact contains MeshLLM native runtime shared libraries for:
 - backend: `metal`
 - flavor: `metal`
 - MeshLLM version: `0.72.1`
-- Skippy ABI: `0.1.35`
+- Skippy ABI: `0.1.38`
 
 `mesh-llm runtime install` reads `manifest.json`, verifies the archive
 checksum from `native-runtimes.json`, installs the artifact into the

@@ -120,6 +120,9 @@ that looks complete but is not. Mesh detects this on the first attempt,
 disables the disk cache for that model, and carries on serving normally.
 In-memory prefix reuse is unaffected.
 
-To check what a running node decided, look for `skippy.kv.archive_status` in
-the logs: `skipped_unsupported_memory` means the model's attention state cannot
-be saved to disk.
+To check what a running node decided, look at `skippy.kv.archive_status`. It is
+emitted through telemetry, not written to the ordinary log: with no exporter
+endpoint configured it is not recorded anywhere. Set `SKIPPY_TELEMETRY_STDERR=1`
+to print it to stderr, or point the node at an OTLP endpoint. A status of
+`skipped_unsupported_memory` means the model's attention state cannot be saved
+to disk.

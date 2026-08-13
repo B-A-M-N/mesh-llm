@@ -167,7 +167,11 @@ impl<E: Clone + serde::Serialize> ExactStateCache<E> {
             self.misses.note_miss(page_id, now_secs());
             return Ok(None);
         };
-        let Some(load) = disk.load(page_id, payload_kind.as_str())? else {
+        let loaded = disk.load(page_id, payload_kind.as_str())?;
+        // A failed verification quarantines the entry inside `load`, so prune
+        // before deciding anything about the result.
+        self.prune_disk_extras();
+        let Some(load) = loaded else {
             self.misses.note_miss(page_id, now_secs());
             return Ok(None);
         };
@@ -241,6 +245,7 @@ impl<E: Clone + serde::Serialize> ExactStateCache<E> {
         if stored {
             self.disk_extras.insert(page_id.to_string(), extra);
         }
+        self.prune_disk_extras();
         stored
     }
 
@@ -442,6 +447,31 @@ impl<E: Clone + serde::Serialize> ExactStateCache<E> {
             self.disk_extras
                 .insert(page_id.to_string(), entry.extra.clone());
         }
+        self.prune_disk_extras();
+    }
+
+    /// Drop descriptors whose page is no longer on disk.
+    ///
+    /// `disk_extras` is only meaningful for a page the tier still holds: it is
+    /// the descriptor that makes those bytes importable. The tier removes
+    /// entries on its own schedule — LRU eviction in `enforce_budget`,
+    /// `quarantine` for a page that fails verification — and those paths know
+    /// nothing about this map. Without pruning, a long-lived process that
+    /// churns the tier accumulates a descriptor per page it ever wrote,
+    /// none of which can ever be used again.
+    ///
+    /// Called after each operation that can remove a disk entry rather than
+    /// from the tier itself, because the tier is payload-agnostic and does not
+    /// know the descriptor type.
+    fn prune_disk_extras(&mut self) {
+        let Some(disk) = self.disk.as_ref() else {
+            self.disk_extras.clear();
+            return;
+        };
+        if self.disk_extras.len() <= disk.entry_count() {
+            return;
+        }
+        self.disk_extras.retain(|page_id, _| disk.contains(page_id));
     }
 
     fn add_token_count(&mut self, token_count: u64) {
