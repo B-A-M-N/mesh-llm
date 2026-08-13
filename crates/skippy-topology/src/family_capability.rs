@@ -1609,15 +1609,6 @@ fn unknown_qwen3_point_release(compact_identity: &str) -> bool {
         .is_some_and(|release| !QWEN35_SERIES_POINT_RELEASES.contains(&release))
 }
 
-/// Distinguishes `Qwen3-5B` (compacts to `qwen35b`) and `Qwen3-8B`
-/// (`qwen38b`) from the Qwen3.5 series.
-///
-/// A `b` directly after the digits is a parameter-count suffix, so they belong
-/// to the model size rather than to a series number.
-fn is_parameter_size_suffix(compact_identity: &str, index: usize) -> bool {
-    compact_identity.as_bytes().get(index) == Some(&b'b')
-}
-
 fn is_qwen3_active_parameter_moe(compact_identity: &str) -> bool {
     if !compact_identity.contains("qwen3") {
         return false;
