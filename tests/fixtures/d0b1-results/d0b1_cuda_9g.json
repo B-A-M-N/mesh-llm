@@ -1,0 +1,19 @@
+{
+  "layer_start": 0,
+  "layer_end": 9,
+  "layer_count": 9,
+  "requested_host_bytes": 9000000000,
+  "planned_accel_bytes": 1597959180,
+  "load_duration_ms": 14466,
+  "first_forward_ms": 95,
+  "forward_passed": true,
+  "rss_delta_kb": 10319040,
+  "mem_available_delta_kb": 10109204,
+  "timeline": [
+    {"label":"T0_pre_open","rss_kb":135252,"mem_available_kb":26781816,"swap_used_kb":2758540,"minflt":19927,"majflt":0},
+    {"label":"T1_model_loaded","rss_kb":10298152,"mem_available_kb":16796372,"swap_used_kb":2758708,"minflt":2546216,"majflt":0},
+    {"label":"T2_session_created","rss_kb":10298152,"mem_available_kb":16796372,"swap_used_kb":2758708,"minflt":2546216,"majflt":0},
+    {"label":"T3_first_forward","rss_kb":10432608,"mem_available_kb":16688880,"swap_used_kb":2758708,"minflt":2574021,"majflt":0},
+    {"label":"T4_post_warmup","rss_kb":10454292,"mem_available_kb":16672612,"swap_used_kb":2758708,"minflt":2578060,"majflt":0}
+  ]
+}

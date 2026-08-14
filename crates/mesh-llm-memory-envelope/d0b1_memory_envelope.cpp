@@ -272,10 +272,17 @@ int main(int argc, char **argv) {
     fprintf(stderr, "T3 fwd=%ldms rss=%ldMB memavail=%ldMB\n", t_fwd, t3.rss_kb/1024, t3.mem_available_kb/1024);
 
     // T4: warmup (3 single-token decodes)
+    long t_warm_total = 0;
+    long t_warm_max = 0;
     for (int i = 0; i < 3; i++) {
+        long t_w_start = now_ms();
         llama_batch one = llama_batch_get_one(&tokens[0], 1);
         llama_decode(ctx, one);
+        long t_w = now_ms() - t_w_start;
+        t_warm_total += t_w;
+        if (t_w > t_warm_max) t_warm_max = t_w;
     }
+    long t_warm_avg = t_warm_total / 3;
     if (sample_memory(&t4) != 0) {
         fprintf(stderr, "D0B1_PROBE_FAIL T4\n");
         skippy_session_end_external_decode(session, nullptr);
@@ -283,7 +290,7 @@ int main(int argc, char **argv) {
         skippy_model_free(model, &err);
         return 3;
     }
-    fprintf(stderr, "T4 rss=%ldMB memavail=%ldMB\n", t4.rss_kb/1024, t4.mem_available_kb/1024);
+    fprintf(stderr, "T4 warm_avg=%ldms warm_max=%ldms rss=%ldMB memavail=%ldMB\n", t_warm_avg, t_warm_max, t4.rss_kb/1024, t4.mem_available_kb/1024);
 
     skippy_session_end_external_decode(session, &err);
     skippy_session_free(session, &err);
