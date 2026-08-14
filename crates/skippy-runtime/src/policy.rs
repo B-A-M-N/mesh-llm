@@ -618,6 +618,56 @@ pub enum PlacementStrategy {
     AutoHybrid,
 }
 
+// ─── Capacity budgeting ─────────────────────────────────────────────────────
+
+/// Per-memory-type capacity.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct MemoryCapacity {
+    pub total_bytes: u64,
+    pub available_bytes: u64,
+    pub reserve_bytes: u64,
+    pub usable_bytes: u64,
+}
+
+/// Node memory capacity: host + accelerator.
+#[derive(Clone, Debug, Default)]
+pub struct NodeMemoryCapacity {
+    pub host: MemoryCapacity,
+    pub accelerator: MemoryCapacity,
+}
+
+/// Capacity budgeting policy.
+#[derive(Clone, Copy, Debug)]
+pub struct CapacityBudgetPolicy {
+    pub host_fixed_reserve_bytes: u64,
+    pub host_reserve_divisor: u64,
+    pub accelerator_fixed_reserve_bytes: u64,
+    pub accelerator_reserve_divisor: u64,
+}
+
+impl Default for CapacityBudgetPolicy {
+    fn default() -> Self {
+        Self {
+            host_fixed_reserve_bytes: 1024 * 1024 * 1024, // 1 GiB
+            host_reserve_divisor: 16,                      // 1/16 = 6.25%
+            accelerator_fixed_reserve_bytes: 512 * 1024 * 1024, // 512 MiB
+            accelerator_reserve_divisor: 8,                // 1/8 = 12.5%
+        }
+    }
+}
+
+/// Budget host memory: available - (fixed + fractional reserve).
+pub fn budget_host_memory(available: u64, policy: &CapacityBudgetPolicy) -> u64 {
+    let fractional = available / policy.host_reserve_divisor;
+    available.saturating_sub(policy.host_fixed_reserve_bytes.saturating_add(fractional))
+}
+
+/// Budget accelerator memory: available - (fixed + fractional reserve).
+pub fn budget_accelerator_memory(available: u64, policy: &CapacityBudgetPolicy) -> u64 {
+    let fractional = available / policy.accelerator_reserve_divisor;
+    available.saturating_sub(policy.accelerator_fixed_reserve_bytes.saturating_add(fractional))
+}
+
 /// Compute stage weight requirements by aggregating class bytes over the
 /// selected layers and owned globals, then projecting through the policy.
 pub fn stage_weight_requirements(
@@ -1084,5 +1134,65 @@ impl Default for StageTensorSelection {
             include_output: false,
             include_other_globals: false,
         }
+    }
+}
+
+#[cfg(test)]
+mod capacity_budget_tests {
+    use super::*;
+
+    #[test]
+    fn c1_default_policy_constants() {
+        let policy = CapacityBudgetPolicy::default();
+        assert_eq!(policy.host_fixed_reserve_bytes, 1024 * 1024 * 1024);
+        assert_eq!(policy.host_reserve_divisor, 16);
+        assert_eq!(policy.accelerator_fixed_reserve_bytes, 512 * 1024 * 1024);
+        assert_eq!(policy.accelerator_reserve_divisor, 8);
+    }
+
+    #[test]
+    fn c2_budget_host_memory_basic() {
+        let policy = CapacityBudgetPolicy::default();
+        let available = 32 * 1024 * 1024 * 1024;
+        let usable = budget_host_memory(available, &policy);
+        let fractional = available / 16;
+        let expected = available - (1024 * 1024 * 1024 + fractional);
+        assert_eq!(usable, expected);
+    }
+
+    #[test]
+    fn c3_budget_accelerator_memory_basic() {
+        let policy = CapacityBudgetPolicy::default();
+        let available = 16 * 1024 * 1024 * 1024;
+        let usable = budget_accelerator_memory(available, &policy);
+        let fractional = available / 8;
+        let expected = available - (512 * 1024 * 1024 + fractional);
+        assert_eq!(usable, expected);
+    }
+
+    #[test]
+    fn c4_budget_saturates_to_zero() {
+        let policy = CapacityBudgetPolicy::default();
+        let available = 100;
+        let usable = budget_host_memory(available, &policy);
+        assert_eq!(usable, 0);
+    }
+
+    #[test]
+    fn c5_node_memory_capacity_default() {
+        let capacity = NodeMemoryCapacity::default();
+        assert_eq!(capacity.host.total_bytes, 0);
+        assert_eq!(capacity.accelerator.total_bytes, 0);
+    }
+
+    #[test]
+    fn c6_memory_capacity_fields() {
+        let mem = MemoryCapacity {
+            total_bytes: 32 * 1024 * 1024 * 1024,
+            available_bytes: 24 * 1024 * 1024 * 1024,
+            reserve_bytes: 2 * 1024 * 1024 * 1024,
+            usable_bytes: 22 * 1024 * 1024 * 1024,
+        };
+        assert_eq!(mem.usable_bytes, 22 * 1024 * 1024 * 1024);
     }
 }

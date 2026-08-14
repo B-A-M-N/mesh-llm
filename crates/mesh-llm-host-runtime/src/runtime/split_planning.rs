@@ -52,12 +52,15 @@ pub(super) struct SplitTopologyPlanInput {
     pub(super) target_decode_tpot_ms: Option<u32>,
     pub(super) minimum_nodes: usize,
     pub(super) nodes: Vec<SplitTopologyPlanNode>,
+    pub(super) layer_class_bytes: Vec<skippy_coordinator::topology::TopologyLayerClassBytes>,
+    pub(super) host_ram_available_bytes: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct SplitTopologyPlanNode {
     pub(super) node_id: String,
     pub(super) detected_vram_bytes: u64,
+    pub(super) detected_host_available_bytes: u64,
     pub(super) max_vram_bytes: Option<u64>,
     pub(super) runtime_headroom_bytes: u64,
     pub(super) stage_transfer_latency_ms: Option<u32>,
@@ -138,7 +141,7 @@ fn topology_planning_input(input: SplitTopologyPlanInput) -> TopologyPlanningInp
             .map(|node| TopologyNode {
                 node_id: node.node_id,
                 detected_vram_bytes: node.detected_vram_bytes,
-                detected_ram_bytes: 0,
+                detected_host_available_bytes: node.detected_host_available_bytes,
                 max_vram_bytes: node.max_vram_bytes,
                 runtime_headroom_bytes: node.runtime_headroom_bytes,
                 stage_transfer_latency_ms: node.stage_transfer_latency_ms,
@@ -147,6 +150,7 @@ fn topology_planning_input(input: SplitTopologyPlanInput) -> TopologyPlanningInp
         context_length_override: input.context_length_override,
         parallel_lanes_override: input.parallel_lanes_override,
         target_decode_tpot_ms: input.target_decode_tpot_ms,
+        layer_class_bytes: input.layer_class_bytes,
     }
 }
 
@@ -363,11 +367,14 @@ fn runtime_slice_plan_input(
             .map(|participant| SplitTopologyPlanNode {
                 node_id: participant.node_id.to_string(),
                 detected_vram_bytes: participant.vram_bytes,
+                detected_host_available_bytes: 0,
                 max_vram_bytes: Some(participant.vram_bytes),
                 runtime_headroom_bytes: default_runtime_headroom_bytes(participant.vram_bytes),
                 stage_transfer_latency_ms: participant.rtt_ms,
             })
             .collect(),
+        layer_class_bytes: Vec::new(),
+        host_ram_available_bytes: 0,
     }
 }
 

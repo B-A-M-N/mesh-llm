@@ -56,7 +56,7 @@ pub struct TopologyLayerClassBytes {
 pub struct TopologyNode {
     pub node_id: String,
     pub detected_vram_bytes: u64,
-    pub detected_ram_bytes: u64,
+    pub detected_host_available_bytes: u64,
     pub max_vram_bytes: Option<u64>,
     pub runtime_headroom_bytes: u64,
     pub stage_transfer_latency_ms: Option<u32>,
@@ -279,7 +279,7 @@ fn usable_nodes(nodes: &[TopologyNode]) -> Vec<UsableNode> {
             UsableNode {
                 node_id: node.node_id.clone(),
                 usable_vram_bytes: capped.saturating_sub(node.runtime_headroom_bytes),
-                usable_ram_bytes: node.detected_ram_bytes.saturating_sub(node.runtime_headroom_bytes),
+                usable_ram_bytes: node.detected_host_available_bytes.saturating_sub(node.runtime_headroom_bytes),
                 stage_transfer_latency_ms: node.stage_transfer_latency_ms,
             }
         })
@@ -646,7 +646,7 @@ mod tests {
         TopologyNode {
             node_id: id.to_string(),
             detected_vram_bytes: gib * GIB,
-            detected_ram_bytes: 0,
+            detected_host_available_bytes: 0,
             max_vram_bytes: None,
             runtime_headroom_bytes: 0,
             stage_transfer_latency_ms: None,
@@ -704,7 +704,7 @@ mod tests {
         TopologyNode {
             node_id: id.to_string(),
             detected_vram_bytes: metal_recommended_bytes,
-            detected_ram_bytes: 0,
+            detected_host_available_bytes: 0,
             max_vram_bytes: Some(metal_recommended_bytes),
             // Metal recommendedMaxWorkingSetSize is already the usable budget
             // reported by the local runtime.

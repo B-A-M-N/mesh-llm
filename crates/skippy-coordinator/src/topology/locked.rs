@@ -174,7 +174,7 @@ mod tests {
         TopologyNode {
             node_id: id.to_string(),
             detected_vram_bytes: gib * GIB,
-            detected_ram_bytes: 0,
+            detected_host_available_bytes: 0,
             max_vram_bytes: None,
             runtime_headroom_bytes: 0,
             stage_transfer_latency_ms: None,
