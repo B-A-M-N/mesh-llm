@@ -571,7 +571,9 @@ fn handle_binary_connection_messages(
         }
 
         let completed_prompt_tokens = decode_record_tokens_sideband(&message).or_else(|| {
-            (message.kind == WireMessageKind::DecodeEmbd)
+            message
+                .kind
+                .requires_predicted_reply()
                 .then(|| {
                     accumulated_prefill_tokens
                         .get(&session_key)
