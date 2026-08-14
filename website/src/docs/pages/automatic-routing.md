@@ -14,7 +14,8 @@ curl -s http://localhost:9337/v1/chat/completions \
   -d '{"model":"mesh","messages":[{"role":"user","content":"Explain QUIC in two sentences."}]}'
 ```
 
-`mesh` is the only automatic directive. Naming a model explicitly
+`mesh` is the canonical automatic directive — `auto` still works as a
+[deprecated alias](#auto-is-deprecated). Naming a model explicitly
 (`"model": "unsloth/gemma-4-E4B-it-GGUF:UD-Q4_K_XL"`) always routes to that
 model and is unaffected by anything on this page.
 

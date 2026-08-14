@@ -308,6 +308,186 @@ async fn model_less_request_resolves_to_a_single_model() {
     }
 }
 
+/// A peer advertising one model, with the capabilities in `descriptor`.
+fn peer_serving(peer_id: iroh::EndpointId, model: &str, vision: bool) -> mesh::PeerInfo {
+    mesh::PeerInfo {
+        id: peer_id,
+        addr: iroh::EndpointAddr {
+            id: peer_id,
+            addrs: Default::default(),
+        },
+        mesh_id: None,
+        mesh_policy_hash: None,
+        genesis_policy: None,
+        role: mesh::NodeRole::Host { http_port: 9337 },
+        first_joined_mesh_ts: None,
+        models: vec![model.to_string()],
+        vram_bytes: 16 * 1024 * 1024 * 1024,
+        rtt_ms: None,
+        model_source: None,
+        admitted: true,
+        serving_models: vec![model.to_string()],
+        hosted_models: vec![model.to_string()],
+        hosted_models_known: true,
+        available_models: vec![],
+        requested_models: vec![],
+        explicit_model_interests: vec![],
+        last_seen: std::time::Instant::now(),
+        last_mentioned: std::time::Instant::now(),
+        version: None,
+        gpu_name: None,
+        hostname: None,
+        is_soc: None,
+        gpu_vram: None,
+        gpu_reserved_bytes: None,
+        gpu_mem_bandwidth_gbps: None,
+        gpu_compute_tflops_fp32: None,
+        gpu_compute_tflops_fp16: None,
+        available_model_metadata: vec![],
+        experts_summary: None,
+        available_model_sizes: std::collections::HashMap::new(),
+        served_model_descriptors: vec![descriptor(model, vision, false)],
+        served_model_runtime: vec![],
+        owner_attestation: None,
+        release_attestation_summary: crate::ReleaseAttestationSummary::default(),
+        artifact_transfer_supported: false,
+        stage_protocol_generation_supported: false,
+        stage_status_list_supported: false,
+        advertised_model_throughput: vec![],
+        display_rtt: None,
+        selected_path: None,
+        propagated_latency: None,
+        owner_summary: crate::crypto::OwnershipSummary::default(),
+        inference_admission_state: None,
+    }
+}
+
+/// Two nodes: this one serves `local_model`, a peer serves `remote_model`.
+///
+/// The peer's model is reachable only as `InferenceTarget::Remote`, so a test
+/// that expects it to be selected is exercising cross-node selection.
+async fn two_node_mesh(
+    local_model: &str,
+    remote_model: &str,
+    remote_is_vision: bool,
+) -> (mesh::Node, election::ModelTargets) {
+    let node = mesh::Node::new_for_tests(crate::mesh::NodeRole::Worker)
+        .await
+        .expect("test node");
+    node.set_hosted_models(vec![local_model.to_string()]).await;
+
+    let peer_id = iroh::EndpointId::from(iroh::SecretKey::generate().public());
+    node.insert_test_peer(peer_serving(peer_id, remote_model, remote_is_vision))
+        .await;
+
+    let mut targets = election::ModelTargets::default();
+    targets.targets.insert(
+        local_model.to_string(),
+        vec![election::InferenceTarget::Local(9000)],
+    );
+    targets.targets.insert(
+        remote_model.to_string(),
+        vec![election::InferenceTarget::Remote(peer_id)],
+    );
+    (node, targets)
+}
+
+#[tokio::test]
+async fn image_request_selects_a_vision_model_served_only_by_a_peer() {
+    // The vision model is not served locally: it reaches the candidate set only
+    // because a peer advertises it (via gossip and a `Remote` target). A
+    // single-node fixture cannot catch a regression that drops peer-served
+    // models from the media filter.
+    //
+    // Scope: this pins candidate *selection* across nodes. It does not prove the
+    // QUIC dispatch to that peer — no request is sent here, and either source
+    // (gossip or the target table) is sufficient on its own. Proving the
+    // delivery path needs a live two-node run.
+    let (node, targets) = two_node_mesh("local-text-model", "remote-vision-model", true).await;
+    let descriptors = vec![
+        descriptor("local-text-model", false, false),
+        descriptor("remote-vision-model", true, false),
+    ];
+
+    let resolution = resolve(
+        Some(automatic::DIRECTIVE),
+        &image_body(automatic::DIRECTIVE),
+        &node,
+        &targets,
+        &descriptors,
+    )
+    .await;
+
+    match resolution {
+        AutoRouteResolution::Continue {
+            effective_model, ..
+        } => assert_eq!(
+            effective_model.as_deref(),
+            Some("remote-vision-model"),
+            "the only vision-capable model is on the peer and must still be chosen"
+        ),
+        AutoRouteResolution::MediaUnsupported => {
+            panic!("a peer serves a vision model, so this must not be refused")
+        }
+    }
+}
+
+#[tokio::test]
+async fn text_request_still_convenes_a_committee_across_two_nodes() {
+    // Two models, one local and one remote: enough for a committee, and the
+    // directive must survive resolution so the MoA gateway forms one.
+    let (node, targets) = two_node_mesh("local-text-model", "remote-text-model", false).await;
+    let descriptors = vec![
+        descriptor("local-text-model", false, false),
+        descriptor("remote-text-model", false, false),
+    ];
+
+    let resolution = resolve(
+        Some(automatic::DIRECTIVE),
+        &text_body(Some(automatic::DIRECTIVE)),
+        &node,
+        &targets,
+        &descriptors,
+    )
+    .await;
+
+    match resolution {
+        AutoRouteResolution::Continue {
+            effective_model, ..
+        } => assert_eq!(effective_model.as_deref(), Some(automatic::DIRECTIVE)),
+        AutoRouteResolution::MediaUnsupported => panic!("text request is not a media failure"),
+    }
+}
+
+#[tokio::test]
+async fn models_listing_advertises_the_directive_with_the_mesh_capability_union() {
+    // The directive must report what the *mesh* can accept. With a text-only
+    // local model and a vision model on a peer, `mesh` has to advertise vision
+    // — a media request will be routed to that peer.
+    use crate::network::openai::moa_gateway::context_selection::virtual_mesh_capabilities;
+
+    let models = vec![
+        "local-text-model".to_string(),
+        "remote-vision-model".to_string(),
+    ];
+    let descriptors = vec![
+        descriptor("local-text-model", false, false),
+        descriptor("remote-vision-model", true, false),
+    ];
+
+    let union = virtual_mesh_capabilities(&models, &descriptors);
+    assert!(
+        union.supports_vision_runtime(),
+        "one peer serves a vision model, so the directive must advertise vision"
+    );
+    assert!(
+        crate::network::openai::moa_gateway::context_selection::should_advertise_virtual_mesh(
+            &models
+        ),
+        "the directive must be listed whenever the mesh serves anything"
+    );
+}
+
 #[tokio::test]
 async fn an_explicitly_named_model_is_never_reinterpreted() {
     let (node, targets) = node_serving(&["text-model", "vision-model"]).await;

@@ -60,8 +60,9 @@ pub fn assign_roles(models: &[ModelEntry]) -> Vec<Assignment> {
     // when no count was supplied, matching the main router's metadata-first
     // sizing in `pick_model_classified`.
     let mut sorted: Vec<ModelEntry> = models.to_vec();
-    sorted.sort_by_key(|m| !entry_is_small_tier(m));
-    // After sort: small-tier first, big-tier last. That way:
+    sort_by_capacity(&mut sorted);
+    // After sort: weakest first, strongest last — small tier before big, and by
+    // verified size within each tier. That way:
     //   first  = fast       (smallest model)
     //   middle = specialist
     //   last   = strong     (biggest model — also used as reducer)
@@ -107,6 +108,66 @@ fn size_is_small_tier(parameter_count_b: Option<f64>) -> Option<bool> {
     parameter_count_b
         .filter(|count| count.is_finite() && *count > 0.0)
         .map(|count| count < SMALL_TIER_MAX_B)
+}
+
+/// A pool member's verified size, when the host supplied a usable one.
+fn usable_parameter_count(entry: &ModelEntry) -> Option<f64> {
+    entry
+        .parameter_count_b
+        .filter(|count| count.is_finite() && *count > 0.0)
+}
+
+/// Sort a pool weakest-first: small tier before big tier, and within each tier
+/// by verified size ascending.
+///
+/// The tier split alone is not enough to order a pool. Sorting on the tier
+/// boolean is stable, so it preserves input order among same-tier models — a
+/// pool arriving as `[70B, 8B, 32B]` sorts to `[8B, 70B, 32B]` and hands the
+/// Strong role (and the reducer) to the 32B while the verified 70B drafts as a
+/// Specialist. Ordering by size within the tier puts the largest model last.
+///
+/// Entries whose size is unknown keep their relative input order and sort
+/// *before* sized entries of the same tier. Unknown size reads as big-tier by
+/// design — a size-less name like `MiniMax-M2.5` should still count as capable
+/// — but an unverified guess must not take the Strong role from a model whose
+/// size the host actually confirmed. An unsized model still becomes Strong when
+/// it is genuinely the most capable thing the pool has.
+pub(crate) fn sort_by_capacity(models: &mut [ModelEntry]) {
+    models.sort_by(capacity_cmp);
+}
+
+/// Sort a pool strongest-first: the reverse of [`sort_by_capacity`].
+///
+/// Uses a reversed comparator rather than sorting ascending and reversing the
+/// slice. Both orders must leave equally-ranked entries in their original
+/// relative order, and reversing a sorted slice would instead flip them — which
+/// silently changes the primary pick for a pool of same-tier, unsized models
+/// (the common shape in fan-out simulations and any mesh whose hosts advertise
+/// no GGUF size).
+pub(crate) fn sort_by_capacity_desc(models: &mut [ModelEntry]) {
+    models.sort_by(|left, right| capacity_cmp(right, left));
+}
+
+/// Order two pool members weakest-to-strongest.
+fn capacity_cmp(left: &ModelEntry, right: &ModelEntry) -> std::cmp::Ordering {
+    entry_is_small_tier(left)
+        .cmp(&entry_is_small_tier(right))
+        .reverse()
+        .then_with(|| {
+            match (usable_parameter_count(left), usable_parameter_count(right)) {
+                // Both sized: smaller first, so the largest lands last.
+                // `total_cmp` avoids the partial-ordering unwrap.
+                (Some(left), Some(right)) => left.total_cmp(&right),
+                // An unsized model sorts before a sized one of the same tier, so
+                // the model whose size the host actually verified is the one
+                // that ends up Strong.
+                (Some(_), None) => std::cmp::Ordering::Greater,
+                (None, Some(_)) => std::cmp::Ordering::Less,
+                // Equal rank: leave the caller's order alone. `sort_by` is
+                // stable, so this preserves host-provided ordering.
+                (None, None) => std::cmp::Ordering::Equal,
+            }
+        })
 }
 
 /// Does this worker pool have a real quality gap?
@@ -289,6 +350,84 @@ mod tests {
             .iter()
             .map(|n| ModelEntry::new((*n).to_string(), 0))
             .collect()
+    }
+
+    /// Pool members with verified sizes, in the order given.
+    fn sized_entries(models: &[(&str, f64)]) -> Vec<ModelEntry> {
+        models
+            .iter()
+            .enumerate()
+            .map(|(index, (name, size))| {
+                ModelEntry::new((*name).to_string(), index).with_parameter_count_b(Some(*size))
+            })
+            .collect()
+    }
+
+    fn role_of(assignments: &[Assignment], model: &str) -> WorkerRole {
+        assignments
+            .iter()
+            .find(|a| a.model_name == model)
+            .map(|a| a.role)
+            .unwrap_or_else(|| panic!("{model} missing from assignments"))
+    }
+
+    #[test]
+    fn strong_role_goes_to_the_largest_verified_model_whatever_the_input_order() {
+        // Tier alone cannot order a pool: sorting on the tier boolean is stable,
+        // so this input used to sort to [8B, 70B, 32B] and hand Strong — and
+        // the reducer — to the 32B while the verified 70B drafted as a
+        // Specialist.
+        let pool = sized_entries(&[("big-70b", 70.6), ("small-8b", 8.2), ("mid-32b", 32.8)]);
+        let assignments = assign_roles(&pool);
+
+        assert_eq!(role_of(&assignments, "small-8b"), WorkerRole::Fast);
+        assert_eq!(role_of(&assignments, "mid-32b"), WorkerRole::Specialist);
+        assert_eq!(role_of(&assignments, "big-70b"), WorkerRole::Strong);
+    }
+
+    #[test]
+    fn capacity_order_is_independent_of_input_permutation() {
+        // Every arrangement of the same pool must produce the same roles.
+        let permutations = [
+            [("a-8b", 8.0), ("b-32b", 32.0), ("c-70b", 70.0)],
+            [("c-70b", 70.0), ("b-32b", 32.0), ("a-8b", 8.0)],
+            [("b-32b", 32.0), ("c-70b", 70.0), ("a-8b", 8.0)],
+            [("c-70b", 70.0), ("a-8b", 8.0), ("b-32b", 32.0)],
+        ];
+        for permutation in permutations {
+            let assignments = assign_roles(&sized_entries(&permutation));
+            assert_eq!(
+                role_of(&assignments, "a-8b"),
+                WorkerRole::Fast,
+                "input order {permutation:?} changed the Fast pick"
+            );
+            assert_eq!(
+                role_of(&assignments, "c-70b"),
+                WorkerRole::Strong,
+                "input order {permutation:?} changed the Strong pick"
+            );
+        }
+    }
+
+    #[test]
+    fn a_verified_size_outranks_an_unknown_size_for_the_strong_role() {
+        // Unknown size reads as big-tier, which is deliberate — a size-less
+        // name like `MiniMax-M2.5` should still be treated as capable. But it
+        // must not take Strong from a model the host verified to be larger.
+        let pool = vec![
+            ModelEntry::new("unknown-size".to_string(), 0).with_parameter_count_b(None),
+            ModelEntry::new("verified-70b".to_string(), 1).with_parameter_count_b(Some(70.0)),
+        ];
+        let assignments = assign_roles(&pool);
+        assert_eq!(role_of(&assignments, "verified-70b"), WorkerRole::Strong);
+    }
+
+    #[test]
+    fn an_all_small_pool_still_orders_by_verified_size() {
+        let pool = sized_entries(&[("mid-8b", 8.0), ("tiny-1b", 1.0), ("small-4b", 4.0)]);
+        let assignments = assign_roles(&pool);
+        assert_eq!(role_of(&assignments, "tiny-1b"), WorkerRole::Fast);
+        assert_eq!(role_of(&assignments, "mid-8b"), WorkerRole::Strong);
     }
 
     #[test]
