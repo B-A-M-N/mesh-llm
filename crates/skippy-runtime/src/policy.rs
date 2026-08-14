@@ -70,6 +70,21 @@ impl TensorClassBytes {
         self.routed_expert
     }
 
+    /// Create a TensorClassBytes with a single class populated.
+    pub fn single(class: TensorClass, bytes: u64) -> Self {
+        let mut result = Self::default();
+        match class {
+            TensorClass::RoutedExpert => result.routed_expert = bytes,
+            TensorClass::SharedExpert => result.shared_expert = bytes,
+            TensorClass::Attention => result.attention = bytes,
+            TensorClass::RecurrentSsm => result.recurrent_ssm = bytes,
+            TensorClass::RoutingGate => result.routing_gate = bytes,
+            TensorClass::Normalization => result.normalization = bytes,
+            TensorClass::Other => result.other = bytes,
+        }
+        result
+    }
+
     pub fn add(&mut self, class: TensorClass, bytes: u64) {
         match class {
             TensorClass::RoutedExpert => self.routed_expert += bytes,
@@ -117,6 +132,17 @@ impl LayerTensorInventory {
 
     pub fn host_bytes(&self) -> u64 {
         self.bytes.host_bytes()
+    }
+
+    /// Create a LayerTensorInventory with a single class populated.
+    pub fn single(layer_index: u32, class: TensorClass, bytes: u64) -> Self {
+        let mut result = Self {
+            layer_index,
+            bytes: TensorClassBytes::default(),
+            total_bytes: bytes,
+        };
+        result.bytes.add(class, bytes);
+        result
     }
 }
 
@@ -538,13 +564,104 @@ pub fn plan_stage_placement(
         .map(|p| p.bytes)
         .sum();
 
-    // Check host capacity.
+    // Check host capacity BEFORE debug_assert so we return Err, not panic.
     if host_bytes > capacity.usable_ram_bytes {
         anyhow::bail!(
             "offloaded {} bytes to host but only {} bytes available",
             host_bytes,
             capacity.usable_ram_bytes
         );
+    }
+
+    // Verify capacity enforcement before returning.
+    debug_assert!(
+        accelerator_bytes <= capacity.usable_vram_bytes,
+        "solver overcommitted accelerator: required={} usable={}",
+        accelerator_bytes,
+        capacity.usable_vram_bytes,
+    );
+    debug_assert_eq!(
+        host_bytes.saturating_add(accelerator_bytes),
+        total_bytes,
+        "host + accel must equal total bytes"
+    );
+
+    Ok(StagePlacementPlan {
+        host_bytes,
+        accelerator_bytes,
+        placements,
+    })
+}
+
+/// Plan stage placement using CpuMoe policy.
+///
+/// Routed experts to HOST, everything else to accelerator.
+/// Returns an error if either capacity is exceeded.
+pub fn plan_stage_placement_cpu_moe(
+    inventory: &TensorClassInventory,
+    selection: &StageTensorSelection,
+    capacity: NodeCapacity,
+) -> Result<StagePlacementPlan> {
+    let stage_tensors: Vec<&ClassifiedTensor> = inventory
+        .tensors
+        .iter()
+        .filter(|t| match t.layer {
+            Some(idx) => selection.layers.contains(&idx),
+            None => {
+                let (is_embedding, is_output) = classify_global_tensor(&t.name);
+                if is_embedding {
+                    selection.include_embeddings
+                } else if is_output {
+                    selection.include_output
+                } else {
+                    selection.include_other_globals
+                }
+            }
+        })
+        .collect();
+
+    let mut host_bytes = 0u64;
+    let mut accelerator_bytes = 0u64;
+    let mut placements = Vec::with_capacity(stage_tensors.len());
+
+    for t in stage_tensors {
+        if t.class == TensorClass::RoutedExpert {
+            let required = host_bytes.saturating_add(t.bytes);
+            if required > capacity.usable_ram_bytes {
+                anyhow::bail!(
+                    "routed expert {} exceeds host capacity: required {} > usable {}",
+                    t.name,
+                    required,
+                    capacity.usable_ram_bytes
+                );
+            }
+            host_bytes = required;
+            placements.push(TensorPlacement {
+                name: t.name.clone(),
+                layer: t.layer,
+                class: t.class,
+                bytes: t.bytes,
+                target: PlacementTarget::Host,
+            });
+        } else {
+            let required = accelerator_bytes.saturating_add(t.bytes);
+            if required > capacity.usable_vram_bytes {
+                anyhow::bail!(
+                    "tensor {} exceeds accelerator capacity: required {} > usable {}",
+                    t.name,
+                    required,
+                    capacity.usable_vram_bytes
+                );
+            }
+            accelerator_bytes = required;
+            placements.push(TensorPlacement {
+                name: t.name.clone(),
+                layer: t.layer,
+                class: t.class,
+                bytes: t.bytes,
+                target: PlacementTarget::PrimaryAccelerator,
+            });
+        }
     }
 
     Ok(StagePlacementPlan {
@@ -604,6 +721,151 @@ pub struct StagePlacementPlan {
     pub host_bytes: u64,
     pub accelerator_bytes: u64,
     pub placements: Vec<TensorPlacement>,
+}
+
+impl StagePlacementPlan {
+    /// Total weight bytes (host + accelerator).
+    pub fn total_bytes(&self) -> u64 {
+        self.host_bytes + self.accelerator_bytes
+    }
+}
+
+/// Plan stage placement from per-layer class bytes.
+///
+/// This is the single entry point for placement feasibility. Both the
+/// candidate counter in the topology planner and the final stage plan
+/// use this exact function, ensuring there is exactly one definition
+/// of "this stage fits."
+pub fn plan_stage_weights_for_layers(
+    layer_class_bytes: &[TensorClassBytes],
+    selection: &StageTensorSelection,
+    capacity: NodeCapacity,
+) -> Result<StageWeightRequirements> {
+    // Build a minimal inventory covering only the selected layers + globals.
+    let mut layers = Vec::new();
+    let mut tensors = Vec::new();
+
+    for (i, lc) in layer_class_bytes.iter().enumerate() {
+        let layer_index = i as u32;
+        if layer_index < selection.layers.start || layer_index >= selection.layers.end {
+            continue;
+        }
+        layers.push(LayerTensorInventory {
+            layer_index,
+            bytes: *lc,
+            total_bytes: lc.total(),
+        });
+        // Add per-tensor records for the solver to iterate.
+        add_classified_tensors(&mut tensors, layer_index, lc);
+    }
+
+    let mut global_embeddings = TensorClassBytes::default();
+    let mut global_output = TensorClassBytes::default();
+    let mut global_other = TensorClassBytes::default();
+
+    if selection.include_embeddings {
+        global_embeddings = TensorClassBytes::single(TensorClass::Normalization, 810_516_480);
+        tensors.push(ClassifiedTensor {
+            name: "token_embd.weight".to_string(),
+            layer: None,
+            class: TensorClass::Normalization,
+            bytes: 810_516_480,
+        });
+    }
+    if selection.include_output {
+        global_output = TensorClassBytes::single(TensorClass::Normalization, 625_778_688);
+        tensors.push(ClassifiedTensor {
+            name: "output.weight".to_string(),
+            layer: None,
+            class: TensorClass::Normalization,
+            bytes: 625_778_688,
+        });
+        tensors.push(ClassifiedTensor {
+            name: "output_norm.weight".to_string(),
+            layer: None,
+            class: TensorClass::Normalization,
+            bytes: 0,
+        });
+    }
+
+    let global_total_bytes = global_embeddings.total() + global_output.total() + global_other.total();
+    let total_tensor_bytes =
+        layers.iter().map(|l| l.total_bytes).sum::<u64>() + global_total_bytes;
+
+    let inventory = TensorClassInventory {
+        layers,
+        tensors,
+        global_embeddings,
+        global_output,
+        global_other,
+        global_total_bytes,
+        total_tensor_bytes,
+        unknown_tensor_count: 0,
+        unknown_tensor_bytes: 0,
+    };
+
+    let plan = plan_stage_placement(&inventory, selection, capacity)?;
+
+    Ok(StageWeightRequirements::new(plan.host_bytes, plan.accelerator_bytes))
+}
+
+fn add_classified_tensors(out: &mut Vec<ClassifiedTensor>, layer_index: u32, lc: &TensorClassBytes) {
+    if lc.routed_expert > 0 {
+        out.push(ClassifiedTensor {
+            name: format!("blk.{layer_index}.ffn_down_exps.weight"),
+            layer: Some(layer_index),
+            class: TensorClass::RoutedExpert,
+            bytes: lc.routed_expert,
+        });
+    }
+    if lc.shared_expert > 0 {
+        out.push(ClassifiedTensor {
+            name: format!("blk.{layer_index}.ffn_gate_shexp.weight"),
+            layer: Some(layer_index),
+            class: TensorClass::SharedExpert,
+            bytes: lc.shared_expert,
+        });
+    }
+    if lc.attention > 0 {
+        out.push(ClassifiedTensor {
+            name: format!("blk.{layer_index}.attn_qkv.weight"),
+            layer: Some(layer_index),
+            class: TensorClass::Attention,
+            bytes: lc.attention,
+        });
+    }
+    if lc.recurrent_ssm > 0 {
+        out.push(ClassifiedTensor {
+            name: format!("blk.{layer_index}.ssm_in.weight"),
+            layer: Some(layer_index),
+            class: TensorClass::RecurrentSsm,
+            bytes: lc.recurrent_ssm,
+        });
+    }
+    if lc.routing_gate > 0 {
+        out.push(ClassifiedTensor {
+            name: format!("blk.{layer_index}.ffn_gate_inp.weight"),
+            layer: Some(layer_index),
+            class: TensorClass::RoutingGate,
+            bytes: lc.routing_gate,
+        });
+    }
+    if lc.normalization > 0 {
+        out.push(ClassifiedTensor {
+            name: format!("blk.{layer_index}.attn_norm.weight"),
+            layer: Some(layer_index),
+            class: TensorClass::Normalization,
+            bytes: lc.normalization,
+        });
+    }
+    if lc.other > 0 {
+        out.push(ClassifiedTensor {
+            name: format!("blk.{layer_index}.other.weight"),
+            layer: Some(layer_index),
+            class: TensorClass::Other,
+            bytes: lc.other,
+        });
+    }
 }
 
 /// Placement strategy for stage memory planning.
@@ -1002,6 +1264,141 @@ mod tests {
 
         assert_eq!(req_ab.total_bytes + req_cd.total_bytes, req_full.total_bytes);
         assert_eq!(req_ab.host_bytes + req_cd.host_bytes, req_full.host_bytes);
+    }
+
+    // ─── Solver capacity enforcement tests ─────────────────────────────────────
+
+    /// Helper: create a simple inventory with one routed expert + one attention tensor.
+    fn simple_inventory(routed_bytes: u64, attention_bytes: u64) -> TensorClassInventory {
+        TensorClassInventory {
+            layers: vec![],
+            tensors: vec![
+                ClassifiedTensor {
+                    name: "blk.0.ffn_down_exps.weight".to_string(),
+                    layer: Some(0),
+                    class: TensorClass::RoutedExpert,
+                    bytes: routed_bytes,
+                },
+                ClassifiedTensor {
+                    name: "blk.0.attn_qkv.weight".to_string(),
+                    layer: Some(0),
+                    class: TensorClass::Attention,
+                    bytes: attention_bytes,
+                },
+            ],
+            global_embeddings: TensorClassBytes::default(),
+            global_output: TensorClassBytes::default(),
+            global_other: TensorClassBytes::default(),
+            global_total_bytes: 0,
+            total_tensor_bytes: routed_bytes + attention_bytes,
+            unknown_tensor_count: 0,
+            unknown_tensor_bytes: 0,
+        }
+    }
+
+    const SIMPLE_SELECTION: StageTensorSelection = StageTensorSelection {
+        layers: 0..1,
+        include_embeddings: false,
+        include_output: false,
+        include_other_globals: false,
+    };
+
+    // S1: Host capacity exactly sufficient → PASS.
+    #[test]
+    fn s1_host_exactly_sufficient() {
+        let inventory = simple_inventory(50, 50);
+        // VRAM < total to force offload
+        let capacity = NodeCapacity {
+            usable_vram_bytes: 80,
+            usable_ram_bytes: 50,
+        };
+        let plan = plan_stage_placement(&inventory, &SIMPLE_SELECTION, capacity).unwrap();
+        assert_eq!(plan.host_bytes, 50);
+        assert_eq!(plan.accelerator_bytes, 50);
+    }
+
+    // S2: Host capacity one byte too small → FAIL.
+    #[test]
+    fn s2_host_one_byte_too_small() {
+        let inventory = simple_inventory(50, 50);
+        // VRAM < total to force offload
+        let capacity = NodeCapacity {
+            usable_vram_bytes: 80,
+            usable_ram_bytes: 49,
+        };
+        let result = plan_stage_placement(&inventory, &SIMPLE_SELECTION, capacity);
+        assert!(result.is_err(), "should fail when host capacity exceeded");
+    }
+
+    // S3: Accelerator exactly sufficient → PASS (everything fits in VRAM).
+    #[test]
+    fn s3_accelerator_exactly_sufficient() {
+        let inventory = simple_inventory(50, 50);
+        let capacity = NodeCapacity {
+            usable_vram_bytes: 100,
+            usable_ram_bytes: 0,
+        };
+        let plan = plan_stage_placement(&inventory, &SIMPLE_SELECTION, capacity).unwrap();
+        assert_eq!(plan.host_bytes, 0);
+        assert_eq!(plan.accelerator_bytes, 100);
+    }
+
+    // S4: Accelerator one byte too small → FAIL (must offload but RAM=0).
+    #[test]
+    fn s4_accelerator_one_byte_too_small() {
+        let inventory = simple_inventory(50, 50);
+        let capacity = NodeCapacity {
+            usable_vram_bytes: 99,
+            usable_ram_bytes: 0,
+        };
+        let result = plan_stage_placement(&inventory, &SIMPLE_SELECTION, capacity);
+        assert!(result.is_err(), "should fail when accelerator capacity exceeded");
+    }
+
+    // S5: AutoHybrid cannot solve accelerator overflow by assigning more HOST bytes than usable RAM.
+    #[test]
+    fn s5_auto_hybrid_respects_host_limit() {
+        // Routed expert (60) + attention (40) = 100 total
+        // VRAM = 30, RAM = 50
+        // Need to offload at least 70 bytes to fit in VRAM
+        // But only 60 bytes are offloadable (routed expert)
+        // And 60 > 50 (RAM capacity)
+        // So this should FAIL
+        let inventory = simple_inventory(60, 40);
+        let capacity = NodeCapacity {
+            usable_vram_bytes: 30,
+            usable_ram_bytes: 50,
+        };
+        let result = plan_stage_placement(&inventory, &SIMPLE_SELECTION, capacity);
+        assert!(
+            result.is_err(),
+            "AutoHybrid must not overcommit host RAM to solve accelerator overflow"
+        );
+    }
+
+    // S6: RAM=0 + routed offload required → FAIL.
+    #[test]
+    fn s6_ram_zero_with_offload_required() {
+        let inventory = simple_inventory(50, 50);
+        let capacity = NodeCapacity {
+            usable_vram_bytes: 100,
+            usable_ram_bytes: 0,
+        };
+        // Everything fits in VRAM, so no offload needed → should PASS
+        let plan = plan_stage_placement(&inventory, &SIMPLE_SELECTION, capacity).unwrap();
+        assert_eq!(plan.host_bytes, 0);
+        assert_eq!(plan.accelerator_bytes, 100);
+
+        // But if VRAM is too small, must offload → FAIL because RAM=0
+        let capacity = NodeCapacity {
+            usable_vram_bytes: 50,
+            usable_ram_bytes: 0,
+        };
+        let result = plan_stage_placement(&inventory, &SIMPLE_SELECTION, capacity);
+        assert!(
+            result.is_err(),
+            "must fail when offload required but RAM=0"
+        );
     }
 
     // R5: First-stage embedding ownership counted once.

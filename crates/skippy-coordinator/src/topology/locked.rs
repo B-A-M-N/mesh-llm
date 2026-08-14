@@ -143,6 +143,7 @@ fn fit_locked_candidate(
             layer_start: locked.layer_start,
             layer_end: locked.layer_end,
             parameter_bytes,
+            placement: None,
         });
     }
 

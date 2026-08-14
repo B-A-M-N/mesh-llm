@@ -1,6 +1,11 @@
 use std::cmp::Ordering;
 use std::path::PathBuf;
 
+use skippy_runtime::policy::{
+    NodeCapacity, StageTensorSelection, TensorClassBytes, StageWeightRequirements,
+    plan_stage_weights_for_layers,
+};
+
 mod locked;
 
 pub use locked::{LockedTopologyStage, plan_locked_topology};
@@ -80,6 +85,7 @@ pub struct TopologyStagePlan {
     pub layer_start: u32,
     pub layer_end: u32,
     pub parameter_bytes: u64,
+    pub placement: Option<StageWeightRequirements>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
@@ -394,28 +400,58 @@ fn fit_candidate(
     let mut minimum_remaining_ram = u64::MAX;
     let mut total_remaining_ram = 0u128;
 
+    // Convert TopologyLayerClassBytes to policy::TensorClassBytes once.
+    let policy_layer_class_bytes: Vec<TensorClassBytes> = input.layer_class_bytes.iter().map(|lc| TensorClassBytes {
+        routed_expert: lc.routed_expert,
+        shared_expert: lc.shared_expert,
+        attention: lc.attention,
+        recurrent_ssm: lc.recurrent_ssm,
+        routing_gate: lc.routing_gate,
+        normalization: lc.normalization,
+        other: lc.other,
+    }).collect();
+
     for (stage_index, node) in capacities.iter().enumerate() {
         let remaining_layers = input.layer_count - next_layer;
         let remaining_nodes = capacities.len() - stage_index;
         let min_for_later = remaining_nodes.saturating_sub(1) as u32;
         let assignable = remaining_layers.saturating_sub(min_for_later);
-        let layer_span = if input.layer_class_bytes.is_empty() {
-            assignable.min(max_contiguous_layers_from(
+
+        let hybrid_fit = if input.layer_class_bytes.is_empty() {
+            max_contiguous_layers_from(
                 &layer_required_bytes,
                 next_layer as usize,
                 assignable as usize,
                 node.usable_vram_bytes,
-            ) as u32)
+            );
+            None
         } else {
-            assignable.min(max_contiguous_hybrid_layers_from(
-                &layer_required_bytes,
-                next_layer as usize,
-                assignable as usize,
+            max_contiguous_hybrid_stage_from(
+                &policy_layer_class_bytes,
+                &layer_weights,
                 node.usable_vram_bytes,
                 node.usable_ram_bytes,
-                &input.layer_class_bytes,
-            ) as u32)
+                input.layer_count,
+                kv_per_layer,
+                next_layer as usize,
+                assignable as usize,
+            )
         };
+
+        let (layer_span, host_bytes, accel_bytes) = match hybrid_fit {
+            Some(ref fit) => (fit.layer_span, fit.requirements.host_bytes, fit.requirements.accelerator_bytes),
+            None => {
+                // VRAM-only fallback (no layer_class_bytes)
+                let span = assignable.min(max_contiguous_layers_from(
+                    &layer_required_bytes,
+                    next_layer as usize,
+                    assignable as usize,
+                    node.usable_vram_bytes,
+                ) as u32);
+                (span, 0, layer_required_bytes.iter().take(span as usize).sum())
+            }
+        };
+
         if layer_span == 0 {
             return None;
         }
@@ -424,37 +460,8 @@ fn fit_candidate(
         let layer_end = layer_start + layer_span;
         let range = layer_start as usize..layer_end as usize;
         let parameter_bytes = sum_u64(&layer_weights[range.clone()]);
-        let required_bytes = sum_u64(&layer_required_bytes[range.clone()]);
 
-        // AutoHybrid: check if we need to offload routed experts to host.
-        let routed_expert_bytes: u64 = if input.layer_class_bytes.is_empty() {
-            0
-        } else {
-            input.layer_class_bytes[range.clone()]
-                .iter()
-                .map(|lc| lc.routed_expert)
-                .sum()
-        };
-        let accelerator_bytes = required_bytes.saturating_sub(routed_expert_bytes);
-
-        // If everything fits in VRAM, no offload needed.
-        // Otherwise, offload routed experts to host and check host capacity.
-        let (host_bytes, final_accel_bytes) = if required_bytes <= node.usable_vram_bytes {
-            (0, required_bytes)
-        } else {
-            if routed_expert_bytes > node.usable_ram_bytes {
-                return None;
-            }
-            if accelerator_bytes > node.usable_vram_bytes {
-                return None;
-            }
-            (routed_expert_bytes, accelerator_bytes)
-        };
-
-        if final_accel_bytes > node.usable_vram_bytes {
-            return None;
-        }
-        let remaining_vram = node.usable_vram_bytes - final_accel_bytes;
+        let remaining_vram = node.usable_vram_bytes.saturating_sub(accel_bytes);
         let remaining_ram = node.usable_ram_bytes.saturating_sub(host_bytes);
         minimum_remaining_vram = minimum_remaining_vram.min(remaining_vram);
         total_remaining_vram += u128::from(remaining_vram);
@@ -467,6 +474,7 @@ fn fit_candidate(
             layer_start,
             layer_end,
             parameter_bytes,
+            placement: Some(StageWeightRequirements::new(host_bytes, accel_bytes)),
         });
         next_layer = layer_end;
     }
@@ -642,33 +650,65 @@ fn max_contiguous_layers_from(
     count
 }
 
-fn max_contiguous_hybrid_layers_from(
-    layer_required_bytes: &[u64],
+/// Feasible hybrid stage (from real solver, not approximation).
+#[derive(Clone, Debug)]
+struct HybridStageFit {
+    pub layer_span: u32,
+    pub requirements: StageWeightRequirements,
+}
+
+/// Find the largest feasible contiguous stage starting at `start` using
+/// the real AutoHybrid placement solver (single source of truth).
+///
+/// `kv_per_layer` is the KV + compute buffer bytes per layer. This is
+/// subtracted from the effective VRAM capacity so the solver only sees
+/// the weight budget.
+fn max_contiguous_hybrid_stage_from(
+    layer_class_bytes: &[TensorClassBytes],
+    layer_weight_bytes: &[u64],
+    node_vram: u64,
+    node_ram: u64,
+    layer_count: u32,
+    kv_per_layer: u64,
     start: usize,
     limit: usize,
-    vram_capacity: u64,
-    ram_capacity: u64,
-    layer_class_bytes: &[TopologyLayerClassBytes],
-) -> u64 {
-    let mut vram_total = 0u64;
-    let mut ram_total = 0u64;
-    let mut count = 0u64;
-    for (i, bytes) in layer_required_bytes.iter().enumerate().skip(start).take(limit) {
-        let routed = layer_class_bytes
-            .get(i)
-            .map(|lc| lc.routed_expert)
-            .unwrap_or(0);
-        let non_routed = bytes.saturating_sub(routed);
-        let next_vram = vram_total.saturating_add(non_routed);
-        let next_ram = ram_total.saturating_add(routed);
-        if next_vram > vram_capacity || next_ram > ram_capacity {
+) -> Option<HybridStageFit> {
+    let mut best = None;
+    let mut cumulative_kv = 0u64;
+
+    for span in 1..=limit {
+        let end = start + span;
+        let selection = StageTensorSelection {
+            layers: start as u32..end as u32,
+            include_embeddings: start == 0,
+            include_output: end == layer_count as usize,
+            include_other_globals: false,
+        };
+
+        // Subtract KV from VRAM capacity for this span.
+        let span_kv = kv_per_layer.saturating_mul(span as u64);
+        let effective_vram = node_vram.saturating_sub(span_kv);
+        if effective_vram == 0 {
             break;
         }
-        vram_total = next_vram;
-        ram_total = next_ram;
-        count += 1;
+
+        let capacity = NodeCapacity {
+            usable_vram_bytes: effective_vram,
+            usable_ram_bytes: node_ram,
+        };
+        match plan_stage_weights_for_layers(layer_class_bytes, &selection, capacity) {
+            Ok(req) => {
+                cumulative_kv = span_kv;
+                best = Some(HybridStageFit {
+                    layer_span: span as u32,
+                    requirements: req,
+                });
+            }
+            Err(_) => break,
+        }
     }
-    count
+
+    best
 }
 
 fn sum_u64(values: &[u64]) -> u64 {
@@ -879,20 +919,43 @@ mod tests {
             // AutoHybrid: accel_bytes = total - routed_expert_bytes.
             let accel_bytes = stage_total_bytes - stage_routed_expert_bytes;
 
-            assert!(
-                accel_bytes <= vram_capacity,
-                "accel_bytes {} exceeds VRAM capacity {} for stage {}",
-                accel_bytes,
-                vram_capacity,
-                stage.node_id
-            );
-            assert!(
-                stage_routed_expert_bytes <= ram_capacity,
-                "routed_expert_bytes {} exceeds RAM capacity {} for stage {}",
+            eprintln!(
+                "STAGE {}..{} on {}: routed_expert_bytes={} plan_host_bytes={} plan_accel_bytes={} usable_ram={} usable_vram={}",
+                stage.layer_start,
+                stage.layer_end,
+                stage.node_id,
                 stage_routed_expert_bytes,
+                stage.placement.as_ref().unwrap().host_bytes,
+                stage.placement.as_ref().unwrap().accelerator_bytes,
                 ram_capacity,
-                stage.node_id
+                vram_capacity,
             );
+
+            assert!(
+                stage.placement.as_ref().unwrap().host_bytes <= ram_capacity,
+                "host_bytes {} exceeds RAM capacity {} for stage {}",
+                stage.placement.as_ref().unwrap().host_bytes,
+                ram_capacity,
+                stage.node_id,
+            );
+
+            assert!(
+                stage.placement.as_ref().unwrap().accelerator_bytes <= vram_capacity,
+                "accel_bytes {} exceeds VRAM capacity {} for stage {}",
+                stage.placement.as_ref().unwrap().accelerator_bytes,
+                vram_capacity,
+                stage.node_id,
+            );
+
+            assert_eq!(
+                stage.placement.as_ref().unwrap().host_bytes + stage.placement.as_ref().unwrap().accelerator_bytes,
+                stage.placement.as_ref().unwrap().total_bytes,
+                "host + accel must equal total for stage {}",
+                stage.node_id,
+            );
+            // Note: AutoHybrid may retain some routed experts on the accelerator,
+            // so plan_host_bytes <= routed_expert_bytes is expected.
+            // The correct invariant is plan_host_bytes <= ram_capacity (checked above).
 
             total_host_bytes += stage_routed_expert_bytes;
         }
