@@ -1,5 +1,9 @@
 #![forbid(unsafe_code)]
 
+// This crate is the stable Rust SDK ownership boundary. Keep client,
+// embedded-serving, and platform-facing adapters aligned here while their
+// implementations remain in the owning modules and crates.
+
 use std::collections::BTreeMap;
 use std::net::IpAddr;
 use std::path::PathBuf;

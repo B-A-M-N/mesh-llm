@@ -18,6 +18,9 @@ mod runtime;
 mod runtime_data;
 mod system;
 
+// This crate root owns the host runtime boundary: runtime orchestration,
+// inference, networking, and product composition stay reachable through the
+// same host contract while their implementations remain in domain modules.
 pub mod sdk;
 
 pub mod proto {

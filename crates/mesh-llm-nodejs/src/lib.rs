@@ -1,5 +1,9 @@
 #![forbid(unsafe_code)]
 
+// This addon owns the JavaScript-facing SDK boundary. Keep conversion,
+// lifecycle, and error translation here; runtime and wire behavior belongs to
+// mesh-llm-sdk so every binding observes the same SDK contract.
+
 #[cfg(feature = "embedded-runtime")]
 use mesh_llm_sdk::embedded_runtime::{EmbeddedChatMessage, EmbeddedServingController};
 use mesh_llm_sdk::events::{Event, EventListener};
