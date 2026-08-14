@@ -2,7 +2,8 @@ use std::cmp::Ordering;
 use std::path::PathBuf;
 
 use skippy_runtime::policy::{
-    NodeCapacity, StageTensorSelection, TensorClassBytes, StageWeightRequirements,
+    CapacityBudgetPolicy, NodeCapacity, StageTensorSelection, TensorClassBytes,
+    StageWeightRequirements, budget_accelerator_memory, budget_host_memory,
     plan_stage_weights_for_layers,
 };
 
@@ -279,14 +280,25 @@ fn usable_nodes(nodes: &[TopologyNode]) -> Vec<UsableNode> {
     let mut nodes = nodes
         .iter()
         .map(|node| {
-            let capped = node
+            let capped_vram = node
                 .max_vram_bytes
                 .map(|max| node.detected_vram_bytes.min(max))
                 .unwrap_or(node.detected_vram_bytes);
+            // When runtime_headroom_bytes is 0, the caller provided already-budgeted
+            // usable capacities. Otherwise apply the capacity budgeting policy.
+            let (usable_vram, usable_ram) = if node.runtime_headroom_bytes == 0 {
+                (capped_vram, node.detected_host_available_bytes)
+            } else {
+                let policy = CapacityBudgetPolicy::default();
+                (
+                    budget_accelerator_memory(capped_vram, &policy),
+                    budget_host_memory(node.detected_host_available_bytes, &policy),
+                )
+            };
             UsableNode {
                 node_id: node.node_id.clone(),
-                usable_vram_bytes: capped.saturating_sub(node.runtime_headroom_bytes),
-                usable_ram_bytes: node.detected_host_available_bytes.saturating_sub(node.runtime_headroom_bytes),
+                usable_vram_bytes: usable_vram,
+                usable_ram_bytes: usable_ram,
                 stage_transfer_latency_ms: node.stage_transfer_latency_ms,
             }
         })
@@ -928,7 +940,7 @@ mod tests {
                 stage.placement.as_ref().unwrap().host_bytes,
                 stage.placement.as_ref().unwrap().accelerator_bytes,
                 ram_capacity,
-                vram_capacity,
+                vram_capacity
             );
 
             assert!(
