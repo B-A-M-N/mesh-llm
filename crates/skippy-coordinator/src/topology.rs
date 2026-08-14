@@ -325,6 +325,8 @@ struct CandidatePlan {
     plan: TopologyPlan,
     minimum_remaining_vram: u64,
     total_remaining_vram: u128,
+    minimum_remaining_ram: u64,
+    total_remaining_ram: u128,
 }
 
 impl Ord for CandidatePlan {
@@ -332,6 +334,8 @@ impl Ord for CandidatePlan {
         self.minimum_remaining_vram
             .cmp(&other.minimum_remaining_vram)
             .then_with(|| self.total_remaining_vram.cmp(&other.total_remaining_vram))
+            .then_with(|| self.minimum_remaining_ram.cmp(&other.minimum_remaining_ram))
+            .then_with(|| self.total_remaining_ram.cmp(&other.total_remaining_ram))
             .then_with(|| {
                 let left = self
                     .plan
@@ -386,6 +390,8 @@ fn fit_candidate(
     let mut stages = Vec::with_capacity(capacities.len());
     let mut minimum_remaining_vram = u64::MAX;
     let mut total_remaining_vram = 0u128;
+    let mut minimum_remaining_ram = u64::MAX;
+    let mut total_remaining_ram = 0u128;
 
     for (stage_index, node) in capacities.iter().enumerate() {
         let remaining_layers = input.layer_count - next_layer;
@@ -409,7 +415,6 @@ fn fit_candidate(
         let required_bytes = sum_u64(&layer_required_bytes[range.clone()]);
 
         // AutoHybrid: check if we need to offload routed experts to host.
-        // Sum routed expert bytes in this range.
         let routed_expert_bytes: u64 = if input.layer_class_bytes.is_empty() {
             0
         } else {
@@ -420,16 +425,12 @@ fn fit_candidate(
         };
         let accelerator_bytes = required_bytes.saturating_sub(routed_expert_bytes);
 
-        // If accelerator alone fits, no offload needed.
-        // If not, offload routed experts to host and check host capacity.
         let (host_bytes, final_accel_bytes) = if accelerator_bytes <= node.usable_vram_bytes {
             (0, required_bytes)
         } else {
-            // Offload routed experts to host.
             if routed_expert_bytes > node.usable_ram_bytes {
                 return None;
             }
-            // Recompute accelerator bytes without routed experts.
             if accelerator_bytes > node.usable_vram_bytes {
                 return None;
             }
@@ -439,9 +440,12 @@ fn fit_candidate(
         if final_accel_bytes > node.usable_vram_bytes {
             return None;
         }
-        let remaining = node.usable_vram_bytes - final_accel_bytes;
-        minimum_remaining_vram = minimum_remaining_vram.min(remaining);
-        total_remaining_vram += u128::from(remaining);
+        let remaining_vram = node.usable_vram_bytes - final_accel_bytes;
+        let remaining_ram = node.usable_ram_bytes.saturating_sub(host_bytes);
+        minimum_remaining_vram = minimum_remaining_vram.min(remaining_vram);
+        total_remaining_vram += u128::from(remaining_vram);
+        minimum_remaining_ram = minimum_remaining_ram.min(remaining_ram);
+        total_remaining_ram += u128::from(remaining_ram);
         stages.push(TopologyStagePlan {
             stage_id: format!("stage-{stage_index}"),
             stage_index: stage_index as u32,
@@ -451,7 +455,6 @@ fn fit_candidate(
             parameter_bytes,
         });
         next_layer = layer_end;
-        let _ = host_bytes; // used for host capacity check above
     }
 
     if next_layer != input.layer_count {
@@ -472,6 +475,8 @@ fn fit_candidate(
         },
         minimum_remaining_vram,
         total_remaining_vram,
+        minimum_remaining_ram,
+        total_remaining_ram,
     })
 }
 

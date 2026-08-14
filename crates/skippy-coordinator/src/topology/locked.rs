@@ -160,6 +160,8 @@ fn fit_locked_candidate(
         },
         minimum_remaining_vram,
         total_remaining_vram,
+        minimum_remaining_ram: 0,
+        total_remaining_ram: 0,
     })
 }
 
