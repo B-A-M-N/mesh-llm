@@ -350,6 +350,7 @@ impl Default for RuntimeConfig {
             glm_dsa_direct_sparse_decode_max_top_k: 0,
             glm_dsa_dense_sparse_mask_max_bytes: 0,
             glm_dsa_compact_flash_min_kv: 0,
+            mtp_source: MtpSource::Disabled,
             placement: std::ptr::null(),
         }
     }
