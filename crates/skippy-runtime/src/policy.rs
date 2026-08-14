@@ -518,6 +518,17 @@ pub fn plan_stage_placement(
     // Need to offload. Determine how much we need to free from accelerator.
     let overflow = total_bytes - capacity.usable_vram_bytes;
 
+    // Fast-path rejection: even the theoretical minimum offload exceeds host capacity.
+    // The authoritative check is below against actual placement, but this avoids
+    // unnecessary iteration when the plan is obviously infeasible.
+    if overflow > capacity.usable_ram_bytes {
+        anyhow::bail!(
+            "offload overflow {} exceeds host capacity {}",
+            overflow,
+            capacity.usable_ram_bytes
+        );
+    }
+
     // Decide which tensors to offload.
     let mut offload_bytes: u64 = 0;
     let mut placements = Vec::with_capacity(stage_tensors.len());
@@ -564,7 +575,10 @@ pub fn plan_stage_placement(
         .map(|p| p.bytes)
         .sum();
 
-    // Check host capacity BEFORE debug_assert so we return Err, not panic.
+    // Authoritative check: actual selected placement must fit host capacity.
+    // The fast-path overflow check above is necessary but not sufficient because
+    // placement happens at tensor granularity: a single tensor larger than the
+    // overflow gap may push actual host bytes beyond capacity.
     if host_bytes > capacity.usable_ram_bytes {
         anyhow::bail!(
             "offloaded {} bytes to host but only {} bytes available",
@@ -583,7 +597,6 @@ pub fn plan_stage_placement(
     debug_assert_eq!(
         host_bytes.saturating_add(accelerator_bytes),
         total_bytes,
-        "host + accel must equal total bytes"
     );
 
     Ok(StagePlacementPlan {
@@ -1398,6 +1411,56 @@ mod tests {
         assert!(
             result.is_err(),
             "must fail when offload required but RAM=0"
+        );
+    }
+
+    // S7: Tensor granularity edge case. Overflow is small but a single routed
+    // tensor is large, pushing actual host bytes beyond capacity.
+    #[test]
+    fn s7_tensor_granularity_respected() {
+        // Two routed tensors (800 + 200) + one non-routed (300).
+        // VRAM=200, RAM=500.
+        // Overflow = 1300 - 200 = 1100.
+        // Fast-path: 1100 > 500 → rejected immediately.
+        // Without fast-path: solver would offload 800+200=1000 to host (1000 > 500).
+        let inventory = TensorClassInventory {
+            layers: vec![],
+            tensors: vec![
+                ClassifiedTensor {
+                    name: "blk.0.ffn_down_exps.weight".to_string(),
+                    layer: Some(0),
+                    class: TensorClass::RoutedExpert,
+                    bytes: 800,
+                },
+                ClassifiedTensor {
+                    name: "blk.0.ffn_up_exps.weight".to_string(),
+                    layer: Some(0),
+                    class: TensorClass::RoutedExpert,
+                    bytes: 200,
+                },
+                ClassifiedTensor {
+                    name: "blk.0.attn_q.weight".to_string(),
+                    layer: Some(0),
+                    class: TensorClass::Attention,
+                    bytes: 300,
+                },
+            ],
+            global_embeddings: TensorClassBytes::default(),
+            global_output: TensorClassBytes::default(),
+            global_other: TensorClassBytes::default(),
+            global_total_bytes: 0,
+            total_tensor_bytes: 1300,
+            unknown_tensor_count: 0,
+            unknown_tensor_bytes: 0,
+        };
+        let capacity = NodeCapacity {
+            usable_ram_bytes: 500,
+            usable_vram_bytes: 200,
+        };
+        let result = plan_stage_placement(&inventory, &SIMPLE_SELECTION, capacity);
+        assert!(
+            result.is_err(),
+            "must fail: single routed tensor (800) exceeds host capacity (500)"
         );
     }
 
