@@ -1035,7 +1035,7 @@ pub(in crate::binary_transport) fn add_binary_record_stats(
 mod tests {
     use super::binary_full_prefill_record_identities;
     use crate::binary_transport::stage_execution::prefix_cache_test_config;
-    use crate::kv_integration::KvStageIntegration;
+    use crate::kv_integration::{ArchiveCandidate, KvStageIntegration, offer_archive_candidate};
     use skippy_protocol::binary::{
         StageStateHeader, StageWireMessage, WireActivationDType, WireMessageKind,
     };
@@ -1107,6 +1107,34 @@ mod tests {
 
         assert_eq!(recorded_shared.page_id, lookup_shared.page_id);
         assert_ne!(recorded_exact.page_id, lookup_exact.page_id);
+    }
+
+    #[test]
+    fn chunked_4905_token_prefill_archives_chain_compatible_4864_candidate() {
+        let config = prefix_cache_test_config();
+        let kv = KvStageIntegration::from_config(&config)
+            .unwrap()
+            .expect("resident prefix cache enabled");
+        let message = prefill_message();
+        let logical_prompt = (0..4905).collect::<Vec<i32>>();
+        let identities = binary_full_prefill_record_identities(
+            &kv,
+            &config,
+            "downstream-session",
+            &message,
+            &logical_prompt,
+        );
+        let mut archive = ArchiveCandidate::default();
+        for identity in &identities {
+            offer_archive_candidate(&mut archive, identity, logical_prompt.len());
+        }
+
+        let archived = archive.take().expect("archive candidate");
+        assert_eq!(archived.identity.token_count, 4864);
+        assert_eq!(
+            archived.identity.prefix_hash,
+            identities[1].identity.prefix_hash
+        );
     }
 }
 
