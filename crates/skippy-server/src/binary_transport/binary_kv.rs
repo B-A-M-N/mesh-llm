@@ -836,7 +836,29 @@ pub(in crate::binary_transport) fn maybe_record_binary_prefill(
     result
 }
 
-pub(in crate::binary_transport) fn accumulate_prefill_tokens(
+pub(in crate::binary_transport) fn accumulate_shared_prefill_tokens(
+    accumulated: &Mutex<BTreeMap<String, Vec<i32>>>,
+    session_id: &str,
+    token_start: usize,
+    token_ids: &[i32],
+) {
+    let mut accumulated = accumulated
+        .lock()
+        .expect("split prefill token lock poisoned");
+    accumulate_prefill_tokens(&mut accumulated, session_id, token_start, token_ids);
+}
+
+pub(in crate::binary_transport) fn take_shared_prefill_tokens(
+    accumulated: &Mutex<BTreeMap<String, Vec<i32>>>,
+    session_id: &str,
+) -> Option<Vec<i32>> {
+    accumulated
+        .lock()
+        .expect("split prefill token lock poisoned")
+        .remove(session_id)
+}
+
+fn accumulate_prefill_tokens(
     accumulated: &mut BTreeMap<String, Vec<i32>>,
     session_id: &str,
     token_start: usize,
@@ -1140,8 +1162,41 @@ mod tests {
 
 #[cfg(test)]
 mod record_gate_tests {
-    use super::candidate_already_resident;
+    use std::{collections::BTreeMap, sync::Mutex};
+
+    use super::{
+        accumulate_shared_prefill_tokens, candidate_already_resident, take_shared_prefill_tokens,
+    };
     use crate::kv_integration::{ArchiveCandidate, PrefillKvIdentity};
+
+    #[test]
+    fn concurrent_lanes_preserve_each_sessions_accumulation() {
+        let accumulated = Mutex::new(BTreeMap::new());
+
+        accumulate_shared_prefill_tokens(&accumulated, "lane-a", 0, &[1, 2]);
+        accumulate_shared_prefill_tokens(&accumulated, "lane-b", 0, &[7, 8]);
+        accumulate_shared_prefill_tokens(&accumulated, "lane-a", 2, &[3, 4]);
+
+        let accumulated = accumulated.lock().expect("test lock poisoned");
+        assert_eq!(accumulated.get("lane-a"), Some(&vec![1, 2, 3, 4]));
+        assert_eq!(accumulated.get("lane-b"), Some(&vec![7, 8]));
+    }
+
+    #[test]
+    fn stopping_one_lane_removes_only_its_session() {
+        let accumulated = Mutex::new(BTreeMap::from([
+            ("lane-a".to_string(), vec![1, 2]),
+            ("lane-b".to_string(), vec![7, 8]),
+        ]));
+
+        assert_eq!(
+            take_shared_prefill_tokens(&accumulated, "lane-a"),
+            Some(vec![1, 2])
+        );
+        let accumulated = accumulated.lock().expect("test lock poisoned");
+        assert!(!accumulated.contains_key("lane-a"));
+        assert_eq!(accumulated.get("lane-b"), Some(&vec![7, 8]));
+    }
 
     fn identity(tokens: u64) -> PrefillKvIdentity {
         PrefillKvIdentity {
