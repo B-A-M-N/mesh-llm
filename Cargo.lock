@@ -4093,6 +4093,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "mesh-llm-memory-envelope"
+version = "0.72.1"
+dependencies = [
+ "anyhow",
+ "clap",
+ "libc",
+ "serde",
+ "serde_json",
+ "skippy-ffi",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "mesh-llm-native-runtime"
 version = "0.72.1"
 dependencies = [
@@ -7405,6 +7419,8 @@ dependencies = [
 name = "skippy-coordinator"
 version = "0.72.1"
 dependencies = [
+ "serde_json",
+ "skippy-runtime",
  "thiserror 2.0.18",
 ]
 

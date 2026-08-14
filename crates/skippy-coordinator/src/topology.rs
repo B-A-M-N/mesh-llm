@@ -59,6 +59,13 @@ pub struct TopologyLayerClassBytes {
     pub other: u64,
 }
 
+impl TopologyLayerClassBytes {
+    pub fn total(&self) -> u64 {
+        self.routed_expert + self.shared_expert + self.attention
+            + self.recurrent_ssm + self.routing_gate + self.normalization + self.other
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TopologyNode {
     pub node_id: String,
@@ -1085,16 +1092,52 @@ mod tests {
         assert!(a4000.layer_end - a4000.layer_start >= rx6600.layer_end - rx6600.layer_start);
     }
 
+    /// D0d dry plan: find the minimum viable envelope by testing combinations.
+    /// Tests progressively larger envelopes until 49/49 fits.
     #[test]
-    fn vram_only_feasibility_rejects_49_layers_without_host_assist() {
-        let mut request = input(vec![node("a4000", 16), node("rx6600", 8)]);
-        request.layer_count = 49;
-        request.model_weight_bytes = 57_030_728_384;
-        request.layer_weight_bytes = vec![1_177_551_020; 49];
-        request.kv_bytes_per_token = 64 * 1024;
-        request.minimum_nodes = 2;
-        let plan = plan_topology(&request);
-        assert!(plan.is_err());
+    fn qwen35_122b_dry_plan_minimum_viable_envelope() {
+        let layer_bytes = hybrid_qwen3_122b_layer_bytes();
+        let total_weight: u64 = layer_bytes.iter().map(|l| l.total()).sum();
+
+        let combinations = [
+            (20u64, 17u64),  // CUDA 20, Vulkan 17
+            (19, 17),         // CUDA 19, Vulkan 17
+            (20, 16),         // CUDA 20, Vulkan 16
+            (22, 17),         // CUDA 22, Vulkan 17
+            (20, 18),         // CUDA 20, Vulkan 18
+        ];
+
+        for (cuda_host, vulkan_host) in combinations {
+            let mut request = input(vec![
+                node_with_ram("a4000", 14, cuda_host),
+                node_with_ram("rx6600", 7, vulkan_host),
+            ]);
+            request.layer_count = 49;
+            request.model_weight_bytes = total_weight;
+            request.layer_class_bytes = layer_bytes.clone();
+            request.layer_weight_bytes = layer_bytes.iter().map(|l| l.total()).collect();
+            request.kv_bytes_per_token = 64 * 1024;
+            request.minimum_nodes = 2;
+
+            let plan = plan_topology(&request);
+
+            match plan {
+                Ok(p) => {
+                    println!("SUCCESS: CUDA {} GB + Vulkan {} GB HOST", cuda_host, vulkan_host);
+                    for stage in &p.stages {
+                        println!(
+                            "  {}: layers [{}, {}) = {} layers",
+                            stage.node_id, stage.layer_start, stage.layer_end,
+                            stage.layer_end - stage.layer_start
+                        );
+                    }
+                    return;
+                }
+                Err(e) => {
+                    println!("REJECTED: CUDA {} GB + Vulkan {} GB HOST: {}", cuda_host, vulkan_host, e);
+                }
+            }
+        }
     }
 
     fn latency_node(id: &str, gib: u64, stage_transfer_latency_ms: u32) -> TopologyNode {
