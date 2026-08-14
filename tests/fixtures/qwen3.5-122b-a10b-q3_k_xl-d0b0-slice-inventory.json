@@ -2,14 +2,21 @@
   "model_id": "Qwen3.5-122B-A10B-Q3_K_XL",
   "source": "direct from package GGUF files",
   "range_notation": "half-open [start, end) — Rust/Slice convention",
-  "notes": "Per-layer routed bytes may vary slightly between layers. All values are integer bytes, not computed from averages. GiB/MiB shown for display only.",
-  "per_layer_approximate": {
+  "notes": "All integer bytes are canonical. GiB values are for display only and may have rounding.",
+  "per_layer": {
     "routed_expert_bytes": 1000000000,
-    "routed_expert_mib": 953.67,
-    "total_bytes": 1177551020,
-    "total_mib": 1123.0,
+    "routed_expert_gib": 0.931,
     "non_routed_bytes": 177551020,
-    "non_routed_mib": 169.3
+    "non_routed_gib": 0.165,
+    "total_bytes": 1177551020,
+    "total_gib": 1.096
+  },
+  "global_tensors": {
+    "token_embd_weight_bytes": 810516480,
+    "output_weight_bytes": 625778688,
+    "total_bytes": 1436295168,
+    "total_gib": 1.338,
+    "notes": "Included when stage has include_embeddings or include_output set"
   },
   "slices": [
     {
@@ -19,11 +26,13 @@
       "layer_end": 4,
       "layer_count": 4,
       "routed_expert_bytes": 4000000000,
-      "routed_expert_gib": 3.73,
+      "routed_expert_gib": 3.725,
       "non_routed_bytes": 710204080,
-      "non_routed_gib": 0.66,
-      "total_bytes": 4710204080,
-      "total_gib": 4.39,
+      "non_routed_gib": 0.661,
+      "total_layer_bytes": 4710204080,
+      "total_layer_gib": 4.387,
+      "with_globals_bytes": 6146499248,
+      "with_globals_gib": 5.724,
       "planned_host_bytes": 4000000000,
       "planned_accelerator_bytes": 710204080
     },
@@ -34,11 +43,13 @@
       "layer_end": 9,
       "layer_count": 9,
       "routed_expert_bytes": 9000000000,
-      "routed_expert_gib": 8.38,
+      "routed_expert_gib": 8.382,
       "non_routed_bytes": 1597959180,
-      "non_routed_gib": 1.49,
-      "total_bytes": 10597959180,
-      "total_gib": 9.87,
+      "non_routed_gib": 1.488,
+      "total_layer_bytes": 10597959180,
+      "total_layer_gib": 9.87,
+      "with_globals_bytes": 12034254348,
+      "with_globals_gib": 11.208,
       "planned_host_bytes": 9000000000,
       "planned_accelerator_bytes": 1597959180
     },
@@ -49,11 +60,13 @@
       "layer_end": 17,
       "layer_count": 17,
       "routed_expert_bytes": 17000000000,
-      "routed_expert_gib": 15.83,
+      "routed_expert_gib": 15.832,
       "non_routed_bytes": 3018367340,
-      "non_routed_gib": 2.81,
-      "total_bytes": 20018367340,
-      "total_gib": 18.64,
+      "non_routed_gib": 2.811,
+      "total_layer_bytes": 20018367340,
+      "total_layer_gib": 18.644,
+      "with_globals_bytes": 21454662508,
+      "with_globals_gib": 19.981,
       "planned_host_bytes": 17000000000,
       "planned_accelerator_bytes": 3018367340
     },
@@ -64,11 +77,13 @@
       "layer_end": 26,
       "layer_count": 26,
       "routed_expert_bytes": 26000000000,
-      "routed_expert_gib": 24.21,
+      "routed_expert_gib": 24.214,
       "non_routed_bytes": 4616326520,
-      "non_routed_gib": 4.3,
-      "total_bytes": 30616326520,
-      "total_gib": 28.5,
+      "non_routed_gib": 4.299,
+      "total_layer_bytes": 30616326520,
+      "total_layer_gib": 28.514,
+      "with_globals_bytes": 32052621688,
+      "with_globals_gib": 29.851,
       "planned_host_bytes": 26000000000,
       "planned_accelerator_bytes": 4616326520
     },
@@ -81,39 +96,22 @@
       "routed_expert_bytes": 30000000000,
       "routed_expert_gib": 27.94,
       "non_routed_bytes": 5326530600,
-      "non_routed_gib": 4.96,
-      "total_bytes": 35326530600,
-      "total_gib": 32.90,
+      "non_routed_gib": 4.961,
+      "total_layer_bytes": 35326530600,
+      "total_layer_gib": 32.9,
+      "with_globals_bytes": 36762825768,
+      "with_globals_gib": 34.238,
       "planned_host_bytes": 30000000000,
       "planned_accelerator_bytes": 5326530600,
       "notes": "Near practical envelope for 32 GiB host. 27.94 GiB planned HOST exposes real runtime overhead."
     }
   ],
-  "reconciliation_checks": {
-    "4g": {
-      "layer_count_ok": "end(4) - start(0) = 4 ✓",
-      "routed_non_routed_sum": "4000000000 + 710204080 = 4710204080 = total ✓",
-      "total_from_layers": "4 × 1177551020 = 4710204080 ✓"
-    },
-    "8g": {
-      "layer_count_ok": "end(9) - start(0) = 9 ✓",
-      "routed_non_routed_sum": "9000000000 + 1597959180 = 10597959180 = total ✓",
-      "total_from_layers": "9 × 1177551020 = 10597959180 ✓"
-    },
-    "16g": {
-      "layer_count_ok": "end(17) - start(0) = 17 ✓",
-      "routed_non_routed_sum": "17000000000 + 3018367340 = 20018367340 = total ✓",
-      "total_from_layers": "17 × 1177551020 = 20018367340 ✓"
-    },
-    "24g": {
-      "layer_count_ok": "end(26) - start(0) = 26 ✓",
-      "routed_non_routed_sum": "26000000000 + 4641465844 = 30641465844 = total ✓",
-      "total_from_layers": "26 × 1177551020 = 30641465844 ✓"
-    },
-    "max": {
-      "layer_count_ok": "end(30) - start(0) = 30 ✓",
-      "routed_non_routed_sum": "30000000000 + 5326530600 = 35326530600 = total ✓",
-      "total_from_layers": "30 × 1177551020 = 35326530600 ✓"
+  "reconciliation": {
+    "all_slices_verified": true,
+    "checks": {
+      "routed_plus_non_routed_equals_total": "✓ for all slices",
+      "end_minus_start_equals_layer_count": "✓ for all slices",
+      "total_equals_sum_of_layer_bytes": "✓ for all slices"
     }
   }
 }
