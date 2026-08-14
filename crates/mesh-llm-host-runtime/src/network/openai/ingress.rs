@@ -1,4 +1,3 @@
-use crate::api;
 use crate::inference::{election, pipeline};
 use crate::logging::{OpenAiLifecycleAttachment, OpenAiRouteObserver};
 use crate::mesh;
@@ -8,7 +7,6 @@ use crate::network::openai::transport as proxy;
 use crate::network::router;
 use mesh_llm_events::audit::{audit_events, emit_audit};
 use mesh_llm_events::{OutputEvent, emit_event};
-use mesh_llm_node::serving::{UnloadOptions, UnloadTarget};
 use mesh_mixture_of_agents as moa;
 
 enum AutoRouteResolution {
@@ -28,7 +26,6 @@ struct IngressRouteContext<'a> {
 
 struct ProxyConnectionContext<'a> {
     route: IngressRouteContext<'a>,
-    control_tx: &'a tokio::sync::mpsc::UnboundedSender<api::RuntimeControlRequest>,
 }
 
 struct AutoRouteDecision {
@@ -126,105 +123,6 @@ async fn bind_api_proxy_listener(
                 }
             }
         }
-    }
-}
-
-async fn send_runtime_control_response<T, F>(
-    tcp_stream: tokio::net::TcpStream,
-    response: Result<Result<T, anyhow::Error>, tokio::sync::oneshot::error::RecvError>,
-    closed_reason: &str,
-    route_observer: OpenAiRouteObserver<'_>,
-    ok_response: F,
-) -> proxy::RouteDispatchOutcome
-where
-    F: FnOnce(T) -> serde_json::Value,
-{
-    match response {
-        Ok(Ok(value)) => response_outcome(
-            200,
-            proxy::send_json_ok(tcp_stream, &ok_response(value)).await,
-        ),
-        Ok(Err(error)) => {
-            let message = error.to_string();
-            let code = api::classify_runtime_error(&message);
-            response_outcome(
-                code,
-                proxy::send_error_observed(tcp_stream, code, &message, route_observer).await,
-            )
-        }
-        Err(_) => response_outcome(
-            503,
-            proxy::send_503_observed(tcp_stream, closed_reason, route_observer).await,
-        ),
-    }
-}
-
-async fn handle_mesh_load_request(
-    tcp_stream: tokio::net::TcpStream,
-    request: &proxy::BufferedHttpRequest,
-    control_tx: &tokio::sync::mpsc::UnboundedSender<api::RuntimeControlRequest>,
-    route_observer: OpenAiRouteObserver<'_>,
-) -> proxy::RouteDispatchOutcome {
-    if let Some(spec) = request.model_name.as_ref() {
-        let (model_ref, profile) = parse_model_with_profile(spec);
-        let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
-        let _ = control_tx.send(api::RuntimeControlRequest::Load {
-            spec: model_ref.to_string(),
-            profile: profile.to_string(),
-            resp: resp_tx,
-        });
-        send_runtime_control_response(
-            tcp_stream,
-            resp_rx.await,
-            "runtime load channel closed",
-            route_observer,
-            |loaded| {
-                serde_json::json!({
-                    "loaded": loaded.model,
-                    "instance_id": loaded.instance_id,
-                })
-            },
-        )
-        .await
-    } else {
-        response_outcome(
-            400,
-            proxy::send_400_observed(tcp_stream, "missing 'model' field", route_observer).await,
-        )
-    }
-}
-
-async fn handle_mesh_unload_request(
-    tcp_stream: tokio::net::TcpStream,
-    request: &proxy::BufferedHttpRequest,
-    control_tx: &tokio::sync::mpsc::UnboundedSender<api::RuntimeControlRequest>,
-    route_observer: OpenAiRouteObserver<'_>,
-) -> proxy::RouteDispatchOutcome {
-    if let Some(name) = request.model_name.as_ref() {
-        let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
-        let _ = control_tx.send(api::RuntimeControlRequest::Unload {
-            target: UnloadTarget::Model(name.clone()),
-            options: UnloadOptions::default(),
-            resp: resp_tx,
-        });
-        send_runtime_control_response(
-            tcp_stream,
-            resp_rx.await,
-            "runtime unload channel closed",
-            route_observer,
-            |dropped| {
-                serde_json::json!({
-                    "dropped": dropped.model,
-                    "instance_id": dropped.instance_id,
-                })
-            },
-        )
-        .await
-    } else {
-        response_outcome(
-            400,
-            proxy::send_400_observed(tcp_stream, "missing 'model' field", route_observer).await,
-        )
     }
 }
 
@@ -829,6 +727,10 @@ async fn maybe_handle_control_request(
     ctx: &ProxyConnectionContext<'_>,
     route_observer: OpenAiRouteObserver<'_>,
 ) -> Result<proxy::RouteDispatchOutcome, tokio::net::TcpStream> {
+    if proxy::is_legacy_lifecycle_path(&request.path) {
+        return Ok(proxy::reject_legacy_lifecycle_request(tcp_stream, route_observer).await);
+    }
+
     if proxy::is_models_list_request(&request.method, &request.path) {
         let outcome = handle_models_list_request(
             tcp_stream,
@@ -840,14 +742,21 @@ async fn maybe_handle_control_request(
         return Ok(outcome);
     }
 
-    let path = request.path.split('?').next().unwrap_or(&request.path);
-    if request.method == "POST" && path == "/mesh/load" {
-        let outcome =
-            handle_mesh_load_request(tcp_stream, request, ctx.control_tx, route_observer).await;
-        return Ok(outcome);
-    }
-
     Err(tcp_stream)
+}
+
+fn pipeline_route_model<'a>(
+    request: &proxy::BufferedHttpRequest,
+    decision: &AutoRouteDecision,
+    routing_model: Option<&'a str>,
+) -> Option<&'a str> {
+    let use_pipeline = decision
+        .classification
+        .as_ref()
+        .map(pipeline::should_pipeline)
+        .unwrap_or(false)
+        && request.response_adapter == proxy::ResponseAdapter::None;
+    use_pipeline.then_some(routing_model).flatten()
 }
 
 async fn try_pipeline_route(
@@ -855,17 +764,9 @@ async fn try_pipeline_route(
     request: &mut proxy::BufferedHttpRequest,
     ctx: &IngressRouteContext<'_>,
     decision: &AutoRouteDecision,
+    routing_model: Option<&str>,
 ) -> Option<proxy::RouteDispatchOutcome> {
-    let use_pipeline = decision
-        .classification
-        .as_ref()
-        .map(pipeline::should_pipeline)
-        .unwrap_or(false)
-        && request.response_adapter == proxy::ResponseAdapter::None;
-    if !use_pipeline {
-        return None;
-    }
-    let strong_name = decision.effective_model.as_deref()?;
+    let strong_name = pipeline_route_model(request, decision, routing_model)?;
     try_pipeline_proxy(ctx.node, tcp_stream, request, ctx.targets, strong_name).await
 }
 
@@ -876,6 +777,14 @@ enum MoaInterceptResult {
     /// Not an MoA request — caller should continue with normal routing,
     /// reusing the returned stream.
     NotMoa(tokio::net::TcpStream),
+    /// MoA could not form a committee but degraded `model=mesh` to a real
+    /// single model (already rewritten on the request). Caller routes it
+    /// normally, but must use this model rather than the stale
+    /// `decision.effective_model` (still "mesh").
+    Degraded {
+        stream: tokio::net::TcpStream,
+        model: Option<String>,
+    },
 }
 
 /// Dispatch to the MoA gateway when `model == "mesh"`. Self-gates on the
@@ -909,7 +818,16 @@ async fn try_handle_moa_intercept(
     .await;
     match result {
         crate::network::openai::moa_gateway::MoaDispatchResult::Passthrough(stream) => {
-            MoaInterceptResult::NotMoa(stream)
+            // The gateway hands the stream back in two cases: the request was
+            // never MoA-shaped, or MoA degraded `model=mesh` to a real single
+            // model by rewriting the request in place. The outer gate above
+            // guarantees we got here with `effective_model == "mesh"`, so this
+            // is the degrade case: routing must use the rewritten model, not
+            // the stale decision.
+            MoaInterceptResult::Degraded {
+                stream,
+                model: request.model_name.clone(),
+            }
         }
         crate::network::openai::moa_gateway::MoaDispatchResult::Responded(status) => {
             proxy::release_request_objects(ctx.route.node, &request.request_object_request_ids)
@@ -981,20 +899,7 @@ async fn handle_buffered_api_request(
     let descriptors = ctx.route.node.all_served_model_descriptors().await;
     proxy::rewrite_public_model_alias(&mut request, &callable, &descriptors);
 
-    if proxy::is_drop_request(&request.method, &request.path) {
-        let outcome = handle_mesh_unload_request(
-            tcp_stream,
-            &request,
-            ctx.control_tx,
-            lifecycle.route_observer(),
-        )
-        .await;
-        lifecycle.terminal(terminal_outcome_for_dispatch(outcome));
-        return;
-    }
-
-    // Admission applies only to new inference work. Control and unload requests
-    // remain available while host activity pauses inference.
+    // Admission applies to inference work after control-path rejection.
     let tcp_stream = match check_activity_admission(
         tcp_stream,
         &ctx.route.node.activity_policy_guard,
@@ -1019,6 +924,7 @@ async fn handle_buffered_api_request(
         }
     };
 
+    let mut routing_model = decision.effective_model.clone();
     let tcp_stream = match try_handle_moa_intercept(
         tcp_stream,
         &mut request,
@@ -1038,11 +944,21 @@ async fn handle_buffered_api_request(
             return;
         }
         MoaInterceptResult::NotMoa(stream) => stream,
+        MoaInterceptResult::Degraded { stream, model } => {
+            routing_model = model;
+            stream
+        }
     };
 
     let mut tcp_stream = tcp_stream;
-    if let Some(outcome) =
-        try_pipeline_route(&mut tcp_stream, &mut request, &ctx.route, &decision).await
+    if let Some(outcome) = try_pipeline_route(
+        &mut tcp_stream,
+        &mut request,
+        &ctx.route,
+        &decision,
+        routing_model.as_deref(),
+    )
+    .await
     {
         proxy::release_request_objects(ctx.route.node, &request.request_object_request_ids).await;
         lifecycle.terminal(terminal_outcome_for_dispatch(outcome));
@@ -1055,13 +971,13 @@ async fn handle_buffered_api_request(
             tcp_stream,
             &mut request,
             &ctx.route,
-            decision.effective_model.as_deref(),
+            routing_model.as_deref(),
             decision.required_tokens,
             route_observer,
         )
         .await
     };
-    if let Some(model) = decision.effective_model.as_deref()
+    if let Some(model) = routing_model.as_deref()
         && !request.is_tokenize_request()
     {
         let mut event =
@@ -1079,7 +995,6 @@ async fn handle_api_proxy_connection(
     node: mesh::Node,
     mut tcp_stream: tokio::net::TcpStream,
     targets: election::ModelTargets,
-    control_tx: tokio::sync::mpsc::UnboundedSender<api::RuntimeControlRequest>,
     affinity: affinity::AffinityRouter,
 ) {
     let plugin_manager = node.plugin_manager().await;
@@ -1096,15 +1011,8 @@ async fn handle_api_proxy_connection(
                 affinity: &affinity,
                 plugin_manager: plugin_manager.as_ref(),
             };
-            handle_buffered_api_request(
-                tcp_stream,
-                request,
-                ProxyConnectionContext {
-                    route,
-                    control_tx: &control_tx,
-                },
-            )
-            .await;
+            handle_buffered_api_request(tcp_stream, request, ProxyConnectionContext { route })
+                .await;
         }
         Err(error) => {
             let _ = super::parse_failure::send_read_failure(tcp_stream, &error).await;
@@ -1119,7 +1027,6 @@ pub(crate) async fn api_proxy(
     node: mesh::Node,
     port: u16,
     target_rx: tokio::sync::watch::Receiver<election::ModelTargets>,
-    control_tx: tokio::sync::mpsc::UnboundedSender<api::RuntimeControlRequest>,
     existing_listener: Option<tokio::net::TcpListener>,
     listen_all: bool,
     affinity: affinity::AffinityRouter,
@@ -1138,9 +1045,8 @@ pub(crate) async fn api_proxy(
         let targets = target_rx.borrow().clone();
         let node = node.clone();
         let affinity = affinity.clone();
-        let control_tx = control_tx.clone();
         tokio::spawn(async move {
-            handle_api_proxy_connection(node, tcp_stream, targets, control_tx, affinity).await;
+            handle_api_proxy_connection(node, tcp_stream, targets, affinity).await;
         });
     }
 }
@@ -1418,6 +1324,150 @@ mod tests {
         let (model_ref, profile) = parse_model_with_profile("model#with#hash#profile");
         assert_eq!(model_ref, "model#with#hash");
         assert_eq!(profile, "profile");
+    }
+
+    /// Regression: the MoA intercept must surface a single-model degradation.
+    ///
+    /// This helper-level test verifies that the gateway rewrites the request
+    /// and returns the resolved model to its caller. The separate pipeline
+    /// regression below verifies that the caller actually consumes that model.
+    #[tokio::test]
+    async fn moa_single_model_degrade_rewrites_routing_model() {
+        let node = mesh::Node::new_for_tests(crate::mesh::NodeRole::Worker)
+            .await
+            .expect("test node");
+        node.set_hosted_models(vec!["local/only-model:Q4_K_M".to_string()])
+            .await;
+        let mut targets = election::ModelTargets::default();
+        targets.targets.insert(
+            "local/only-model:Q4_K_M".to_string(),
+            vec![election::InferenceTarget::Local(1)],
+        );
+        let affinity = affinity::AffinityRouter::new();
+
+        // The helper returns the connected stream; this test only inspects the
+        // degradation result and intentionally does not dispatch it.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let client = tokio::net::TcpStream::connect(addr);
+        let server = async { listener.accept().await.map(|(stream, _)| stream) };
+        let (_client_side, server_side) = tokio::join!(client, server);
+        let tcp_stream = server_side.expect("accept");
+
+        let body = br#"{"model":"mesh","messages":[{"role":"user","content":"hi"}]}"#;
+        let raw = format!(
+            "POST /v1/chat/completions HTTP/1.1\r\nHost: t\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        )
+        .into_bytes()
+        .into_iter()
+        .chain(body.iter().copied())
+        .collect::<Vec<u8>>();
+        let mut request = proxy::BufferedHttpRequest {
+            raw,
+            method: "POST".to_owned(),
+            path: "/v1/chat/completions".to_owned(),
+            client_path: "/v1/chat/completions".to_owned(),
+            request_id: RequestId::default(),
+            body_json: None,
+            body_json_attempted: false,
+            body_bytes: None,
+            body_len_bytes: body.len(),
+            completion_tokens: None,
+            stream: None,
+            model_name: Some("mesh".to_owned()),
+            request_object_request_ids: Vec::new(),
+            response_adapter: proxy::ResponseAdapter::OpenAiChatCompletionsJson,
+            correlation_id: None,
+        };
+        let decision = AutoRouteDecision {
+            effective_model: Some("mesh".to_owned()),
+            classification: None,
+            required_tokens: None,
+        };
+        let ctx = ProxyConnectionContext {
+            route: IngressRouteContext {
+                node: &node,
+                targets: &targets,
+                affinity: &affinity,
+                plugin_manager: None,
+            },
+        };
+        let lifecycle = OpenAiLifecycleAttachment::unowned();
+
+        let result = try_handle_moa_intercept(
+            tcp_stream,
+            &mut request,
+            &ctx,
+            &decision,
+            lifecycle.route_observer(),
+        )
+        .await;
+
+        match result {
+            MoaInterceptResult::Degraded { model, .. } => {
+                assert_eq!(
+                    model.as_deref(),
+                    Some("local/only-model:Q4_K_M"),
+                    "degrade must carry the rewritten real model for routing"
+                );
+                assert_eq!(
+                    request.model_name.as_deref(),
+                    Some("local/only-model:Q4_K_M"),
+                    "request must be rewritten in place"
+                );
+            }
+            MoaInterceptResult::NotMoa(_) => {
+                panic!(
+                    "single-model model=mesh fell through as NotMoa — routing would use the stale \
+                     'mesh' model and 404 (#1175 regression)"
+                );
+            }
+            MoaInterceptResult::Handled(outcome) => {
+                panic!("expected degrade passthrough, got handled outcome: {outcome:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn moa_degraded_model_is_consumed_by_pipeline_dispatch() {
+        use crate::network::router::{Category, Classification, Complexity};
+
+        let request = proxy::BufferedHttpRequest {
+            raw: Vec::new(),
+            method: "POST".to_owned(),
+            path: "/v1/chat/completions".to_owned(),
+            client_path: "/v1/chat/completions".to_owned(),
+            request_id: RequestId::default(),
+            body_json: None,
+            body_json_attempted: false,
+            body_bytes: None,
+            body_len_bytes: 0,
+            completion_tokens: None,
+            stream: None,
+            model_name: Some("local/only-model:Q4_K_M".to_owned()),
+            request_object_request_ids: Vec::new(),
+            response_adapter: proxy::ResponseAdapter::None,
+            correlation_id: None,
+        };
+        let decision = AutoRouteDecision {
+            effective_model: Some("mesh".to_owned()),
+            classification: Some(Classification {
+                category: Category::Code,
+                complexity: Complexity::Deep,
+                needs_tools: true,
+                has_media_inputs: false,
+            }),
+            required_tokens: None,
+        };
+
+        assert_eq!(
+            pipeline_route_model(&request, &decision, request.model_name.as_deref(),),
+            Some("local/only-model:Q4_K_M"),
+            "pipeline dispatch must consume the post-degradation model, not stale 'mesh'"
+        );
     }
 
     // --- Routing behavior tests for model-independent daemon support ---
