@@ -23,6 +23,8 @@ pub struct NativeRuntimePlatform {
 pub struct NativeRuntimeArtifact {
     pub id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mesh_version: Option<String>,
     pub skippy_abi: String,
     pub platform: NativeRuntimePlatform,
@@ -163,6 +165,14 @@ fn validate_artifact(artifact: &NativeRuntimeArtifact) -> Result<()> {
     if artifact.id.trim().is_empty() {
         bail!("native runtime artifact id is empty");
     }
+    if let Some(build_id) = &artifact.build_id {
+        validate_build_id(build_id).with_context(|| {
+            format!(
+                "native runtime artifact {} has invalid build_id",
+                artifact.id
+            )
+        })?;
+    }
     if artifact.skippy_abi.trim().is_empty() {
         bail!(
             "native runtime artifact {} skippy_abi is empty",
@@ -242,6 +252,20 @@ fn validate_runtime_path(relative: &str) -> Result<()> {
     Ok(())
 }
 
+fn validate_build_id(value: &str) -> Result<()> {
+    let Some(digest) = value.strip_prefix("sha256:") else {
+        bail!("expected sha256:<64 lowercase hex>");
+    };
+    if digest.len() != 64
+        || !digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        bail!("expected sha256:<64 lowercase hex>");
+    }
+    Ok(())
+}
+
 fn normalize_sha256(value: &str) -> Result<String> {
     let value = value
         .trim()
@@ -292,6 +316,7 @@ mod tests {
             r#"{
   "runtime": {
     "id": "meshllm-runtime-linux-x86_64-cuda12",
+    "build_id": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
     "mesh_version": "0.68.0",
     "skippy_abi": "0.1.25",
     "platform": {
@@ -319,6 +344,10 @@ mod tests {
         let manifest = NativeRuntimeManifest::read_from_dir(temp.path()).unwrap();
 
         assert_eq!(manifest.runtime.id, "meshllm-runtime-linux-x86_64-cuda12");
+        assert_eq!(
+            manifest.runtime.build_id.as_deref(),
+            Some("sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        );
         assert_eq!(manifest.runtime.skippy_abi, "0.1.25");
         assert_eq!(manifest.runtime.backend.kind.as_str(), "cuda");
     }
@@ -345,7 +374,37 @@ mod tests {
         .unwrap();
 
         assert_eq!(manifest.artifacts.len(), 1);
+        assert_eq!(manifest.artifacts[0].build_id, None);
         assert_eq!(manifest.artifacts[0].backend, NativeRuntimeBackend::cpu());
+    }
+
+    #[test]
+    fn rejects_invalid_runtime_build_ids() {
+        for build_id in [
+            "",
+            &"a".repeat(64),
+            &format!("sha256:{}", "a".repeat(63)),
+            &format!("sha256:{}", "A".repeat(64)),
+            &format!("sha256:{}g", "a".repeat(63)),
+        ] {
+            let json = format!(
+                r#"{{
+  "mesh_version": "0.68.0",
+  "skippy_abi": "0.1.25",
+  "artifacts": [{{
+    "id": "runtime",
+    "build_id": "{build_id}",
+    "skippy_abi": "0.1.25",
+    "platform": {{"os": "linux", "arch": "x86_64"}},
+    "backend": {{"kind": "cpu"}},
+    "libraries": ["lib/runtime.so"]
+  }}]
+}}"#
+            );
+
+            let error = NativeRuntimeReleaseManifest::from_json_str(&json).unwrap_err();
+            assert!(error.to_string().contains("invalid build_id"), "{build_id}");
+        }
     }
 
     #[test]
@@ -357,6 +416,7 @@ mod tests {
         let manifest = NativeRuntimeManifest {
             runtime: NativeRuntimeArtifact {
                 id: "meshllm-runtime-linux-x86_64-cpu".to_string(),
+                build_id: None,
                 mesh_version: Some("0.68.0".to_string()),
                 skippy_abi: "0.1.25".to_string(),
                 platform: NativeRuntimePlatform {
@@ -395,6 +455,7 @@ mod tests {
         let manifest = NativeRuntimeManifest {
             runtime: NativeRuntimeArtifact {
                 id: "meshllm-runtime-linux-x86_64-cuda12".to_string(),
+                build_id: None,
                 mesh_version: Some("0.68.0".to_string()),
                 skippy_abi: "0.1.25".to_string(),
                 platform: NativeRuntimePlatform {
@@ -478,6 +539,7 @@ mod tests {
     fn rejects_runtime_checksum_path_traversal() {
         let artifact = NativeRuntimeArtifact {
             id: "meshllm-runtime-linux-x86_64-cpu".to_string(),
+            build_id: None,
             mesh_version: Some("0.68.0".to_string()),
             skippy_abi: "0.1.25".to_string(),
             platform: NativeRuntimePlatform {

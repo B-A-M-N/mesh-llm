@@ -656,6 +656,22 @@ manifest = {
         "llama_patch_digest": "$patch_digest" or None,
     },
 }
+canonical_runtime = {
+    key: value
+    for key, value in manifest["runtime"].items()
+    if key not in {"url", "sha256", "signature"}
+}
+build_identity = {
+    "runtime": canonical_runtime,
+    "build": manifest["build"],
+}
+canonical_bytes = json.dumps(
+    build_identity,
+    sort_keys=True,
+    separators=(",", ":"),
+    ensure_ascii=False,
+).encode("utf-8")
+manifest["runtime"]["build_id"] = "sha256:" + hashlib.sha256(canonical_bytes).hexdigest()
 with open(manifest_path, "w", encoding="utf-8") as fh:
     json.dump(manifest, fh, indent=2, sort_keys=True)
     fh.write("\\n")

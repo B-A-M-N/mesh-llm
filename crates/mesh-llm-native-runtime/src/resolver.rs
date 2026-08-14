@@ -205,7 +205,9 @@ impl NativeRuntimeResolver {
             artifact.mesh_version_or(&self.mesh_version),
             artifact.native_runtime_id(),
         )?;
-        if let Some(installed) = installed {
+        if let Some(installed) = installed
+            && artifact_identity_matches(&installed.manifest.runtime, artifact)
+        {
             return Ok(NativeRuntimeSource::Installed {
                 path: installed.path,
             });
@@ -223,6 +225,10 @@ fn parse_cuda_major(value: &str) -> Option<u32> {
 }
 
 fn artifact_key(artifact: &NativeRuntimeArtifact) -> String {
+    // Candidate evaluation is lane-based: the selected release/bundle artifact
+    // must replace any installed candidate for the same lane. Build identity is
+    // enforced later by source_for_artifact when deciding whether cached bytes
+    // satisfy that selected artifact.
     format!(
         "{}\0{}\0{}",
         artifact.id,
@@ -376,6 +382,10 @@ fn artifact_identity_matches(
     candidate.id == selected.id
         && candidate.mesh_version.as_deref() == selected.mesh_version.as_deref()
         && candidate.skippy_abi == selected.skippy_abi
+        && selected
+            .build_id
+            .as_ref()
+            .is_none_or(|build_id| candidate.build_id.as_ref() == Some(build_id))
 }
 
 fn evaluate_backend_requirements(
@@ -577,6 +587,7 @@ mod tests {
     fn artifact(id: &str, backend: NativeRuntimeBackend) -> NativeRuntimeArtifact {
         NativeRuntimeArtifact {
             id: id.to_string(),
+            build_id: None,
             mesh_version: Some("0.68.0".to_string()),
             skippy_abi: "0.1.25".to_string(),
             platform: NativeRuntimePlatform {
@@ -1008,6 +1019,7 @@ mod tests {
             mesh_version: "0.67.0".to_string(),
             skippy_abi: "0.1.25".to_string(),
             artifacts: vec![NativeRuntimeArtifact {
+                build_id: None,
                 mesh_version: Some("0.67.0".to_string()),
                 ..cuda_runtime("meshllm-runtime-linux-x86_64-cuda12", 12, &["sm_90"])
             }],
@@ -1030,6 +1042,7 @@ mod tests {
             mesh_version: "0.67.0".to_string(),
             skippy_abi: "0.1.25".to_string(),
             artifacts: vec![NativeRuntimeArtifact {
+                build_id: None,
                 mesh_version: Some("0.67.0".to_string()),
                 ..cuda_runtime("meshllm-runtime-linux-x86_64-cuda12", 12, &["sm_90"])
             }],
@@ -1121,12 +1134,101 @@ mod tests {
         );
     }
 
+    fn resolve_with_cached_and_selected_build(
+        cached_build_id: Option<&str>,
+        selected_build_id: Option<&str>,
+    ) -> NativeRuntimeResolution {
+        let bundle = tempfile::tempdir().unwrap();
+        let cache_root = tempfile::tempdir().unwrap();
+        let runtime_id = "meshllm-runtime-linux-x86_64-cpu";
+        let mut cached = artifact(runtime_id, NativeRuntimeBackend::cpu());
+        cached.build_id = cached_build_id.map(str::to_string);
+        write_bundle_runtime(bundle.path(), cached);
+        let cache = NativeRuntimeCache::new(cache_root.path());
+        let installed = cache.install_from_dir(bundle.path()).unwrap();
+
+        let mut selected = artifact(runtime_id, NativeRuntimeBackend::cpu());
+        selected.build_id = selected_build_id.map(str::to_string);
+        selected.url = Some("https://example.invalid/runtime.tar.gz".to_string());
+        let resolution = NativeRuntimeResolver::new(
+            "0.68.0",
+            HostRuntimeProfile {
+                available_flavors: BTreeSet::from([NativeRuntimeBackendKind::Cpu]),
+                cuda: None,
+                ..profile()
+            },
+            NativeRuntimeReleaseManifest {
+                mesh_version: "0.68.0".to_string(),
+                skippy_abi: "0.1.25".to_string(),
+                artifacts: vec![selected],
+            },
+            cache,
+        )
+        .with_skippy_abi_version("0.1.25")
+        .resolve(&RuntimeSelection::Recommended)
+        .unwrap();
+        assert_eq!(
+            installed.path,
+            cache_root.path().join("0.68.0").join(runtime_id)
+        );
+        resolution
+    }
+
+    #[test]
+    fn selected_build_does_not_reuse_cached_runtime_without_build_id() {
+        let resolution = resolve_with_cached_and_selected_build(
+            None,
+            Some("sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+        );
+        assert!(matches!(
+            resolution.source,
+            NativeRuntimeSource::Download { .. }
+        ));
+    }
+
+    #[test]
+    fn selected_build_does_not_reuse_cached_runtime_with_different_build_id() {
+        let resolution = resolve_with_cached_and_selected_build(
+            Some("sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            Some("sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+        );
+        assert!(matches!(
+            resolution.source,
+            NativeRuntimeSource::Download { .. }
+        ));
+    }
+
+    #[test]
+    fn selected_build_reuses_cached_runtime_with_matching_build_id() {
+        let resolution = resolve_with_cached_and_selected_build(
+            Some("sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"),
+            Some("sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"),
+        );
+        assert!(matches!(
+            resolution.source,
+            NativeRuntimeSource::Installed { .. }
+        ));
+    }
+
+    #[test]
+    fn legacy_selected_artifact_reuses_cached_runtime_regardless_of_build_id() {
+        let resolution = resolve_with_cached_and_selected_build(
+            Some("sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"),
+            None,
+        );
+        assert!(matches!(
+            resolution.source,
+            NativeRuntimeSource::Installed { .. }
+        ));
+    }
+
     #[test]
     fn stale_bundle_with_same_id_does_not_satisfy_selected_artifact() {
         let bundle = tempfile::tempdir().unwrap();
         let cache_root = tempfile::tempdir().unwrap();
         let runtime_id = "meshllm-runtime-linux-x86_64-cpu";
         let stale_bundle_artifact = NativeRuntimeArtifact {
+            build_id: None,
             mesh_version: Some("0.67.0".to_string()),
             ..artifact(runtime_id, NativeRuntimeBackend::cpu())
         };

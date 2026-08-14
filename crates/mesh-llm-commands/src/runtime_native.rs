@@ -420,6 +420,7 @@ mod tests {
         std::fs::write(path.join("lib/libllama.so"), b"native runtime").unwrap();
         NativeRuntimeManifest {
             runtime: NativeRuntimeArtifact {
+                build_id: None,
                 id: runtime_id.to_string(),
                 mesh_version: Some(CURRENT_MESH_VERSION.to_string()),
                 skippy_abi: "0.1.25".to_string(),

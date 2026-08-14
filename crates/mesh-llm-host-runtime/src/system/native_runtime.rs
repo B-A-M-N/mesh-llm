@@ -455,6 +455,7 @@ mod dynamic {
             fs::write(dir.join(&library_rel_path), b"native runtime").unwrap();
             let manifest = NativeRuntimeManifest {
                 runtime: NativeRuntimeArtifact {
+                    build_id: None,
                     id: id.to_string(),
                     mesh_version: version.map(ToString::to_string),
                     skippy_abi: "0.1.25".to_string(),
@@ -728,6 +729,7 @@ mod dynamic {
                 artifacts: Vec::new(),
             };
             let artifact = NativeRuntimeArtifact {
+                build_id: None,
                 id: runtime_id.to_string(),
                 mesh_version: Some(release_version.to_string()),
                 skippy_abi: "0.1.25".to_string(),

@@ -421,6 +421,7 @@ mod tests {
         let manifest = NativeRuntimeManifest {
             runtime: NativeRuntimeArtifact {
                 id: id.to_string(),
+                build_id: None,
                 mesh_version: Some(version.to_string()),
                 skippy_abi: "0.1.25".to_string(),
                 platform: NativeRuntimePlatform {

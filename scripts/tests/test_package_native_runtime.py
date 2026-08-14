@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -13,6 +14,44 @@ SCRIPT = ROOT / "scripts" / "package-native-runtime.sh"
 
 
 class PackageNativeRuntimeTests(unittest.TestCase):
+    def test_build_id_is_deterministic_and_preserves_runtime_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            build_dir = root / "build"
+            build_dir.mkdir()
+            (build_dir / "libggml.so").write_bytes(b"dependency")
+            (build_dir / "libllama.so").write_bytes(b"primary")
+            env = self.package_environment(root, build_dir)
+
+            first = self.package_cpu(root / "first", env)
+            second = self.package_cpu(root / "second", env)
+
+            runtime = first["runtime"]
+            self.assertEqual(runtime["id"], "meshllm-native-runtime-linux-x86_64-cpu")
+            self.assertRegex(runtime["build_id"], r"^sha256:[0-9a-f]{64}$")
+            self.assertEqual(runtime["build_id"], second["runtime"]["build_id"])
+            self.assertEqual(runtime["build_id"], self.expected_build_id(first))
+            self.assertTrue(
+                (root / "first" / f'{runtime["id"]}.tar.gz').is_file()
+            )
+
+    def test_build_id_changes_when_canonical_runtime_content_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            build_dir = root / "build"
+            build_dir.mkdir()
+            library = build_dir / "libllama.so"
+            library.write_bytes(b"first content")
+            env = self.package_environment(root, build_dir)
+            first = self.package_cpu(root / "first", env)
+
+            library.write_bytes(b"second content")
+            second = self.package_cpu(root / "second", env)
+
+            self.assertNotEqual(
+                first["runtime"]["build_id"], second["runtime"]["build_id"]
+            )
+
     def test_cpu_package_with_no_tools_is_safe_under_macos_bash(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -137,6 +176,13 @@ class PackageNativeRuntimeTests(unittest.TestCase):
                 manifest["runtime"]["backend"]["rocm"]["gpu_arches"],
                 ["gfx90a", "gfx942", "gfx1151"],
             )
+            self.assertEqual(
+                manifest["runtime"]["build_id"], self.expected_build_id(manifest)
+            )
+            self.assertEqual(
+                list(manifest["runtime"]["tools"]),
+                ["tools/mesh-llm-gpu-benchmark"],
+            )
 
     def test_cuda_flavor_uses_mesh_cuda_version_major(self) -> None:
         self.assertEqual(
@@ -172,6 +218,56 @@ class PackageNativeRuntimeTests(unittest.TestCase):
                     "MESH_LLM_CUDA_TOOLKIT_MAJOR must be digits-only",
                     result.stderr,
                 )
+
+    def expected_build_id(self, manifest: dict) -> str:
+        runtime = {
+            key: value
+            for key, value in manifest["runtime"].items()
+            if key not in {"build_id", "url", "sha256", "signature"}
+        }
+        canonical = json.dumps(
+            {"runtime": runtime, "build": manifest["build"]},
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+        return f"sha256:{hashlib.sha256(canonical).hexdigest()}"
+
+    def package_environment(self, root: Path, build_dir: Path) -> dict[str, str]:
+        tool_dir = root / "tools"
+        tool_dir.mkdir(exist_ok=True)
+        patchelf = tool_dir / "patchelf"
+        patchelf.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        patchelf.chmod(0o755)
+        env = os.environ.copy()
+        env["LLAMA_STAGE_BUILD_DIR"] = str(build_dir)
+        env["PATH"] = f"{tool_dir}{os.pathsep}{env['PATH']}"
+        return env
+
+    def package_cpu(self, output: Path, env: dict[str, str]) -> dict:
+        result = subprocess.run(
+            [
+                "/bin/bash",
+                str(SCRIPT),
+                "--backend",
+                "cpu",
+                "--target",
+                "x86_64-unknown-linux-gnu",
+                "--out",
+                str(output),
+            ],
+            env=env,
+            text=True,
+            capture_output=True,
+        )
+        result.check_returncode()
+        return json.loads(
+            (
+                output
+                / "meshllm-native-runtime-linux-x86_64-cpu"
+                / "manifest.json"
+            ).read_text(encoding="utf-8")
+        )
 
     def backend_flavor(
         self,
