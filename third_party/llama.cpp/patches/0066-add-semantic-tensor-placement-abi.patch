@@ -1,0 +1,422 @@
+From 4a0251b6cf9c3c7e0657717b7c6a1231626656d6 Mon Sep 17 00:00:00 2001
+From: B-A-M-N <bamn@users.noreply.github.com>
+Date: Thu, 13 Aug 2026 23:45:58 -0500
+Subject: [PATCH] feat(skippy): add semantic tensor placement ABI
+
+Add the durable semantic placement API that replaces the temporary raw
+ggml_backend_buffer_type_t override:
+
+  enum skippy_placement_target { DEFAULT, HOST, PRIMARY_ACCELERATOR };
+  struct skippy_tensor_placement_rule { pattern, target };
+  struct skippy_model_placement { struct_size, abi_version, rules, rule_count };
+
+Bump Skippy ABI to 0.1.37 and add placement ABI v1 (versioned
+independently so releasing 0.1.38 does not break an unchanged plan).
+
+skippy_resolve_model_placement() resolves each rule's target to a concrete
+local GGML buffer type (HOST -> CUDA_Host / Vulkan_Host, PRIMARY_ACCELERATOR
+-> device buffer) after backend selection is authoritative. Validates the
+full plan (ABI, enum, regex) before constructing any output, so a malformed
+plan fails cleanly before the multi-GB GGUF load. Enforces the mmap-safety
+invariant: any HOST rule forces LLAMA_LOAD_MODE_NONE.
+
+ABI negotiation fields (struct_size, abi_version) are the first two fields
+of skippy_runtime_config; a mismatch is a clean error, never silent
+reinterpretation.
+
+Owned rule/pattern handling: Skippy copies pattern strings into stable
+owned storage before building the llama_model_tensor_buft_overrides array,
+so caller storage need not outlive the load.
+---
+ include/skippy.h        |  43 +++++++++
+ include/skippy/common.h |  25 ++++-
+ src/skippy.cpp          | 198 +++++++++++++++++++++++++++++++++++++---
+ 3 files changed, 252 insertions(+), 14 deletions(-)
+
+diff --git a/include/skippy.h b/include/skippy.h
+index f60e7c2ee..052ee5250 100644
+--- a/include/skippy.h
++++ b/include/skippy.h
+@@ -19,6 +19,34 @@ enum skippy_load_mode {
+     SKIPPY_LOAD_MODE_ARTIFACT_SLICE       = 2,
+ };
+ 
++// Semantic tensor placement targets. Mesh specifies intent; Skippy resolves
++// each target to a concrete GGML buffer type locally (e.g. HOST -> CUDA_Host on
++// a CUDA node, Vulkan_Host on a Vulkan node, CPU elsewhere). Mesh never sees
++// GGML pointer types or backend-specific buffer names.
++enum skippy_placement_target {
++    SKIPPY_PLACEMENT_DEFAULT           = 0,  // backend default (no override)
++    SKIPPY_PLACEMENT_HOST              = 1,  // host/RAM-resident (CPU-accessible)
++    SKIPPY_PLACEMENT_PRIMARY_ACCELERATOR = 2, // force the node's primary GPU
++};
++
++// A single regex/tensor-name placement rule. `pattern` is matched against the
++// ggml tensor name (substring match, consistent with llama.cpp's
++// tensor_buft_overrides convention). The array is NULL-terminated-by-count:
++// caller owns `rules` and the pattern strings for the whole model-load op.
++struct skippy_tensor_placement_rule {
++    const char * pattern;
++    enum skippy_placement_target target;
++};
++
++// Versioned placement plan. Carried by skippy_runtime_config::placement.
++// `struct_size` lets the runtime validate the caller's view of the struct.
++struct skippy_model_placement {
++    uint32_t struct_size;   // sizeof(struct skippy_model_placement)
++    uint32_t abi_version;   // composite ABI version this plan was built against
++    const struct skippy_tensor_placement_rule * rules;
++    size_t rule_count;
++};
++
+ enum skippy_tensor_role {
+     SKIPPY_TENSOR_ROLE_UNKNOWN            = 0,
+     SKIPPY_TENSOR_ROLE_METADATA           = 1,
+@@ -61,6 +89,14 @@ struct skippy_slice_plan;
+ struct skippy_ngram_cache;
+ 
+ struct skippy_runtime_config {
++    // ABI negotiation fields. Caller fills these; the runtime validates them
++    // before dereferencing any other field. `struct_size` must equal
++    // sizeof(struct skippy_runtime_config) from the caller's view;
++    // `abi_version` is the composite (MAJOR.MINOR.PATCH) the caller built
++    // against. A mismatch is a clean ABI error, never silent reinterpretation.
++    uint32_t struct_size;
++    uint32_t abi_version;
++
+     int32_t stage_index;
+     int32_t layer_start;
+     int32_t layer_end;
+@@ -100,6 +136,13 @@ struct skippy_runtime_config {
+     int32_t  glm_dsa_direct_sparse_decode_max_top_k;
+     uint64_t glm_dsa_dense_sparse_mask_max_bytes;
+     int32_t  glm_dsa_compact_flash_min_kv;
++
++    // Durable semantic placement plan (replaces the temporary raw
++    // ggml_backend_buffer_type_t override). Skippy resolves each rule's
++    // target to a concrete local buffer type. When any rule targets HOST,
++    // the runtime forces use_mmap=false for this load (mmap + host override
++    // is known to SIGSEGV in this pinned build). May be NULL (no overrides).
++    const struct skippy_model_placement * placement;
+ };
+ 
+ struct skippy_tensor_info {
+diff --git a/include/skippy/common.h b/include/skippy/common.h
+index 71084f823..433cb7889 100644
+--- a/include/skippy/common.h
++++ b/include/skippy/common.h
+@@ -26,7 +26,30 @@ extern "C" {
+ 
+ #define SKIPPY_ABI_VERSION_MAJOR 0
+ #define SKIPPY_ABI_VERSION_MINOR 1
+-#define SKIPPY_ABI_VERSION_PATCH 36
++#define SKIPPY_ABI_VERSION_PATCH 37
++
++// Composite runtime ABI version packed as 0xMMmmpppp for single-value compare.
++#define SKIPPY_ABI_VERSION_PACK(major, minor, patch) \
++    ((((uint32_t) (major)) << 24) | \
++     (((uint32_t) (minor)) << 16) | \
++     ((uint32_t) (patch)))
++
++#define SKIPPY_ABI_VERSION \
++    SKIPPY_ABI_VERSION_PACK( \
++        SKIPPY_ABI_VERSION_MAJOR, \
++        SKIPPY_ABI_VERSION_MINOR, \
++        SKIPPY_ABI_VERSION_PATCH)
++
++// Semantic placement-plan ABI, versioned INDEPENDENTLY of the runtime ABI so
++// that releasing Skippy 0.1.38 does not retroactively break an unchanged plan
++// struct. V1 for the 0.1.37 introduction.
++#define SKIPPY_MODEL_PLACEMENT_ABI_VERSION_MAJOR 1
++#define SKIPPY_MODEL_PLACEMENT_ABI_VERSION_MINOR 0
++#define SKIPPY_MODEL_PLACEMENT_ABI_VERSION \
++    SKIPPY_ABI_VERSION_PACK( \
++        SKIPPY_MODEL_PLACEMENT_ABI_VERSION_MAJOR, \
++        SKIPPY_MODEL_PLACEMENT_ABI_VERSION_MINOR, \
++        0)
+ 
+ enum skippy_feature {
+     SKIPPY_FEATURE_RUNTIME_SLICE          = 1 << 0,
+diff --git a/src/skippy.cpp b/src/skippy.cpp
+index 30e3400bd..6655bde8f 100644
+--- a/src/skippy.cpp
++++ b/src/skippy.cpp
+@@ -1005,8 +1005,11 @@ static int32_t skippy_default_thread_count() {
+ static enum skippy_status skippy_apply_selected_backend_device(
+         const struct skippy_runtime_config * config,
+         llama_model_params & params,
+-        std::vector<ggml_backend_dev_t> & selected_devices,
++        ggml_backend_dev_t * selected_dev_out,
+         struct skippy_error ** out_error) {
++    if (selected_dev_out != nullptr) {
++        *selected_dev_out = nullptr;
++    }
+     if (config == nullptr || config->selected_backend_device == nullptr || config->selected_backend_device[0] == '\0') {
+         return SKIPPY_STATUS_OK;
+     }
+@@ -1029,11 +1032,17 @@ static enum skippy_status skippy_apply_selected_backend_device(
+         return SKIPPY_STATUS_INVALID_ARGUMENT;
+     }
+ 
++    // Local storage with static lifetime: llama reads params.devices during
++    // model load, so the array must outlive this call.
++    static std::vector<ggml_backend_dev_t> selected_devices;
+     selected_devices.clear();
+     selected_devices.push_back(dev);
+     selected_devices.push_back(nullptr);
+     params.devices = selected_devices.data();
+     params.main_gpu = 0;
++    if (selected_dev_out != nullptr) {
++        *selected_dev_out = dev;
++    }
+     return SKIPPY_STATUS_OK;
+ }
+ 
+@@ -5024,6 +5033,148 @@ static enum skippy_status skippy_finish_model_open(
+     return skippy_success(out_error);
+ }
+ 
++// Owned, resolved placement. Holds Skippy-owned pattern strings and the
++// llama.cpp override array so caller storage need not outlive the load. The
++// llama override array is NULL-terminated internally (extra sentinel slot).
++struct skippy_resolved_model_placement {
++    std::vector<std::string> patterns;
++    std::vector<llama_model_tensor_buft_override> overrides;  // +1 sentinel
++    bool has_host_rules = false;
++};
++
++// Resolve the semantic skippy_model_placement plan into a llama.cpp
++// tensor_buft_overrides array. MUST be called AFTER the selected backend device
++// has been applied (so `selected_dev` is authoritative). Validates the entire
++// plan (ABI, enum, regex) BEFORE constructing any output, so a malformed plan
++// fails cleanly before the multi-GB GGUF load. Enforces the mmap-safety
++// invariant (any HOST rule forces use_mmap=false) before loader construction.
++static enum skippy_status skippy_resolve_model_placement(
++        const struct skippy_runtime_config * config,
++        ggml_backend_dev_t selected_dev,
++        llama_model_params & params,
++        skippy_resolved_model_placement & out,
++        struct skippy_error ** out_error) {
++    if (config == nullptr || config->placement == nullptr) {
++        return SKIPPY_STATUS_OK;  // no overrides; default placement
++    }
++    const struct skippy_model_placement * plan = config->placement;
++
++    // 1. ABI negotiation checks (before touching llama).
++    if (plan->struct_size < sizeof(struct skippy_model_placement)) {
++        skippy_set_error(out_error, SKIPPY_STATUS_BUFFER_TOO_SMALL,
++            "placement struct_size smaller than expected");
++        return SKIPPY_STATUS_BUFFER_TOO_SMALL;
++    }
++    if (plan->abi_version != SKIPPY_MODEL_PLACEMENT_ABI_VERSION) {
++        skippy_set_error(out_error, SKIPPY_STATUS_INVALID_ARGUMENT,
++            "unsupported placement abi_version");
++        return SKIPPY_STATUS_INVALID_ARGUMENT;
++    }
++    // 2. pointer/count consistency.
++    if ((plan->rules == nullptr) != (plan->rule_count == 0)) {
++        skippy_set_error(out_error, SKIPPY_STATUS_INVALID_ARGUMENT,
++            "placement rules null but rule_count != 0");
++        return SKIPPY_STATUS_INVALID_ARGUMENT;
++    }
++
++    // 3+4. validate each rule's pattern + enum value, compile regex.
++    // Semantic targets resolved per-rule below.
++    for (size_t i = 0; i < plan->rule_count; i++) {
++        const struct skippy_tensor_placement_rule * r = &plan->rules[i];
++        if (r->pattern == nullptr || r->pattern[0] == '\0') {
++            skippy_set_error(out_error, SKIPPY_STATUS_INVALID_ARGUMENT,
++                "placement rule with null/empty pattern");
++            return SKIPPY_STATUS_INVALID_ARGUMENT;
++        }
++        switch (r->target) {
++            case SKIPPY_PLACEMENT_DEFAULT:
++            case SKIPPY_PLACEMENT_HOST:
++            case SKIPPY_PLACEMENT_PRIMARY_ACCELERATOR:
++                break;
++            default:
++                skippy_set_error(out_error, SKIPPY_STATUS_INVALID_ARGUMENT,
++                    "unknown placement target enum value");
++                return SKIPPY_STATUS_INVALID_ARGUMENT;
++        }
++        // Compile the regex now so a malformed pattern fails before load.
++        try {
++            std::regex re(r->pattern, std::regex::extended);
++            (void) re;
++        } catch (const std::regex_error & e) {
++            skippy_set_error(out_error, SKIPPY_STATUS_INVALID_ARGUMENT,
++                ("invalid placement regex: " + std::string(r->pattern)).c_str());
++            return SKIPPY_STATUS_INVALID_ARGUMENT;
++        }
++    }
++
++    // Resolve concrete buffer types from the authoritative selected device.
++    // HOST -> the device's host-side buffer (CUDA_Host / Vulkan_Host), falling
++    // back to plain CPU storage; PRIMARY_ACCELERATOR -> the device buffer.
++    ggml_backend_buffer_type_t accel_buft = nullptr;
++    bool selected_is_cpu = (selected_dev != nullptr)
++        && (ggml_backend_dev_type(selected_dev) == GGML_BACKEND_DEVICE_TYPE_CPU);
++    if (selected_dev != nullptr && !selected_is_cpu) {
++        accel_buft = ggml_backend_dev_buffer_type(selected_dev);
++    }
++    ggml_backend_buffer_type_t host_buft =
++        (selected_dev != nullptr) ? ggml_backend_dev_host_buffer_type(selected_dev)
++                                  : nullptr;
++    if (host_buft == nullptr) {
++        host_buft = ggml_backend_cpu_buffer_type();
++    }
++
++    // 5. copy pattern strings into owned storage first (stable addresses).
++    out.patterns.reserve(plan->rule_count);
++    out.overrides.reserve(plan->rule_count + 1);
++    for (size_t i = 0; i < plan->rule_count; i++) {
++        out.patterns.emplace_back(plan->rules[i].pattern);
++    }
++
++    // 6+7. build overrides referencing the now-stable owned strings.
++    for (size_t i = 0; i < plan->rule_count; i++) {
++        enum skippy_placement_target target = plan->rules[i].target;
++        if (target == SKIPPY_PLACEMENT_DEFAULT) {
++            continue;  // no concrete override; DEFAULT does NOT cancel a prior rule
++        }
++        ggml_backend_buffer_type_t buft = nullptr;
++        if (target == SKIPPY_PLACEMENT_HOST) {
++            buft = host_buft;
++            out.has_host_rules = true;
++        } else {  // PRIMARY_ACCELERATOR
++            if (accel_buft == nullptr) {
++                skippy_set_error(out_error, SKIPPY_STATUS_UNSUPPORTED,
++                    "PRIMARY_ACCELERATOR requested but no accelerator selected");
++                return SKIPPY_STATUS_UNSUPPORTED;
++            }
++            buft = accel_buft;
++        }
++        out.overrides.push_back({ out.patterns[i].c_str(), buft });
++    }
++    // 7b. llama NULL terminator.
++    out.overrides.push_back({ nullptr, nullptr });
++
++    // 8+9. point params at owned overrides; enforce mmap invariant.
++    // mmap is controlled solely via load_mode in this pinned llama.cpp (there
++    // is no params.use_mmap member); force allocation (LLAMA_LOAD_MODE_NONE)
++    // whenever any HOST rule is present. This overrides an explicit caller
++    // mmap request for this pinned runtime.
++    if (out.overrides.size() > 1) {
++        if (out.has_host_rules) {
++            if (params.load_mode == LLAMA_LOAD_MODE_MMAP || params.load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK) {
++                fprintf(stderr, "host tensor placement active; disabling mmap\n");
++            }
++            params.load_mode = LLAMA_LOAD_MODE_NONE;
++        }
++        params.tensor_buft_overrides = out.overrides.data();
++    }
++    fprintf(stderr,
++        "SKIPPY_PLACEMENT_EFFECTIVE host_rules=%d load_mode=%d overrides=%zu\n",
++        out.has_host_rules ? 1 : 0,
++        (int) params.load_mode,
++        out.overrides.empty() ? 0 : out.overrides.size() - 1);
++    return SKIPPY_STATUS_OK;
++}
++
+ static enum skippy_status skippy_model_open_impl(
+         const char * path,
+         const struct skippy_runtime_config * config,
+@@ -5069,17 +5220,16 @@ static enum skippy_status skippy_model_open_impl(
+             params.use_extra_bufts = false;
+         }
+     }
+-    if (event_scope.is_enabled()) {
+-        params.progress_callback = skippy_model_open_progress_callback;
+-        params.progress_callback_user_data = &event_scope;
++    params.progress_callback = skippy_model_open_progress_callback;
++    params.progress_callback_user_data = &event_scope;
+     }
+ 
+     llama_backend_init();
+     if (!ggml_backend_reg_count()) {
+         ggml_backend_load_all();
+     }
+-    std::vector<ggml_backend_dev_t> selected_devices;
+-    enum skippy_status device_status = skippy_apply_selected_backend_device(config, params, selected_devices, out_error);
++    ggml_backend_dev_t selected_dev = nullptr;
++    enum skippy_status device_status = skippy_apply_selected_backend_device(config, params, &selected_dev, out_error);
+     if (device_status != SKIPPY_STATUS_OK) {
+         if (out_error != nullptr && *out_error != nullptr) {
+             event_scope.emit_failure(device_status, (*out_error)->message);
+@@ -5088,6 +5238,14 @@ static enum skippy_status skippy_model_open_impl(
+         }
+         return device_status;
+     }
++
++    // Resolve semantic placement AFTER backend selection (selected_dev now authoritative).
++    skippy_resolved_model_placement resolved;
++    enum skippy_status placement_status = skippy_resolve_model_placement(config, selected_dev, params, resolved, out_error);
++    if (placement_status != SKIPPY_STATUS_OK) {
++        event_scope.emit_failure(placement_status, (*out_error && *out_error) ? (*out_error)->message : "placement resolution failed");
++        return placement_status;
++    }
+     skippy_filter_scope filter_scope(config);
+     llama_model * model = llama_model_load_from_file(path, params);
+     if (model == nullptr) {
+@@ -5155,17 +5313,16 @@ static enum skippy_status skippy_model_open_from_parts_impl(
+             params.use_extra_bufts = false;
+         }
+     }
+-    if (event_scope.is_enabled()) {
+-        params.progress_callback = skippy_model_open_progress_callback;
+-        params.progress_callback_user_data = &event_scope;
++    params.progress_callback = skippy_model_open_progress_callback;
++    params.progress_callback_user_data = &event_scope;
+     }
+ 
+     llama_backend_init();
+     if (!ggml_backend_reg_count()) {
+         ggml_backend_load_all();
+     }
+-    std::vector<ggml_backend_dev_t> selected_devices;
+-    enum skippy_status device_status = skippy_apply_selected_backend_device(config, params, selected_devices, out_error);
++    ggml_backend_dev_t selected_dev = nullptr;
++    enum skippy_status device_status = skippy_apply_selected_backend_device(config, params, &selected_dev, out_error);
+     if (device_status != SKIPPY_STATUS_OK) {
+         if (out_error != nullptr && *out_error != nullptr) {
+             event_scope.emit_failure(device_status, (*out_error)->message);
+@@ -5174,6 +5331,14 @@ static enum skippy_status skippy_model_open_from_parts_impl(
+         }
+         return device_status;
+     }
++
++    // Resolve semantic placement AFTER backend selection (selected_dev now authoritative).
++    skippy_resolved_model_placement resolved;
++    enum skippy_status placement_status = skippy_resolve_model_placement(config, selected_dev, params, resolved, out_error);
++    if (placement_status != SKIPPY_STATUS_OK) {
++        event_scope.emit_failure(placement_status, (*out_error && *out_error) ? (*out_error)->message : "placement resolution failed");
++        return placement_status;
++    }
+     skippy_filter_scope filter_scope(config);
+     llama_model * model = llama_model_load_from_parts(paths, path_count, params);
+     if (model == nullptr) {
+@@ -5230,12 +5395,19 @@ enum skippy_status skippy_model_attach_mtp_draft_model(
+     if (!ggml_backend_reg_count()) {
+         ggml_backend_load_all();
+     }
+-    std::vector<ggml_backend_dev_t> selected_devices;
+-    enum skippy_status device_status = skippy_apply_selected_backend_device(config, model_params, selected_devices, out_error);
++    ggml_backend_dev_t selected_dev = nullptr;
++    enum skippy_status device_status = skippy_apply_selected_backend_device(config, model_params, &selected_dev, out_error);
+     if (device_status != SKIPPY_STATUS_OK) {
+         return device_status;
+     }
+ 
++    // Resolve semantic placement AFTER backend selection (draft model path).
++    skippy_resolved_model_placement resolved;
++    enum skippy_status placement_status = skippy_resolve_model_placement(config, selected_dev, model_params, resolved, out_error);
++    if (placement_status != SKIPPY_STATUS_OK) {
++        return placement_status;
++    }
++
+     skippy_filter_scope filter_scope(config);
+     llama_model * draft_model = llama_model_load_from_file(path, model_params);
+     if (draft_model == nullptr) {
+-- 
+2.34.1
+
