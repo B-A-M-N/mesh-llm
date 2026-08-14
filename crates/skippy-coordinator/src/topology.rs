@@ -36,12 +36,27 @@ pub struct TopologyPlanningInput {
     pub context_length_override: Option<u32>,
     pub parallel_lanes_override: Option<usize>,
     pub target_decode_tpot_ms: Option<u32>,
+    pub layer_class_bytes: Vec<TopologyLayerClassBytes>,
+}
+
+/// Per-layer class byte breakdown (mirrors skippy_runtime::policy::TensorClassBytes
+/// but defined locally to avoid a circular dependency with skippy-runtime).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct TopologyLayerClassBytes {
+    pub routed_expert: u64,
+    pub shared_expert: u64,
+    pub attention: u64,
+    pub recurrent_ssm: u64,
+    pub routing_gate: u64,
+    pub normalization: u64,
+    pub other: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TopologyNode {
     pub node_id: String,
     pub detected_vram_bytes: u64,
+    pub detected_ram_bytes: u64,
     pub max_vram_bytes: Option<u64>,
     pub runtime_headroom_bytes: u64,
     pub stage_transfer_latency_ms: Option<u32>,
@@ -249,6 +264,7 @@ pub fn minimum_valid_context(native_context: u32) -> u32 {
 struct UsableNode {
     node_id: String,
     usable_vram_bytes: u64,
+    usable_ram_bytes: u64,
     stage_transfer_latency_ms: Option<u32>,
 }
 
@@ -263,6 +279,7 @@ fn usable_nodes(nodes: &[TopologyNode]) -> Vec<UsableNode> {
             UsableNode {
                 node_id: node.node_id.clone(),
                 usable_vram_bytes: capped.saturating_sub(node.runtime_headroom_bytes),
+                usable_ram_bytes: node.detected_ram_bytes.saturating_sub(node.runtime_headroom_bytes),
                 stage_transfer_latency_ms: node.stage_transfer_latency_ms,
             }
         })
@@ -389,11 +406,40 @@ fn fit_candidate(
         let layer_end = layer_start + layer_span;
         let range = layer_start as usize..layer_end as usize;
         let parameter_bytes = sum_u64(&layer_weights[range.clone()]);
-        let required_bytes = sum_u64(&layer_required_bytes[range]);
-        if required_bytes > node.usable_vram_bytes {
+        let required_bytes = sum_u64(&layer_required_bytes[range.clone()]);
+
+        // AutoHybrid: check if we need to offload routed experts to host.
+        // Sum routed expert bytes in this range.
+        let routed_expert_bytes: u64 = if input.layer_class_bytes.is_empty() {
+            0
+        } else {
+            input.layer_class_bytes[range.clone()]
+                .iter()
+                .map(|lc| lc.routed_expert)
+                .sum()
+        };
+        let accelerator_bytes = required_bytes.saturating_sub(routed_expert_bytes);
+
+        // If accelerator alone fits, no offload needed.
+        // If not, offload routed experts to host and check host capacity.
+        let (host_bytes, final_accel_bytes) = if accelerator_bytes <= node.usable_vram_bytes {
+            (0, required_bytes)
+        } else {
+            // Offload routed experts to host.
+            if routed_expert_bytes > node.usable_ram_bytes {
+                return None;
+            }
+            // Recompute accelerator bytes without routed experts.
+            if accelerator_bytes > node.usable_vram_bytes {
+                return None;
+            }
+            (routed_expert_bytes, accelerator_bytes)
+        };
+
+        if final_accel_bytes > node.usable_vram_bytes {
             return None;
         }
-        let remaining = node.usable_vram_bytes - required_bytes;
+        let remaining = node.usable_vram_bytes - final_accel_bytes;
         minimum_remaining_vram = minimum_remaining_vram.min(remaining);
         total_remaining_vram += u128::from(remaining);
         stages.push(TopologyStagePlan {
@@ -405,6 +451,7 @@ fn fit_candidate(
             parameter_bytes,
         });
         next_layer = layer_end;
+        let _ = host_bytes; // used for host capacity check above
     }
 
     if next_layer != input.layer_count {
@@ -599,6 +646,7 @@ mod tests {
         TopologyNode {
             node_id: id.to_string(),
             detected_vram_bytes: gib * GIB,
+            detected_ram_bytes: 0,
             max_vram_bytes: None,
             runtime_headroom_bytes: 0,
             stage_transfer_latency_ms: None,
@@ -624,6 +672,7 @@ mod tests {
             context_length_override: None,
             parallel_lanes_override: None,
             target_decode_tpot_ms: None,
+            layer_class_bytes: Vec::new(),
         }
     }
 
@@ -639,6 +688,7 @@ mod tests {
             context_length_override: None,
             parallel_lanes_override: None,
             target_decode_tpot_ms: None,
+            layer_class_bytes: Vec::new(),
         }
     }
 
@@ -654,6 +704,7 @@ mod tests {
         TopologyNode {
             node_id: id.to_string(),
             detected_vram_bytes: metal_recommended_bytes,
+            detected_ram_bytes: 0,
             max_vram_bytes: Some(metal_recommended_bytes),
             // Metal recommendedMaxWorkingSetSize is already the usable budget
             // reported by the local runtime.

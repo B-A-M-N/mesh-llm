@@ -138,6 +138,7 @@ fn topology_planning_input(input: SplitTopologyPlanInput) -> TopologyPlanningInp
             .map(|node| TopologyNode {
                 node_id: node.node_id,
                 detected_vram_bytes: node.detected_vram_bytes,
+                detected_ram_bytes: 0,
                 max_vram_bytes: node.max_vram_bytes,
                 runtime_headroom_bytes: node.runtime_headroom_bytes,
                 stage_transfer_latency_ms: node.stage_transfer_latency_ms,
