@@ -144,7 +144,15 @@ fn handle_binary_connection_messages(
     let mut pending_prefill_replies = 0usize;
     let mut pending_reply_stats = StageReplyStats::default();
     let mut request_summary = BinaryRequestSummary::default();
-    let mut accumulated_prefill_tokens: BTreeMap<String, Vec<i32>> = BTreeMap::new();
+    let mut accumulated_prefill_tokens = kv
+        .map(|cache| {
+            cache
+                .split_prefill_tokens
+                .lock()
+                .expect("split prefill token lock poisoned")
+                .clone()
+        })
+        .unwrap_or_default();
     let mut prediction_return_streams: BTreeMap<(u64, u64), TcpStream> = BTreeMap::new();
     let mut next_message = Some(first_message);
     let mut async_forwarder = if async_prefill_forward || max_inflight > 1 {
@@ -335,6 +343,13 @@ fn handle_binary_connection_messages(
                 message.pos_start.max(0) as usize,
                 &token_ids,
             );
+            if let Some(cache) = kv {
+                *cache
+                    .split_prefill_tokens
+                    .lock()
+                    .expect("split prefill token lock poisoned") =
+                    accumulated_prefill_tokens.clone();
+            }
         }
         let mut message_reply_stats = StageReplyStats::default();
         let lookup_result = maybe_lookup_binary_prefill(

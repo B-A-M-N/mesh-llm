@@ -141,6 +141,7 @@ pub struct KvStageIntegration {
     pub(crate) exact_states: Arc<Mutex<ExactStateCache<ExactStateExtra>>>,
     pub(crate) first_tokens: Arc<Mutex<BTreeMap<String, i32>>>,
     pub(crate) replay_tokens: Arc<Mutex<BTreeMap<String, Vec<i32>>>>,
+    pub(crate) split_prefill_tokens: Arc<Mutex<BTreeMap<String, Vec<i32>>>>,
     /// Latches native layouts that cannot produce a disk-safe page. Composite ISWA
     /// layouts are supported by ABI 0.1.39; unknown layouts still decline once.
     pub(crate) dense_archive_unsupported: Arc<AtomicBool>,

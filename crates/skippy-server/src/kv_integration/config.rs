@@ -89,6 +89,7 @@ impl KvStageIntegration {
             exact_states: Arc::new(Mutex::new(exact_states)),
             first_tokens: Arc::new(Mutex::new(BTreeMap::new())),
             replay_tokens: Arc::new(Mutex::new(BTreeMap::new())),
+            split_prefill_tokens: Arc::new(Mutex::new(BTreeMap::new())),
             dense_archive_unsupported: Arc::new(AtomicBool::new(false)),
             _disk_budget_reservation: disk_budget_reservation,
         }))
