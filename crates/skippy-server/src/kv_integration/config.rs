@@ -77,10 +77,45 @@ fn effective_cache_payload(
     }
 }
 
+/// Whether the model family is known to be recurrent or hybrid, from the shared
+/// capability table rather than from artifact contents.
+///
+/// Returns `None` when the identity does not resolve to a known family, which is
+/// the case this function cannot answer and content inspection must.
+fn recurrent_state_from_family(config: &StageConfig) -> Option<bool> {
+    let identity = format!(
+        "{} {}",
+        config.model_id,
+        config.model_path.as_deref().unwrap_or_default()
+    )
+    .to_ascii_lowercase();
+    let capability = infer_family_capability(&identity, 0, 0)?;
+    let expectation = STAGE_RUNTIME_LLAMA_FAMILY_EXPECTATIONS
+        .iter()
+        .find(|expectation| expectation.family_id == capability.family_id)?;
+    Some(expectation.recurrent_or_hybrid)
+}
+
 pub(crate) fn model_requires_recurrent_state(config: &StageConfig) -> bool {
-    let Some(path) = kv_cache_inspection_path(config) else {
-        return false;
-    };
+    // The family capability table is authoritative when it recognises the
+    // identity. Content inspection may only escalate to recurrent from here, never
+    // de-escalate: a hybrid model has layers with no recurrent tensors at all, so
+    // absence in a sampled artifact is not evidence of a non-recurrent family.
+    if recurrent_state_from_family(config) == Some(true) {
+        return true;
+    }
+
+    // Inspect every artifact assigned to this stage, not just the first. Hybrid
+    // architectures interleave recurrent and full-attention layers (for qwen35,
+    // `(i + 1) % full_attention_interval != 0`), so the first layer file in a
+    // stage range can legitimately contain no recurrent tensors while later
+    // retained layers do.
+    kv_cache_inspection_paths(config)
+        .into_iter()
+        .any(|path| artifact_has_recurrent_tensors(&path))
+}
+
+fn artifact_has_recurrent_tensors(path: &Path) -> bool {
     let Ok(info) = ModelInfo::open(path) else {
         return false;
     };
@@ -92,32 +127,56 @@ pub(crate) fn model_requires_recurrent_state(config: &StageConfig) -> bool {
         .any(|tensor| tensor_name_requires_recurrent_state(&tensor.name))
 }
 
-fn kv_cache_inspection_path(config: &StageConfig) -> Option<PathBuf> {
-    let path = config.model_path.as_deref()?;
+/// Artifacts to inspect for recurrent tensors, in scan order.
+///
+/// For layer packages this is every layer file retained by the stage's layer
+/// range; scanning stops at the first artifact with recurrent tensors, so the
+/// common case reads one header.
+fn kv_cache_inspection_paths(config: &StageConfig) -> Vec<PathBuf> {
+    let Some(path) = config.model_path.as_deref() else {
+        return Vec::new();
+    };
     match config.load_mode {
         LoadMode::LayerPackage => {
             let package_dir = std::path::Path::new(path);
-            layer_package_inspection_path(package_dir, config.layer_start, config.layer_end)
-                .or_else(|| layer_package_metadata_path(package_dir))
+            let layers =
+                layer_package_inspection_paths(package_dir, config.layer_start, config.layer_end);
+            if !layers.is_empty() {
+                return layers;
+            }
+            layer_package_metadata_path(package_dir)
                 .or_else(|| Some(PathBuf::from(path)))
+                .into_iter()
+                .collect()
         }
-        LoadMode::RuntimeSlice | LoadMode::ArtifactSlice => Some(PathBuf::from(path)),
+        LoadMode::RuntimeSlice | LoadMode::ArtifactSlice => vec![PathBuf::from(path)],
     }
 }
 
-fn layer_package_inspection_path(
+/// Every existing layer artifact retained by `[layer_start, layer_end)`.
+///
+/// Falls back to the first declared layer when the range selects nothing, which
+/// preserves the previous behaviour for callers that pass a degenerate range.
+fn layer_package_inspection_paths(
     package_dir: &Path,
     layer_start: u32,
     layer_end: u32,
-) -> Option<PathBuf> {
-    let manifest_path = package_dir.join("model-package.json");
-    let manifest: serde_json::Value =
-        serde_json::from_slice(&fs::read(manifest_path).ok()?).ok()?;
-    let layers = manifest.get("layers")?.as_array()?;
-    let selected = layers
+) -> Vec<PathBuf> {
+    let Some(layers) = layer_package_manifest_layers(package_dir) else {
+        return Vec::new();
+    };
+    let resolve = |layer: &serde_json::Value| -> Option<PathBuf> {
+        let path = PathBuf::from(layer.get("path")?.as_str()?);
+        if path.is_absolute() {
+            return None;
+        }
+        let absolute = package_dir.join(path);
+        absolute.is_file().then_some(absolute)
+    };
+    let selected: Vec<PathBuf> = layers
         .iter()
         .enumerate()
-        .find(|(index, layer)| {
+        .filter(|(index, layer)| {
             let layer_index = layer
                 .get("layer_index")
                 .and_then(|value| value.as_u64())
@@ -125,15 +184,19 @@ fn layer_package_inspection_path(
                 .unwrap_or(*index as u32);
             layer_index >= layer_start && layer_index < layer_end
         })
-        .or_else(|| layers.first().map(|layer| (0, layer)))?
-        .1;
-    let path = selected.get("path")?.as_str()?;
-    let path = PathBuf::from(path);
-    if path.is_absolute() {
-        return None;
+        .filter_map(|(_, layer)| resolve(layer))
+        .collect();
+    if !selected.is_empty() {
+        return selected;
     }
-    let absolute = package_dir.join(path);
-    absolute.is_file().then_some(absolute)
+    layers.first().and_then(resolve).into_iter().collect()
+}
+
+fn layer_package_manifest_layers(package_dir: &Path) -> Option<Vec<serde_json::Value>> {
+    let manifest_path = package_dir.join("model-package.json");
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(manifest_path).ok()?).ok()?;
+    Some(manifest.get("layers")?.as_array()?.clone())
 }
 
 fn layer_package_metadata_path(package_dir: &Path) -> Option<PathBuf> {
@@ -354,8 +417,195 @@ mod tests {
         config.layer_end = 2;
 
         assert_eq!(
-            kv_cache_inspection_path(&config),
-            Some(dir.path().join("layers/00001.gguf"))
+            kv_cache_inspection_paths(&config),
+            vec![dir.path().join("layers/00001.gguf")]
+        );
+    }
+
+    /// Writes a minimal but valid GGUF containing only tensor metadata for the
+    /// given names. `ModelInfo::open` reads names via the native loader, so these
+    /// must be real GGUFs rather than placeholder bytes.
+    fn write_gguf_with_tensor_names(path: &Path, tensor_names: &[String]) {
+        const GGUF_MAGIC: &[u8; 4] = b"GGUF";
+        const GGUF_VERSION: u32 = 3;
+        const GGUF_TYPE_UINT32: u32 = 4;
+        const GGUF_TYPE_STRING: u32 = 8;
+        const GGML_TYPE_F32: u32 = 0;
+        const ALIGNMENT: usize = 32;
+
+        let mut out: Vec<u8> = Vec::new();
+        out.extend_from_slice(GGUF_MAGIC);
+        out.extend_from_slice(&GGUF_VERSION.to_le_bytes());
+        out.extend_from_slice(&(tensor_names.len() as u64).to_le_bytes());
+
+        let mut kv: Vec<u8> = Vec::new();
+        let mut kv_count: u64 = 0;
+        let push_str = |buf: &mut Vec<u8>, value: &str| {
+            buf.extend_from_slice(&(value.len() as u64).to_le_bytes());
+            buf.extend_from_slice(value.as_bytes());
+        };
+        push_str(&mut kv, "general.architecture");
+        kv.extend_from_slice(&GGUF_TYPE_STRING.to_le_bytes());
+        push_str(&mut kv, "qwen35");
+        kv_count += 1;
+        push_str(&mut kv, "qwen35.block_count");
+        kv.extend_from_slice(&GGUF_TYPE_UINT32.to_le_bytes());
+        kv.extend_from_slice(&32u32.to_le_bytes());
+        kv_count += 1;
+        push_str(&mut kv, "general.alignment");
+        kv.extend_from_slice(&GGUF_TYPE_UINT32.to_le_bytes());
+        kv.extend_from_slice(&(ALIGNMENT as u32).to_le_bytes());
+        kv_count += 1;
+
+        out.extend_from_slice(&kv_count.to_le_bytes());
+        out.extend_from_slice(&kv);
+
+        // One F32 scalar per tensor, laid out back to back at aligned offsets.
+        let element_bytes = 4usize;
+        let stride = element_bytes.next_multiple_of(ALIGNMENT);
+        for (index, name) in tensor_names.iter().enumerate() {
+            out.extend_from_slice(&(name.len() as u64).to_le_bytes());
+            out.extend_from_slice(name.as_bytes());
+            out.extend_from_slice(&1u32.to_le_bytes()); // n_dims
+            out.extend_from_slice(&1u64.to_le_bytes()); // ne[0]
+            out.extend_from_slice(&GGML_TYPE_F32.to_le_bytes());
+            out.extend_from_slice(&((index * stride) as u64).to_le_bytes());
+        }
+
+        let padding = out.len().next_multiple_of(ALIGNMENT) - out.len();
+        out.extend(std::iter::repeat_n(0u8, padding));
+        out.extend(std::iter::repeat_n(0u8, stride * tensor_names.len()));
+
+        fs::write(path, out).unwrap();
+    }
+
+    /// Builds a layer package whose layer files are real GGUFs, with recurrent
+    /// tensors present only in the blocks named by `recurrent_blocks`.
+    ///
+    /// Mirrors the hybrid qwen35 shape measured on
+    /// `mradermacher/UnifiedReward-Edit-qwen35-4b-i1-GGUF`: blocks where
+    /// `(i + 1) % full_attention_interval == 0` carry no `ssm_*` tensors at all.
+    fn write_hybrid_layer_package(dir: &Path, block_count: u32, recurrent_blocks: &[u32]) {
+        fs::create_dir_all(dir.join("shared")).unwrap();
+        fs::create_dir_all(dir.join("layers")).unwrap();
+        let mut layers = Vec::new();
+        for block in 0..block_count {
+            let relative = format!("layers/{block:05}.gguf");
+            let tensor_names: Vec<String> = if recurrent_blocks.contains(&block) {
+                vec![
+                    format!("blk.{block}.ssm_in.weight"),
+                    format!("blk.{block}.ssm_dt.weight"),
+                    format!("blk.{block}.attn_norm.weight"),
+                ]
+            } else {
+                vec![
+                    format!("blk.{block}.attn_q.weight"),
+                    format!("blk.{block}.attn_k.weight"),
+                    format!("blk.{block}.attn_norm.weight"),
+                ]
+            };
+            write_gguf_with_tensor_names(&dir.join(&relative), &tensor_names);
+            layers.push(serde_json::json!({
+                "layer_index": block,
+                "path": relative,
+            }));
+        }
+        let manifest = serde_json::json!({ "layers": layers });
+        fs::write(
+            dir.join("model-package.json"),
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn hybrid_package_config(dir: &Path, layer_start: u32, layer_end: u32) -> StageConfig {
+        // Deliberately an identity the family capability table does not resolve, so
+        // the test exercises content inspection rather than the family shortcut.
+        let mut config = test_config("unknown-vendor/unregistered-hybrid-package");
+        config.load_mode = LoadMode::LayerPackage;
+        config.model_path = Some(dir.to_string_lossy().to_string());
+        config.layer_start = layer_start;
+        config.layer_end = layer_end;
+        config
+    }
+
+    /// Regression for #1312. A stage whose *first* retained layer is
+    /// full-attention, with recurrent tensors in a later retained layer, must
+    /// still classify as recurrent. Sampling only the first layer file returned
+    /// false here and allowed a `ResidentKv` payload on a recurrent model.
+    #[test]
+    fn hybrid_stage_starting_on_full_attention_layer_requires_recurrent_state() {
+        let dir = tempfile::tempdir().unwrap();
+        // qwen35 with full_attention_interval = 4: blocks 3 and 7 are full-attention.
+        let recurrent = [0, 1, 2, 4, 5, 6];
+        write_hybrid_layer_package(dir.path(), 8, &recurrent);
+
+        // Stage starts at block 3, which carries no ssm_* tensors.
+        let config = hybrid_package_config(dir.path(), 3, 8);
+        let paths = kv_cache_inspection_paths(&config);
+        assert_eq!(
+            paths.len(),
+            5,
+            "must inspect every retained layer: {paths:?}"
+        );
+        assert!(
+            !artifact_has_recurrent_tensors(&paths[0]),
+            "first retained layer must be the full-attention one for this regression"
+        );
+        assert!(
+            model_requires_recurrent_state(&config),
+            "recurrent tensors in a later retained layer must be detected"
+        );
+    }
+
+    /// Inverse control: when no retained layer has recurrent tensors, the stage
+    /// must classify non-recurrent. Guards against the fix over-reporting.
+    #[test]
+    fn stage_with_no_recurrent_retained_layers_does_not_require_recurrent_state() {
+        let dir = tempfile::tempdir().unwrap();
+        // Recurrent tensors exist in the model, but not in this stage's range.
+        let recurrent = [0, 1, 2];
+        write_hybrid_layer_package(dir.path(), 8, &recurrent);
+
+        let config = hybrid_package_config(dir.path(), 3, 8);
+        assert!(
+            !model_requires_recurrent_state(&config),
+            "no retained layer has recurrent tensors"
+        );
+    }
+
+    /// The naive even split hides the bug: both stage starts land on recurrent
+    /// blocks, so first-layer sampling happens to be correct. Recorded so a
+    /// future change cannot mistake this shape for coverage.
+    #[test]
+    fn hybrid_even_split_starts_on_recurrent_layers_in_both_stages() {
+        let dir = tempfile::tempdir().unwrap();
+        let recurrent = [0, 1, 2, 4, 5, 6];
+        write_hybrid_layer_package(dir.path(), 8, &recurrent);
+
+        for (layer_start, layer_end) in [(0, 4), (4, 8)] {
+            let config = hybrid_package_config(dir.path(), layer_start, layer_end);
+            let paths = kv_cache_inspection_paths(&config);
+            assert!(
+                artifact_has_recurrent_tensors(&paths[0]),
+                "{layer_start}..{layer_end} first layer is recurrent, so this split cannot \
+                 detect the sampling defect"
+            );
+            assert!(model_requires_recurrent_state(&config));
+        }
+    }
+
+    /// A recurrent family recognised by the capability table must classify
+    /// recurrent without reading any artifact, and content absence must not
+    /// de-escalate it.
+    #[test]
+    fn known_recurrent_family_requires_recurrent_state_without_artifacts() {
+        let mut config = test_config("tiiuae/Falcon-H1-0.5B-Instruct-GGUF:Q4_K_M");
+        config.model_path = Some("/nonexistent/path/does-not-exist.gguf".to_string());
+        assert_eq!(recurrent_state_from_family(&config), Some(true));
+        assert!(
+            model_requires_recurrent_state(&config),
+            "capability table must be authoritative when it resolves"
         );
     }
 
@@ -379,8 +629,8 @@ mod tests {
         config.model_path = Some(dir.path().to_string_lossy().to_string());
 
         assert_eq!(
-            kv_cache_inspection_path(&config),
-            Some(dir.path().join("shared/metadata.gguf"))
+            kv_cache_inspection_paths(&config),
+            vec![dir.path().join("shared/metadata.gguf")]
         );
     }
 
