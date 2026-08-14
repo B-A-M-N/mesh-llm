@@ -570,7 +570,16 @@ fn handle_binary_connection_messages(
             }
         }
 
-        if let Some(full_prompt_tokens) = decode_record_tokens_sideband(&message) {
+        let completed_prompt_tokens = decode_record_tokens_sideband(&message).or_else(|| {
+            (message.kind == WireMessageKind::DecodeEmbd)
+                .then(|| {
+                    accumulated_prefill_tokens
+                        .get(&session_key)
+                        .map(Vec::as_slice)
+                })
+                .flatten()
+        });
+        if let Some(full_prompt_tokens) = completed_prompt_tokens {
             let mut runtime = runtime.lock().expect("runtime lock poisoned");
             let record = maybe_record_binary_full_prefill(
                 config,
