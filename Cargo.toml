@@ -7,6 +7,7 @@ members = [
     "crates/mesh-llm-events",
     "crates/mesh-llm-build-info",
     "crates/mesh-llm-gpu-bench",
+    "crates/mesh-llm-memory-envelope",
     "crates/mesh-llm-host-runtime",
     "crates/mesh-llm-log-store",
     "crates/mesh-llm-hardware-profile",
