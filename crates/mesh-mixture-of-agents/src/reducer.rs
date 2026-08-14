@@ -44,14 +44,14 @@ pub(crate) fn reducer_candidates(config: &GatewayConfig) -> Vec<(String, usize)>
         // rather than return empty and fail the turn.
     }
 
-    // No host guidance (or all indices stale): fall back to name-derived size
-    // tier, big-tier first. Preserves prior behaviour for tests and callers
-    // that don't populate `actor_candidates`.
+    // No host guidance (or all indices stale): fall back to size tier,
+    // big-tier first. Prefers each entry's verified parameter count and parses
+    // the name only when none was supplied.
     let mut big = Vec::new();
     let mut small = Vec::new();
     for m in &config.models {
         let entry = (m.name.clone(), m.backend_index);
-        if worker::is_single_digit_b_name(&m.name) {
+        if worker::entry_is_small_tier(m) {
             small.push(entry);
         } else {
             big.push(entry);

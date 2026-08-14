@@ -59,7 +59,7 @@ use serde_json::{Value, json};
 use session::Session;
 use std::time::{Duration, Instant};
 use worker::WorkerRole;
-pub use worker::{model_name_is_small_tier, strip_thinking, truncate_chars};
+pub use worker::{SMALL_TIER_MAX_B, entry_is_small_tier, strip_thinking, truncate_chars};
 
 const SAME_TOOL_FORCE_ANSWER_THRESHOLD: usize = 3;
 
@@ -402,6 +402,7 @@ async fn handle_query(
         dispatched.push(fanout::DispatchedWorker {
             model: model_name.clone(),
             role,
+            small_tier: assignment.small_tier,
         });
 
         join_set.spawn(async move {
