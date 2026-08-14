@@ -649,9 +649,9 @@ impl Default for CapacityBudgetPolicy {
     fn default() -> Self {
         Self {
             host_fixed_reserve_bytes: 1024 * 1024 * 1024, // 1 GiB
-            host_reserve_divisor: 16,                      // 1/16 = 6.25%
-            accelerator_fixed_reserve_bytes: 512 * 1024 * 1024, // 512 MiB
-            accelerator_reserve_divisor: 8,                // 1/8 = 12.5%
+            host_reserve_divisor: 16,                     // 1/16 = 6.25%
+            accelerator_fixed_reserve_bytes: 0,
+            accelerator_reserve_divisor: 10, // 1/10 = 10% (matches existing headroom)
         }
     }
 }
@@ -1146,8 +1146,8 @@ mod capacity_budget_tests {
         let policy = CapacityBudgetPolicy::default();
         assert_eq!(policy.host_fixed_reserve_bytes, 1024 * 1024 * 1024);
         assert_eq!(policy.host_reserve_divisor, 16);
-        assert_eq!(policy.accelerator_fixed_reserve_bytes, 512 * 1024 * 1024);
-        assert_eq!(policy.accelerator_reserve_divisor, 8);
+        assert_eq!(policy.accelerator_fixed_reserve_bytes, 0);
+        assert_eq!(policy.accelerator_reserve_divisor, 10);
     }
 
     #[test]
@@ -1163,10 +1163,11 @@ mod capacity_budget_tests {
     #[test]
     fn c3_budget_accelerator_memory_basic() {
         let policy = CapacityBudgetPolicy::default();
+        // 16 GiB available → 10% reserve = 1.6 GiB
         let available = 16 * 1024 * 1024 * 1024;
         let usable = budget_accelerator_memory(available, &policy);
-        let fractional = available / 8;
-        let expected = available - (512 * 1024 * 1024 + fractional);
+        let fractional = available / 10; // 10% of available
+        let expected = available - fractional;
         assert_eq!(usable, expected);
     }
 
