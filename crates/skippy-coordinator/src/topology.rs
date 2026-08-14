@@ -1,4 +1,5 @@
 use std::cmp::Ordering;
+use std::path::PathBuf;
 
 mod locked;
 
@@ -398,12 +399,23 @@ fn fit_candidate(
         let remaining_nodes = capacities.len() - stage_index;
         let min_for_later = remaining_nodes.saturating_sub(1) as u32;
         let assignable = remaining_layers.saturating_sub(min_for_later);
-        let layer_span = assignable.min(max_contiguous_layers_from(
-            &layer_required_bytes,
-            next_layer as usize,
-            assignable as usize,
-            node.usable_vram_bytes,
-        ) as u32);
+        let layer_span = if input.layer_class_bytes.is_empty() {
+            assignable.min(max_contiguous_layers_from(
+                &layer_required_bytes,
+                next_layer as usize,
+                assignable as usize,
+                node.usable_vram_bytes,
+            ) as u32)
+        } else {
+            assignable.min(max_contiguous_hybrid_layers_from(
+                &layer_required_bytes,
+                next_layer as usize,
+                assignable as usize,
+                node.usable_vram_bytes,
+                node.usable_ram_bytes,
+                &input.layer_class_bytes,
+            ) as u32)
+        };
         if layer_span == 0 {
             return None;
         }
@@ -425,7 +437,9 @@ fn fit_candidate(
         };
         let accelerator_bytes = required_bytes.saturating_sub(routed_expert_bytes);
 
-        let (host_bytes, final_accel_bytes) = if accelerator_bytes <= node.usable_vram_bytes {
+        // If everything fits in VRAM, no offload needed.
+        // Otherwise, offload routed experts to host and check host capacity.
+        let (host_bytes, final_accel_bytes) = if required_bytes <= node.usable_vram_bytes {
             (0, required_bytes)
         } else {
             if routed_expert_bytes > node.usable_ram_bytes {
@@ -628,6 +642,35 @@ fn max_contiguous_layers_from(
     count
 }
 
+fn max_contiguous_hybrid_layers_from(
+    layer_required_bytes: &[u64],
+    start: usize,
+    limit: usize,
+    vram_capacity: u64,
+    ram_capacity: u64,
+    layer_class_bytes: &[TopologyLayerClassBytes],
+) -> u64 {
+    let mut vram_total = 0u64;
+    let mut ram_total = 0u64;
+    let mut count = 0u64;
+    for (i, bytes) in layer_required_bytes.iter().enumerate().skip(start).take(limit) {
+        let routed = layer_class_bytes
+            .get(i)
+            .map(|lc| lc.routed_expert)
+            .unwrap_or(0);
+        let non_routed = bytes.saturating_sub(routed);
+        let next_vram = vram_total.saturating_add(non_routed);
+        let next_ram = ram_total.saturating_add(routed);
+        if next_vram > vram_capacity || next_ram > ram_capacity {
+            break;
+        }
+        vram_total = next_vram;
+        ram_total = next_ram;
+        count += 1;
+    }
+    count
+}
+
 fn sum_u64(values: &[u64]) -> u64 {
     values
         .iter()
@@ -656,6 +699,327 @@ mod tests {
             runtime_headroom_bytes: 0,
             stage_transfer_latency_ms: None,
         }
+    }
+
+    fn node_with_ram(id: &str, gib: u64, host_gib: u64) -> TopologyNode {
+        TopologyNode {
+            node_id: id.to_string(),
+            detected_vram_bytes: gib * GIB,
+            detected_host_available_bytes: host_gib * GIB,
+            max_vram_bytes: None,
+            runtime_headroom_bytes: 0,
+            stage_transfer_latency_ms: None,
+        }
+    }
+
+    fn hybrid_qwen3_122b_layer_bytes() -> Vec<TopologyLayerClassBytes> {
+        // Load from fixture file for consistency with real package dimensions.
+        // The fixture is generated from the actual Qwen3.5-122B-A10B Q3_K_XL model.
+        let fixture_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/qwen3.5-122b-a10b-q3_k_xl-layer-inventory.json");
+        std::fs::read_to_string(&fixture_path)
+            .ok()
+            .and_then(|content| serde_json::from_str::<serde_json::Value>(&content).ok())
+            .and_then(|value| {
+                let layers = value.get("layers")?.as_array()?;
+                let mut result = Vec::new();
+                for layer in layers {
+                    let class_bytes = layer.get("class_bytes")?;
+                    result.push(TopologyLayerClassBytes {
+                        routed_expert: class_bytes.get("routed_expert")?.as_u64()?,
+                        shared_expert: class_bytes.get("shared_expert")?.as_u64()?,
+                        attention: class_bytes.get("attention")?.as_u64()?,
+                        recurrent_ssm: class_bytes.get("recurrent_ssm")?.as_u64()?,
+                        routing_gate: class_bytes.get("routing_gate")?.as_u64()?,
+                        normalization: class_bytes.get("normalization")?.as_u64()?,
+                        other: class_bytes.get("other")?.as_u64()?,
+                    });
+                }
+                Some(result)
+            })
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn qwen35_122b_auto_hybrid_offloads_routed_experts_to_host() {
+        // Load the real fixture file for Qwen3.5-122B-A10B Q3_K_XL.
+        let fixture_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/qwen3.5-122b-a10b-q3_k_xl-layer-inventory.json");
+        let fixture = std::fs::read_to_string(&fixture_path)
+            .expect("fixture file should exist");
+        let fixture: serde_json::Value =
+            serde_json::from_str(&fixture).expect("fixture should be valid JSON");
+
+        let layers = fixture["layers"]
+            .as_array()
+            .expect("fixture should have layers array");
+        let layer_count = layers.len() as u32;
+
+        // Build layer_class_bytes and layer_weight_bytes from fixture.
+        let mut layer_class_bytes = Vec::new();
+        let mut layer_weight_bytes = Vec::new();
+        let mut total_weight_bytes = 0u64;
+        let mut total_routed_expert_bytes = 0u64;
+
+        for layer in layers {
+            let tensor_bytes = layer["tensor_bytes"]
+                .as_u64()
+                .expect("tensor_bytes should be u64");
+            let class_bytes = &layer["class_bytes"];
+
+            let routed_expert = class_bytes["routed_expert"]
+                .as_u64()
+                .expect("routed_expert should be u64");
+            let shared_expert = class_bytes["shared_expert"]
+                .as_u64()
+                .expect("shared_expert should be u64");
+            let attention = class_bytes["attention"].as_u64().expect("attention should be u64");
+            let recurrent_ssm = class_bytes["recurrent_ssm"]
+                .as_u64()
+                .expect("recurrent_ssm should be u64");
+            let routing_gate = class_bytes["routing_gate"]
+                .as_u64()
+                .expect("routing_gate should be u64");
+            let normalization = class_bytes["normalization"]
+                .as_u64()
+                .expect("normalization should be u64");
+            let other = class_bytes["other"].as_u64().expect("other should be u64");
+
+            // Verify class sum == tensor_bytes.
+            let class_sum =
+                routed_expert + shared_expert + attention + recurrent_ssm + routing_gate + normalization + other;
+            assert_eq!(
+                class_sum, tensor_bytes,
+                "class sum {} != tensor_bytes {} for layer {}",
+                class_sum,
+                tensor_bytes,
+                layer["layer_index"].as_u64().unwrap_or(0)
+            );
+
+            layer_class_bytes.push(TopologyLayerClassBytes {
+                routed_expert,
+                shared_expert,
+                attention,
+                recurrent_ssm,
+                routing_gate,
+                normalization,
+                other,
+            });
+            layer_weight_bytes.push(tensor_bytes);
+            total_weight_bytes += tensor_bytes;
+            total_routed_expert_bytes += routed_expert;
+        }
+
+        // A4000: 16 GB VRAM, 32 GB RAM.
+        // RX 6600 XT: 8 GB VRAM, 32 GB RAM.
+        let mut request = input(vec![
+            node_with_ram("a4000", 16, 32),
+            node_with_ram("rx6600", 8, 32),
+        ]);
+        request.layer_count = layer_count;
+        request.model_weight_bytes = total_weight_bytes;
+        request.layer_class_bytes = layer_class_bytes.clone();
+        request.layer_weight_bytes = layer_weight_bytes.clone();
+        request.kv_bytes_per_token = 64 * 1024;
+        request.minimum_nodes = 2;
+
+        let plan = plan_topology(&request).expect("plan_topology should succeed");
+
+        // Assert 49/49 layers assigned with no gaps/overlaps.
+        assert_eq!(plan.stages.len(), 2);
+        let mut all_layers = Vec::new();
+        for stage in &plan.stages {
+            all_layers.push((stage.layer_start, stage.layer_end, stage.node_id.clone()));
+        }
+        all_layers.sort_by_key(|(start, _, _)| *start);
+
+        // Verify contiguous coverage.
+        assert_eq!(all_layers[0].0, 0, "first stage should start at layer 0");
+        for i in 1..all_layers.len() {
+            assert_eq!(
+                all_layers[i].0, all_layers[i - 1].1,
+                "stages should be contiguous without gaps"
+            );
+        }
+        assert_eq!(
+            all_layers.last().unwrap().1,
+            layer_count,
+            "last stage should end at layer_count"
+        );
+
+        // Verify accel_bytes <= usable_vram AND host_bytes <= usable_ram for each stage.
+        let a4000_vram = 16 * GIB;
+        let rx6600_vram = 8 * GIB;
+        let a4000_ram = 32 * GIB;
+        let rx6600_ram = 32 * GIB;
+
+        let mut total_host_bytes = 0u64;
+        for stage in &plan.stages {
+            let vram_capacity = if stage.node_id == "a4000" {
+                a4000_vram
+            } else {
+                rx6600_vram
+            };
+            let ram_capacity = if stage.node_id == "a4000" {
+                a4000_ram
+            } else {
+                rx6600_ram
+            };
+
+            let stage_routed_expert_bytes: u64 = layer_class_bytes
+                [stage.layer_start as usize..stage.layer_end as usize]
+                .iter()
+                .map(|lc| lc.routed_expert)
+                .sum();
+            let stage_total_bytes: u64 =
+                layer_weight_bytes[stage.layer_start as usize..stage.layer_end as usize]
+                    .iter()
+                    .sum();
+
+            // AutoHybrid: accel_bytes = total - routed_expert_bytes.
+            let accel_bytes = stage_total_bytes - stage_routed_expert_bytes;
+
+            assert!(
+                accel_bytes <= vram_capacity,
+                "accel_bytes {} exceeds VRAM capacity {} for stage {}",
+                accel_bytes,
+                vram_capacity,
+                stage.node_id
+            );
+            assert!(
+                stage_routed_expert_bytes <= ram_capacity,
+                "routed_expert_bytes {} exceeds RAM capacity {} for stage {}",
+                stage_routed_expert_bytes,
+                ram_capacity,
+                stage.node_id
+            );
+
+            total_host_bytes += stage_routed_expert_bytes;
+        }
+
+        // Assert at least some routed expert bytes were offloaded to host
+        // (proving AutoHybrid worked).
+        assert!(
+            total_host_bytes > 0,
+            "expected at least some routed expert bytes to be offloaded to host"
+        );
+
+        // Print the resulting boundary.
+        println!("Qwen3.5-122B-A10B Q3_K_XL topology plan:");
+        for stage in &plan.stages {
+            println!(
+                "  {}: layers {}..{} ({} layers, {} routed expert bytes)",
+                stage.node_id,
+                stage.layer_start,
+                stage.layer_end,
+                stage.layer_end - stage.layer_start,
+                layer_class_bytes[stage.layer_start as usize..stage.layer_end as usize]
+                    .iter()
+                    .map(|lc| lc.routed_expert)
+                    .sum::<u64>()
+            );
+        }
+    }
+
+    #[test]
+    fn qwen35_122b_vram_only_rejection_fails_without_host_assist() {
+        // Load the real fixture file.
+        let fixture_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/qwen3.5-122b-a10b-q3_k_xl-layer-inventory.json");
+        let fixture = std::fs::read_to_string(&fixture_path)
+            .expect("fixture file should exist");
+        let fixture: serde_json::Value =
+            serde_json::from_str(&fixture).expect("fixture should be valid JSON");
+
+        let layers = fixture["layers"]
+            .as_array()
+            .expect("fixture should have layers array");
+        let layer_count = layers.len() as u32;
+
+        let mut layer_class_bytes = Vec::new();
+        let mut layer_weight_bytes = Vec::new();
+        let mut total_weight_bytes = 0u64;
+
+        for layer in layers {
+            let tensor_bytes = layer["tensor_bytes"]
+                .as_u64()
+                .expect("tensor_bytes should be u64");
+            let class_bytes = &layer["class_bytes"];
+
+            layer_class_bytes.push(TopologyLayerClassBytes {
+                routed_expert: class_bytes["routed_expert"]
+                    .as_u64()
+                    .expect("routed_expert should be u64"),
+                shared_expert: class_bytes["shared_expert"]
+                    .as_u64()
+                    .expect("shared_expert should be u64"),
+                attention: class_bytes["attention"].as_u64().expect("attention should be u64"),
+                recurrent_ssm: class_bytes["recurrent_ssm"]
+                    .as_u64()
+                    .expect("recurrent_ssm should be u64"),
+                routing_gate: class_bytes["routing_gate"]
+                    .as_u64()
+                    .expect("routing_gate should be u64"),
+                normalization: class_bytes["normalization"]
+                    .as_u64()
+                    .expect("normalization should be u64"),
+                other: class_bytes["other"].as_u64().expect("other should be u64"),
+            });
+            layer_weight_bytes.push(tensor_bytes);
+            total_weight_bytes += tensor_bytes;
+        }
+
+        // A4000: 16 GB VRAM, 0 GB RAM (VRAM-only mode).
+        // RX 6600 XT: 8 GB VRAM, 0 GB RAM (VRAM-only mode).
+        let mut request = input(vec![
+            node("a4000", 16),
+            node("rx6600", 8),
+        ]);
+        request.layer_count = layer_count;
+        request.model_weight_bytes = total_weight_bytes;
+        request.layer_class_bytes = layer_class_bytes;
+        request.layer_weight_bytes = layer_weight_bytes;
+        request.kv_bytes_per_token = 64 * 1024;
+        request.minimum_nodes = 2;
+
+        // Plan should fail because without host RAM, the routed experts cannot
+        // be offloaded, and the layers won't fit in VRAM alone.
+        let plan = plan_topology(&request);
+        assert!(
+            plan.is_err(),
+            "plan_topology should fail when host_ram_available_bytes = 0 for all nodes"
+        );
+    }
+
+    #[test]
+    fn qwen_122b_assigns_more_layers_to_higher_vram_node_with_host_assist() {
+        let mut request = input(vec![
+            node_with_ram("a4000", 16, 32),
+            node_with_ram("rx6600", 8, 32),
+        ]);
+        request.layer_count = 49;
+        request.model_weight_bytes = 57_030_728_384;
+        request.layer_class_bytes = hybrid_qwen3_122b_layer_bytes();
+        request.layer_weight_bytes = vec![1_177_551_020; 49];
+        request.kv_bytes_per_token = 64 * 1024;
+        request.minimum_nodes = 2;
+        let plan = plan_topology(&request).unwrap();
+        assert_eq!(plan.stages.len(), 2);
+        let a4000 = plan.stages.iter().find(|s| s.node_id == "a4000").unwrap();
+        let rx6600 = plan.stages.iter().find(|s| s.node_id == "rx6600").unwrap();
+        assert!(a4000.layer_end - a4000.layer_start >= rx6600.layer_end - rx6600.layer_start);
+    }
+
+    #[test]
+    fn vram_only_feasibility_rejects_49_layers_without_host_assist() {
+        let mut request = input(vec![node("a4000", 16), node("rx6600", 8)]);
+        request.layer_count = 49;
+        request.model_weight_bytes = 57_030_728_384;
+        request.layer_weight_bytes = vec![1_177_551_020; 49];
+        request.kv_bytes_per_token = 64 * 1024;
+        request.minimum_nodes = 2;
+        let plan = plan_topology(&request);
+        assert!(plan.is_err());
     }
 
     fn latency_node(id: &str, gib: u64, stage_transfer_latency_ms: u32) -> TopologyNode {

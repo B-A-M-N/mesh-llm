@@ -10,3 +10,6 @@ homepage = "https://github.com/Mesh-LLM/mesh-llm"
 
 [dependencies]
 thiserror = "2"
+
+[dev-dependencies]
+serde_json = "1"
