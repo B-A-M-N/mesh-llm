@@ -316,6 +316,20 @@ pub struct MtmdInputChunks {
 }
 
 #[repr(C)]
+pub struct MtmdHelperVideo {
+    _private: [u8; 0],
+}
+
+/// Mirrors llama.cpp's `mtmd_helper_bitmap_wrapper`: the decoded bitmap plus
+/// an optional video context (non-null only for video inputs, which own the
+/// frame storage the bitmap points into).
+#[repr(C)]
+pub struct MtmdHelperBitmapWrapper {
+    pub bitmap: *mut MtmdBitmap,
+    pub video_ctx: *mut MtmdHelperVideo,
+}
+
+#[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MtmdInputChunkType {
     Text = 0,
@@ -888,7 +902,8 @@ mod dynamic {
         mtmd_context_params_default() -> MtmdContextParams;
         mtmd_init_from_file(mmproj_fname: *const c_char, text_model: *const Opaque, ctx_params: MtmdContextParams) -> *mut MtmdContext;
         mtmd_free(ctx: *mut MtmdContext);
-        mtmd_helper_bitmap_init_from_buf(ctx: *mut MtmdContext, buf: *const u8, len: usize) -> *mut MtmdBitmap;
+        mtmd_helper_bitmap_init_from_buf(ctx: *mut MtmdContext, buf: *const u8, len: usize, placeholder: bool) -> MtmdHelperBitmapWrapper;
+        mtmd_helper_video_free(video: *mut MtmdHelperVideo);
         mtmd_bitmap_free(bitmap: *mut MtmdBitmap);
         mtmd_input_chunks_init() -> *mut MtmdInputChunks;
         mtmd_input_chunks_free(chunks: *mut MtmdInputChunks);
@@ -1753,7 +1768,10 @@ unsafe extern "C" {
         ctx: *mut MtmdContext,
         buf: *const u8,
         len: usize,
-    ) -> *mut MtmdBitmap;
+        placeholder: bool,
+    ) -> MtmdHelperBitmapWrapper;
+
+    pub fn mtmd_helper_video_free(video: *mut MtmdHelperVideo);
 
     pub fn mtmd_bitmap_free(bitmap: *mut MtmdBitmap);
 
