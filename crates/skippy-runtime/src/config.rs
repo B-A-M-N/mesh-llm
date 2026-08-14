@@ -166,6 +166,9 @@ impl RuntimeConfig {
                 glm_dsa_direct_sparse_decode_max_top_k: 0,
                 glm_dsa_dense_sparse_mask_max_bytes: 0,
                 glm_dsa_compact_flash_min_kv: 0,
+                struct_size: std::mem::size_of::<RawRuntimeConfig>() as u32,
+                abi_version: skippy_ffi::ABI_VERSION,
+                placement: std::ptr::null(),
             },
             _selected_backend_device: selected_backend_device,
         })

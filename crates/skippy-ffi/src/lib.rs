@@ -2,6 +2,72 @@ pub const ABI_VERSION_MAJOR: u32 = 0;
 pub const ABI_VERSION_MINOR: u32 = 1;
 pub const ABI_VERSION_PATCH: u32 = 38;
 pub const FEATURE_BACKEND_DEVICES: u64 = 1 << 23;
+
+// Composite runtime ABI version, packed to mirror the C `SKIPPY_ABI_VERSION_PACK`
+// macro exactly: major<<24 | minor<<16 | patch.
+pub const ABI_VERSION: u32 =
+    (ABI_VERSION_MAJOR << 24) | (ABI_VERSION_MINOR << 16) | ABI_VERSION_PATCH;
+
+// Placement-plan ABI (independent of runtime ABI; mirrors
+// SKIPPY_MODEL_PLACEMENT_ABI_VERSION). V1.
+pub const MODEL_PLACEMENT_ABI_VERSION_MAJOR: u32 = 1;
+pub const MODEL_PLACEMENT_ABI_VERSION_MINOR: u32 = 0;
+pub const MODEL_PLACEMENT_ABI_VERSION: u32 =
+    (MODEL_PLACEMENT_ABI_VERSION_MAJOR << 24) | (MODEL_PLACEMENT_ABI_VERSION_MINOR << 16);
+
+#[cfg(test)]
+mod abi_layout_tests {
+    use super::*;
+
+    // Layout parity with the C ABI. These values are produced by the C side via
+    // `sizeof(struct skippy_runtime_config)` and
+    // `offsetof(struct skippy_runtime_config, <field>)` and must be kept in
+    // sync. Run `scripts/dump_abi_layout.sh` (C) to regenerate if the C struct
+    // changes.
+    const EXPECTED_RUNTIME_CONFIG_SIZE: usize = 128;
+    const EXPECTED_STRUCT_SIZE_OFFSET: usize = 0;
+    const EXPECTED_ABI_VERSION_OFFSET: usize = 4;
+    const EXPECTED_PLACEMENT_OFFSET: usize = 120;
+    const EXPECTED_MODEL_PLACEMENT_SIZE: usize = 24;
+
+    #[test]
+    fn runtime_config_layout_parity() {
+        assert_eq!(std::mem::size_of::<RuntimeConfig>(), EXPECTED_RUNTIME_CONFIG_SIZE);
+        assert_eq!(std::mem::offset_of!(RuntimeConfig, struct_size), EXPECTED_STRUCT_SIZE_OFFSET);
+        assert_eq!(std::mem::offset_of!(RuntimeConfig, abi_version), EXPECTED_ABI_VERSION_OFFSET);
+        assert_eq!(std::mem::offset_of!(RuntimeConfig, placement), EXPECTED_PLACEMENT_OFFSET);
+    }
+
+    #[test]
+    fn model_placement_layout_parity() {
+        assert_eq!(std::mem::size_of::<SkippyModelPlacement>(), EXPECTED_MODEL_PLACEMENT_SIZE);
+        assert_eq!(std::mem::offset_of!(SkippyModelPlacement, struct_size), 0);
+        assert_eq!(std::mem::offset_of!(SkippyModelPlacement, abi_version), 4);
+        assert_eq!(std::mem::offset_of!(SkippyModelPlacement, rules), 8);
+        assert_eq!(std::mem::offset_of!(SkippyModelPlacement, rule_count), 16);
+    }
+
+    #[test]
+    fn abi_version_encoding() {
+        assert_eq!(ABI_VERSION, 0x0001_0026);
+        assert_eq!(MODEL_PLACEMENT_ABI_VERSION, 0x0100_0000);
+    }
+
+    #[test]
+    fn placement_target_discriminants() {
+        assert_eq!(SkippyPlacementTarget::Default as u32, 0);
+        assert_eq!(SkippyPlacementTarget::Host as u32, 1);
+        assert_eq!(SkippyPlacementTarget::PrimaryAccelerator as u32, 2);
+    }
+
+    #[test]
+    fn tensor_placement_rule_layout_parity() {
+        // On x86-64: pointer(8) + enum(4) + padding(4) = 16.
+        assert_eq!(std::mem::size_of::<SkippyTensorPlacementRule>(), 16);
+        assert_eq!(std::mem::offset_of!(SkippyTensorPlacementRule, pattern), 0);
+        assert_eq!(std::mem::offset_of!(SkippyTensorPlacementRule, target), 8);
+    }
+}
 pub const FEATURE_RUNTIME_EVENTS: u64 = 1 << 24;
 pub const FEATURE_NATIVE_MTP_N1: u64 = 1 << 25;
 pub const FEATURE_NGRAM_CACHE_DRAFT: u64 = 1 << 26;
@@ -212,6 +278,9 @@ pub struct Error {
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct RuntimeConfig {
+    pub struct_size: u32,
+    pub abi_version: u32,
+
     pub stage_index: i32,
     pub layer_start: i32,
     pub layer_end: i32,
@@ -243,6 +312,131 @@ pub struct RuntimeConfig {
     pub glm_dsa_direct_sparse_decode_max_top_k: i32,
     pub glm_dsa_dense_sparse_mask_max_bytes: u64,
     pub glm_dsa_compact_flash_min_kv: i32,
+    pub placement: *const SkippyModelPlacement,
+}
+
+impl Default for RuntimeConfig {
+    fn default() -> Self {
+        Self {
+            struct_size: std::mem::size_of::<Self>() as u32,
+            abi_version: ABI_VERSION,
+            stage_index: 0,
+            layer_start: 0,
+            layer_end: 0,
+            ctx_size: 0,
+            lane_count: 0,
+            n_batch: 0,
+            n_ubatch: 0,
+            n_threads: 0,
+            n_threads_batch: 0,
+            n_gpu_layers: 0,
+            has_mmap_override: false,
+            use_mmap: false,
+            use_mlock: false,
+            cache_type_k: 0,
+            cache_type_v: 0,
+            flash_attn_type: 0,
+            load_mode: LoadMode::RuntimeSlice,
+            disable_repack: false,
+            use_mmap_prefetch: false,
+            use_mmap_buffer: false,
+            filter_tensors_on_load: false,
+            include_embeddings: false,
+            include_output: false,
+            selected_backend_device: std::ptr::null(),
+            glm_dsa_policy_profile: 0,
+            glm_dsa_policy_flags: 0,
+            glm_dsa_short_prefill_max_tokens: 0,
+            glm_dsa_direct_sparse_decode_max_top_k: 0,
+            glm_dsa_dense_sparse_mask_max_bytes: 0,
+            glm_dsa_compact_flash_min_kv: 0,
+            placement: std::ptr::null(),
+        }
+    }
+}
+
+/// Semantic placement targets. Mesh specifies intent; the native runtime
+/// resolves each target to a concrete local buffer type.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SkippyPlacementTarget {
+    Default = 0,
+    Host = 1,
+    PrimaryAccelerator = 2,
+}
+
+/// A single regex/name placement rule. `pattern` is matched against the ggml
+/// tensor name (substring match, llama.cpp convention).
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct SkippyTensorPlacementRule {
+    pub pattern: *const c_char,
+    pub target: SkippyPlacementTarget,
+}
+
+/// Versioned semantic placement plan. `struct_size` lets the runtime validate
+/// the caller's view of the struct; `abi_version` is the composite ABI version.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct SkippyModelPlacement {
+    pub struct_size: u32,
+    pub abi_version: u32,
+    pub rules: *const SkippyTensorPlacementRule,
+    pub rule_count: usize,
+}
+
+/// Safe owner for a semantic placement plan across an FFI model-open call.
+///
+/// Holds `CString` pattern storage and the FFI rule/placement structs so their
+/// pointers stay valid for the whole duration of `skippy_model_open*`. Drop
+/// order matters: `cstrings` and `ffi_rules` must outlive `ffi_placement`, and
+/// all must outlive the model-open call.
+pub struct OwnedModelPlacement {
+    cstrings: Vec<std::ffi::CString>,
+    ffi_rules: Vec<SkippyTensorPlacementRule>,
+    ffi_placement: SkippyModelPlacement,
+}
+
+impl OwnedModelPlacement {
+    /// Build an owned placement plan from ergonomic Rust rule tuples.
+    ///
+    /// Each `(pattern, target)` is converted into a stable `CString` and a
+    /// `#[repr(C)]` rule whose `pattern` points at the owned `CString`. The
+    /// resulting `SkippyModelPlacement` is layout-compatible with the C ABI.
+    pub fn new(rules: &[(String, SkippyPlacementTarget)]) -> Self {
+        let mut cstrings = Vec::with_capacity(rules.len());
+        let mut ffi_rules = Vec::with_capacity(rules.len());
+        for (pattern, target) in rules {
+            let c = std::ffi::CString::new(pattern.as_str())
+                .expect("placement pattern contained NUL");
+            ffi_rules.push(SkippyTensorPlacementRule {
+                pattern: c.as_ptr(),
+                target: *target,
+            });
+            cstrings.push(c);
+        }
+        let ffi_placement = SkippyModelPlacement {
+            struct_size: std::mem::size_of::<SkippyModelPlacement>() as u32,
+            abi_version: MODEL_PLACEMENT_ABI_VERSION,
+            rules: if ffi_rules.is_empty() {
+                std::ptr::null()
+            } else {
+                ffi_rules.as_ptr()
+            },
+            rule_count: ffi_rules.len(),
+        };
+        Self {
+            cstrings,
+            ffi_rules,
+            ffi_placement,
+        }
+    }
+
+    /// Borrow the FFI placement struct for passing to the native runtime.
+    /// The returned reference is only valid while `self` is alive.
+    pub fn as_ref(&self) -> &SkippyModelPlacement {
+        &self.ffi_placement
+    }
 }
 
 #[repr(C)]
@@ -713,7 +907,30 @@ mod dynamic {
         let symbols = unsafe { Symbols::load_paths(&collected) }?;
         SYMBOLS
             .set(symbols)
-            .map_err(|_| NativeRuntimeLoadError::AlreadyLoaded)
+            .map_err(|_| NativeRuntimeLoadError::AlreadyLoaded)?;
+
+        // After loading the core runtime libraries, explicitly load dynamic GGML
+        // backends (libggml-cuda.so, libggml-vulkan.so, etc.) from the runtime's
+        // lib directory. The bundled backends are not in the executable's
+        // directory or CWD, so ggml_backend_load_all() (which calls
+        // ggml_backend_load_all_from_path(nullptr)) will not find them.
+        if let Some(first_lib) = collected.first() {
+            if let Some(lib_dir) = first_lib.parent() {
+                let lib_dir_c = std::ffi::CString::new(
+                    lib_dir.to_string_lossy().as_bytes().to_vec(),
+                )
+                .map_err(|err| {
+                    NativeRuntimeLoadError::Load(format!(
+                        "native runtime lib directory path is not valid C string: {err}"
+                    ))
+                })?;
+                unsafe {
+                    skippy_runtime_load_backends_from_path(lib_dir_c.as_ptr());
+                }
+            }
+        }
+
+        Ok(())
     }
 
     fn symbols() -> &'static Symbols {
@@ -827,6 +1044,7 @@ mod dynamic {
         skippy_ngram_cache_draft(cache: *mut NgramCache, continuation_prefix: *const i32, continuation_prefix_count: usize, max_draft_tokens: u16, output_tokens: *mut i32, output_token_capacity: usize, out_token_count: *mut usize, out_error: *mut *mut Error) -> Status;
         skippy_backend_device_count(out_count: *mut usize, out_error: *mut *mut Error) -> Status;
         skippy_backend_device_at(index: usize, out_device: *mut BackendDevice, out_error: *mut *mut Error) -> Status;
+        skippy_runtime_load_backends_from_path(path: *const c_char) -> bool;
         skippy_model_open(path: *const c_char, config: *const RuntimeConfig, out_model: *mut *mut Model, out_error: *mut *mut Error) -> Status;
         skippy_model_open_from_parts(paths: *const *const c_char, path_count: usize, config: *const RuntimeConfig, out_model: *mut *mut Model, out_error: *mut *mut Error) -> Status;
         skippy_model_free(model: *mut Model, out_error: *mut *mut Error) -> Status;
