@@ -59,7 +59,7 @@ removable after this branch's runner contract is active on protected main.
 | `ci-linux-sdk-slice.yml`, `ci-macos-sdk-slice.yml` | Platform-local Rust/Kotlin/Swift smoke consumers; SDK producers are independent top-level calls |
 | `ci-runner-contract-slice.yml` | Provider/cache/plan trust and main runner-image checks |
 | `native-sdk-artifact.yml` | Typed native SDK producer |
-| `swift-sdk-artifact.yml` | Fixed `macos-15` host-only/full XCFramework producer |
+| `swift-sdk-artifact.yml` | Host-only/full XCFramework producer; trusted main remains `macos-15`, while eligible same-repository PRs follow the protected Depot macOS 15 gate |
 | `smoke.yml` | Artifact-based inference/OpenAI/split smoke |
 | `scripted-binary-smoke.yml` | Artifact-based scripted product smoke |
 | `sdk-smoke.yml` | Artifact-based SDK consumers |
@@ -109,6 +109,15 @@ from that same catalog.
 - `configure-sccache-gha`: event/provider-derived compiler-cache setup.
 - `capture-sccache-stats`: machine-readable cache evidence.
 
+`scripts/collect-ci-metrics.py` is the read-only timing evidence collector. Its
+schema-v3 report keeps workflow wall/queue, job runner queue, measured
+dependency wait, job execution, runner-minutes, cancelled runner-minutes and
+peak workers separate. It groups observations by provider, operating system,
+architecture, semantic runner role and Depot size, and emits deterministic
+queue/capacity heuristics plus an optional provider-cohort comparison. Raw
+inputs and dated reports belong under `/tmp` or a tracking issue/artifact, not
+under `ci/` or this inventory.
+
 Artifacts are correctness boundaries; caches only accelerate regeneration.
 PR artifacts generally retain for one day. Protected same-repository and fork
 lanes cannot publish shared trusted-main caches, and Depot cache access is
@@ -129,15 +138,32 @@ non-fail-fast, failed producers suppress only declared consumers through
 GitHub-hosted labels are `ubuntu-24.04`, `ubuntu-24.04-arm`, `macos-15`, and
 `windows-2022`. Depot labels are selected only by `select-ci-runners` for
 trusted main Linux when `DEPOT_RUNNERS_ENABLED` is exactly `true`; no workflow
-accepts a raw provider label. The documented `gpu-nvidia` ephemeral scale set
-is the sole uncredentialed, hardware-qualified same-repository PR exception.
+accepts a raw provider label. Current ordinary PR execution remains hosted
+until the protected PR gate is separately activated. The intended final gate
+may cover eligible build/test rows across Linux, Depot macOS 15 and Windows
+2022 when equivalent images/architectures exist; planning/required summaries,
+credential-bearing smokes, `gpu-nvidia` hardware and uncertified Intel macOS
+rows remain exceptions. The documented `gpu-nvidia` ephemeral scale set is
+the sole current uncredentialed, hardware-qualified same-repository PR
+exception.
 
 The future Depot PR gate is documented in `ci/DEPOT_MIGRATION.md`. It requires
 cache isolation, no PR cache/registry tokens, exact protected workflow refs,
 ephemeral runners, a sentinel canary, and a tested GitHub rollback. No Depot
 settings or runner groups are changed by this workflow refactor.
 
+External administrative posture is now verified as follows: automatic Depot
+Cache connectivity is disabled, automatic Registry Actions authentication is
+disabled, and the Depot runner group is restricted to `Mesh-LLM/mesh-llm` and
+the exact protected workflow refs. The repository token cannot independently
+inspect organization runner-group settings through the API (403), so these
+remain external facts rather than checked-in evidence. The protected
+branch/main canary, same-repository PR canary, fork PR canary, provider-parity
+comparison, and rollback run are still pending; `DEPOT_RUNNERS_ENABLED` or a
+successful manual canary does not prove PR isolation.
+
 Relevant repository variable names include `DEPOT_RUNNERS_ENABLED`,
+`DEPOT_PR_RUNNERS_ENABLED` (absent/false until protected PR activation),
 `CUDA_VERSION`, `VULKAN_SDK_VERSION`, smoke configuration variables, and
 release/deployment variables. Secret values never belong in this inventory;
 known names include `HF_TOKEN`, release-attestation keys, `CARGO_REGISTRY_TOKEN`
