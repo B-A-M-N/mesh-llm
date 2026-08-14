@@ -444,8 +444,8 @@ impl StageOpenAiBackend {
                         json!("failed_error"),
                     );
                     attrs.insert(
-                        "skippy.kv.archive_error".to_string(),
-                        json!(error.to_string()),
+                        "skippy.kv.archive_error_class".to_string(),
+                        json!(crate::kv_integration::telemetry_error_class(&error)),
                     );
                 }
             }
@@ -608,8 +608,8 @@ impl StageOpenAiBackend {
                         json!("failed_error"),
                     );
                     attrs.insert(
-                        "skippy.kv.archive_error".to_string(),
-                        json!(error.to_string()),
+                        "skippy.kv.archive_error_class".to_string(),
+                        json!(crate::kv_integration::telemetry_error_class(&error)),
                     );
                 }
             }

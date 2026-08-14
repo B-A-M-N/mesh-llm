@@ -18,7 +18,7 @@ built. Both are in scope below.
 | Family | Payload | On eviction |
 |---|---|---|
 | Dense attention (llama, qwen3, deepseek2/3, glm4, minimax) | `ResidentKv` | native seq drop; **state is lost**, next request recomputes |
-| Sliding-window / hybrid ISWA (Gemma 3/4, gpt-oss, cohere2, llama4) | `ResidentKv` | same, and disk retention is **declined** — see "Sliding-window models" below |
+| Interleaved sliding-window attention (ISWA), including ISWA in a hybrid wrapper (Gemma 3/4 and any family using the same llama.cpp memory types) | `ResidentKv` or `KvRecurrent` | composite base-cache + SWA-suffix page is persisted; recurrent state is also retained when present |
 | Hybrid/recurrent (Qwen3Next, Falcon-H1, RWKV/Mamba) | `KvRecurrent` | `export_kv_page` + `export_recurrent_state` into an in-RAM BLAKE3 block store |
 
 `ResidentKv` is a *performance* default, not a capability boundary: borrowing
@@ -838,42 +838,36 @@ instance's live files.
 
 ## Model coverage
 
-Validated by live measurement, single node, ~6.3k-token agent prompt:
+Validated by live measurement:
 
-| Model | Attention memory | Disk reuse |
+| Model / topology | Attention memory | Actual validation |
 |---|---|---|
-| Qwen3-8B Q4_K_M (dense) | plain KV cache | yes -- 5.16s -> 0.47s, 6272 cached |
-| gemma-4-26B-A4B (MoE) | hybrid ISWA | declined, by design |
+| Qwen3-8B Q4_K_M, single node, ~6.3k-token agent prompt | plain KV cache | disk reuse: 5.16s -> 0.47s, 6272 cached |
+| Qwen3-8B Q4_K_M, two physical nodes, ~16.9k-token agent prompt | plain KV cache, split by layer range | 31.02s cold -> 1.27s cross-session -> 1.54s after restarting both nodes |
+| Gemma 4 26B A4B | composite ISWA | the earlier run correctly declined before composite support existed; **no live post-support restart-reuse result has been recorded yet** |
 
-**MoE is not the axis.** Experts live in the feed-forward layers and carry no
-state between tokens, so a mixture-of-experts model with an ordinary KV cache
-behaves exactly like a dense one here. The axis is whether attention KV is the
+**MoE is not the axis.** Experts live in feed-forward layers and carry no state
+between tokens. The relevant question is whether Mesh can export the model's
 complete continuation state.
 
-Gemma fails that test, and this is worth being precise about because the
-symptom is easy to misread as an MoE limitation. `llama_kv_cache_iswa` holds
-two caches: a base cache covering the full context for the non-SWA layers, and
-a window-bounded cache for the SWA layers. For an N-token prefix the correct
-state is `0..N` on the base layers but only the visible suffix on the SWA
-layers. One page with one token range cannot express that, so the native side
-declines the export -- correctly. Exporting the base cache alone would yield a
-page that silently omits every SWA layer, and importing it would advance
-`n_past` over state that was never restored.
+Current composite ISWA support handles the two-cache shape used by
+`llama_kv_cache_iswa`: a full-prefix base cache plus the visible suffix from the
+window-bounded SWA cache. It also recognizes `llama_memory_hybrid_iswa`; in that
+case the composite attention page is retained together with the recurrent state
+already carried by `KvRecurrent`. Import is intentionally restricted to a fresh
+session so both component caches advance from the same restored prefix.
 
-Two things follow, and both are now implemented:
+Coverage added with the codec includes Rust tests for descriptor JSON
+round-tripping, payload/range validation, overflow and corruption rejection,
+and legacy/single-page compatibility. That is structural validation, not a
+model-level correctness or performance result. A live Gemma 3/4 cold, warm,
+and post-restart probe remains required before claiming the composite path is
+certified.
 
-- The unsupported memory layout is latched per stage, so the cost is one
-  declined export rather than one per prefill, and it reports
-  `skipped_unsupported_memory` instead of `failed_export`. Nothing is broken;
-  this model simply cannot use the tier.
-- Gemma keeps `ResidentKv`, because a sequence copy duplicates both caches, so
-  in-process reuse is unaffected. Only the disk tier is out of reach.
-
-Note that Gemma shows no prefix reuse at all on `origin/main` either, disk tier
-or not -- verified by building `ff5e79f8` and running the same probe, which
-also returns `cached_tokens=0`. That is a pre-existing gap, not a regression
-from this branch, and out of scope here.
-
-Supporting SWA on disk needs a composite page: a full-prefix base page plus an
-SWA suffix page. That is separate work, and adding the ISWA types to the export
-path without it would be unsafe rather than merely incomplete.
+Remaining unsupported cases are hybrid or future llama.cpp memory layouts that
+cannot expose their *complete* continuation state as plain KV, KV plus recurrent
+state, or the two-component ISWA codec. Those layouts still fail closed: the
+unsupported result is latched per stage, telemetry reports
+`skipped_unsupported_memory`, and serving continues without disk retention.
+Do not infer support merely from a family label such as “hybrid” or “SWA”; the
+runtime memory type and a live restore validation are authoritative.

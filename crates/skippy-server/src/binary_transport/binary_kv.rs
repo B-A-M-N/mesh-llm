@@ -305,7 +305,10 @@ pub(in crate::binary_transport) fn maybe_prefix_cache_control(
                         _ => "restore_error",
                     };
                     attrs.insert("skippy.kv.decision".to_string(), json!(decision));
-                    attrs.insert("skippy.kv.error".to_string(), json!(error.to_string()));
+                    attrs.insert(
+                        "skippy.kv.error_class".to_string(),
+                        json!(crate::kv_integration::telemetry_error_class(&error)),
+                    );
                 }
             }
         }
@@ -532,7 +535,10 @@ pub(in crate::binary_transport) fn maybe_lookup_binary_prefill(
                     "skippy.kv.decision".to_string(),
                     json!("activation_hit_kv_error"),
                 );
-                attrs.insert("skippy.kv.error".to_string(), json!(error.to_string()));
+                attrs.insert(
+                    "skippy.kv.error_class".to_string(),
+                    json!(crate::kv_integration::telemetry_error_class(&error)),
+                );
                 telemetry.emit("stage.binary_kv_lookup_decision", attrs);
                 return result;
             }
@@ -574,7 +580,10 @@ pub(in crate::binary_transport) fn maybe_lookup_binary_prefill(
                 json!(elapsed_ms(started)),
             );
             attrs.insert("skippy.kv.decision".to_string(), json!("resident_error"));
-            attrs.insert("skippy.kv.error".to_string(), json!(error.to_string()));
+            attrs.insert(
+                "skippy.kv.error_class".to_string(),
+                json!(crate::kv_integration::telemetry_error_class(&error)),
+            );
             telemetry.emit("stage.binary_kv_lookup_decision", attrs);
             return result;
         }
@@ -711,8 +720,8 @@ pub(in crate::binary_transport) fn maybe_record_binary_prefill(
                     Ok(None) => {}
                     Err(error) => {
                         attrs.insert(
-                            "skippy.exact_cache.record_error".to_string(),
-                            json!(error.to_string()),
+                            "skippy.exact_cache.record_error_class".to_string(),
+                            json!(crate::kv_integration::telemetry_error_class(&error)),
                         );
                     }
                 }
@@ -737,8 +746,8 @@ pub(in crate::binary_transport) fn maybe_record_binary_prefill(
                 Ok(None) => {}
                 Err(error) => {
                     attrs.insert(
-                        "skippy.kv.record_error".to_string(),
-                        json!(error.to_string()),
+                        "skippy.kv.record_error_class".to_string(),
+                        json!(crate::kv_integration::telemetry_error_class(&error)),
                     );
                     break;
                 }
@@ -781,8 +790,8 @@ pub(in crate::binary_transport) fn maybe_record_binary_prefill(
                     json!("failed_error"),
                 );
                 attrs.insert(
-                    "skippy.kv.archive_error".to_string(),
-                    json!(error.to_string()),
+                    "skippy.kv.archive_error_class".to_string(),
+                    json!(crate::kv_integration::telemetry_error_class(&error)),
                 );
             }
         }
@@ -923,8 +932,8 @@ pub(in crate::binary_transport) fn maybe_record_binary_full_prefill(
                 Ok(None) => {}
                 Err(error) => {
                     attrs.insert(
-                        "skippy.exact_cache.record_error".to_string(),
-                        json!(error.to_string()),
+                        "skippy.exact_cache.record_error_class".to_string(),
+                        json!(crate::kv_integration::telemetry_error_class(&error)),
                     );
                 }
             }
@@ -956,8 +965,8 @@ pub(in crate::binary_transport) fn maybe_record_binary_full_prefill(
             Ok(None) => {}
             Err(error) => {
                 attrs.insert(
-                    "skippy.kv.record_error".to_string(),
-                    json!(error.to_string()),
+                    "skippy.kv.record_error_class".to_string(),
+                    json!(crate::kv_integration::telemetry_error_class(&error)),
                 );
                 break;
             }
@@ -974,8 +983,8 @@ pub(in crate::binary_transport) fn maybe_record_binary_full_prefill(
                     json!("failed_error"),
                 );
                 attrs.insert(
-                    "skippy.kv.archive_error".to_string(),
-                    json!(error.to_string()),
+                    "skippy.kv.archive_error_class".to_string(),
+                    json!(crate::kv_integration::telemetry_error_class(&error)),
                 );
             }
         }

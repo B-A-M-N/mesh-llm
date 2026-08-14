@@ -3,8 +3,28 @@ use std::{
     fs,
     path::Path,
     path::PathBuf,
-    sync::{Arc, Mutex, atomic::AtomicBool},
+    sync::{Arc, Mutex, OnceLock, atomic::AtomicBool},
 };
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum KvDiskCacheBudget {
+    Off,
+    Auto,
+    Bytes(u64),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KvDiskCacheConfig {
+    pub budget: KvDiskCacheBudget,
+    pub directory: Option<PathBuf>,
+}
+
+static DISK_CACHE_CONFIG: OnceLock<KvDiskCacheConfig> = OnceLock::new();
+
+/// Install host-owned disk-cache policy before any stage is constructed.
+pub fn configure_kv_disk_cache(config: KvDiskCacheConfig) -> Result<(), KvDiskCacheConfig> {
+    DISK_CACHE_CONFIG.set(config)
+}
 
 use anyhow::Result;
 use skippy_cache::{
@@ -52,8 +72,10 @@ impl KvStageIntegration {
             cache_config.max_entries.clamp(1, 512),
             cache_config.max_bytes,
         );
-        if let Some(disk) = open_disk_tier(config) {
-            exact_states = exact_states.with_disk_tier(disk);
+        let disk = open_disk_tier(config);
+        let disk_budget_reservation = disk.as_ref().map(|opened| opened.reservation.clone());
+        if let Some(opened) = disk {
+            exact_states = exact_states.with_disk_tier(opened.tier);
         }
         Ok(Some(Self {
             mode,
@@ -68,47 +90,31 @@ impl KvStageIntegration {
             first_tokens: Arc::new(Mutex::new(BTreeMap::new())),
             replay_tokens: Arc::new(Mutex::new(BTreeMap::new())),
             dense_archive_unsupported: Arc::new(AtomicBool::new(false)),
+            _disk_budget_reservation: disk_budget_reservation,
         }))
     }
 }
 
-/// Open the KV disk tier for this stage, if configured.
-///
-/// The tier is **opt-in**: it writes gigabytes to the user's disk, so it is
-/// not something to enable silently. Set `SKIPPY_KV_DISK_TIER_MIB` to a size
-/// (or `SKIPPY_KV_DISK_TIER=1` for the default budget) to turn it on.
-///
-/// Entries are namespaced per stage identity, so two stages on one machine —
-/// including two stages of the same split — never share a directory. Page
-/// identity already covers configuration differences; this keeps the
-/// *directories* separable so operators can reason about and delete them.
-fn open_disk_tier(config: &StageConfig) -> Option<PrefixDiskTier> {
+/// Open the KV disk tier for this stage. Host configuration wins; legacy
+/// environment variables remain compatibility input when no host configured it.
+struct OpenedDiskTier {
+    tier: PrefixDiskTier,
+    reservation: disk_budget::BudgetReservation,
+}
+
+fn open_disk_tier(config: &StageConfig) -> Option<OpenedDiskTier> {
     let root = disk_tier_root(config);
-    // Persisting pages requires the identity to be anchored to *content*, not
-    // to a display name. `model_id` is a human-facing label -- two different
-    // GGUFs can legitimately be served under one name, and across a restart
-    // there is nothing to notice the swap. In-process that is harmless
-    // because pages die with the process; on disk it means a stale page from
-    // different weights is served as a hit, which is silent numerical
-    // corruption.
-    //
-    // So require at least one content digest before enabling the tier, and
-    // say why when declining. Refusing to cache is always recoverable; a
-    // wrong hit is not.
     if !has_valid_content_digest(config) {
         eprintln!(
-            "skippy: KV disk tier disabled for stage {}: no valid content digest \
-             (manifest_sha256/source_model_sha256) to anchor cache identity across \
-             restarts",
+            "skippy: KV disk tier disabled for stage {}: no valid content digest",
             config.stage_id
         );
         return None;
     }
-    let max_bytes = stage_disk_budget_bytes(&root, config)?;
-    match PrefixDiskTier::open(&root, max_bytes) {
-        Ok(tier) => Some(tier),
+    let reservation = stage_disk_budget(&root, config)?;
+    match PrefixDiskTier::open(&root, reservation.bytes()) {
+        Ok(tier) => Some(OpenedDiskTier { tier, reservation }),
         Err(error) => {
-            // A cache that cannot be opened must never stop the node serving.
             eprintln!("skippy: KV disk tier unavailable, continuing without it: {error}");
             None
         }
@@ -129,24 +135,17 @@ fn is_sha256_digest(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
-/// This stage's share of the node-level disk budget.
-///
-/// The budget is resolved once per node and shared out, so the configured
-/// number is a node total rather than a per-stage allowance that silently
-/// multiplies by the number of loaded models. See `disk_budget`.
-fn stage_disk_budget_bytes(root: &Path, config: &StageConfig) -> Option<u64> {
-    // Free space is measured on the nearest ancestor that exists. Neither
-    // `root` nor its parent is created until `PrefixDiskTier::open` runs, and
-    // `statvfs` on a missing path fails -- which the policy correctly reads
-    // as "do not enable". Probing only the parent therefore disabled the tier
-    // on every first run, before the cache directory had ever been created.
+/// Reserve this stage's desired working set from the node-level budget.
+fn stage_disk_budget(root: &Path, config: &StageConfig) -> Option<disk_budget::BudgetReservation> {
     let probe = disk_budget::existing_ancestor(root);
     let free_bytes = disk_budget::free_space_bytes(&probe);
-    let budget = disk_budget::resolve_node_budget(
-        explicit_disk_tier_bytes(),
-        disk_tier_explicitly_enabled(),
-        free_bytes,
-    );
+    let policy = effective_disk_cache_config();
+    let (explicit, enabled) = match policy.budget {
+        KvDiskCacheBudget::Off => (None, false),
+        KvDiskCacheBudget::Auto => (None, true),
+        KvDiskCacheBudget::Bytes(bytes) => (Some(bytes), true),
+    };
+    let budget = disk_budget::resolve_node_budget(explicit, enabled, free_bytes);
     if let NodeBudget::InsufficientSpace { free_bytes } = budget {
         eprintln!(
             "skippy: KV disk tier disabled for stage {}: only {:.1} GiB free on {}",
@@ -157,47 +156,67 @@ fn stage_disk_budget_bytes(root: &Path, config: &StageConfig) -> Option<u64> {
         return None;
     }
     let node_bytes = budget.bytes()?;
-    let share = disk_budget::claim_stage_share(node_bytes);
-    if share.is_none() {
-        eprintln!(
-            "skippy: KV disk tier disabled for stage {}: node disk budget already fully claimed",
-            config.stage_id,
-        );
-    }
-    share
+    let desired = config
+        .kv_cache
+        .as_ref()
+        .map(|cache| cache.max_bytes)
+        .filter(|bytes| *bytes > 0)
+        .unwrap_or(node_bytes);
+    disk_budget::reserve(node_bytes, desired)
 }
 
-/// An explicitly configured node-level budget, if any.
+fn effective_disk_cache_config() -> KvDiskCacheConfig {
+    DISK_CACHE_CONFIG.get().cloned().unwrap_or_else(|| {
+        let budget = explicit_disk_tier_bytes()
+            .map(KvDiskCacheBudget::Bytes)
+            .unwrap_or_else(|| {
+                if legacy_disk_tier_disabled() {
+                    KvDiskCacheBudget::Off
+                } else {
+                    KvDiskCacheBudget::Auto
+                }
+            });
+        KvDiskCacheConfig {
+            budget,
+            directory: None,
+        }
+    })
+}
+
 fn explicit_disk_tier_bytes() -> Option<u64> {
-    let value = std::env::var("SKIPPY_KV_DISK_TIER_MIB").ok()?;
-    let mib = value.trim().parse::<u64>().ok()?;
+    let mib = std::env::var("SKIPPY_KV_DISK_TIER_MIB")
+        .ok()?
+        .trim()
+        .parse::<u64>()
+        .ok()?;
     (mib > 0).then(|| mib.saturating_mul(1024 * 1024))
 }
 
-fn disk_tier_explicitly_enabled() -> bool {
+fn legacy_disk_tier_disabled() -> bool {
     std::env::var("SKIPPY_KV_DISK_TIER")
         .ok()
-        .map(|value| {
+        .is_some_and(|value| {
             matches!(
                 value.trim().to_ascii_lowercase().as_str(),
-                "1" | "on" | "true"
+                "0" | "off" | "false"
             )
         })
-        .unwrap_or(false)
 }
 
 fn disk_tier_root(config: &StageConfig) -> PathBuf {
-    let base = std::env::var("SKIPPY_KV_DISK_TIER_DIR")
-        .ok()
-        .map(PathBuf::from)
+    let base = effective_disk_cache_config()
+        .directory
+        .or_else(|| {
+            std::env::var("SKIPPY_KV_DISK_TIER_DIR")
+                .ok()
+                .map(PathBuf::from)
+        })
         .unwrap_or_else(|| {
             std::env::var("MESH_LLM_HOME")
                 .map(PathBuf::from)
                 .unwrap_or_else(|_| dirs_home().join(".mesh-llm"))
                 .join("kv-cache")
         });
-    // Stage identity, hashed so no model or path text lands in a directory
-    // name, and so the name stays a fixed length.
     let mut hasher = blake3::Hasher::new();
     hasher.update(config.model_id.as_bytes());
     hasher.update(config.stage_id.as_bytes());

@@ -345,8 +345,8 @@ impl DenseArchiveOutcome {
         }
         if let Self::Failed(DenseArchiveFailure::Export { reason }) = self {
             attrs.insert(
-                "skippy.kv.archive_error".to_string(),
-                serde_json::json!(reason),
+                "skippy.kv.archive_error_class".to_string(),
+                serde_json::json!(super::telemetry_error_class_from_message(reason)),
             );
         }
     }

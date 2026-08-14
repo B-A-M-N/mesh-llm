@@ -608,73 +608,45 @@ pub(super) fn configure_run_auto_process_state(
     configure_skippy_native_logging(runtime.as_ref().map(|runtime| runtime.dir()));
 }
 
-/// Translate `--kv-cache-disk` into the environment the stage runtime reads.
-///
-/// The disk tier is resolved deep inside `skippy-server`, per stage, from
-/// `SKIPPY_KV_DISK_TIER*`. Those stay the underlying mechanism -- this only
-/// gives the feature a supported front door, because a capability that can
-/// only be reached by exporting an undocumented variable is not one users can
-/// be expected to find.
-///
-/// An explicit environment variable always wins, so existing setups and tests
-/// keep working unchanged.
+/// Propagate CLI policy through a typed process-local configuration. This does
+/// not mutate process environment; lower-level legacy environment variables
+/// remain available when skippy-server is used without this host configuration.
 fn configure_kv_disk_cache(options: &RuntimeOptions) {
-    if let Some(dir) = options.kv_cache_disk_dir.as_ref()
-        && std::env::var_os("SKIPPY_KV_DISK_TIER_DIR").is_none()
-    {
-        // TODO: Audit that the environment access only happens in single-threaded code.
-        unsafe { std::env::set_var("SKIPPY_KV_DISK_TIER_DIR", dir) };
-    }
-
-    let Some(raw) = options.kv_cache_disk.as_ref() else {
-        return;
+    let budget = parse_kv_cache_disk(&options.kv_cache_disk)
+        .expect("CLI validates --kv-cache-disk before runtime startup");
+    let budget = match budget {
+        KvDiskBudget::Off => skippy_server::KvDiskCacheBudget::Off,
+        KvDiskBudget::Auto => skippy_server::KvDiskCacheBudget::Auto,
+        KvDiskBudget::Mib(mib) => {
+            skippy_server::KvDiskCacheBudget::Bytes(mib.saturating_mul(1024 * 1024))
+        }
     };
-    if std::env::var_os("SKIPPY_KV_DISK_TIER_MIB").is_some()
-        || std::env::var_os("SKIPPY_KV_DISK_TIER").is_some()
-    {
-        return;
-    }
-
-    match parse_kv_cache_disk(raw) {
-        Some(KvDiskBudget::Auto) => {
-            // TODO: Audit that the environment access only happens in single-threaded code.
-            unsafe { std::env::set_var("SKIPPY_KV_DISK_TIER", "1") };
-        }
-        Some(KvDiskBudget::Mib(mib)) => {
-            // TODO: Audit that the environment access only happens in single-threaded code.
-            unsafe { std::env::set_var("SKIPPY_KV_DISK_TIER_MIB", mib.to_string()) };
-        }
-        None => {
-            eprintln!(
-                "mesh-llm: ignoring --kv-cache-disk {raw:?}: expected a positive size in GB, or \"auto\""
-            );
-        }
+    let config = skippy_server::KvDiskCacheConfig {
+        budget,
+        directory: options.kv_cache_disk_dir.clone(),
+    };
+    if skippy_server::configure_kv_disk_cache(config).is_err() {
+        tracing::debug!("KV disk cache policy was already configured");
     }
 }
 
-/// What the user asked for with `--kv-cache-disk`.
 #[derive(Debug, PartialEq, Eq)]
 enum KvDiskBudget {
-    /// Let the existing free-space policy pick the size.
+    Off,
     Auto,
-    /// An explicit node-wide budget.
     Mib(u64),
 }
 
-/// Parse `--kv-cache-disk` without touching the environment, so the policy is
-/// testable on its own.
 fn parse_kv_cache_disk(raw: &str) -> Option<KvDiskBudget> {
     let value = raw.trim();
-    // `auto` hands sizing to the existing free-space policy rather than
-    // inventing a second one here.
+    if value.eq_ignore_ascii_case("off") {
+        return Some(KvDiskBudget::Off);
+    }
     if value.eq_ignore_ascii_case("auto") {
         return Some(KvDiskBudget::Auto);
     }
     match value.parse::<f64>() {
-        // A budget that rounds to zero MiB would disable the tier while
-        // looking like it had been asked for, so refuse it rather than
-        // silently doing nothing.
-        Ok(gb) if gb.is_finite() && gb > 0.0 && (gb * 1024.0) >= 1.0 => {
+        Ok(gb) if gb.is_finite() && gb > 0.0 && gb * 1024.0 >= 1.0 => {
             Some(KvDiskBudget::Mib((gb * 1024.0).round() as u64))
         }
         _ => None,
@@ -1610,6 +1582,7 @@ mod kv_cache_disk_tests {
     fn auto_defers_to_the_free_space_policy() {
         assert_eq!(parse_kv_cache_disk("auto"), Some(KvDiskBudget::Auto));
         assert_eq!(parse_kv_cache_disk("AUTO"), Some(KvDiskBudget::Auto));
+        assert_eq!(parse_kv_cache_disk("off"), Some(KvDiskBudget::Off));
     }
 
     /// Each of these would otherwise disable the tier while looking like the

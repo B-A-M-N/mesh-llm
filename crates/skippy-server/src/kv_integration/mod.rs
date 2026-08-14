@@ -18,6 +18,7 @@ use crate::kv_proto::{
 
 mod activation;
 mod config;
+pub use config::{KvDiskCacheBudget, KvDiskCacheConfig, configure_kv_disk_cache};
 mod dense_disk;
 mod disk_budget;
 pub use dense_disk::{
@@ -34,6 +35,41 @@ pub use records::{
     PrefillKvIdentity, RecordPageOutcome, ResidentActivationRecord, ResidentActivationRestore,
     ResidentPrefixRecord, ResidentPrefixRestore,
 };
+
+/// Return a bounded, stable telemetry class without exporting error text.
+///
+/// Detailed errors remain available to callers for local diagnostics, while metrics
+/// only receive one of this fixed set of labels.
+pub(crate) fn telemetry_error_class(error: &anyhow::Error) -> &'static str {
+    telemetry_error_class_from_message(&error.to_string())
+}
+
+pub(crate) fn telemetry_error_class_from_message(message: &str) -> &'static str {
+    let message = message.to_ascii_lowercase();
+    if message.contains("checksum") || message.contains("digest") {
+        "integrity"
+    } else if message.contains("not found") || message.contains("missing") {
+        "not_found"
+    } else if message.contains("unsupported") || message.contains("disabled") {
+        "unsupported"
+    } else if message.contains("invalid") || message.contains("mismatch") {
+        "invalid_data"
+    } else if message.contains("timeout") || message.contains("unavailable") {
+        "unavailable"
+    } else if message.contains("permission") || message.contains("denied") {
+        "permission"
+    } else if message.contains("io error")
+        || message.contains("i/o error")
+        || message.contains("failed to read")
+        || message.contains("failed to write")
+    {
+        "io"
+    } else if message.contains("native") || message.contains("runtime") {
+        "runtime"
+    } else {
+        "internal"
+    }
+}
 
 pub(crate) fn proactive_eviction_error_kind(error: &anyhow::Error) -> &'static str {
     let message = error.to_string();
@@ -108,6 +144,9 @@ pub struct KvStageIntegration {
     /// Latches native layouts that cannot produce a disk-safe page. Composite ISWA
     /// layouts are supported by ABI 0.1.39; unknown layouts still decline once.
     pub(crate) dense_archive_unsupported: Arc<AtomicBool>,
+    /// Keeps this stage's node-level disk allowance reserved for exactly as
+    /// long as the stage integration can use its disk tier.
+    _disk_budget_reservation: Option<disk_budget::BudgetReservation>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -439,5 +478,26 @@ fn local_trust_checksum(page_id: &str, byte_size: u64) -> Checksum {
     Checksum {
         algorithm: ChecksumAlgorithm::Sha256 as i32,
         digest: digest.finalize().to_vec(),
+    }
+}
+
+#[cfg(test)]
+mod telemetry_error_class_tests {
+    use super::telemetry_error_class_from_message;
+
+    #[test]
+    fn maps_detailed_errors_to_bounded_classes() {
+        assert_eq!(
+            telemetry_error_class_from_message("checksum mismatch for page abc"),
+            "integrity"
+        );
+        assert_eq!(
+            telemetry_error_class_from_message("permission denied: /secret/path"),
+            "permission"
+        );
+        assert_eq!(
+            telemetry_error_class_from_message("arbitrary secret detail 123"),
+            "internal"
+        );
     }
 }

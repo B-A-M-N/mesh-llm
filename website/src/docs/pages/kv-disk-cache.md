@@ -112,13 +112,25 @@ applies depends on the shape of the model's attention state, not on whether it
 is MoE: experts sit in the feed-forward layers and carry no state between
 tokens.
 
-**Sliding-window attention models are the exception.** Gemma 3 and 4, and other
-models llama.cpp backs with interleaved sliding-window attention, split
-attention state across a full-context cache and a window-bounded one. A saved
-page cannot describe both, and saving only part of it would restore a prompt
-that looks complete but is not. Mesh detects this on the first attempt,
-disables the disk cache for that model, and carries on serving normally.
-In-memory prefix reuse is unaffected.
+Interleaved sliding-window attention (ISWA) is supported. For models such as
+Gemma 3 and Gemma 4, llama.cpp keeps a full-context base cache and a
+window-bounded SWA cache. Mesh saves those as one composite page: the complete
+base range plus the visible SWA suffix, each with its own descriptor. The same
+codec also covers ISWA inside a hybrid attention/recurrent memory wrapper; the
+recurrent state is retained alongside the composite attention page.
+
+Other hybrid memory layouts are not assumed to be safe. If the native runtime
+cannot export the model's complete continuation state in one of the supported
+plain-KV, KV-plus-recurrent, or composite-ISWA forms, Mesh declines disk
+retention for that stage and continues serving normally. In-memory prefix reuse
+is unaffected.
+
+The composite descriptor and corruption checks have Rust unit coverage. Live
+restart validation with Muse-Glimmer-30B Q4_K_XL restored 1,920 cached tokens
+from a 2,038-token prompt: wall time fell from 3.76 seconds cold to 0.43 seconds
+after restart. The 54.3 MB composite page contained 13 full-context layers and
+39 SWA layers. Inkling remains unsupported because it combines recurrent state
+with ISWA and requires both forms to be restored together.
 
 To check what a running node decided, look at `skippy.kv.archive_status`. It is
 emitted through telemetry, not written to the ordinary log: with no exporter
