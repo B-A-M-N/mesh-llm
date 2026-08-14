@@ -3,6 +3,7 @@ use crate::logging::{OpenAiLifecycleAttachment, OpenAiRouteObserver};
 use crate::mesh;
 use crate::network::affinity;
 use crate::network::openai::auto_route;
+use crate::network::openai::automatic;
 use crate::network::openai::transport as proxy;
 use crate::network::router;
 use mesh_llm_events::audit::{audit_events, emit_audit};
@@ -182,7 +183,14 @@ async fn resolve_auto_routed_model(
     required_tokens: Option<u32>,
     affinity: &affinity::AffinityRouter,
 ) -> AutoRouteResolution {
-    if request.model_name.is_some() && request.model_name.as_deref() != Some("auto") {
+    // An explicitly named model routes to itself. The automatic directive (in
+    // either spelling) resolves here, so `mesh` reaches the same
+    // media-capability filter and readiness/affinity selection as `auto` —
+    // without it, a `mesh` request with an image skipped the filter entirely
+    // and had its image silently dropped downstream.
+    if let Some(model) = request.model_name.as_deref()
+        && !automatic::is_directive(model)
+    {
         return AutoRouteResolution::Continue {
             effective_model: request.model_name.clone(),
             classification: None,
@@ -196,6 +204,25 @@ async fn resolve_auto_routed_model(
             classification: None,
         };
     };
+
+    automatic::warn_if_deprecated_alias(request.model_name.as_deref());
+
+    match automatic::serving_mode(request.model_name.as_deref(), body_json) {
+        // Committee mode keeps the directive as the effective model so the MoA
+        // gateway picks the request up.
+        automatic::ServingMode::Committee => {
+            return AutoRouteResolution::Continue {
+                effective_model: Some(automatic::DIRECTIVE.to_string()),
+                classification: None,
+            };
+        }
+        // Single-model mode falls through to the capability-, readiness- and
+        // affinity-aware selection below.
+        automatic::ServingMode::SingleModel(reason) => tracing::debug!(
+            reason = reason.as_str(),
+            "automatic routing: serving from a single model"
+        ),
+    }
 
     let classification = router::classify(body_json);
     let media = router::media_requirements(body_json);
@@ -1142,6 +1169,10 @@ pub(crate) fn callable_models(targets: &election::ModelTargets) -> Vec<String> {
 #[cfg(test)]
 #[path = "ingress_tests/durable_artifacts.rs"]
 mod durable_artifacts;
+
+#[cfg(test)]
+#[path = "ingress_tests/automatic_routing.rs"]
+mod automatic_routing;
 
 #[cfg(test)]
 mod tests {

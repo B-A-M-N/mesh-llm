@@ -15,6 +15,7 @@ use self::workers::effective_enable_thinking_for_moa;
 use crate::inference::election;
 use crate::logging::OpenAiRouteObserver;
 use crate::mesh;
+use crate::network::openai::automatic;
 use crate::network::openai::transport as proxy;
 use mesh_llm_events::logging::events::TokenUsage;
 use mesh_mixture_of_agents as moa;
@@ -119,7 +120,7 @@ pub async fn try_handle_moa(
     required_tokens: Option<u32>,
     route_observer: OpenAiRouteObserver<'_>,
 ) -> MoaDispatchResult {
-    if effective_model != Some(moa::VIRTUAL_MODEL_NAME) {
+    if !effective_model.is_some_and(automatic::is_directive) {
         return MoaDispatchResult::Passthrough(tcp_stream);
     }
 
@@ -155,6 +156,29 @@ pub async fn try_handle_moa(
                 Err(_) => MoaDispatchResult::Dropped("moa_response_write_failed"),
             };
         }
+    }
+
+    // Mode gate. A committee cannot honour every request: it compares and
+    // synthesises drafts as text, so media content has no aggregation
+    // semantics, and it calls workers non-streaming because the arbiter needs
+    // whole drafts to detect divergence. Those requests are served by a single
+    // capability-selected model instead, which the caller resolves through the
+    // ordinary auto selector once we hand the stream back.
+    // The stream is handed back with the directive still in the request, *not*
+    // rewritten to a concrete model. The caller recognises the directive as an
+    // automatic request and runs the full selector (media capability filter,
+    // readiness, affinity, context fit). Rewriting here would make the request
+    // look explicitly addressed and skip exactly the media filter a media
+    // request needs.
+    if let automatic::ServingMode::SingleModel(reason) =
+        automatic::serving_mode(effective_model, &body_json)
+    {
+        tracing::info!(
+            reason = reason.as_str(),
+            "MoA: serving {} from a single model",
+            automatic::DIRECTIVE
+        );
+        return MoaDispatchResult::Passthrough(tcp_stream);
     }
 
     let enable_thinking = effective_enable_thinking_for_moa(&body_json);
